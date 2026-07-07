@@ -1,0 +1,54 @@
+version(2);
+project_name = "compute_ql";
+
+patterns = {
+"*.c",
+"*.cpp",
+"*.h",
+"*.inc",
+"*.bat",
+"*.4coder",
+"*.mdesk",
+"*.hlsl",
+"*.gdb",
+};
+blacklist_patterns = {
+".*",
+};
+
+load_paths = {
+	.win = {
+		{ .path = "./src", .recursive = true, .relative = true, },
+	},
+};
+
+commands = {
+	.build = {
+		.win = "build.bat",
+		.out = "*compilation*",
+		.footer_panel = true,
+		.save_dirty_files = true,
+		.cursor_at_end = false,
+	},
+	.run = {
+		.win = "run.bat",
+		.out = "*compilation*",
+		.footer_panel = true,
+		.save_dirty_files = true,
+		.cursor_at_end = false,
+	},
+	.test = {
+	.win = "test.bat",
+	.out = "*compilation*",
+	.footer_panel = true,
+	.save_dirty_files = false,
+	.cursor_at_end = false,
+	}
+};
+
+fkey_command = {
+.F1 = "build",
+.F2 = "test",
+.F3 = "run",
+};
+

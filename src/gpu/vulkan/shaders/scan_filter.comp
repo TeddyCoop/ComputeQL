@@ -1,0 +1,269 @@
+#version 450
+#extension GL_ARB_gpu_shader_fp64 : enable
+
+// tec: generic, precompiled scan+filter operator.
+// Interprets a small per-row bytecode program (compiled on the CPU from the SQL WHERE clause)
+// against up to QE_MAX_COLUMN_BINDINGS column buffers, and appends the row index of every
+// matching row to the output indices buffer.
+//
+// NOTE: binding layout/opcode values MUST stay in sync with src/query_exec/query_exec.h
+
+layout(local_size_x = 1) in;
+
+#define OP_PUSH_TRUE     0
+#define OP_LOAD_NUM_COL  1
+#define OP_PUSH_CONST    2
+#define OP_CMP_EQ        3
+#define OP_CMP_NE        4
+#define OP_CMP_LT        5
+#define OP_CMP_GT        6
+#define OP_CMP_LE        7
+#define OP_CMP_GE        8
+#define OP_AND           9
+#define OP_OR            10
+#define OP_STR_EQ        11
+#define OP_STR_CONTAINS  12
+#define OP_HALT          13
+
+#define COLTYPE_U32      1
+#define COLTYPE_U64      2
+#define COLTYPE_F32      3
+#define COLTYPE_F64      4
+
+#define MAX_STACK 16
+
+layout(std430, binding = 0) readonly buffer BytecodeBuf   { uint bytecode[]; };
+layout(std430, binding = 1) readonly buffer NumConstsBuf  { uint num_consts[]; };
+layout(std430, binding = 2) readonly buffer StrConstsBuf  { uint str_consts[]; };
+layout(std430, binding = 3) buffer OutIndicesBuf          { uint out_indices[]; };
+layout(std430, binding = 4) buffer OutCountBuf            { uint out_count[]; };
+
+layout(std430, binding = 6)  readonly buffer ColBuf6  { uint col_data6[]; };
+layout(std430, binding = 7)  readonly buffer ColBuf7  { uint col_data7[]; };
+layout(std430, binding = 8)  readonly buffer ColBuf8  { uint col_data8[]; };
+layout(std430, binding = 9)  readonly buffer ColBuf9  { uint col_data9[]; };
+layout(std430, binding = 10) readonly buffer ColBuf10 { uint col_data10[]; };
+layout(std430, binding = 11) readonly buffer ColBuf11 { uint col_data11[]; };
+layout(std430, binding = 12) readonly buffer ColBuf12 { uint col_data12[]; };
+layout(std430, binding = 13) readonly buffer ColBuf13 { uint col_data13[]; };
+layout(std430, binding = 14) readonly buffer ColBuf14 { uint col_data14[]; };
+layout(std430, binding = 15) readonly buffer ColBuf15 { uint col_data15[]; };
+
+layout(push_constant) uniform PushConstants
+{
+  uint words[16];
+} pc;
+
+uint
+read_col_word(uint slot, uint word_index)
+{
+  switch (slot)
+  {
+    case 0u: return col_data6[word_index];
+    case 1u: return col_data7[word_index];
+    case 2u: return col_data8[word_index];
+    case 3u: return col_data9[word_index];
+    case 4u: return col_data10[word_index];
+    case 5u: return col_data11[word_index];
+    case 6u: return col_data12[word_index];
+    case 7u: return col_data13[word_index];
+    case 8u: return col_data14[word_index];
+    case 9u: return col_data15[word_index];
+  }
+  return 0u;
+}
+
+uint
+read_col_byte(uint slot, uint byte_index)
+{
+  uint word = read_col_word(slot, byte_index / 4u);
+  uint shift = (byte_index % 4u) * 8u;
+  return (word >> shift) & 0xffu;
+}
+
+uint
+read_str_const_byte(uint word_offset, uint byte_index)
+{
+  uint word = str_consts[word_offset + byte_index / 4u];
+  uint shift = (byte_index % 4u) * 8u;
+  return (word >> shift) & 0xffu;
+}
+
+// tec: string columns occupy two consecutive slots: `slot` is the raw byte data buffer,
+// `slot + 1` is the (row_count + 1) U64 offsets array (2 words per offset, high word ignored -
+// string blobs are assumed to stay under 4GB per chunk).
+uint
+read_str_offset(uint offsets_slot, uint row)
+{
+  return read_col_word(offsets_slot, row * 2u);
+}
+
+double
+read_num_column_value(uint slot, uint coltype, uint row)
+{
+  if (coltype == COLTYPE_U32)
+  {
+    return double(read_col_word(slot, row));
+  }
+  else if (coltype == COLTYPE_U64)
+  {
+    uint lo = read_col_word(slot, row * 2u + 0u);
+    uint hi = read_col_word(slot, row * 2u + 1u);
+    return double(hi) * 4294967296.0LF + double(lo);
+  }
+  else if (coltype == COLTYPE_F32)
+  {
+    return double(uintBitsToFloat(read_col_word(slot, row)));
+  }
+  else // COLTYPE_F64
+  {
+    uint lo = read_col_word(slot, row * 2u + 0u);
+    uint hi = read_col_word(slot, row * 2u + 1u);
+    return packDouble2x32(uvec2(lo, hi));
+  }
+}
+
+bool
+str_eq(uint slot, uint row, uint const_word_offset, uint const_len)
+{
+  uint start = read_str_offset(slot + 1u, row);
+  uint end = read_str_offset(slot + 1u, row + 1u);
+  uint len = end - start;
+
+  if (len != const_len) return false;
+
+  for (uint i = 0u; i < len; i++)
+  {
+    if (read_col_byte(slot, start + i) != read_str_const_byte(const_word_offset, i))
+    {
+      return false;
+    }
+  }
+  return true;
+}
+
+// tec: defensive cap on string length considered by the byte-scan loops below - protects against
+// a corrupt/underflowed offset pair turning a single row's scan into a multi-billion iteration
+// loop (which looks identical to a genuine GPU hang from the host's point of view).
+#define MAX_SANE_STRING_LEN 1048576u
+
+bool
+str_contains(uint slot, uint row, uint const_word_offset, uint const_len)
+{
+  uint start = read_str_offset(slot + 1u, row);
+  uint end = read_str_offset(slot + 1u, row + 1u);
+  uint len = end - start;
+
+  if (const_len == 0u) return true;
+  if (len > MAX_SANE_STRING_LEN) return false;
+  if (const_len > len) return false;
+
+  for (uint window = 0u; window <= len - const_len; window++)
+  {
+    bool match = true;
+    for (uint i = 0u; i < const_len; i++)
+    {
+      if (read_col_byte(slot, start + window + i) != read_str_const_byte(const_word_offset, i))
+      {
+        match = false;
+        break;
+      }
+    }
+    if (match) return true;
+  }
+  return false;
+}
+
+void
+main()
+{
+  uint row_count = pc.words[0];
+  uint row = gl_GlobalInvocationID.x;
+  if (row >= row_count) return;
+
+  double stack[MAX_STACK];
+  int sp = 0;
+
+  uint ip = 0u;
+  bool running = true;
+
+  // tec: defensive bound on both the instruction pointer and total steps taken - guards against
+  // a corrupt/malformed bytecode stream (or a bug in a comparator) turning into a driver-hanging
+  // infinite loop instead of a clean early exit.
+  uint bytecode_word_count = bytecode.length();
+  uint steps = 0u;
+
+  while (running && ip < bytecode_word_count && steps < bytecode_word_count + 64u)
+  {
+    steps++;
+    uint opcode = bytecode[ip++];
+
+    switch (opcode)
+    {
+      case OP_HALT:
+      {
+        running = false;
+      } break;
+
+      case OP_PUSH_TRUE:
+      {
+        stack[sp++] = 1.0LF;
+      } break;
+
+      case OP_LOAD_NUM_COL:
+      {
+        uint operand = bytecode[ip++];
+        uint slot = operand & 0xffu;
+        uint coltype = (operand >> 8) & 0xffu;
+        stack[sp++] = read_num_column_value(slot, coltype, row);
+      } break;
+
+      case OP_PUSH_CONST:
+      {
+        uint const_index = bytecode[ip++];
+        uint lo = num_consts[const_index * 2u + 0u];
+        uint hi = num_consts[const_index * 2u + 1u];
+        stack[sp++] = packDouble2x32(uvec2(lo, hi));
+      } break;
+
+      case OP_CMP_EQ: { double b = stack[--sp]; double a = stack[--sp]; stack[sp++] = (a == b) ? 1.0LF : 0.0LF; } break;
+      case OP_CMP_NE: { double b = stack[--sp]; double a = stack[--sp]; stack[sp++] = (a != b) ? 1.0LF : 0.0LF; } break;
+      case OP_CMP_LT: { double b = stack[--sp]; double a = stack[--sp]; stack[sp++] = (a <  b) ? 1.0LF : 0.0LF; } break;
+      case OP_CMP_GT: { double b = stack[--sp]; double a = stack[--sp]; stack[sp++] = (a >  b) ? 1.0LF : 0.0LF; } break;
+      case OP_CMP_LE: { double b = stack[--sp]; double a = stack[--sp]; stack[sp++] = (a <= b) ? 1.0LF : 0.0LF; } break;
+      case OP_CMP_GE: { double b = stack[--sp]; double a = stack[--sp]; stack[sp++] = (a >= b) ? 1.0LF : 0.0LF; } break;
+
+      case OP_AND: { double b = stack[--sp]; double a = stack[--sp]; stack[sp++] = (a != 0.0LF && b != 0.0LF) ? 1.0LF : 0.0LF; } break;
+      case OP_OR:  { double b = stack[--sp]; double a = stack[--sp]; stack[sp++] = (a != 0.0LF || b != 0.0LF) ? 1.0LF : 0.0LF; } break;
+
+      case OP_STR_EQ:
+      {
+        uint slot = bytecode[ip++];
+        uint const_word_offset = bytecode[ip++];
+        uint const_len = bytecode[ip++];
+        stack[sp++] = str_eq(slot, row, const_word_offset, const_len) ? 1.0LF : 0.0LF;
+      } break;
+
+      case OP_STR_CONTAINS:
+      {
+        uint slot = bytecode[ip++];
+        uint const_word_offset = bytecode[ip++];
+        uint const_len = bytecode[ip++];
+        stack[sp++] = str_contains(slot, row, const_word_offset, const_len) ? 1.0LF : 0.0LF;
+      } break;
+
+      default:
+      {
+        running = false;
+      } break;
+    }
+  }
+
+  bool matched = (sp > 0) && (stack[sp - 1] != 0.0LF);
+  if (matched)
+  {
+    uint pos = atomicAdd(out_count[0], 1u);
+    out_indices[pos * 2u + 0u] = row;
+    out_indices[pos * 2u + 1u] = 0u;
+  }
+}
