@@ -299,18 +299,19 @@ app_perform_kernel(Arena* arena, GDB_Database* database, IR_Node* root_node)
 
   APP_KernelResult result = { 0 };
 
-  GDB_Table* table = gdb_database_find_table(database, ir_node_find_child(root_node, IR_NodeType_Table)->value);
-  if (!table)
+  PLAN_Node* plan = plan_build_from_select(arena, database, root_node);
+  PLAN_ExecResult plan_result = plan_execute(arena, database, plan, root_node);
+
+  if (!plan_result.supported)
   {
-    log_error("app_perform_kernel: table not found");
+    log_error("app_perform_kernel: query has no supported execution path yet, returning no rows");
     ProfEnd();
     return result;
   }
 
-  QE_ScanResult scan_result = qe_scan_filter(arena, database, table, root_node);
-  result.indices = scan_result.indices;
-  result.count = scan_result.count;
-  result.cap = scan_result.count;
+  result.indices = plan_result.indices;
+  result.count = plan_result.count;
+  result.cap = plan_result.count;
 
   ProfEnd();
   return result;

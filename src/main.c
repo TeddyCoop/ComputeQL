@@ -13,6 +13,7 @@
 #include "ir_gen/ir_gen_inc.h"
 #include "gpu/gpu_inc.h"
 #include "query_exec/query_exec.h"
+#include "planner/planner.h"
 #include "application.h"
 #include "thread_pool/thread_pool.h"
 
@@ -22,6 +23,7 @@
 #include "ir_gen/ir_gen_inc.c"
 #include "gdb/gdb_inc.c"
 #include "query_exec/query_exec.c"
+#include "planner/planner.c"
 #include "application.c"
 #include "thread_pool/thread_pool.c"
 
