@@ -1,0 +1,112 @@
+#version 450
+#extension GL_ARB_gpu_shader_fp64 : enable
+
+// tec: pass 3/3 of the group-by pipeline - one thread per GROUP (not per row), looping serially
+// over its own CSR member-row list. Serial-per-thread accumulation (rather than cross-thread
+// atomics) sidesteps the lack of 64-bit/double atomics with vulkan (unless the VK_KHR_shader_atomic_int64 extension is enabled) 
+// Up to QE_AGG_MAX_EXPRS aggregate expressions are computed per group in one pass
+//  each expression's function is packed 4 bits per slot into a single push-constant word
+//
+// NOTE: binding layout/push-constant slot order/func codes MUST stay in sync with qe_aggregate
+
+layout(local_size_x = 1) in;
+
+#define FUNC_COUNT 0u
+#define FUNC_SUM   1u
+#define FUNC_AVG   2u
+#define FUNC_MIN   3u
+#define FUNC_MAX   4u
+
+layout(std430, binding = 0) readonly buffer MembersBuf  { uint group_member_rows[]; };
+layout(std430, binding = 1) readonly buffer OffsetsBuf  { uint slot_offsets[]; };
+layout(std430, binding = 2) readonly buffer GroupIdsBuf { uint group_ids[]; };
+layout(std430, binding = 3) buffer ReprBuf              { uint representative_row_out[]; };
+layout(std430, binding = 4) buffer ResultsBuf           { double results_out[]; };
+
+layout(std430, binding = 5)  readonly buffer Arg0Buf { double arg0[]; };
+layout(std430, binding = 6)  readonly buffer Arg1Buf { double arg1[]; };
+layout(std430, binding = 7)  readonly buffer Arg2Buf { double arg2[]; };
+layout(std430, binding = 8)  readonly buffer Arg3Buf { double arg3[]; };
+layout(std430, binding = 9)  readonly buffer Arg4Buf { double arg4[]; };
+layout(std430, binding = 10) readonly buffer Arg5Buf { double arg5[]; };
+layout(std430, binding = 11) readonly buffer Arg6Buf { double arg6[]; };
+layout(std430, binding = 12) readonly buffer Arg7Buf { double arg7[]; };
+
+layout(push_constant) uniform PushConstants
+{
+  uint words[16];
+} pc;
+
+double
+read_arg(uint e, uint row)
+{
+  switch (e)
+  {
+    case 0u: return arg0[row];
+    case 1u: return arg1[row];
+    case 2u: return arg2[row];
+    case 3u: return arg3[row];
+    case 4u: return arg4[row];
+    case 5u: return arg5[row];
+    case 6u: return arg6[row];
+    case 7u: return arg7[row];
+  }
+  return 0.0LF;
+}
+
+void
+main()
+{
+  uint num_groups = pc.words[0];
+  uint num_exprs  = pc.words[2];
+  uint func_codes = pc.words[4];
+
+  uint g = gl_GlobalInvocationID.x;
+  if (g >= num_groups) return;
+
+  uint slot = group_ids[g];
+  uint start = slot_offsets[slot];
+  uint end = slot_offsets[slot + 1u];
+
+  representative_row_out[g] = (end > start) ? group_member_rows[start] : 0xffffffffu;
+
+  for (uint e = 0u; e < num_exprs; e++)
+  {
+    uint func = (func_codes >> (e * 4u)) & 0xfu;
+
+    double acc = 0.0LF;
+    double mn = 1.0e300LF;
+    double mx = -1.0e300LF;
+    uint count = 0u;
+
+    for (uint m = start; m < end; m++)
+    {
+      uint row = group_member_rows[m];
+      count++;
+
+      if (func == FUNC_SUM || func == FUNC_AVG)
+      {
+        acc += read_arg(e, row);
+      }
+      else if (func == FUNC_MIN)
+      {
+        double v = read_arg(e, row);
+        if (v < mn) mn = v;
+      }
+      else if (func == FUNC_MAX)
+      {
+        double v = read_arg(e, row);
+        if (v > mx) mx = v;
+      }
+    }
+
+    double result;
+    if (func == FUNC_COUNT) result = double(count);
+    else if (func == FUNC_SUM) result = acc;
+    else if (func == FUNC_AVG) result = (count > 0u) ? (acc / double(count)) : 0.0LF;
+    else if (func == FUNC_MIN) result = mn;
+    else result = mx;
+
+    results_out[g * num_exprs + e] = result;
+  }
+}

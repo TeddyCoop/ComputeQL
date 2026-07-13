@@ -701,7 +701,7 @@ struct DateTime
 typedef U64 DenseTime;
 
 ////////////////////////////////
-//~ allen: Files
+//~ tec: Files
 
 typedef U32 FilePropertyFlags;
 enum

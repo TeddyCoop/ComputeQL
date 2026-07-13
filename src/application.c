@@ -8,7 +8,7 @@ app_execute_query(String8 sql_query)
   
   SQL_TokenizeResult tokenize_result = sql_tokenize_from_text(arena, sql_query);
   SQL_Node* sql_root = sql_parse(arena, tokenize_result.tokens, tokenize_result.count, sql_query);
-
+  
   if (sql_root == NULL || g_sql_parse_error.has_error)
   {
     log_error("failed to parse query, aborting");
@@ -16,7 +16,7 @@ app_execute_query(String8 sql_query)
     ProfEnd();
     return;
   }
-
+  
   IR_Query* ir_query = ir_generate_from_ast(arena, sql_root);
   //sql_tokens_print(tokenize_result);
   //sql_print_ast(sql_root);
@@ -104,12 +104,6 @@ app_execute_query(String8 sql_query)
             
             switch (column->type)
             {
-              // tec: NOTE - these scalar values must be arena-allocated (not stack locals) since
-              // value_ptr is stashed into row_data[] and only actually consumed later by
-              // gdb_table_add_row() once every column in the row has been visited. A stack local
-              // scoped to this switch-case's block would get silently clobbered by the next
-              // loop iteration's locals before gdb_table_add_row() ever reads it (this previously
-              // corrupted every column except the last one in each row).
               case GDB_ColumnType_U32:
               {
                 U32* value = push_array(scratch.arena, U32, 1);
@@ -222,50 +216,103 @@ app_execute_query(String8 sql_query)
         
         ir_expand_star_to_columns(arena, database, ir_execution_node);
         
-        APP_KernelResult result = app_perform_kernel(arena, database, ir_execution_node);
+        PLAN_ExecResult result = app_perform_kernel(arena, database, ir_execution_node);
         
         IR_Node* select_output_columns = ir_node_find_child(ir_execution_node, IR_NodeType_ColumnList);
-        GDB_Table* table = gdb_database_find_table(database, ir_node_find_child(ir_execution_node, IR_NodeType_Table)->value);
+        U64 result_count = result.is_materialized ? result.materialized.count : result.rows.count;
         
-        log_info("result count %llu", result.count);
-#if PRINT_SELECT_OUTPUT
-        Temp scratch = scratch_begin(0, 0);
-        for (U64 i = 0; i < result.count; i++)
+        log_info("result count %llu", result_count);
+        
+        if (result.supported && select_output_columns)
         {
-          U64 row_index = result.indices[i];
-          for (IR_Node* column_node = select_output_columns->first; column_node != NULL; column_node = column_node->next)
+          Temp scratch = scratch_begin(0, 0);
+          
+          for (U64 i = 0; i < result_count; i++)
           {
-            GDB_Column* column = gdb_table_find_column(table, column_node->value);
-            void* data = gdb_column_get_data(column, row_index);
-            
-            switch (column->type)
+            for (IR_Node* column_node = select_output_columns->first; column_node != NULL; column_node = column_node->next)
             {
-              case GDB_ColumnType_U32:
-              printf("%u ", *(U32*)data);
-              break;
-              case GDB_ColumnType_U64:
-              printf("%llu ", *(U64*)data);
-              break;
-              case GDB_ColumnType_F32:
-              printf("%f ", *(F32*)data);
-              break;
-              case GDB_ColumnType_F64:
-              printf("%lf ", *(F64*)data);
-              break;
-              case GDB_ColumnType_String8: 
+              if (result.is_materialized)
               {
-                String8 str = gdb_column_get_string(scratch.arena, column, row_index);
-                printf("%.*s ", str8_varg(str));
-              } break;
-              default:
-              printf("UNKNOWN ");
-              break;
+                String8 name = qe_column_list_item_display_name(scratch.arena, column_node);
+                PLAN_AggColumn* col = NULL;
+                for (U64 c = 0; c < result.materialized.column_count; c++)
+                {
+                  if (str8_match(result.materialized.columns[c].name, name, 0))
+                  {
+                    col = &result.materialized.columns[c];
+                    break;
+                  }
+                }
+                
+                if (!col)
+                {
+                  printf("? ");
+                }
+                else if (col->type == GDB_ColumnType_String8)
+                {
+                  printf("%.*s ", str8_varg(col->string_values[i]));
+                }
+                else if (col->type == GDB_ColumnType_U32 || col->type == GDB_ColumnType_U64)
+                {
+                  printf("%llu ", (U64)col->numeric_values[i]);
+                }
+                else
+                {
+                  printf("%lf ", col->numeric_values[i]);
+                }
+              }
+              else
+              {
+                String8 bare_name = {0};
+                GDB_Table* col_table = qe_resolve_column_table(&result.rows, column_node->value, &bare_name);
+                if (!col_table)
+                {
+                  printf("? ");
+                  continue;
+                }
+                
+                U64 table_slot = qe_rowset_table_slot(&result.rows, col_table);
+                U64 row_index = result.rows.row_indices[table_slot][i];
+                
+                if (row_index == PLAN_NULL_ROW)
+                {
+                  printf("NULL ");
+                  continue;
+                }
+                
+                GDB_Column* column = gdb_table_find_column(col_table, bare_name);
+                void* data = gdb_column_get_data(column, row_index);
+                
+                switch (column->type)
+                {
+                  case GDB_ColumnType_U32:
+                  printf("%u ", *(U32*)data);
+                  break;
+                  case GDB_ColumnType_U64:
+                  printf("%llu ", *(U64*)data);
+                  break;
+                  case GDB_ColumnType_F32:
+                  printf("%f ", *(F32*)data);
+                  break;
+                  case GDB_ColumnType_F64:
+                  printf("%lf ", *(F64*)data);
+                  break;
+                  case GDB_ColumnType_String8:
+                  {
+                    String8 str = gdb_column_get_string(scratch.arena, column, row_index);
+                    printf("%.*s ", str8_varg(str));
+                  } break;
+                  default:
+                  printf("UNKNOWN ");
+                  break;
+                }
+              }
             }
+            printf("\n");
           }
-          printf("\n");
+          
           scratch_end(scratch);
         }
-#endif
         
         log_info("total 'SELECT' query time: %.4f ms", (os_now_microseconds() - start_time) / 1000.0f);
         
@@ -292,27 +339,19 @@ app_execute_query(String8 sql_query)
   ProfEnd();
 }
 
-internal APP_KernelResult
+internal PLAN_ExecResult
 app_perform_kernel(Arena* arena, GDB_Database* database, IR_Node* root_node)
 {
   ProfBeginFunction();
-
-  APP_KernelResult result = { 0 };
-
+  
   PLAN_Node* plan = plan_build_from_select(arena, database, root_node);
-  PLAN_ExecResult plan_result = plan_execute(arena, database, plan, root_node);
-
-  if (!plan_result.supported)
+  PLAN_ExecResult result = plan_execute(arena, database, plan, root_node);
+  
+  if (!result.supported)
   {
     log_error("app_perform_kernel: query has no supported execution path yet, returning no rows");
-    ProfEnd();
-    return result;
   }
-
-  result.indices = plan_result.indices;
-  result.count = plan_result.count;
-  result.cap = plan_result.count;
-
+  
   ProfEnd();
   return result;
 }

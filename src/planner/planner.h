@@ -9,8 +9,10 @@
 // canonical SQL evaluation order (FROM/JOIN -> WHERE -> GROUP BY -> HAVING -> SELECT list ->
 // ORDER BY -> LIMIT/OFFSET), and plan_execute() walks it directly.
 //
-// Only Scan and Filter-over-a-single-Scan currently have a GPU kernel behind them
-// (query_exec.c's scan_filter). Every other node type is structurally complete but plan_execute() reports them as not-yet-implemented rather than crashing or silently returning wrong rows
+// Scan/Filter/Join/Sort/Limit-over-rows all produce a PLAN_RowSet (row indices into one or
+// more base tables). Aggregate/Having produce a PLAN_Materialized instead - their output rows
+// aren't indices into anything, they're freshly computed values. PLAN_ExecResult carries
+// whichever one is valid, tagged by is_materialized.
 
 typedef enum PLAN_NodeType
 {
@@ -43,14 +45,6 @@ struct PLAN_Node
   IR_Node* order_by;    // tec: Sort only - OrderBy IR node
   IR_Node* limit_node;  // tec: Limit only - Limit IR node, NULL if no LIMIT was given
   IR_Node* offset_node; // tec: Limit only - Offset IR node, NULL if no OFFSET was given
-};
-
-typedef struct PLAN_ExecResult PLAN_ExecResult;
-struct PLAN_ExecResult
-{
-  U64* indices;
-  U64 count;
-  B32 supported; // tec: 0 if this plan (or a node beneath it) has no kernel to execute it yet
 };
 
 internal PLAN_Node* plan_node_make(Arena* arena, PLAN_NodeType type);

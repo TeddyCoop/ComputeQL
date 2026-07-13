@@ -1,0 +1,140 @@
+#version 450
+#extension GL_ARB_gpu_shader_fp64 : enable
+
+// tec: pass 2/2 of qe_hash_join. one thread per probe-side (left) row. Hashes its key (same
+// hash function as hash_join_build_count.comp - MUST stay identical or a real match could hash
+// to a different bucket than its build-side counterpart), scans only its own bucket's CSR range,
+// and confirms each candidate with a real value comparison (hash collisions across distinct keys
+// are expected and handled here, not by the hash table structure itself). LEFT JOIN's unmatched
+// row is emitted by the very same thread that already knows it found nothing
+//
+// NOTE: binding layout/push-constant slot order MUST stay in sync with qe_hash_join.
+
+layout(local_size_x = 1) in;
+
+layout(std430, binding = 0) readonly buffer BuildDataBuf     { uint build_data[]; };
+layout(std430, binding = 1) readonly buffer BuildOffBuf      { uint build_off[]; };
+layout(std430, binding = 2) readonly buffer BucketOffsetsBuf { uint bucket_offsets[]; };
+layout(std430, binding = 3) readonly buffer BucketRowsBuf    { uint bucket_rows[]; };
+layout(std430, binding = 4) readonly buffer ProbeDataBuf     { uint probe_data[]; };
+layout(std430, binding = 5) readonly buffer ProbeOffBuf      { uint probe_off[]; };
+layout(std430, binding = 6) buffer OutPairsBuf               { uint out_pairs[]; };
+layout(std430, binding = 7) buffer OutCountBuf                { uint out_count[]; };
+
+layout(push_constant) uniform PushConstants
+{
+  uint words[16];
+} pc;
+
+#define BUILD_NULL 0xffffffffu
+
+uint read_build_byte(uint idx) { uint word = build_data[idx / 4u]; return (word >> ((idx % 4u) * 8u)) & 0xffu; }
+uint read_probe_byte(uint idx) { uint word = probe_data[idx / 4u]; return (word >> ((idx % 4u) * 8u)) & 0xffu; }
+uint read_build_off(uint row) { return build_off[row * 2u]; }
+uint read_probe_off(uint row) { return probe_off[row * 2u]; }
+
+double
+read_build_num(uint row)
+{
+  uint lo = build_data[row * 2u + 0u];
+  uint hi = build_data[row * 2u + 1u];
+  return packDouble2x32(uvec2(lo, hi));
+}
+
+double
+read_probe_num(uint row)
+{
+  uint lo = probe_data[row * 2u + 0u];
+  uint hi = probe_data[row * 2u + 1u];
+  return packDouble2x32(uvec2(lo, hi));
+}
+
+bool
+keys_equal_str(uint build_row, uint probe_row)
+{
+  uint bs = read_build_off(build_row), be = read_build_off(build_row + 1u);
+  uint ps = read_probe_off(probe_row), pe = read_probe_off(probe_row + 1u);
+  uint blen = be - bs, plen = pe - ps;
+  if (blen != plen) return false;
+
+  for (uint i = 0u; i < blen; i++)
+  {
+    if (read_build_byte(bs + i) != read_probe_byte(ps + i)) return false;
+  }
+  return true;
+}
+
+uint
+hash_u32(uint x)
+{
+  x ^= x >> 16u; x *= 0x7feb352du;
+  x ^= x >> 15u; x *= 0x846ca68bu;
+  x ^= x >> 16u;
+  return x;
+}
+
+void
+main()
+{
+  uint probe_row_count = pc.words[0];
+  uint num_buckets     = pc.words[2];
+  uint is_left_join    = pc.words[4];
+  uint is_string_key   = pc.words[6];
+  uint out_capacity    = pc.words[8];
+
+  uint probe_row = gl_GlobalInvocationID.x;
+  if (probe_row >= probe_row_count) return;
+
+  uint h;
+  if (is_string_key != 0u)
+  {
+    uint start = read_probe_off(probe_row);
+    uint end = read_probe_off(probe_row + 1u);
+    h = 2166136261u;
+    for (uint i = start; i < end; i++)
+    {
+      h = (h ^ read_probe_byte(i)) * 16777619u;
+    }
+  }
+  else
+  {
+    uvec2 bits = unpackDouble2x32(read_probe_num(probe_row));
+    h = hash_u32(bits.x ^ hash_u32(bits.y));
+  }
+
+  uint bucket = h % num_buckets;
+  uint start = bucket_offsets[bucket];
+  uint end = bucket_offsets[bucket + 1u];
+
+  bool found_any = false;
+  for (uint m = start; m < end; m++)
+  {
+    uint build_row = bucket_rows[m];
+    bool eq = (is_string_key != 0u) ? keys_equal_str(build_row, probe_row) : (read_build_num(build_row) == read_probe_num(probe_row));
+
+    if (eq)
+    {
+      found_any = true;
+      uint pos = atomicAdd(out_count[0], 1u);
+      if (pos < out_capacity)
+      {
+        out_pairs[pos * 4u + 0u] = probe_row;
+        out_pairs[pos * 4u + 1u] = 0u;
+        out_pairs[pos * 4u + 2u] = build_row;
+        out_pairs[pos * 4u + 3u] = 0u;
+      }
+    }
+  }
+
+  if (!found_any && is_left_join != 0u)
+  {
+    uint pos = atomicAdd(out_count[0], 1u);
+    if (pos < out_capacity)
+    {
+      out_pairs[pos * 4u + 0u] = probe_row;
+      out_pairs[pos * 4u + 1u] = 0u;
+      out_pairs[pos * 4u + 2u] = BUILD_NULL;
+      out_pairs[pos * 4u + 3u] = BUILD_NULL;
+    }
+  }
+}

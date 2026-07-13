@@ -23,7 +23,7 @@ plan_build_from_select(Arena* arena, GDB_Database* database, IR_Node* select_ir_
   if (!select_ir_node) return NULL;
   
   //- tec: FROM - primary table, any comma-joined tables, and any JOIN clauses, folded into
-  // a left-deep tree in the order they appear (e.g. "FROM a, b JOIN c" -> Join(Join(a,b), c)).
+  // a left-deep tree in the order they appear (e.g. "FROM a, b JOIN c" -> Join(Join(a,b), c))
   PLAN_Node* from_plan = NULL;
   
   for (IR_Node* child = select_ir_node->first; child != NULL; child = child->next)
@@ -49,7 +49,7 @@ plan_build_from_select(Arena* arena, GDB_Database* database, IR_Node* select_ir_
     }
     else if (child->type == IR_NodeType_Join)
     {
-      // tec: sql_parse_join_clause always builds this as exactly two children - the joined table first, the ON condition expression last
+      // tec: sql_parse_join_clause always builds this as two children: the joined table first, the ON condition expression last
       IR_Node* joined_table_ir = child->first;
       IR_Node* join_condition_ir = child->last;
       
@@ -80,7 +80,7 @@ plan_build_from_select(Arena* arena, GDB_Database* database, IR_Node* select_ir_
   
   //- tec: GROUP BY / aggregates - needed whenever there's an explicit GROUP BY, or an
   // aggregate call anywhere in the select list or HAVING (ie "SELECT COUNT(*) FROM t"
-  // has no GROUP BY but still aggregates into a single group).
+  // has no GROUP BY but still aggregates into a single group)
   IR_Node* column_list_ir = ir_node_find_child(select_ir_node, IR_NodeType_ColumnList);
   IR_Node* group_by_ir = ir_node_find_child(select_ir_node, IR_NodeType_GroupBy);
   IR_Node* having_ir = ir_node_find_child(select_ir_node, IR_NodeType_Having);
@@ -139,6 +139,22 @@ plan_build_from_select(Arena* arena, GDB_Database* database, IR_Node* select_ir_
   return plan;
 }
 
+internal PLAN_ExecResult plan_execute_join(Arena* arena, GDB_Database* database, PLAN_Node* join_plan, IR_Node* select_ir_node, IR_Node* residual_where_root);
+
+internal PLAN_ExecResult
+plan_wrap_scan_result(Arena* arena, GDB_Table* table, QE_ScanResult scan_result)
+{
+  PLAN_ExecResult result = {0};
+  result.rows.tables = push_array(arena, GDB_Table*, 1);
+  result.rows.tables[0] = table;
+  result.rows.table_count = 1;
+  result.rows.row_indices = push_array(arena, U64*, 1);
+  result.rows.row_indices[0] = scan_result.indices;
+  result.rows.count = scan_result.count;
+  result.supported = 1;
+  return result;
+}
+
 internal PLAN_ExecResult
 plan_execute(Arena* arena, GDB_Database* database, PLAN_Node* plan, IR_Node* select_ir_node)
 {
@@ -155,40 +171,84 @@ plan_execute(Arena* arena, GDB_Database* database, PLAN_Node* plan, IR_Node* sel
         break;
       }
       
-      // tec: todays single scan_filter kernel does the scan and (if present) the WHERE
-      // filter in one GPU dispatch, re-deriving the Where IR node from select_ir_node itself
-      // that's why this is reached both for a bare Scan and for Filter-over-Scan below
-      QE_ScanResult scan_result = qe_scan_filter(arena, database, plan->table, select_ir_node);
-      result.indices = scan_result.indices;
-      result.count = scan_result.count;
-      result.supported = 1;
+      // tec: a bare Scan is always unfiltered (no where_clause) - it's reached both directly
+      // (no WHERE at all) and as a Join's raw input, where it must return ALL of its rows
+      // regardless of what the query's WHERE says about *other* tables. WHERE is applied
+      // explicitly by the Filter case below (Filter-over-Scan) or as a post-join residual filter
+      QE_ScanResult scan_result = qe_scan_filter(arena, database, plan->table, NULL);
+      result = plan_wrap_scan_result(arena, plan->table, scan_result);
     } break;
     
     case PLAN_NodeType_Filter:
     {
       if (plan->input && plan->input->type == PLAN_NodeType_Scan)
       {
-        result = plan_execute(arena, database, plan->input, select_ir_node);
+        // tec: plan->condition is the Where IR node itself, passed straight to qe_scan_filter
+        // (which does the scan and the filter in one GPU dispatch) rather than through the
+        // generic unfiltered Scan case above
+        QE_ScanResult scan_result = qe_scan_filter(arena, database, plan->input->table, plan->condition);
+        result = plan_wrap_scan_result(arena, plan->input->table, scan_result);
+      }
+      else if (plan->input && plan->input->type == PLAN_NodeType_Join)
+      {
+        // tec: plan->condition is the Where IR node itself - ->first is its actual condition
+        // tree root (same convention as Having, see qe_apply_having)
+        IR_Node* where_root = plan->condition ? plan->condition->first : NULL;
+        result = plan_execute_join(arena, database, plan->input, select_ir_node, where_root);
       }
       else
       {
-        log_error("plan_execute: filtering over a join has no kernel yet (task #6) - query cannot execute");
+        log_error("plan_execute: filtering over this input has no kernel yet (task #6) - query cannot execute");
       }
     } break;
     
     case PLAN_NodeType_Join:
+    {
+      result = plan_execute_join(arena, database, plan, select_ir_node, NULL);
+    } break;
+    
     case PLAN_NodeType_Aggregate:
+    {
+      result = plan_execute(arena, database, plan->input, select_ir_node);
+      if (result.supported)
+      {
+        if (result.is_materialized)
+        {
+          log_error("plan_execute: nested aggregation is not supported");
+          result.supported = 0;
+        }
+        else
+        {
+          IR_Node* having_ir = ir_node_find_child(select_ir_node, IR_NodeType_Having);
+          PLAN_Materialized materialized = qe_aggregate(arena, database, &result.rows, plan->group_by, plan->column_list, having_ir);
+          
+          result.rows = (PLAN_RowSet){0};
+          result.is_materialized = 1;
+          result.materialized = materialized;
+        }
+      }
+    } break;
+    
     case PLAN_NodeType_Having:
     {
-      String8 type_name = plan_node_type_to_string(plan->type);
-      log_error("plan_execute: '%.*s' has no GPU kernel yet (task #6) - query cannot execute",
-                str8_varg(type_name));
+      result = plan_execute(arena, database, plan->input, select_ir_node);
+      if (result.supported)
+      {
+        if (!result.is_materialized)
+        {
+          log_error("plan_execute: HAVING without GROUP BY/aggregates in scope is not supported");
+          result.supported = 0;
+        }
+        else
+        {
+          result.materialized = qe_apply_having(arena, &result.materialized, plan->condition);
+        }
+      }
     } break;
     
     case PLAN_NodeType_Project:
     {
-      // tec: no projection kernel yet - application.c's Select case already does its own
-      // column selection on the CPU from the matched row indices, so just pass rows through.
+      // tec: no projection kernel yet
       result = plan_execute(arena, database, plan->input, select_ir_node);
     } break;
     
@@ -197,7 +257,14 @@ plan_execute(Arena* arena, GDB_Database* database, PLAN_Node* plan, IR_Node* sel
       result = plan_execute(arena, database, plan->input, select_ir_node);
       if (result.supported)
       {
-        log_error("plan_execute: 'order by' has no sort kernel yet (task #6) - returning unsorted rows");
+        if (result.is_materialized)
+        {
+          result.materialized = qe_sort_materialized(arena, &result.materialized, plan->order_by);
+        }
+        else
+        {
+          result.rows = qe_sort_rows(arena, &result.rows, plan->order_by);
+        }
       }
     } break;
     
@@ -209,20 +276,92 @@ plan_execute(Arena* arena, GDB_Database* database, PLAN_Node* plan, IR_Node* sel
         U64 offset = plan->offset_node ? u64_from_str8(plan->offset_node->value, 10) : 0;
         U64 limit = plan->limit_node ? u64_from_str8(plan->limit_node->value, 10) : max_U64;
         
-        if (offset >= result.count)
+        if (result.is_materialized)
         {
-          result.indices = NULL;
-          result.count = 0;
+          PLAN_Materialized* m = &result.materialized;
+          if (offset >= m->count)
+          {
+            m->count = 0;
+          }
+          else
+          {
+            U64 new_count = Min(m->count - offset, limit);
+            for (U64 c = 0; c < m->column_count; c++)
+            {
+              PLAN_AggColumn* col = &m->columns[c];
+              if (col->numeric_values) col->numeric_values = col->numeric_values + offset;
+              if (col->string_values) col->string_values = col->string_values + offset;
+            }
+            m->count = new_count;
+          }
         }
         else
         {
-          result.indices = result.indices + offset;
-          result.count = Min(result.count - offset, limit);
+          PLAN_RowSet* rs = &result.rows;
+          if (offset >= rs->count)
+          {
+            rs->count = 0;
+          }
+          else
+          {
+            U64 new_count = Min(rs->count - offset, limit);
+            for (U64 t = 0; t < rs->table_count; t++)
+            {
+              rs->row_indices[t] = rs->row_indices[t] + offset;
+            }
+            rs->count = new_count;
+          }
         }
       }
     } break;
   }
   
+  return result;
+}
+
+internal PLAN_ExecResult
+plan_execute_join(Arena* arena, GDB_Database* database, PLAN_Node* join_plan, IR_Node* select_ir_node, IR_Node* residual_where_root)
+{
+  PLAN_ExecResult result = {0};
+  
+  PLAN_ExecResult left_result = plan_execute(arena, database, join_plan->input, select_ir_node);
+  if (!left_result.supported || left_result.is_materialized)
+  {
+    log_error("plan_execute: join's left-hand input has no usable row set");
+    return result;
+  }
+  
+  GDB_Table* right_table = join_plan->input2 ? join_plan->input2->table : NULL;
+  if (!right_table)
+  {
+    log_error("plan_execute: join's right-hand side must resolve to a real table");
+    return result;
+  }
+  
+  String8 join_type = join_plan->value;
+  IR_Node* equi_condition = NULL;
+  B32 is_cross = str8_match(join_plan->value, str8_lit("cross"), 0);
+  
+  if (!is_cross)
+  {
+    equi_condition = qe_find_equi_condition(&left_result.rows, right_table, join_plan->condition);
+  }
+  else
+  {
+    join_type = str8_lit("inner"); // tec: a comma-join's real predicate lives in WHERE, not here
+    equi_condition = residual_where_root ? qe_find_equi_condition(&left_result.rows, right_table, residual_where_root) : NULL;
+  }
+  
+  if (!equi_condition)
+  {
+    log_error("plan_execute: only equi-joins are supported (no usable 'a = b' clause found between the joined tables)");
+    return result;
+  }
+  
+  PLAN_RowSet joined_rows = qe_hash_join(arena, &left_result.rows, right_table, join_type, equi_condition);
+  
+  result.rows = residual_where_root ? qe_filter_joined_rows(arena, &joined_rows, residual_where_root) : joined_rows;
+  result.supported = 1;
   return result;
 }
 

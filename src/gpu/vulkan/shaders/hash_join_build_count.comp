@@ -1,0 +1,83 @@
+#version 450
+#extension GL_ARB_gpu_shader_fp64 : enable
+
+// tec: pass 1/2 of qe_hash_join's build side - hashes each build-side (right table) row's key
+// into a bucket histogram. Unlike qe_aggregate's assign pass, this does not deduplicate by key, every build row is kept (even duplicate keys), because join semantics require every matching
+// pair to appear, not one row per distinct key. Real key equality is confirmed later, in the
+// probe pass, by comparing actual values - hashing here is purely a lookup-narrowing structure.
+//
+// NOTE: binding layout/push-constant slot order MUST stay in sync with qe_hash_join.
+
+layout(local_size_x = 1) in;
+
+layout(std430, binding = 0) readonly buffer BuildDataBuf { uint build_data[]; };
+layout(std430, binding = 1) readonly buffer BuildOffBuf  { uint build_off[]; };
+layout(std430, binding = 2) buffer BucketCountBuf        { uint bucket_count[]; };
+layout(std430, binding = 3) buffer RowBucketBuf          { uint row_bucket_out[]; };
+
+layout(push_constant) uniform PushConstants
+{
+  uint words[16];
+} pc;
+
+uint
+read_byte(uint idx)
+{
+  uint word = build_data[idx / 4u];
+  return (word >> ((idx % 4u) * 8u)) & 0xffu;
+}
+
+uint
+read_off(uint row)
+{
+  return build_off[row * 2u]; // tec: low word only - blobs assumed under 4GB, matches scan_filter.comp
+}
+
+double
+read_num(uint row)
+{
+  uint lo = build_data[row * 2u + 0u];
+  uint hi = build_data[row * 2u + 1u];
+  return packDouble2x32(uvec2(lo, hi));
+}
+
+uint
+hash_u32(uint x)
+{
+  x ^= x >> 16u; x *= 0x7feb352du;
+  x ^= x >> 15u; x *= 0x846ca68bu;
+  x ^= x >> 16u;
+  return x;
+}
+
+void
+main()
+{
+  uint row_count      = pc.words[0];
+  uint num_buckets    = pc.words[2];
+  uint is_string_key  = pc.words[4];
+
+  uint row = gl_GlobalInvocationID.x;
+  if (row >= row_count) return;
+
+  uint h;
+  if (is_string_key != 0u)
+  {
+    uint start = read_off(row);
+    uint end = read_off(row + 1u);
+    h = 2166136261u;
+    for (uint i = start; i < end; i++)
+    {
+      h = (h ^ read_byte(i)) * 16777619u;
+    }
+  }
+  else
+  {
+    uvec2 bits = unpackDouble2x32(read_num(row));
+    h = hash_u32(bits.x ^ hash_u32(bits.y));
+  }
+
+  uint bucket = h % num_buckets;
+  row_bucket_out[row] = bucket;
+  atomicAdd(bucket_count[bucket], 1u);
+}

@@ -1,0 +1,95 @@
+#version 450
+#extension GL_ARB_gpu_shader_fp64 : enable
+
+// tec: generic bitonic sort over up to QE_SORT_MAX_KEYS numeric keys (tie-broken key0..key3,
+// each with its own independent ascending/descending direction) and a payload of up to
+// QE_SORT_MAX_TABLES row-index columns that travels along with each key (so this works
+// unchanged whether the input is a bare table scan or a multi-table join's row set).
+//
+// CPU orchestration pads the array to a power of two with invalid ("valid" word = 0) entries before dispatching
+//
+// One dispatch per (stage, pass) - see the standard iterative bitonic sort network. Element
+// position, not identity, decides ascending/descending sub-block at each stage, so the network
+// works with ANY consistent total-order comparator, not just plain numeric '<' - that's what
+// lets it plug in the invalid-always-last / multi-key rule below.
+//
+// NOTE: binding layout/push-constant slot order MUST stay in sync with qe_sort_rows
+
+layout(local_size_x = 1) in;
+
+#define QE_SORT_MAX_KEYS   4
+#define QE_SORT_MAX_TABLES 4
+#define PAYLOAD_STRIDE 9u // tec: 4 tables x 2 words (lo,hi) + 1 valid word
+
+layout(std430, binding = 0) buffer KeysBuf    { double keys[]; };
+layout(std430, binding = 1) buffer PayloadBuf { uint payload[]; };
+
+layout(push_constant) uniform PushConstants
+{
+  uint words[16];
+} pc;
+
+bool
+less_than(uint i, uint j, uint num_keys, uint dir_mask)
+{
+  uint vi = payload[i * PAYLOAD_STRIDE + 8u];
+  uint vj = payload[j * PAYLOAD_STRIDE + 8u];
+  if (vi != vj) return vi > vj; // tec: valid (1) always sorts before invalid/padding (0)
+  if (vi == 0u) return false;   // tec: both padding - no preference
+
+  for (uint k = 0u; k < num_keys; k++)
+  {
+    double a = keys[i * QE_SORT_MAX_KEYS + k];
+    double b = keys[j * QE_SORT_MAX_KEYS + k];
+    if (a == b) continue;
+    bool desc = ((dir_mask >> k) & 1u) != 0u;
+    return desc ? (a > b) : (a < b);
+  }
+  return false;
+}
+
+void
+swap_elements(uint i, uint j)
+{
+  for (uint k = 0u; k < QE_SORT_MAX_KEYS; k++)
+  {
+    double tmp = keys[i * QE_SORT_MAX_KEYS + k];
+    keys[i * QE_SORT_MAX_KEYS + k] = keys[j * QE_SORT_MAX_KEYS + k];
+    keys[j * QE_SORT_MAX_KEYS + k] = tmp;
+  }
+  for (uint w = 0u; w < PAYLOAD_STRIDE; w++)
+  {
+    uint tmp = payload[i * PAYLOAD_STRIDE + w];
+    payload[i * PAYLOAD_STRIDE + w] = payload[j * PAYLOAD_STRIDE + w];
+    payload[j * PAYLOAD_STRIDE + w] = tmp;
+  }
+}
+
+void
+main()
+{
+  uint padded_count = pc.words[0];
+  uint num_keys     = pc.words[2];
+  uint dir_mask      = pc.words[4];
+  uint stage        = pc.words[6];
+  uint pass_        = pc.words[8];
+
+  uint distance = 1u << pass_;
+
+  uint t = gl_GlobalInvocationID.x;
+  uint half_count = padded_count >> 1u;
+  if (t >= half_count) return;
+
+  uint low = t & (distance - 1u);
+  uint i = ((t - low) << 1u) + low;
+  uint j = i + distance;
+  if (j >= padded_count) return;
+
+  bool ascending_block = ((i >> (stage + 1u)) & 1u) == 0u;
+
+  bool should_swap = ascending_block ? less_than(j, i, num_keys, dir_mask) : less_than(i, j, num_keys, dir_mask);
+  if (should_swap)
+  {
+    swap_elements(i, j);
+  }
+}

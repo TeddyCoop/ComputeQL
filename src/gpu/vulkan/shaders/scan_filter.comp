@@ -2,11 +2,9 @@
 #extension GL_ARB_gpu_shader_fp64 : enable
 
 // tec: generic, precompiled scan+filter operator.
-// Interprets a small per-row bytecode program (compiled on the CPU from the SQL WHERE clause)
-// against up to QE_MAX_COLUMN_BINDINGS column buffers, and appends the row index of every
-// matching row to the output indices buffer.
+// Interprets a small per-row bytecode program matching row to the output indices buffer.
 //
-// NOTE: binding layout/opcode values MUST stay in sync with src/query_exec/query_exec.h
+// NOTE: binding layout/opcode values MUST stay in sync with query_exec.h
 
 layout(local_size_x = 1) in;
 
@@ -90,8 +88,7 @@ read_str_const_byte(uint word_offset, uint byte_index)
 }
 
 // tec: string columns occupy two consecutive slots: `slot` is the raw byte data buffer,
-// `slot + 1` is the (row_count + 1) U64 offsets array (2 words per offset, high word ignored -
-// string blobs are assumed to stay under 4GB per chunk).
+// `slot + 1` is the (row_count + 1) U64 offsets array (2 words per offset, high word ignored, string blobs are assumed to stay under 4GB per chunk).
 uint
 read_str_offset(uint offsets_slot, uint row)
 {
@@ -144,7 +141,7 @@ str_eq(uint slot, uint row, uint const_word_offset, uint const_len)
 
 // tec: defensive cap on string length considered by the byte-scan loops below - protects against
 // a corrupt/underflowed offset pair turning a single row's scan into a multi-billion iteration
-// loop (which looks identical to a genuine GPU hang from the host's point of view).
+// loop
 #define MAX_SANE_STRING_LEN 1048576u
 
 bool

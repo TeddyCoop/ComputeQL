@@ -1,0 +1,33 @@
+#version 450
+
+// tec: generic counting-sort scatter, shared by qe_aggregate (pass 2/3: rows -> group member
+// lists) and qe_hash_join (build-side rows -> per-bucket CSR lists). Each thread claims the next
+// free slot within its own bucket/group via an atomic cursor pre-seeded by the CPU to that
+// bucket/group's prefix-summed start offset, and writes its row index there.
+//
+// NOTE: binding layout MUST stay in sync with qe_aggregate/qe_hash_join
+
+layout(local_size_x = 1) in;
+
+layout(std430, binding = 0) readonly buffer RowSlotBuf { uint row_slot[]; };
+layout(std430, binding = 1) buffer CursorBuf           { uint slot_cursor[]; };
+layout(std430, binding = 2) buffer OutRowsBuf          { uint out_rows[]; };
+
+layout(push_constant) uniform PushConstants
+{
+  uint words[16];
+} pc;
+
+void
+main()
+{
+  uint row_count = pc.words[0];
+  uint row = gl_GlobalInvocationID.x;
+  if (row >= row_count) return;
+
+  uint slot = row_slot[row];
+  if (slot == 0xffffffffu) return; // tec: dropped row (aggregate hash-table overflow) - skip
+
+  uint pos = atomicAdd(slot_cursor[slot], 1u);
+  out_rows[pos] = row;
+}

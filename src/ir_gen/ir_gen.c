@@ -33,11 +33,12 @@ ir_generate_recursive(Arena* arena, SQL_Node* sql_node)
   ir_node->type = ir_type_from_sql_node_type(sql_node->type);
   ir_node->value = sql_node->value;
   
-  IR_Node **ir_child_next = &ir_node->first;
+  // tec: build children via ir_node_add_child (not a hand-rolled ->next chain) so 
+  // ->last/->prev/->parent all end up correctly populated too
   for (SQL_Node *child = sql_node->first; child; child = child->next)
   {
-    *ir_child_next = ir_generate_recursive(arena, child);
-    ir_child_next = &((*ir_child_next)->next);
+    IR_Node *ir_child = ir_generate_recursive(arena, child);
+    ir_node_add_child(ir_node, ir_child);
   }
   
   return ir_node;
@@ -101,17 +102,17 @@ ir_type_from_sql_node_type(SQL_NodeType sql_type)
     case SQL_NodeType_Limit:         return IR_NodeType_Limit;
     case SQL_NodeType_Offset:        return IR_NodeType_Offset;
     case SQL_NodeType_AggregateCall: return IR_NodeType_AggregateCall;
-
-    // Special cases
+    
+    // special cases
     case SQL_NodeType_Row:           return IR_NodeType_ValueGroup;
     case SQL_NodeType_Type:          return IR_NodeType_Type;
     
-    // Nodes that may not have a direct IR mapping:     
+    // nodes that may not have a direct IR mapping:     
     case SQL_NodeType_Drop:  
-    return IR_NodeType_Condition; // Placeholder, modify as needed
+    return IR_NodeType_Condition; // placeholder
     
     default:
-    return IR_NodeType_Condition; // Fallback for unknown types
+    return IR_NodeType_Condition; // fallback for unknown types
   }
 }
 
@@ -224,7 +225,12 @@ ir_expand_star_to_columns(Arena *arena, GDB_Database *db, IR_Node *select_node)
   IR_Node *table_node = ir_node_find_child(select_node, IR_NodeType_Table);
   IR_Node *column_list = ir_node_find_child(select_node, IR_NodeType_ColumnList);
   
-  //if (!column_list || column_list->first != NULL) return;
+  // tec: only a bare 'SELECT *' needs expanding
+  B32 is_bare_star = column_list && column_list->first && column_list->first == column_list->last &&
+    column_list->first->type == IR_NodeType_Column && str8_match(column_list->first->value, str8_lit("*"), 0);
+  if (!is_bare_star) return;
+  
+  column_list->first = column_list->last = NULL;
   
   GDB_Table *table = gdb_database_find_table(db, table_node->value);
   
