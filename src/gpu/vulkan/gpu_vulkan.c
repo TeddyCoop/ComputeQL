@@ -87,6 +87,35 @@ gpu_init(void)
   g_vulkan_state->physical_device = selected;
   g_vulkan_state->compute_queue_family_index = compute_queue_family_index;
   
+  //- tec: detect Resizable BAR / Smart Access Memory
+  //( AMD and NVIDIA both support this on modern hardware/drivers)
+  // a memory type that's both DEVICE_LOCAL and HOST_VISIBLE means
+  // gpu_buffer_alloc can map VRAM directly and memcpy into it, instead of always going through
+  // a staging buffer + vkCmdCopyBuffer
+  {
+    VkPhysicalDeviceMemoryProperties mem_props;
+    vkGetPhysicalDeviceMemoryProperties(selected, &mem_props);
+    
+    VkMemoryPropertyFlags rebar_flags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    for (U32 i = 0; i < mem_props.memoryTypeCount; i++)
+    {
+      if ((mem_props.memoryTypes[i].propertyFlags & rebar_flags) == rebar_flags)
+      {
+        U64 heap_size = mem_props.memoryHeaps[mem_props.memoryTypes[i].heapIndex].size;
+        if (heap_size > g_vulkan_state->rebar_heap_size)
+        {
+          g_vulkan_state->rebar_supported = 1;
+          g_vulkan_state->rebar_heap_size = heap_size;
+        }
+      }
+    }
+    
+    if (g_vulkan_state->rebar_supported)
+    {
+      log_info("Resizable BAR detected (%llu MB host-visible VRAM) - GPU buffer uploads will skip staging where possible", g_vulkan_state->rebar_heap_size / (1024 * 1024));
+    }
+  }
+  
   //- tec: device properties (timestamps for GPU kernel timing)
   VkPhysicalDeviceProperties device_props;
   vkGetPhysicalDeviceProperties(selected, &device_props);
@@ -306,6 +335,19 @@ gpu_init(void)
 internal void
 gpu_release(void)
 {
+  if (g_vulkan_state->upload_staging_capacity != 0)
+  {
+    vkUnmapMemory(g_vulkan_state->device, g_vulkan_state->upload_staging_memory);
+    vkDestroyBuffer(g_vulkan_state->device, g_vulkan_state->upload_staging_buffer, 0);
+    vkFreeMemory(g_vulkan_state->device, g_vulkan_state->upload_staging_memory, 0);
+  }
+  if (g_vulkan_state->download_staging_capacity != 0)
+  {
+    vkUnmapMemory(g_vulkan_state->device, g_vulkan_state->download_staging_memory);
+    vkDestroyBuffer(g_vulkan_state->device, g_vulkan_state->download_staging_buffer, 0);
+    vkFreeMemory(g_vulkan_state->device, g_vulkan_state->download_staging_memory, 0);
+  }
+  
   vkDestroyFence(g_vulkan_state->device, g_vulkan_state->submit_fence, 0);
   vkDestroyQueryPool(g_vulkan_state->device, g_vulkan_state->timestamp_query_pool, 0);
   vkDestroyPipelineLayout(g_vulkan_state->device, g_vulkan_state->shared_pipeline_layout, 0);
@@ -447,56 +489,78 @@ gpu_vulkan_alloc_raw_buffer(U64 size, VkBufferUsageFlags usage, VkMemoryProperty
   return 1;
 }
 
-// tec: uploads `data` into `dst` (a device-local, non-mapped buffer) via a transient staging buffer
+// tec: grows a persistent staging buffer
+// (one of the g_vulkan_state->{upload,download}_staging_*groups) to at least `needed_size`, remapping if it had to reallocate
+internal void
+gpu_vulkan_ensure_staging_capacity(VkBufferUsageFlags usage, VkMemoryPropertyFlags mem_props,
+                                   VkBuffer* buffer, VkDeviceMemory* memory, void** mapped, U64* capacity,
+                                   U64 needed_size)
+{
+  if (needed_size <= *capacity)
+  {
+    return;
+  }
+  
+  if (*capacity != 0)
+  {
+    vkUnmapMemory(g_vulkan_state->device, *memory);
+    vkDestroyBuffer(g_vulkan_state->device, *buffer, 0);
+    vkFreeMemory(g_vulkan_state->device, *memory, 0);
+    *capacity = 0;
+  }
+  
+  if (!gpu_vulkan_alloc_raw_buffer(needed_size, usage, mem_props, buffer, memory))
+  {
+    *mapped = 0;
+    return;
+  }
+  
+  vkMapMemory(g_vulkan_state->device, *memory, 0, needed_size, 0, mapped);
+  *capacity = needed_size;
+}
+
+// tec: uploads `data` into `dst` (a device-local, non-mapped buffer) via the persistent upload staging buffer
 internal void
 gpu_vulkan_staged_upload(GPU_Buffer* dst, void* data, U64 size)
 {
-  VkBuffer staging_buffer;
-  VkDeviceMemory staging_memory;
-  VkMemoryPropertyFlags staging_mem_props = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-  if (!gpu_vulkan_alloc_raw_buffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, staging_mem_props, &staging_buffer, &staging_memory))
+  gpu_vulkan_ensure_staging_capacity(VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                                     &g_vulkan_state->upload_staging_buffer, &g_vulkan_state->upload_staging_memory,
+                                     &g_vulkan_state->upload_staging_mapped, &g_vulkan_state->upload_staging_capacity,
+                                     size);
+  if (size > g_vulkan_state->upload_staging_capacity)
   {
     return;
   }
   
-  void* mapped = 0;
-  vkMapMemory(g_vulkan_state->device, staging_memory, 0, size, 0, &mapped);
-  MemoryCopy(mapped, data, size);
-  vkUnmapMemory(g_vulkan_state->device, staging_memory);
+  MemoryCopy(g_vulkan_state->upload_staging_mapped, data, size);
   
   VkCommandBuffer cmd = gpu_vulkan_begin_one_time_cmd();
   VkBufferCopy copy_region = { .size = size };
-  vkCmdCopyBuffer(cmd, staging_buffer, dst->buffer, 1, &copy_region);
+  vkCmdCopyBuffer(cmd, g_vulkan_state->upload_staging_buffer, dst->buffer, 1, &copy_region);
   gpu_vulkan_end_and_submit_cmd(cmd);
-  
-  vkDestroyBuffer(g_vulkan_state->device, staging_buffer, 0);
-  vkFreeMemory(g_vulkan_state->device, staging_memory, 0);
 }
 
-// tec: downloads `size` bytes from `src` (a device-local, non-mapped buffer) into `data` via a transient staging buffer
+// tec: downloads `size` bytes from `src` (a device-local, non-mapped buffer) into `data` via the persistent download staging buffer
 internal void
 gpu_vulkan_staged_download(GPU_Buffer* src, void* data, U64 size)
 {
-  VkBuffer staging_buffer;
-  VkDeviceMemory staging_memory;
-  VkMemoryPropertyFlags staging_mem_props = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
-  if (!gpu_vulkan_alloc_raw_buffer(size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, staging_mem_props, &staging_buffer, &staging_memory))
+  gpu_vulkan_ensure_staging_capacity(VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+                                     &g_vulkan_state->download_staging_buffer, &g_vulkan_state->download_staging_memory,
+                                     &g_vulkan_state->download_staging_mapped, &g_vulkan_state->download_staging_capacity,
+                                     size);
+  if (size > g_vulkan_state->download_staging_capacity)
   {
     return;
   }
   
   VkCommandBuffer cmd = gpu_vulkan_begin_one_time_cmd();
   VkBufferCopy copy_region = { .size = size };
-  vkCmdCopyBuffer(cmd, src->buffer, staging_buffer, 1, &copy_region);
+  vkCmdCopyBuffer(cmd, src->buffer, g_vulkan_state->download_staging_buffer, 1, &copy_region);
   gpu_vulkan_end_and_submit_cmd(cmd);
   
-  void* mapped = 0;
-  vkMapMemory(g_vulkan_state->device, staging_memory, 0, size, 0, &mapped);
-  MemoryCopy(data, mapped, size);
-  vkUnmapMemory(g_vulkan_state->device, staging_memory);
-  
-  vkDestroyBuffer(g_vulkan_state->device, staging_buffer, 0);
-  vkFreeMemory(g_vulkan_state->device, staging_memory, 0);
+  MemoryCopy(data, g_vulkan_state->download_staging_mapped, size);
 }
 
 internal GPU_Buffer*
@@ -510,6 +574,25 @@ gpu_buffer_alloc(U64 size, GPU_BufferFlags flags, void* data)
   
   B32 host_visible = (flags & GPU_BufferFlag_HostVisible) != 0;
   B32 device_local = (flags & GPU_BufferFlag_DeviceLocal) != 0;
+  
+  // tec: every buffer that isn't explicitly host-visible-only falls through to the
+  // device-local branch below, which historically always meant "staged upload". on a
+  // Resizable BAR system we can instead map VRAM directly and skip that round trip
+  // try it first here; mapped_ptr ends up set either way, so gpu_buffer_write/read's
+  // existing mapped_ptr fast path picks this up for free.
+  if (!host_visible && g_vulkan_state->rebar_supported && size <= g_vulkan_state->rebar_heap_size)
+  {
+    VkMemoryPropertyFlags rebar_props = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    if (gpu_vulkan_alloc_raw_buffer(size, usage, rebar_props, &result->buffer, &result->memory))
+    {
+      vkMapMemory(g_vulkan_state->device, result->memory, 0, size, 0, &result->mapped_ptr);
+      if (data)
+      {
+        MemoryCopy(result->mapped_ptr, data, size);
+      }
+      return result;
+    }
+  }
   
   VkMemoryPropertyFlags mem_props = 0;
   if (host_visible)

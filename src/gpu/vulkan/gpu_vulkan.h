@@ -19,43 +19,60 @@ struct GPU_Buffer
 struct GPU_Kernel
 {
   String8 name;
-
+  
   VkShaderModule shader;
   VkPipeline pipeline;
-
+  
   VkDescriptorSet descriptor_set;
-
+  
   GPU_Buffer* bound_buffers[GPU_VULKAN_MAX_BOUND_BUFFERS];
   U32 bound_buffer_count;
-
+  
   U64 push_constants[GPU_VULKAN_PUSH_CONSTANT_COUNT];
 };
 
 struct GPU_State
 {
   Arena* arena;
-
+  
   VkInstance instance;
   VkPhysicalDevice physical_device;
   VkDevice device;
-
+  
   VkQueue compute_queue;
   U32 compute_queue_family_index;
-
+  
   VkCommandPool command_pool;
   VkCommandBuffer command_buffer;
-
+  
   VkDescriptorPool descriptor_pool;
   VkDescriptorSetLayout shared_descriptor_set_layout;
   VkPipelineLayout shared_pipeline_layout;
-
+  
   VkQueryPool timestamp_query_pool;
   F32 timestamp_period_ns;
-
+  
   VkFence submit_fence;
   U64 last_kernel_time_microseconds;
-
+  
   B32 has_memory_budget_ext;
+  
+  // tec: Resizable BAR
+  // a memory type that's both DEVICE_LOCAL and HOST_VISIBLE lets gpu_buffer_alloc write straight into vram with a memcpy, skipping the staging-buffer + vkCmdCopyBuffer round trip entirely
+  // rebar_heap_size bounds how large a buffer can use that path before falling back to the staged path.
+  B32 rebar_supported;
+  U64 rebar_heap_size;
+  
+  // tec: persistent, lazily-grown, permanently-mapped staging buffers that are reused
+  VkBuffer upload_staging_buffer;
+  VkDeviceMemory upload_staging_memory;
+  void* upload_staging_mapped;
+  U64 upload_staging_capacity;
+  
+  VkBuffer download_staging_buffer;
+  VkDeviceMemory download_staging_memory;
+  void* download_staging_mapped;
+  U64 download_staging_capacity;
 };
 
 global GPU_State* g_vulkan_state = 0;

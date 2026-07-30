@@ -1,15 +1,15 @@
 # ComputeQL - A GPU-Accelerated SQL Database
 
-ComputeQL is a from-scratch, columnar SQL database written in C99 that executes queries as **GPU compute kernels** instead of on the CPU. Rather than compiling a bespoke shader per query, it interprets a compact **bytecode VM** inside a small library of precompiled Vulkan compute shaders — so arbitrary WHERE-clause expressions can be evaluated on the GPU without any runtime shader compilation.
+ComputeQL is a from-scratch, columnar SQL database written in C99 that executes queries as **GPU compute kernels** instead of on the CPU. Rather than compiling a bespoke shader per query, it interprets a compact **bytecode VM** inside a small library of precompiled Vulkan compute shaders - so arbitrary WHERE-clause expressions can be evaluated on the GPU without any runtime shader compilation.
 
 > **Status:** ComputeQL is the successor of a previous project GDB. The storage engine, Vulkan execution backend, and SQL parser are functional; query planning and multi-operator GPU execution (joins, sorts, aggregates) are in progress. See [Roadmap](#roadmap) below for exactly what's implemented today versus planned.
 
 ## How it works
 
-1. **Storage** — Data lives in a hand-rolled columnar format (`GDB_Database` → `GDB_Table` → `GDB_Column`), one file per column, memory-mapped on load. Small columns are loaded fully into memory; columns past a size threshold are streamed/disk-backed automatically.
-2. **Parsing** — A hand-rolled recursive-descent SQL tokenizer/parser turns query text into an AST, with position-aware syntax error reporting (line, column, and a caret pointing at the offending token).
-3. **IR lowering** — The AST is lowered into an intermediate representation (IR) tree that the execution layer walks directly.
-4. **GPU execution** — WHERE-clause expressions are compiled to a small stack-based bytecode ISA. The CPU uploads column data and the bytecode program to fixed GPU descriptor bindings, dispatches a Vulkan compute shader that interprets the bytecode per-row, and reads back matching row indices. Tables larger than the configured GPU buffer size are automatically chunked across multiple dispatches.
+1. **Storage** - Data lives in a hand-rolled columnar format (`GDB_Database` -> `GDB_Table` -> `GDB_Column`), one file per column, memory-mapped on load. Small columns are loaded fully into memory; columns past a size threshold are streamed/disk-backed automatically.
+2. **Parsing** - A hand-rolled recursive-descent SQL tokenizer/parser turns query text into an AST, with position-aware syntax error reporting (line, column, and a caret pointing at the offending token).
+3. **IR lowering** - The AST is lowered into an intermediate representation (IR) tree that the execution layer walks directly.
+4. **GPU execution** - WHERE-clause expressions are compiled to a small stack-based bytecode ISA. The CPU uploads column data and the bytecode program to fixed GPU descriptor bindings, dispatches a Vulkan compute shader that interprets the bytecode per-row, and reads back matching row indices. Tables larger than the configured GPU buffer size are automatically chunked across multiple dispatches.
 
 ## Current capabilities
 
@@ -46,7 +46,7 @@ Ordered from "next" to "later":
 - [ ] **Query planner** - introduce a logical -> physical planning stage between IR generation and execution (predicate pushdown, column pruning, join ordering), replacing today's direct single-shot scan+filter dispatch.
 - [ ] **GPU join kernel** - hash join for the inner/left equi-joins the parser already accepts.
 - [ ] **GPU sort kernel** - for `ORDER BY` (a GPU bitonic sort is the natural fit).
-- [ ] **GPU group-by/aggregate kernel** — `SUM`/`COUNT`/`AVG`/`MIN`/`MAX`, keyed by group.
+- [ ] **GPU group-by/aggregate kernel** - `SUM`/`COUNT`/`AVG`/`MIN`/`MAX`, keyed by group.
 - [ ] **GPU projection kernel** - move column projection off the CPU path and into the same operator pipeline as scan/filter/join/sort.
 - [ ] **`INSERT`/`ALTER`/`DELETE` execution hardening** - `DELETE` currently parses but isn't executed yet, and `INSERT` without an explicit column list has a known crash (tracked internally); both need attention alongside the planner work.
 - [ ] **Cross-engine benchmarking** - driver scripts to run head-to-head comparisons and publish results.
