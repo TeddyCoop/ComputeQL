@@ -950,6 +950,10 @@ gdb_column_close(GDB_Column* column)
   if (column->is_disk_backed)
   {
     os_file_close(column->file);
+    if (!os_handle_match(os_handle_zero(), column->file_map_backing_file))
+    {
+      os_file_close(column->file_map_backing_file);
+    }
   }
 }
 
@@ -1218,7 +1222,7 @@ gdb_column_get_data(GDB_Column* column, U64 index)
     OS_Handle file = column->file;
     if (os_handle_match(os_handle_zero(), file))
     {
-      file = os_file_open(OS_AccessFlag_Read, column->disk_path);
+      file = os_file_open(OS_AccessFlag_Read | OS_AccessFlag_ShareRead, column->disk_path);
     }
     void* data = arena_push(column->arena, column->size, 8);
     os_file_read(file, r1u64(offset, offset + column->size), data);
@@ -1245,7 +1249,7 @@ gdb_column_get_string(Arena *arena, GDB_Column *column, U64 index)
     B32 temp_opened = 0;
     if (os_handle_match(os_handle_zero(), file))
     {
-      file = os_file_open(OS_AccessFlag_Read, column->disk_path);
+      file = os_file_open(OS_AccessFlag_Read | OS_AccessFlag_ShareRead, column->disk_path);
       temp_opened = 1;
     }
     
@@ -1366,7 +1370,7 @@ gdb_column_get_data_range(Arena* arena, GDB_Column* column, Rng1U64 row_range, U
     return data_ptr;
   }
   
-  // Open file handle if not already opened
+  // tec: create io handles
   if (os_handle_match(os_handle_zero(), column->file))
   {
     column->file = os_file_open(OS_AccessFlag_Read, column->disk_path);
@@ -1378,8 +1382,6 @@ gdb_column_get_data_range(Arena* arena, GDB_Column* column, Rng1U64 row_range, U
       return NULL;
     }
   }
-  
-  // Open file mapping if not already mapped
   if (os_handle_match(os_handle_zero(), column->file_map))
   {
     column->file_map = os_file_map_open(OS_AccessFlag_Read, column->file);
@@ -1392,7 +1394,6 @@ gdb_column_get_data_range(Arena* arena, GDB_Column* column, Rng1U64 row_range, U
     }
   }
   
-  // Calculate byte range in file
   U64 byte_offset = row_range.min * column->size;
   Rng1U64 byte_range = r1u64(byte_offset, byte_offset + size);
   
@@ -1401,7 +1402,6 @@ gdb_column_get_data_range(Arena* arena, GDB_Column* column, Rng1U64 row_range, U
     byte_range.max = os_properties_from_file(column->file).size;
   }
   
-  // Map and return directly
   void* mapped_ptr = os_file_map_view_open(column->file_map, OS_AccessFlag_Read, byte_range);
   if (!mapped_ptr)
   {
@@ -1438,16 +1438,21 @@ gdb_column_get_string_chunk(Arena* arena, GDB_Column* column, Rng1U64 row_range)
   
   if (column->is_disk_backed)
   {
+    // tec: ShareRead
+    // map_backing_file (once created) stays open for column's whole lifetime
+    // so without ShareRead it would  lock this file against every other readerwith a sharing-violation failure.
     OS_Handle file = column->file;
     if (os_handle_match(os_handle_zero(), file))
     {
-      file = os_file_open(OS_AccessFlag_Read, column->disk_path);
+      file = os_file_open(OS_AccessFlag_Read | OS_AccessFlag_ShareRead, column->disk_path);
     }
     OS_Handle file_map = column->file_map;
     if (os_handle_match(os_handle_zero(), file_map))
     {
-      file_map = os_file_map_open(OS_AccessFlag_Read, file);
+      OS_Handle map_backing_file = os_file_open(OS_AccessFlag_Read | OS_AccessFlag_ShareRead, column->disk_path);
+      file_map = os_file_map_open(OS_AccessFlag_Read, map_backing_file);
       column->file_map = file_map;
+      column->file_map_backing_file = map_backing_file;
     }
     
     // tec: on-disk string column layout (see gdb_table_save):
@@ -1515,7 +1520,6 @@ gdb_column_get_string_chunk(Arena* arena, GDB_Column* column, Rng1U64 row_range)
     {
       os_file_close(file);
     }
-    
     
     result.size = size;
     result.row_count = row_count;

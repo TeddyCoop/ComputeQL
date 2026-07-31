@@ -256,6 +256,142 @@ qe_bytecode_program_build(QE_BytecodeProgram* prog, GDB_Database* database, GDB_
   qe_bytecode_emit(prog, QE_Opcode_Halt);
 }
 
+//~ tec: double-buffered chunk prefetch for qe_scan_filter
+/*
+  abackground thread loads the next chunk from disk while the main thread uploads, dispatches, and reads back the current chunk, overlapping disk IO with GPU work
+
+the worker only performs gdb_column_* reads into host memory. all GPU work remains on the
+main thread because the dispatch path uses shared sync stuff
+
+the next chunk is not prefetched until the current chunk has finished uploading and any mapped string data has been closed
+*/
+typedef struct QE_PrefetchBindingResult QE_PrefetchBindingResult;
+struct QE_PrefetchBindingResult
+{
+  B32 valid;
+  B32 is_string;
+  void* data_ptr;
+  U64 size;
+  GDB_StringDataChunk str_chunk;
+};
+
+typedef struct QE_PrefetchSlot QE_PrefetchSlot;
+struct QE_PrefetchSlot
+{
+  Arena* arena;
+  Rng1U64 chunk_range;
+  U64 chunk_rows;
+  QE_PrefetchBindingResult bindings[QE_MAX_COLUMN_BINDINGS];
+};
+
+internal void
+qe_prefetch_read_slot(QE_PrefetchSlot* slot, QE_BytecodeProgram* prog, Rng1U64 range, U64 rows)
+{
+  slot->chunk_range = range;
+  slot->chunk_rows = rows;
+  
+  for (U32 i = 0; i < prog->binding_count; i++)
+  {
+    QE_ColumnBinding* binding = &prog->bindings[i];
+    QE_PrefetchBindingResult* out = &slot->bindings[i];
+    MemoryZeroStruct(out);
+    
+    if (binding->type == GDB_ColumnType_String8)
+    {
+      out->is_string = 1;
+      out->str_chunk = gdb_column_get_string_chunk(slot->arena, binding->column, range);
+      out->valid = (out->str_chunk.data != 0 && out->str_chunk.offsets != 0);
+    }
+    else
+    {
+      out->data_ptr = gdb_column_get_data_range(slot->arena, binding->column, range, &out->size);
+      out->valid = (out->data_ptr != 0);
+    }
+  }
+}
+
+typedef struct QE_PrefetchCtx QE_PrefetchCtx;
+struct QE_PrefetchCtx
+{
+  QE_BytecodeProgram* prog;
+  QE_PrefetchSlot slots[2];
+  
+  OS_Handle worker;
+  // tec: main -> worker, "a request is pending" (mailbox depth 1)
+  OS_Handle request_sem; 
+  // tec: worker -> main, "the requested slot is filled"
+  OS_Handle ready_sem;   
+  
+  U32 pending_slot;
+  Rng1U64 pending_range;
+  U64 pending_rows;
+  B32 stop;
+};
+
+internal void
+qe_prefetch_worker_main(void* raw_ctx)
+{
+  TCTX tctx_;
+  tctx_init_and_equip(&tctx_);
+  
+  QE_PrefetchCtx* ctx = (QE_PrefetchCtx*)raw_ctx;
+  for (;;)
+  {
+    os_semaphore_take(ctx->request_sem, max_U64);
+    if (ctx->stop)
+    {
+      break;
+    }
+    
+    arena_clear(ctx->slots[ctx->pending_slot].arena);
+    qe_prefetch_read_slot(&ctx->slots[ctx->pending_slot], ctx->prog, ctx->pending_range, ctx->pending_rows);
+    os_semaphore_drop(ctx->ready_sem);
+  }
+}
+
+internal QE_PrefetchCtx*
+qe_prefetch_start(Arena* arena, QE_BytecodeProgram* prog)
+{
+  QE_PrefetchCtx* ctx = push_array(arena, QE_PrefetchCtx, 1);
+  ctx->prog = prog;
+  ctx->slots[0].arena = arena_alloc();
+  ctx->slots[1].arena = arena_alloc();
+  ctx->request_sem = os_semaphore_alloc(0, 1, str8_zero());
+  ctx->ready_sem = os_semaphore_alloc(0, 1, str8_zero());
+  ctx->worker = os_thread_launch(qe_prefetch_worker_main, ctx, 0);
+  return ctx;
+}
+
+// tec: asks the background thread to read `range` into slot `slot_index` (0 or 1)
+internal void
+qe_prefetch_request(QE_PrefetchCtx* ctx, U32 slot_index, Rng1U64 range, U64 rows)
+{
+  ctx->pending_slot = slot_index;
+  ctx->pending_range = range;
+  ctx->pending_rows = rows;
+  os_semaphore_drop(ctx->request_sem);
+}
+
+// tec: blocks until the most recently requested slot is ready, then returns it
+internal QE_PrefetchSlot*
+qe_prefetch_wait(QE_PrefetchCtx* ctx, U32 slot_index)
+{
+  os_semaphore_take(ctx->ready_sem, max_U64);
+  return &ctx->slots[slot_index];
+}
+
+internal void
+qe_prefetch_stop(QE_PrefetchCtx* ctx)
+{
+  ctx->stop = 1;
+  os_semaphore_drop(ctx->request_sem);
+  os_thread_join(ctx->worker, max_U64);
+  os_semaphore_release(ctx->request_sem);
+  os_semaphore_release(ctx->ready_sem);
+  arena_release(ctx->slots[0].arena);
+  arena_release(ctx->slots[1].arena);
+}
+
 internal QE_ScanResult
 qe_scan_filter(Arena* arena, GDB_Database* database, GDB_Table* table, IR_Node* where_clause)
 {
@@ -313,6 +449,7 @@ qe_scan_filter(Arena* arena, GDB_Database* database, GDB_Table* table, IR_Node* 
   
   U64 gpu_kernel_execution_time = 0;
   U64 load_data_from_disk_time = 0;
+  U64 prefetch_stall_time = 0;
   
   B32 needs_chunking = largest_column_size > GPU_MAX_BUFFER_SIZE;
   
@@ -334,9 +471,13 @@ qe_scan_filter(Arena* arena, GDB_Database* database, GDB_Table* table, IR_Node* 
     chunk_count = (table->row_count + rows_per_chunk - 1) / rows_per_chunk;
   }
   
+  // tec: only worth a background thread + two extra arenas when there's a next chunk to hide IO for the common single-chunk case
+  QE_PrefetchCtx* prefetch = (chunk_count > 1) ? qe_prefetch_start(arena, prog) : 0;
+  
   for (U64 chunk_index = 0; chunk_index < chunk_count; chunk_index++)
   {
-    Temp chunk_arena = temp_begin(arena);
+    Temp fallback_arena = {0};
+    B32 using_prefetch = (prefetch != 0);
     
     U64 chunk_row_start = chunk_index * rows_per_chunk;
     U64 chunk_rows = needs_chunking ? Min(rows_per_chunk, table->row_count - chunk_row_start) : table->row_count;
@@ -344,30 +485,58 @@ qe_scan_filter(Arena* arena, GDB_Database* database, GDB_Table* table, IR_Node* 
     
     log_info("filtering rows %llu-%llu", chunk_range.min, chunk_range.max);
     
+    QE_PrefetchSlot* slot;
+    if (using_prefetch)
+    {
+      if (chunk_index == 0)
+      {
+        // tec: nothing to overlap chunk 0s read with yet, so do it synchronously on the main thread, straight into slot 0.
+        U64 start_read_time = os_now_microseconds();
+        arena_clear(prefetch->slots[0].arena);
+        qe_prefetch_read_slot(&prefetch->slots[0], prog, chunk_range, chunk_rows);
+        load_data_from_disk_time += os_now_microseconds() - start_read_time;
+        slot = &prefetch->slots[0];
+      }
+      else
+      {
+        // tec: this chunk's read was kicked off during the previous chunk's dispatch below
+        // usually already done by now, so this should stall near zero if IO is well hidden
+        U64 wait_start = os_now_microseconds();
+        slot = qe_prefetch_wait(prefetch, (U32)(chunk_index % 2));
+        prefetch_stall_time += os_now_microseconds() - wait_start;
+      }
+    }
+    else
+    {
+      fallback_arena = temp_begin(arena);
+      slot = push_array(fallback_arena.arena, QE_PrefetchSlot, 1);
+      slot->arena = fallback_arena.arena;
+      U64 start_read_time = os_now_microseconds();
+      qe_prefetch_read_slot(slot, prog, chunk_range, chunk_rows);
+      load_data_from_disk_time += os_now_microseconds() - start_read_time;
+    }
+    
     ProfBegin("allocating column GPU buffers");
     GPU_Buffer* column_gpu_buffers[QE_MAX_COLUMN_BINDINGS] = {0};
     
     for (U32 i = 0; i < prog->binding_count; i++)
     {
       QE_ColumnBinding* binding = &prog->bindings[i];
+      QE_PrefetchBindingResult* in = &slot->bindings[i];
       U32 descriptor_binding = QE_BINDING_COLUMN_BASE + binding->first_slot;
       
       if (binding->type == GDB_ColumnType_String8)
       {
-        U64 start_read_time = os_now_microseconds();
-        GDB_StringDataChunk str_chunk = gdb_column_get_string_chunk(chunk_arena.arena, binding->column, chunk_range);
-        load_data_from_disk_time += os_now_microseconds() - start_read_time;
-        
-        if (str_chunk.data && str_chunk.offsets)
+        if (in->valid)
         {
-          GPU_Buffer* data_buf = gpu_buffer_alloc(str_chunk.size, GPU_BufferFlag_Write | GPU_BufferFlag_HostVisible, 0);
-          gpu_buffer_write(data_buf, str_chunk.data, str_chunk.size);
+          GPU_Buffer* data_buf = gpu_buffer_alloc(in->str_chunk.size, GPU_BufferFlag_Write | GPU_BufferFlag_HostVisible, 0);
+          gpu_buffer_write(data_buf, in->str_chunk.data, in->str_chunk.size);
           column_gpu_buffers[binding->first_slot + 0] = data_buf;
           gpu_kernel_set_arg_buffer(kernel, descriptor_binding + 0, data_buf);
           
           // tec: +1 row for the trailing offset used to compute the last strings size
-          U64 offsets_size = (str_chunk.row_count + 1) * sizeof(U64);
-          GPU_Buffer* offsets_buf = gpu_buffer_alloc(offsets_size, GPU_BufferFlag_Write | GPU_BufferFlag_CopyHostPointer, str_chunk.offsets);
+          U64 offsets_size = (in->str_chunk.row_count + 1) * sizeof(U64);
+          GPU_Buffer* offsets_buf = gpu_buffer_alloc(offsets_size, GPU_BufferFlag_Write | GPU_BufferFlag_CopyHostPointer, in->str_chunk.offsets);
           column_gpu_buffers[binding->first_slot + 1] = offsets_buf;
           gpu_kernel_set_arg_buffer(kernel, descriptor_binding + 1, offsets_buf);
         }
@@ -376,22 +545,15 @@ qe_scan_filter(Arena* arena, GDB_Database* database, GDB_Table* table, IR_Node* 
           log_error("qe_scan_filter: failed to load string data/offsets for column '%.*s'", str8_varg(binding->name));
         }
         
+        // tec: safe to close now, the data's already been copyed into the GPU buffer above
         gdb_column_close_string_chunk(binding->column);
       }
-      else
+      else if (in->valid)
       {
-        U64 size = 0;
-        U64 start_read_time = os_now_microseconds();
-        void* data_ptr = gdb_column_get_data_range(chunk_arena.arena, binding->column, chunk_range, &size);
-        load_data_from_disk_time += os_now_microseconds() - start_read_time;
-        
-        if (data_ptr)
-        {
-          GPU_Buffer* data_buf = gpu_buffer_alloc(size, GPU_BufferFlag_Write, 0);
-          gpu_buffer_write(data_buf, data_ptr, size);
-          column_gpu_buffers[binding->first_slot] = data_buf;
-          gpu_kernel_set_arg_buffer(kernel, descriptor_binding, data_buf);
-        }
+        GPU_Buffer* data_buf = gpu_buffer_alloc(in->size, GPU_BufferFlag_Write, 0);
+        gpu_buffer_write(data_buf, in->data_ptr, in->size);
+        column_gpu_buffers[binding->first_slot] = data_buf;
+        gpu_kernel_set_arg_buffer(kernel, descriptor_binding, data_buf);
       }
     }
     
@@ -403,6 +565,16 @@ qe_scan_filter(Arena* arena, GDB_Database* database, GDB_Table* table, IR_Node* 
     gpu_kernel_set_arg_buffer(kernel, QE_BINDING_OUT_INDICES, output_buffer);
     gpu_kernel_set_arg_buffer(kernel, QE_BINDING_OUT_COUNT, result_counter_buffer);
     gpu_kernel_set_arg_u64(kernel, QE_PUSH_CONSTANT_ROW_COUNT, chunk_rows);
+    
+    // tec: this chunk's columns are now fully read+uploaded+closed
+    // so its safe to kick off the next chunk's read in the background
+    if (using_prefetch && chunk_index + 1 < chunk_count)
+    {
+      U64 next_row_start = (chunk_index + 1) * rows_per_chunk;
+      U64 next_rows = Min(rows_per_chunk, table->row_count - next_row_start);
+      Rng1U64 next_range = r1u64(next_row_start, next_row_start + next_rows);
+      qe_prefetch_request(prefetch, (U32)((chunk_index + 1) % 2), next_range, next_rows);
+    }
     
     // tec: TODO fix local size. one workgroup per row for now, revisit for performance later
     gpu_kernel_execute(kernel, (U32)chunk_rows, 1);
@@ -420,7 +592,10 @@ qe_scan_filter(Arena* arena, GDB_Database* database, GDB_Table* table, IR_Node* 
       if (column_gpu_buffers[binding->first_slot]) gpu_buffer_release(column_gpu_buffers[binding->first_slot]);
       if (binding->slot_count == 2 && column_gpu_buffers[binding->first_slot + 1]) gpu_buffer_release(column_gpu_buffers[binding->first_slot + 1]);
     }
-    temp_end(chunk_arena);
+    if (!using_prefetch)
+    {
+      temp_end(fallback_arena);
+    }
     
     if (result_count != 0)
     {
@@ -445,6 +620,11 @@ qe_scan_filter(Arena* arena, GDB_Database* database, GDB_Table* table, IR_Node* 
     gpu_buffer_release(result_counter_buffer);
   }
   
+  if (prefetch)
+  {
+    qe_prefetch_stop(prefetch);
+  }
+  
   gpu_buffer_release(bytecode_buffer);
   gpu_buffer_release(num_consts_buffer);
   gpu_buffer_release(str_consts_buffer);
@@ -452,6 +632,10 @@ qe_scan_filter(Arena* arena, GDB_Database* database, GDB_Table* table, IR_Node* 
   
   log_info("gpu kernel total execution time: %llu microseconds", gpu_kernel_execution_time);
   log_info("load from disk total time: %llu microseconds", load_data_from_disk_time);
+  if (chunk_count > 1)
+  {
+    log_info("prefetch stall time (time the GPU sat idle waiting on disk I/O the pipeline failed to hide): %llu microseconds", prefetch_stall_time);
+  }
   
   ProfBegin("flatten result chunks");
   {
@@ -1853,7 +2037,7 @@ qe_hash_join(Arena* arena, PLAN_RowSet* left, GDB_Table* right_table, String8 jo
   }
   bucket_offsets[num_buckets] = running;
   
-  //- tec: pass 2/2 (build side) - scatter build rows into per-bucket CSR lists (shared csr_scatter.comp)
+  //- tec: pass 2/2 (build side). scatter build rows into per-bucket CSR lists
   GPU_Kernel* scatter_kernel = gpu_kernel_alloc(str8_lit("csr_scatter"));
   GPU_Buffer* cursor_buf = gpu_buffer_alloc(num_buckets * sizeof(U32), GPU_BufferFlag_ReadWrite, bucket_offsets);
   GPU_Buffer* bucket_rows_buf = gpu_buffer_alloc(Max(build_row_count, 1) * sizeof(U32), GPU_BufferFlag_ReadWrite, 0);
@@ -1873,9 +2057,8 @@ qe_hash_join(Arena* arena, PLAN_RowSet* left, GDB_Table* right_table, String8 jo
   gpu_buffer_release(cursor_buf);
   gpu_kernel_release(scatter_kernel);
   
-  // tec: probe from the left side. output capacity is a bounded heuristic (equal-join fan out is
-  // usually proportional to input size, not the full cross product) if the real match count
-  // exceeds it, thats detected below and reported loudly rather than silently truncated
+  // tec: probe from the left side. output capacity is a bounded heuristic
+  // if the real match count exceeds it, thats detected below and reported rather than silently truncated
   U64 out_capacity = Max(probe_row_count, build_row_count) * 64 + probe_row_count;
   U64 max_capacity = GPU_MAX_BUFFER_SIZE / (4 * sizeof(U32));
   if (out_capacity > max_capacity) out_capacity = max_capacity;

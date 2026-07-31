@@ -50,6 +50,7 @@
 #define GDB_DISK_BACKED_THRESHOLD_SIZE KB(4)
 #endif
 
+//~ tec: column information 
 typedef U32 GDB_ColumnType;
 enum
 {
@@ -89,7 +90,11 @@ struct GDB_StringDataChunk
   U64 row_count;
 };
 
+//~ tec: declare db structs
 typedef struct GDB_Column GDB_Column;
+typedef struct GDB_Table GDB_Table;
+typedef struct GDB_Database GDB_Database;
+
 struct GDB_Column
 {
   Arena* arena;
@@ -105,20 +110,21 @@ struct GDB_Column
   U8 *data;
   U64 *offsets;
   
-  // tec: disk backed
+  //- tec: io
   B32 is_disk_backed;
   B32 disk_backed_offset_initialized;
   String8 disk_path;
   OS_Handle file;
   OS_Handle file_map;
+  // tec: kept open only for as long as file_map is cached, independent of `file`
+  OS_Handle file_map_backing_file; 
   U64 mapped_size;
   void* mapped_ptr;
   Rng1U64 current_mapped_range;
   
-  struct GDB_Table* parent_table;
+  GDB_Table* parent_table;
 };
 
-typedef struct GDB_Table GDB_Table;
 struct GDB_Table
 {
   Arena* arena;
@@ -129,10 +135,20 @@ struct GDB_Table
   U64 row_count;
   GDB_Column** columns;
   
-  struct GDB_Database* parent_database;
+  GDB_Database* parent_database;
 };
 
-// tec: multithreading csv
+struct GDB_Database
+{
+  Arena* arena;
+  
+  String8 name;
+  U64 table_count;
+  U64 table_capacity;
+  GDB_Table** tables;
+};
+
+//~ tec: csv loading
 typedef struct GDB_CSV_ThreadColumnData GDB_CSV_ThreadColumnData;
 struct GDB_CSV_ThreadColumnData
 {
@@ -155,17 +171,7 @@ struct GDB_CSV_ThreadContext
   U64 view_size;
 };
 
-typedef struct GDB_Database GDB_Database;
-struct GDB_Database
-{
-  Arena* arena;
-  
-  String8 name;
-  U64 table_count;
-  U64 table_capacity;
-  GDB_Table** tables;
-};
-
+//~ tec: state
 typedef struct GDB_State GDB_State;
 struct GDB_State
 {
