@@ -88,10 +88,6 @@ gpu_init(void)
   g_vulkan_state->compute_queue_family_index = compute_queue_family_index;
   
   //- tec: detect Resizable BAR / Smart Access Memory
-  //( AMD and NVIDIA both support this on modern hardware/drivers)
-  // a memory type that's both DEVICE_LOCAL and HOST_VISIBLE means
-  // gpu_buffer_alloc can map VRAM directly and memcpy into it, instead of always going through
-  // a staging buffer + vkCmdCopyBuffer
   {
     VkPhysicalDeviceMemoryProperties mem_props;
     vkGetPhysicalDeviceMemoryProperties(selected, &mem_props);
@@ -127,16 +123,39 @@ gpu_init(void)
   VkExtensionProperties *ext_props = push_array(arena, VkExtensionProperties, ext_count);
   vkEnumerateDeviceExtensionProperties(selected, 0, &ext_count, ext_props);
   
-  char *enabled_extensions[1];
+  char *enabled_extensions[2];
   U32 enabled_extension_count = 0;
   U64 budget_ext_name_size = cstring8_length((U8*)VK_EXT_MEMORY_BUDGET_EXTENSION_NAME) + 1;
+  U64 ext_mem_host_name_size = cstring8_length((U8*)VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME) + 1;
   for (U32 i = 0; i < ext_count; i++)
   {
     if (MemoryMatch(ext_props[i].extensionName, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME, budget_ext_name_size))
     {
       enabled_extensions[enabled_extension_count++] = VK_EXT_MEMORY_BUDGET_EXTENSION_NAME;
       g_vulkan_state->has_memory_budget_ext = 1;
-      break;
+    }
+    else if (MemoryMatch(ext_props[i].extensionName, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME, ext_mem_host_name_size))
+    {
+      enabled_extensions[enabled_extension_count++] = VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME;
+      g_vulkan_state->has_external_memory_host_ext = 1;
+    }
+  }
+  
+  //- tec: VK_EXT_external_memory_host
+  if (g_vulkan_state->has_external_memory_host_ext)
+  {
+    VkPhysicalDeviceExternalMemoryHostPropertiesEXT ext_mem_host_props = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT };
+    VkPhysicalDeviceProperties2 props2 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &ext_mem_host_props };
+    vkGetPhysicalDeviceProperties2(selected, &props2);
+    g_vulkan_state->min_imported_host_pointer_alignment = ext_mem_host_props.minImportedHostPointerAlignment;
+    
+    if (g_vulkan_state->min_imported_host_pointer_alignment == 0 || g_vulkan_state->min_imported_host_pointer_alignment > 4096)
+    {
+      g_vulkan_state->has_external_memory_host_ext = 0;
+    }
+    else
+    {
+      log_info("VK_EXT_external_memory_host supported (alignment=%llu) - disk-backed numeric column reads will import mapped file views directly, skipping the upload copy", g_vulkan_state->min_imported_host_pointer_alignment);
     }
   }
   
@@ -190,6 +209,15 @@ gpu_init(void)
   }
   
   vkGetDeviceQueue(g_vulkan_state->device, compute_queue_family_index, 0, &g_vulkan_state->compute_queue);
+  
+  if (g_vulkan_state->has_external_memory_host_ext)
+  {
+    g_vulkan_state->vkGetMemoryHostPointerPropertiesEXT_fn = (PFN_vkGetMemoryHostPointerPropertiesEXT)vkGetDeviceProcAddr(g_vulkan_state->device, "vkGetMemoryHostPointerPropertiesEXT");
+    if (!g_vulkan_state->vkGetMemoryHostPointerPropertiesEXT_fn)
+    {
+      g_vulkan_state->has_external_memory_host_ext = 0;
+    }
+  }
   
   //- tec: command pool
   VkCommandPoolCreateInfo pool_info =
@@ -626,6 +654,98 @@ gpu_buffer_alloc(U64 size, GPU_BufferFlags flags, void* data)
   return result;
 }
 
+// tec: imports an existing host pointer (such as an OS mapped file view) directly as a VkBuffer's backing memory via VK_EXT_external_memory_host
+internal GPU_Buffer*
+gpu_buffer_import_host_readonly(void* host_ptr, U64 size)
+{
+  if (!g_vulkan_state->has_external_memory_host_ext || !host_ptr || size == 0)
+  {
+    return 0;
+  }
+  
+  U64 align = g_vulkan_state->min_imported_host_pointer_alignment;
+  U64 addr = (U64)host_ptr;
+  U64 aligned_addr = addr & ~(align - 1);
+  void* aligned_ptr = (void*)aligned_addr;
+  U64 front_pad = addr - aligned_addr;
+  U64 import_size = AlignPow2(front_pad + size, align);
+  
+  VkMemoryHostPointerPropertiesEXT host_props = 
+  { 
+    .sType = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT 
+  };
+  
+  if (g_vulkan_state->vkGetMemoryHostPointerPropertiesEXT_fn(g_vulkan_state->device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, aligned_ptr, &host_props) != VK_SUCCESS)
+  {
+    return 0;
+  }
+  
+  VkExternalMemoryBufferCreateInfo ext_buf_info = 
+  { 
+    .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO, 
+    .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT
+  };
+  VkBufferCreateInfo buf_info =
+  {
+    .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+    .pNext = &ext_buf_info,
+    .size = import_size,
+    .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+    .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+  };
+  
+  VkBuffer buffer;
+  if (vkCreateBuffer(g_vulkan_state->device, &buf_info, 0, &buffer) != VK_SUCCESS)
+  {
+    return 0;
+  }
+  
+  VkMemoryRequirements mem_req;
+  vkGetBufferMemoryRequirements(g_vulkan_state->device, buffer, &mem_req);
+  
+  U32 mem_type = gpu_vulkan_find_memory_type(mem_req.memoryTypeBits & host_props.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+  if (mem_type == UINT32_MAX)
+  {
+    vkDestroyBuffer(g_vulkan_state->device, buffer, 0);
+    return 0;
+  }
+  
+  VkImportMemoryHostPointerInfoEXT import_info = 
+  { 
+    .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT, 
+    .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, 
+    .pHostPointer = aligned_ptr 
+  };
+  VkMemoryAllocateInfo alloc_info = 
+  { 
+    .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, 
+    .pNext = &import_info,
+    .allocationSize = import_size,
+    .memoryTypeIndex = mem_type
+  };
+  
+  VkDeviceMemory memory;
+  if (vkAllocateMemory(g_vulkan_state->device, &alloc_info, 0, &memory) != VK_SUCCESS)
+  {
+    vkDestroyBuffer(g_vulkan_state->device, buffer, 0);
+    return 0;
+  }
+  
+  if (vkBindBufferMemory(g_vulkan_state->device, buffer, memory, 0) != VK_SUCCESS)
+  {
+    vkDestroyBuffer(g_vulkan_state->device, buffer, 0);
+    vkFreeMemory(g_vulkan_state->device, memory, 0);
+    return 0;
+  }
+  
+  GPU_Buffer* result = push_array(g_vulkan_state->arena, GPU_Buffer, 1);
+  result->buffer = buffer;
+  result->memory = memory;
+  result->size = size;
+  result->bind_offset = front_pad;
+  return result;
+}
+
 internal void
 gpu_buffer_release(GPU_Buffer* buffer)
 {
@@ -806,7 +926,7 @@ gpu_kernel_set_arg_buffer(GPU_Kernel* kernel, U32 index, GPU_Buffer* buffer)
   VkDescriptorBufferInfo buffer_info =
   {
     .buffer = buffer->buffer,
-    .offset = 0,
+    .offset = buffer->bind_offset,
     .range = buffer->size,
   };
   

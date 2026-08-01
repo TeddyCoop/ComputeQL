@@ -550,8 +550,22 @@ qe_scan_filter(Arena* arena, GDB_Database* database, GDB_Table* table, IR_Node* 
       }
       else if (in->valid)
       {
-        GPU_Buffer* data_buf = gpu_buffer_alloc(in->size, GPU_BufferFlag_Write, 0);
-        gpu_buffer_write(data_buf, in->data_ptr, in->size);
+        // tec: for a disk-backed column, in->data_ptr already points into an OS file mapping
+        // (see gdb_column_get_data_range) with real committed pages behind it - safe to hand
+        // straight to Vulkan via VK_EXT_external_memory_host and skip the copy entirely. Not
+        // attempted for in-memory columns: in->data_ptr there points into a plain heap/arena
+        // allocation with no guarantee of extra readable bytes past it, which the alignment
+        // rounding in gpu_buffer_import_host_readonly relies on being safe to touch.
+        GPU_Buffer* data_buf = 0;
+        if (binding->column->is_disk_backed)
+        {
+          data_buf = gpu_buffer_import_host_readonly(in->data_ptr, in->size);
+        }
+        if (!data_buf)
+        {
+          data_buf = gpu_buffer_alloc(in->size, GPU_BufferFlag_Write, 0);
+          gpu_buffer_write(data_buf, in->data_ptr, in->size);
+        }
         column_gpu_buffers[binding->first_slot] = data_buf;
         gpu_kernel_set_arg_buffer(kernel, descriptor_binding, data_buf);
       }

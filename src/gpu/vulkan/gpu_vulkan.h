@@ -14,6 +14,7 @@ struct GPU_Buffer
   VkDeviceMemory memory;
   U64 size;
   void* mapped_ptr;
+  U64 bind_offset;
 };
 
 struct GPU_Kernel
@@ -56,6 +57,11 @@ struct GPU_State
   U64 last_kernel_time_microseconds;
   
   B32 has_memory_budget_ext;
+  
+  // tec: lets gpu_buffer_import_host_readonly import an OS mapped file view directly as a VkBuffer's backing memory, with no CPU copy at all
+  B32 has_external_memory_host_ext;
+  U64 min_imported_host_pointer_alignment;
+  PFN_vkGetMemoryHostPointerPropertiesEXT vkGetMemoryHostPointerPropertiesEXT_fn; // tec: extension function, not in the static loader import lib - must be resolved via vkGetDeviceProcAddr
   
   // tec: Resizable BAR
   // a memory type that's both DEVICE_LOCAL and HOST_VISIBLE lets gpu_buffer_alloc write straight into vram with a memcpy, skipping the staging-buffer + vkCmdCopyBuffer round trip entirely
