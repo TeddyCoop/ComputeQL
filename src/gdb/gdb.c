@@ -84,6 +84,29 @@ gdb_database_add_table(GDB_Database* database, GDB_Table* table)
   database->tables[database->table_count++] = table;
 }
 
+internal void
+gdb_database_replace_table(GDB_Database* database, GDB_Table* new_table)
+{
+  for (U64 i = 0; i < database->table_count; i++)
+  {
+    GDB_Table* old_table = database->tables[i];
+    if (str8_match(old_table->name, new_table->name, 0))
+    {
+      for (U64 c = 0; c < old_table->column_count; c++)
+      {
+        gdb_column_close(old_table->columns[c]);
+      }
+      gdb_table_release(old_table);
+
+      new_table->parent_database = database;
+      database->tables[i] = new_table;
+      return;
+    }
+  }
+
+  gdb_database_add_table(database, new_table);
+}
+
 global String8 g_gdb_database_save_path = str8_lit_comp("gdb_data/");
 
 internal B32
@@ -1220,13 +1243,18 @@ gdb_column_get_data(GDB_Column* column, U64 index)
   {
     U64 offset = index * column->size;
     OS_Handle file = column->file;
+    B32 temp_opened = 0;
     if (os_handle_match(os_handle_zero(), file))
     {
       file = os_file_open(OS_AccessFlag_Read | OS_AccessFlag_ShareRead, column->disk_path);
+      temp_opened = 1;
     }
     void* data = arena_push(column->arena, column->size, 8);
     os_file_read(file, r1u64(offset, offset + column->size), data);
-    os_file_close(file);
+    if (temp_opened)
+    {
+      os_file_close(file);
+    }
     return data;
   }
   else

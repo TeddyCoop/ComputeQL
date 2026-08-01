@@ -194,6 +194,7 @@ internal void gdb_add_database(GDB_Database* database);
 internal GDB_Database* gdb_database_alloc(String8 name);
 internal void gdb_database_release(GDB_Database* database);
 internal void gdb_database_add_table(GDB_Database* database, GDB_Table* table);
+internal void gdb_database_replace_table(GDB_Database* database, GDB_Table* new_table);
 internal B32 gdb_database_save(GDB_Database* database, String8 directory);
 internal GDB_Database* gdb_database_load(String8 directory);
 internal void gdb_database_close(GDB_Database* database);

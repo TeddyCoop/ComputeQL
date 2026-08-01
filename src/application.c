@@ -188,22 +188,14 @@ app_execute_query(String8 sql_query)
         IR_Node* table_node = ir_node_find_child(ir_execution_node, IR_NodeType_Table);
         IR_Node* import_file_node = ir_node_find_child(ir_execution_node, IR_NodeType_Literal);
         
-        //if (gdb_database_contains_table(database, table_node->value))
-        {
-          
-        }
-        //else
-        {
-          Temp scratch = scratch_begin(0, 0);
-          String8 filepath = push_str8f(scratch.arena, "%.*s", 
-                                        str8_varg(import_file_node->value));
-          //GDB_Table* table = gdb_table_import_csv(database, filepath);
-          GDB_Table* table = gdb_table_import_csv_streaming(database, table_node->value, filepath);
-          //table->name = push_str8_copy(table->arena, table_node->value);
-          //table->name = push_str8_copy(table->arena, table_node->value);
-          scratch_end(scratch);
-          gdb_database_add_table(database, table);
-        }
+        Temp scratch = scratch_begin(0, 0);
+        String8 filepath = push_str8f(scratch.arena, "%.*s",
+                                      str8_varg(import_file_node->value));
+        GDB_Table* table = gdb_table_import_csv_streaming(database, table_node->value, filepath);
+        scratch_end(scratch);
+        
+        // tec: a table with this name may already exist, replace it
+        gdb_database_replace_table(database, table);
         
         ProfEnd();
       } break;
