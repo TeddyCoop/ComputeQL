@@ -258,8 +258,6 @@ app_execute_query(String8 sql_query)
           }
           else
           {
-            // tec: gather each selected column once via qe_gather_numeric_column/qe_gather_string_column
-            // instead of calling gdb_column_get_data/gdb_column_get_string per row per column
             U64 column_count = 0;
             for (IR_Node* c = select_output_columns->first; c != NULL; c = c->next) column_count++;
 

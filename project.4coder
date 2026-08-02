@@ -38,11 +38,18 @@ commands = {
 		.cursor_at_end = false,
 	},
 	.test = {
-	.win = "test.bat",
-	.out = "*compilation*",
-	.footer_panel = true,
-	.save_dirty_files = false,
-	.cursor_at_end = false,
+		.win = "test.bat",
+		.out = "*compilation*",
+		.footer_panel = true,
+		.save_dirty_files = false,
+		.cursor_at_end = false,
+	},
+	.build_and_run_tests = {
+		.win = "build_and_run_tests.bat",
+		.out = "*compilation*",
+		.footer_panel = true,
+		.save_dirty_files = false,
+		.cursor_at_end = false,
 	}
 };
 
@@ -50,5 +57,6 @@ fkey_command = {
 .F1 = "build",
 .F2 = "test",
 .F3 = "run",
+.F4 = "build_and_run_tests",
 };
 

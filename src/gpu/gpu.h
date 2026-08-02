@@ -37,6 +37,7 @@ internal U64 gpu_device_total_memory(void);
 internal U64 gpu_device_free_memory(void);
 
 internal GPU_Buffer* gpu_buffer_alloc(U64 size, GPU_BufferFlags flags, void* data);
+internal GPU_Buffer* gpu_buffer_alloc_pooled(String8 name, U64 size, GPU_BufferFlags flags, void* data);
 // tec: imports an existing host pointer directly. returns 0 if fails for any reason or not supported
 internal GPU_Buffer* gpu_buffer_import_host_readonly(void* host_ptr, U64 size);
 internal void gpu_buffer_release(GPU_Buffer* buffer);

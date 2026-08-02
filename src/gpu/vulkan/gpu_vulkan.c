@@ -466,17 +466,19 @@ internal void
 gpu_vulkan_end_and_submit_cmd(VkCommandBuffer cmd)
 {
   vkEndCommandBuffer(cmd);
-  
+
   VkSubmitInfo submit_info =
   {
     .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
     .commandBufferCount = 1,
     .pCommandBuffers = &cmd,
   };
-  
+
+  U64 t0 = os_now_microseconds();
   vkResetFences(g_vulkan_state->device, 1, &g_vulkan_state->submit_fence);
   vkQueueSubmit(g_vulkan_state->compute_queue, 1, &submit_info, g_vulkan_state->submit_fence);
   vkWaitForFences(g_vulkan_state->device, 1, &g_vulkan_state->submit_fence, VK_TRUE, UINT64_MAX);
+  log_info("submit+wait wall time: %llu microseconds", os_now_microseconds() - t0);
 }
 
 internal B32
@@ -660,6 +662,43 @@ gpu_buffer_alloc(U64 size, GPU_BufferFlags flags, void* data)
   }
   
   return result;
+}
+
+internal GPU_Buffer*
+gpu_buffer_alloc_pooled(String8 name, U64 size, GPU_BufferFlags flags, void* data)
+{
+  for (U32 i = 0; i < g_vulkan_state->pooled_buffer_count; i++)
+  {
+    GPU_PooledBuffer* slot = &g_vulkan_state->pooled_buffers[i];
+    if (!str8_match(slot->name, name, 0)) continue;
+
+    if (size > slot->capacity)
+    {
+      gpu_buffer_release(slot->buffer);
+      slot->buffer = gpu_buffer_alloc(size, flags, data);
+      slot->capacity = size;
+    }
+    else
+    {
+      slot->buffer->size = size;
+      if (data) gpu_buffer_write(slot->buffer, data, size);
+    }
+    return slot->buffer;
+  }
+
+  GPU_Buffer* buffer = gpu_buffer_alloc(size, flags, data);
+  if (g_vulkan_state->pooled_buffer_count < GPU_VULKAN_MAX_POOLED_BUFFERS)
+  {
+    GPU_PooledBuffer* slot = &g_vulkan_state->pooled_buffers[g_vulkan_state->pooled_buffer_count++];
+    slot->name = name;
+    slot->buffer = buffer;
+    slot->capacity = size;
+  }
+  else
+  {
+    log_error("gpu_buffer_alloc_pooled: pool full, '%.*s' will not be cached", str8_varg(name));
+  }
+  return buffer;
 }
 
 // tec: imports an existing host pointer (such as an OS mapped file view) directly as a VkBuffer's backing memory via VK_EXT_external_memory_host

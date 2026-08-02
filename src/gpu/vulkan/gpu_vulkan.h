@@ -8,6 +8,7 @@
 #define GPU_VULKAN_MAX_BOUND_BUFFERS 16
 #define GPU_VULKAN_PUSH_CONSTANT_COUNT 8
 #define GPU_VULKAN_MAX_CACHED_KERNELS 16
+#define GPU_VULKAN_MAX_POOLED_BUFFERS 16
 
 struct GPU_Buffer
 {
@@ -33,20 +34,28 @@ struct GPU_Kernel
   U64 push_constants[GPU_VULKAN_PUSH_CONSTANT_COUNT];
 };
 
+typedef struct GPU_PooledBuffer GPU_PooledBuffer;
+struct GPU_PooledBuffer
+{
+  String8 name;
+  GPU_Buffer* buffer;
+  U64 capacity;
+};
+
 struct GPU_State
 {
   Arena* arena;
-  
+
   VkInstance instance;
   VkPhysicalDevice physical_device;
   VkDevice device;
-  
+
   VkQueue compute_queue;
   U32 compute_queue_family_index;
-  
+
   VkCommandPool command_pool;
   VkCommandBuffer command_buffer;
-  
+
   VkDescriptorPool descriptor_pool;
   VkDescriptorSetLayout shared_descriptor_set_layout;
   VkPipelineLayout shared_pipeline_layout;
@@ -54,6 +63,10 @@ struct GPU_State
   // tec: gpu_kernel_alloc caches by name
   GPU_Kernel* kernel_cache[GPU_VULKAN_MAX_CACHED_KERNELS];
   U32 kernel_cache_count;
+
+  // tec: gpu_buffer_alloc_pooled caches by name
+  GPU_PooledBuffer pooled_buffers[GPU_VULKAN_MAX_POOLED_BUFFERS];
+  U32 pooled_buffer_count;
   
   VkQueryPool timestamp_query_pool;
   F32 timestamp_period_ns;

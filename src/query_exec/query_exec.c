@@ -411,16 +411,16 @@ qe_scan_filter(Arena* arena, GDB_Database* database, GDB_Table* table, IR_Node* 
   }
   
   //- tec: upload the (query-invariant) bytecode + constant pool buffers once, outside the chunk loop
-  GPU_Buffer* bytecode_buffer = gpu_buffer_alloc(Max(prog->word_count, 1) * sizeof(U32), GPU_BufferFlag_Write, 0);
+  GPU_Buffer* bytecode_buffer = gpu_buffer_alloc_pooled(str8_lit("scan_filter_bytecode"), Max(prog->word_count, 1) * sizeof(U32), GPU_BufferFlag_Write, 0);
   gpu_buffer_write(bytecode_buffer, prog->words, prog->word_count * sizeof(U32));
-  
-  GPU_Buffer* num_consts_buffer = gpu_buffer_alloc(Max(prog->const_count * 2, 1) * sizeof(U32), GPU_BufferFlag_Write, 0);
+
+  GPU_Buffer* num_consts_buffer = gpu_buffer_alloc_pooled(str8_lit("scan_filter_num_consts"), Max(prog->const_count * 2, 1) * sizeof(U32), GPU_BufferFlag_Write, 0);
   if (prog->const_count > 0)
   {
     gpu_buffer_write(num_consts_buffer, prog->consts, prog->const_count * 2 * sizeof(U32));
   }
-  
-  GPU_Buffer* str_consts_buffer = gpu_buffer_alloc(Max(prog->str_const_pool_size, 4), GPU_BufferFlag_Write, 0);
+
+  GPU_Buffer* str_consts_buffer = gpu_buffer_alloc_pooled(str8_lit("scan_filter_str_consts"), Max(prog->str_const_pool_size, 4), GPU_BufferFlag_Write, 0);
   if (prog->str_const_pool_size > 0)
   {
     gpu_buffer_write(str_consts_buffer, prog->str_const_pool, prog->str_const_pool_size);
@@ -450,6 +450,9 @@ qe_scan_filter(Arena* arena, GDB_Database* database, GDB_Table* table, IR_Node* 
   U64 gpu_kernel_execution_time = 0;
   U64 load_data_from_disk_time = 0;
   U64 prefetch_stall_time = 0;
+  U64 buffer_alloc_time = 0;
+  U64 buffer_release_time = 0;
+  U64 submit_wait_time = 0;
   
   B32 needs_chunking = largest_column_size > GPU_MAX_BUFFER_SIZE;
   
@@ -517,8 +520,9 @@ qe_scan_filter(Arena* arena, GDB_Database* database, GDB_Table* table, IR_Node* 
     }
     
     ProfBegin("allocating column GPU buffers");
+    U64 buffer_alloc_start = os_now_microseconds();
     GPU_Buffer* column_gpu_buffers[QE_MAX_COLUMN_BINDINGS] = {0};
-    
+
     for (U32 i = 0; i < prog->binding_count; i++)
     {
       QE_ColumnBinding* binding = &prog->bindings[i];
@@ -571,11 +575,12 @@ qe_scan_filter(Arena* arena, GDB_Database* database, GDB_Table* table, IR_Node* 
       }
     }
     
-    GPU_Buffer* output_buffer = gpu_buffer_alloc(Max(chunk_rows, 1) * 2 * sizeof(U32), GPU_BufferFlag_Read, 0);
+    GPU_Buffer* output_buffer = gpu_buffer_alloc_pooled(str8_lit("scan_filter_output"), Max(chunk_rows, 1) * 2 * sizeof(U32), GPU_BufferFlag_Read, 0);
     U32 zero_count[2] = {0, 0};
-    GPU_Buffer* result_counter_buffer = gpu_buffer_alloc(sizeof(zero_count), GPU_BufferFlag_ReadWrite | GPU_BufferFlag_HostCached, zero_count);
+    GPU_Buffer* result_counter_buffer = gpu_buffer_alloc_pooled(str8_lit("scan_filter_result_counter"), sizeof(zero_count), GPU_BufferFlag_ReadWrite | GPU_BufferFlag_HostCached, zero_count);
+    buffer_alloc_time += os_now_microseconds() - buffer_alloc_start;
     ProfEnd();
-    
+
     gpu_kernel_set_arg_buffer(kernel, QE_BINDING_OUT_INDICES, output_buffer);
     gpu_kernel_set_arg_buffer(kernel, QE_BINDING_OUT_COUNT, result_counter_buffer);
     gpu_kernel_set_arg_u64(kernel, QE_PUSH_CONSTANT_ROW_COUNT, chunk_rows);
@@ -591,21 +596,25 @@ qe_scan_filter(Arena* arena, GDB_Database* database, GDB_Table* table, IR_Node* 
     }
     
     // tec: TODO fix local size. one workgroup per row for now, revisit for performance later
+    U64 submit_wait_start = os_now_microseconds();
     gpu_kernel_execute(kernel, (U32)chunk_rows, 1);
     gpu_kernel_execution_time += gpu_get_executed_kernel_time_microseconds();
-    
+
     gpu_wait();
-    
+    submit_wait_time += os_now_microseconds() - submit_wait_start;
+
     U32 result_count32[2] = {0, 0};
     gpu_buffer_read(result_counter_buffer, result_count32, sizeof(result_count32));
     U64 result_count = result_count32[0];
     
+    U64 buffer_release_start = os_now_microseconds();
     for (U32 i = 0; i < prog->binding_count; i++)
     {
       QE_ColumnBinding* binding = &prog->bindings[i];
       if (column_gpu_buffers[binding->first_slot]) gpu_buffer_release(column_gpu_buffers[binding->first_slot]);
       if (binding->slot_count == 2 && column_gpu_buffers[binding->first_slot + 1]) gpu_buffer_release(column_gpu_buffers[binding->first_slot + 1]);
     }
+    buffer_release_time += os_now_microseconds() - buffer_release_start;
     if (!using_prefetch)
     {
       temp_end(fallback_arena);
@@ -629,23 +638,20 @@ qe_scan_filter(Arena* arena, GDB_Database* database, GDB_Table* table, IR_Node* 
       *tail = rc;
       tail = &rc->next;
     }
-    
-    gpu_buffer_release(output_buffer);
-    gpu_buffer_release(result_counter_buffer);
   }
-  
+
   if (prefetch)
   {
     qe_prefetch_stop(prefetch);
   }
-  
-  gpu_buffer_release(bytecode_buffer);
-  gpu_buffer_release(num_consts_buffer);
-  gpu_buffer_release(str_consts_buffer);
+
   gpu_kernel_release(kernel);
   
   log_info("gpu kernel total execution time: %llu microseconds", gpu_kernel_execution_time);
   log_info("load from disk total time: %llu microseconds", load_data_from_disk_time);
+  log_info("buffer alloc total time: %llu microseconds", buffer_alloc_time);
+  log_info("buffer release total time: %llu microseconds", buffer_release_time);
+  log_info("submit+wait (gpu_kernel_execute + gpu_wait) total time: %llu microseconds", submit_wait_time);
   if (chunk_count > 1)
   {
     log_info("prefetch stall time (time the GPU sat idle waiting on disk I/O the pipeline failed to hide): %llu microseconds", prefetch_stall_time);
