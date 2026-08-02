@@ -180,13 +180,13 @@ bench_gdb_consume_result(PLAN_ExecResult* result, IR_Node* select_node, U64* out
   {
     Temp scratch = scratch_begin(0, 0);
 
-    for (U64 i = 0; i < result_count; i++)
+    if (result->is_materialized)
     {
-      U64 row_hash = BENCH_FNV_OFFSET_BASIS;
-
-      for (IR_Node* column_node = select_output_columns->first; column_node != NULL; column_node = column_node->next)
+      for (U64 i = 0; i < result_count; i++)
       {
-        if (result->is_materialized)
+        U64 row_hash = BENCH_FNV_OFFSET_BASIS;
+
+        for (IR_Node* column_node = select_output_columns->first; column_node != NULL; column_node = column_node->next)
         {
           String8 name = qe_column_list_item_display_name(scratch.arena, column_node);
           PLAN_AggColumn* col = NULL;
@@ -209,36 +209,84 @@ bench_gdb_consume_result(PLAN_ExecResult* result, IR_Node* select_node, U64* out
             row_hash = bench_fnv_mix_u64(row_hash, bench_scaled_round(col->numeric_values[i]));
           }
         }
+
+        checksum += row_hash;
+      }
+    }
+    else
+    {
+      // tec: gather each selected column once instead of one gdb_column_get_data/gdb_column_get_string
+      U64 column_count = 0;
+      for (IR_Node* c = select_output_columns->first; c != NULL; c = c->next) column_count++;
+
+      typedef struct BenchColGather BenchColGather;
+      struct BenchColGather
+      {
+        B32 resolved;
+        U64 table_slot;
+        GDB_ColumnType type;
+        F64* numeric_values;
+        GDB_StringDataChunk strings;
+      };
+
+      BenchColGather* gathered = push_array(scratch.arena, BenchColGather, Max(column_count, 1));
+
+      U64 ci = 0;
+      for (IR_Node* column_node = select_output_columns->first; column_node != NULL; column_node = column_node->next, ci++)
+      {
+        String8 bare_name = {0};
+        GDB_Table* col_table = qe_resolve_column_table(&result->rows, column_node->value, &bare_name);
+        if (!col_table) continue;
+
+        GDB_Column* column = gdb_table_find_column(col_table, bare_name);
+        if (!column) continue;
+
+        gathered[ci].resolved = 1;
+        gathered[ci].table_slot = qe_rowset_table_slot(&result->rows, col_table);
+        gathered[ci].type = column->type;
+
+        if (column->type == GDB_ColumnType_String8)
+        {
+          gathered[ci].strings = qe_gather_string_column(scratch.arena, &result->rows, col_table, column);
+        }
         else
         {
-          String8 bare_name = {0};
-          GDB_Table* col_table = qe_resolve_column_table(&result->rows, column_node->value, &bare_name);
-          if (!col_table) continue;
+          gathered[ci].numeric_values = qe_gather_numeric_column(scratch.arena, &result->rows, col_table, column);
+        }
+      }
 
-          U64 table_slot = qe_rowset_table_slot(&result->rows, col_table);
-          U64 row_index = result->rows.row_indices[table_slot][i];
+      for (U64 i = 0; i < result_count; i++)
+      {
+        U64 row_hash = BENCH_FNV_OFFSET_BASIS;
+
+        ci = 0;
+        for (IR_Node* column_node = select_output_columns->first; column_node != NULL; column_node = column_node->next, ci++)
+        {
+          if (!gathered[ci].resolved) continue;
+
+          U64 row_index = result->rows.row_indices[gathered[ci].table_slot][i];
           if (row_index == PLAN_NULL_ROW) continue;
 
-          GDB_Column* column = gdb_table_find_column(col_table, bare_name);
-          void* data = gdb_column_get_data(column, row_index);
-
-          switch (column->type)
+          switch (gathered[ci].type)
           {
-            case GDB_ColumnType_U32: row_hash = bench_fnv_mix_u64(row_hash, *(U32*)data); break;
-            case GDB_ColumnType_U64: row_hash = bench_fnv_mix_u64(row_hash, *(U64*)data); break;
-            case GDB_ColumnType_F32: row_hash = bench_fnv_mix_u64(row_hash, bench_scaled_round(*(F32*)data)); break;
-            case GDB_ColumnType_F64: row_hash = bench_fnv_mix_u64(row_hash, bench_scaled_round(*(F64*)data)); break;
+            case GDB_ColumnType_U32: row_hash = bench_fnv_mix_u64(row_hash, (U32)gathered[ci].numeric_values[i]); break;
+            case GDB_ColumnType_U64: row_hash = bench_fnv_mix_u64(row_hash, (U64)gathered[ci].numeric_values[i]); break;
+            case GDB_ColumnType_F32: row_hash = bench_fnv_mix_u64(row_hash, bench_scaled_round((F32)gathered[ci].numeric_values[i])); break;
+            case GDB_ColumnType_F64: row_hash = bench_fnv_mix_u64(row_hash, bench_scaled_round(gathered[ci].numeric_values[i])); break;
             case GDB_ColumnType_String8:
             {
-              String8 str = gdb_column_get_string(scratch.arena, column, row_index);
+              GDB_StringDataChunk* chunk = &gathered[ci].strings;
+              U64 start = chunk->offsets[i];
+              U64 end = chunk->offsets[i + 1];
+              String8 str = str8((U8*)chunk->data + start, end - start);
               row_hash = bench_fnv_mix_string(row_hash, str);
             } break;
             default: break;
           }
         }
-      }
 
-      checksum += row_hash;
+        checksum += row_hash;
+      }
     }
 
     scratch_end(scratch);

@@ -23,7 +23,7 @@ qe_add_numeric_const(QE_BytecodeProgram* prog, F64 value)
   MemoryCopy(&bits, &value, sizeof(bits));
   
   U32 index = (U32)prog->const_count;
-  prog->consts[index * 2 + 0] = (U32)(bits & max_U64); // 0xffffffffull
+  prog->consts[index * 2 + 0] = (U32)(bits & max_U64);
   prog->consts[index * 2 + 1] = (U32)(bits >> 32);
   prog->const_count++;
   
@@ -784,52 +784,116 @@ qe_rowset_table_slot(PLAN_RowSet* rows, GDB_Table* table)
 internal F64*
 qe_gather_numeric_column(Arena* arena, PLAN_RowSet* rows, GDB_Table* table, GDB_Column* column)
 {
+  ProfBeginFunction();
+
   F64* values = push_array(arena, F64, Max(rows->count, 1));
-  
+
   U64 table_slot = qe_rowset_table_slot(rows, table);
   if (table_slot == max_U64)
   {
     log_error("qe_gather_numeric_column: table '%.*s' not part of this row set", str8_varg(table->name));
+    ProfEnd();
     return values;
   }
-  
+
   U64* table_rows = rows->row_indices[table_slot];
+
+  // tec: bound the row indices this gather actually touches, then pull the whole span in one read
+  U64 min_row = max_U64;
+  U64 max_row = 0;
   for (U64 i = 0; i < rows->count; i++)
   {
     U64 row = table_rows[i];
-    values[i] = (row == PLAN_NULL_ROW) ? 0.0 : qe_read_numeric_as_f64(column, row);
+    if (row == PLAN_NULL_ROW) continue;
+    if (row < min_row) min_row = row;
+    if (row > max_row) max_row = row;
   }
-  
+
+  void* base_ptr = 0;
+  if (min_row != max_U64)
+  {
+    U64 range_size = 0;
+    base_ptr = gdb_column_get_data_range(arena, column, r1u64(min_row, max_row + 1), &range_size);
+  }
+
+  for (U64 i = 0; i < rows->count; i++)
+  {
+    U64 row = table_rows[i];
+    if (row == PLAN_NULL_ROW || !base_ptr)
+    {
+      values[i] = 0.0;
+      continue;
+    }
+
+    void* data = (U8*)base_ptr + (row - min_row) * column->size;
+    switch (column->type)
+    {
+      case GDB_ColumnType_U32: values[i] = (F64)(*(U32*)data); break;
+      case GDB_ColumnType_U64: values[i] = (F64)(*(U64*)data); break;
+      case GDB_ColumnType_F32: values[i] = (F64)(*(F32*)data); break;
+      case GDB_ColumnType_F64: values[i] = *(F64*)data; break;
+      default: values[i] = 0.0; break;
+    }
+  }
+
+  ProfEnd();
   return values;
 }
 
 internal GDB_StringDataChunk
 qe_gather_string_column(Arena* arena, PLAN_RowSet* rows, GDB_Table* table, GDB_Column* column)
 {
+  ProfBeginFunction();
+
   GDB_StringDataChunk chunk = {0};
   chunk.row_count = rows->count;
   chunk.offsets = push_array(arena, U64, rows->count + 1);
-  
+
   U64 table_slot = qe_rowset_table_slot(rows, table);
   if (table_slot == max_U64)
   {
     log_error("qe_gather_string_column: table '%.*s' not part of this row set", str8_varg(table->name));
+    ProfEnd();
     return chunk;
   }
-  
+
   Temp scratch = scratch_begin(&arena, 1);
   String8* strs = push_array(scratch.arena, String8, Max(rows->count, 1));
   U64* table_rows = rows->row_indices[table_slot];
   U64 total_size = 0;
-  
+
+  U64 min_row = max_U64;
+  U64 max_row = 0;
   for (U64 i = 0; i < rows->count; i++)
   {
     U64 row = table_rows[i];
-    String8 s = (row == PLAN_NULL_ROW) ? str8_lit("") : gdb_column_get_string(scratch.arena, column, row);
+    if (row == PLAN_NULL_ROW) continue;
+    if (row < min_row) min_row = row;
+    if (row > max_row) max_row = row;
+  }
+
+  GDB_StringDataChunk src = {0};
+  if (min_row != max_U64)
+  {
+    src = gdb_column_get_string_chunk(scratch.arena, column, r1u64(min_row, max_row + 1));
+  }
+
+  for (U64 i = 0; i < rows->count; i++)
+  {
+    U64 row = table_rows[i];
+    String8 s = {0};
+    if (row != PLAN_NULL_ROW && src.data)
+    {
+      U64 local = row - min_row;
+      U64 start = src.offsets[local];
+      U64 end = src.offsets[local + 1];
+      s.str = (U8*)src.data + start;
+      s.size = end - start;
+    }
     strs[i] = s;
     total_size += s.size;
   }
-  
+
   U8* data = push_array(arena, U8, Max(total_size, 1));
   U64 cursor = 0;
   chunk.offsets[0] = 0;
@@ -839,11 +903,17 @@ qe_gather_string_column(Arena* arena, PLAN_RowSet* rows, GDB_Table* table, GDB_C
     cursor += strs[i].size;
     chunk.offsets[i + 1] = cursor;
   }
-  
+
   chunk.data = data;
   chunk.size = total_size;
-  
+
+  if (src.data)
+  {
+    gdb_column_close_string_chunk(column);
+  }
+
   scratch_end(scratch);
+  ProfEnd();
   return chunk;
 }
 

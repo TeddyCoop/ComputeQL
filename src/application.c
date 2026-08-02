@@ -218,12 +218,12 @@ app_execute_query(String8 sql_query)
         if (result.supported && select_output_columns)
         {
           Temp scratch = scratch_begin(0, 0);
-          
-          for (U64 i = 0; i < result_count; i++)
+
+          if (result.is_materialized)
           {
-            for (IR_Node* column_node = select_output_columns->first; column_node != NULL; column_node = column_node->next)
+            for (U64 i = 0; i < result_count; i++)
             {
-              if (result.is_materialized)
+              for (IR_Node* column_node = select_output_columns->first; column_node != NULL; column_node = column_node->next)
               {
                 String8 name = qe_column_list_item_display_name(scratch.arena, column_node);
                 PLAN_AggColumn* col = NULL;
@@ -235,7 +235,7 @@ app_execute_query(String8 sql_query)
                     break;
                   }
                 }
-                
+
                 if (!col)
                 {
                   printf("? ");
@@ -253,45 +253,92 @@ app_execute_query(String8 sql_query)
                   printf("%lf ", col->numeric_values[i]);
                 }
               }
+              printf("\n");
+            }
+          }
+          else
+          {
+            // tec: gather each selected column once via qe_gather_numeric_column/qe_gather_string_column
+            // instead of calling gdb_column_get_data/gdb_column_get_string per row per column
+            U64 column_count = 0;
+            for (IR_Node* c = select_output_columns->first; c != NULL; c = c->next) column_count++;
+
+            typedef struct SelectColGather SelectColGather;
+            struct SelectColGather
+            {
+              B32 resolved;
+              GDB_Table* col_table;
+              U64 table_slot;
+              GDB_ColumnType type;
+              F64* numeric_values;
+              GDB_StringDataChunk strings;
+            };
+
+            SelectColGather* gathered = push_array(scratch.arena, SelectColGather, Max(column_count, 1));
+
+            U64 ci = 0;
+            for (IR_Node* column_node = select_output_columns->first; column_node != NULL; column_node = column_node->next, ci++)
+            {
+              String8 bare_name = {0};
+              GDB_Table* col_table = qe_resolve_column_table(&result.rows, column_node->value, &bare_name);
+              if (!col_table) continue;
+
+              GDB_Column* column = gdb_table_find_column(col_table, bare_name);
+              if (!column) continue;
+
+              gathered[ci].resolved = 1;
+              gathered[ci].col_table = col_table;
+              gathered[ci].table_slot = qe_rowset_table_slot(&result.rows, col_table);
+              gathered[ci].type = column->type;
+
+              if (column->type == GDB_ColumnType_String8)
+              {
+                gathered[ci].strings = qe_gather_string_column(scratch.arena, &result.rows, col_table, column);
+              }
               else
               {
-                String8 bare_name = {0};
-                GDB_Table* col_table = qe_resolve_column_table(&result.rows, column_node->value, &bare_name);
-                if (!col_table)
+                gathered[ci].numeric_values = qe_gather_numeric_column(scratch.arena, &result.rows, col_table, column);
+              }
+            }
+
+            for (U64 i = 0; i < result_count; i++)
+            {
+              ci = 0;
+              for (IR_Node* column_node = select_output_columns->first; column_node != NULL; column_node = column_node->next, ci++)
+              {
+                if (!gathered[ci].resolved)
                 {
                   printf("? ");
                   continue;
                 }
-                
-                U64 table_slot = qe_rowset_table_slot(&result.rows, col_table);
-                U64 row_index = result.rows.row_indices[table_slot][i];
-                
+
+                U64 row_index = result.rows.row_indices[gathered[ci].table_slot][i];
                 if (row_index == PLAN_NULL_ROW)
                 {
                   printf("NULL ");
                   continue;
                 }
-                
-                GDB_Column* column = gdb_table_find_column(col_table, bare_name);
-                void* data = gdb_column_get_data(column, row_index);
-                
-                switch (column->type)
+
+                switch (gathered[ci].type)
                 {
                   case GDB_ColumnType_U32:
-                  printf("%u ", *(U32*)data);
+                  printf("%u ", (U32)gathered[ci].numeric_values[i]);
                   break;
                   case GDB_ColumnType_U64:
-                  printf("%llu ", *(U64*)data);
+                  printf("%llu ", (U64)gathered[ci].numeric_values[i]);
                   break;
                   case GDB_ColumnType_F32:
-                  printf("%f ", *(F32*)data);
+                  printf("%f ", (F32)gathered[ci].numeric_values[i]);
                   break;
                   case GDB_ColumnType_F64:
-                  printf("%lf ", *(F64*)data);
+                  printf("%lf ", gathered[ci].numeric_values[i]);
                   break;
                   case GDB_ColumnType_String8:
                   {
-                    String8 str = gdb_column_get_string(scratch.arena, column, row_index);
+                    GDB_StringDataChunk* chunk = &gathered[ci].strings;
+                    U64 start = chunk->offsets[i];
+                    U64 end = chunk->offsets[i + 1];
+                    String8 str = str8((U8*)chunk->data + start, end - start);
                     printf("%.*s ", str8_varg(str));
                   } break;
                   default:
@@ -299,10 +346,10 @@ app_execute_query(String8 sql_query)
                   break;
                 }
               }
+              printf("\n");
             }
-            printf("\n");
           }
-          
+
           scratch_end(scratch);
         }
         
