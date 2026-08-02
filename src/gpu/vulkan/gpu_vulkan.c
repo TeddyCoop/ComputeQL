@@ -259,6 +259,7 @@ gpu_init(void)
   VkDescriptorPoolCreateInfo desc_pool_info =
   {
     .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+    .flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
     .poolSizeCount = 1,
     .pPoolSizes = pool_sizes,
     .maxSets = 64,
@@ -376,6 +377,13 @@ gpu_release(void)
     vkFreeMemory(g_vulkan_state->device, g_vulkan_state->download_staging_memory, 0);
   }
   
+  for (U32 i = 0; i < g_vulkan_state->kernel_cache_count; i++)
+  {
+    GPU_Kernel* kernel = g_vulkan_state->kernel_cache[i];
+    vkDestroyPipeline(g_vulkan_state->device, kernel->pipeline, 0);
+    vkDestroyShaderModule(g_vulkan_state->device, kernel->shader, 0);
+  }
+
   vkDestroyFence(g_vulkan_state->device, g_vulkan_state->submit_fence, 0);
   vkDestroyQueryPool(g_vulkan_state->device, g_vulkan_state->timestamp_query_pool, 0);
   vkDestroyPipelineLayout(g_vulkan_state->device, g_vulkan_state->shared_pipeline_layout, 0);
@@ -833,7 +841,17 @@ internal GPU_Kernel*
 gpu_kernel_alloc(String8 name)
 {
   ProfBeginFunction();
-  
+
+  // tec: cached by name
+  for (U32 i = 0; i < g_vulkan_state->kernel_cache_count; i++)
+  {
+    if (str8_match(g_vulkan_state->kernel_cache[i]->name, name, 0))
+    {
+      ProfEnd();
+      return g_vulkan_state->kernel_cache[i];
+    }
+  }
+
   String8 spirv_bin = gpu_vulkan_load_spirv_from_disk(g_vulkan_state->arena, name);
   if (spirv_bin.size == 0)
   {
@@ -901,7 +919,17 @@ gpu_kernel_alloc(String8 name)
   kernel->shader = shader;
   kernel->pipeline = pipeline;
   kernel->descriptor_set = descriptor_set;
-  
+
+  if (g_vulkan_state->kernel_cache_count < GPU_VULKAN_MAX_CACHED_KERNELS)
+  {
+    g_vulkan_state->kernel_cache[g_vulkan_state->kernel_cache_count++] = kernel;
+  }
+  else
+  {
+    log_error("gpu_kernel_alloc: kernel cache full (%u), '%.*s' will be recompiled every call",
+              (U32)GPU_VULKAN_MAX_CACHED_KERNELS, str8_varg(name));
+  }
+
   ProfEnd();
   return kernel;
 }
@@ -909,9 +937,7 @@ gpu_kernel_alloc(String8 name)
 internal void
 gpu_kernel_release(GPU_Kernel *kernel)
 {
-  vkFreeDescriptorSets(g_vulkan_state->device, g_vulkan_state->descriptor_pool, 1, &kernel->descriptor_set);
-  vkDestroyPipeline(g_vulkan_state->device, kernel->pipeline, 0);
-  vkDestroyShaderModule(g_vulkan_state->device, kernel->shader, 0);
+  // do nothing, kernels are cached
 }
 
 internal void

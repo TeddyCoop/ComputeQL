@@ -989,10 +989,11 @@ gdb_column_add_data_disk_backed(GDB_Column* column, void* data)
     OS_Handle file = column->file;
     if (os_handle_match(os_handle_zero(), file))
     {
-      file = os_file_open(OS_AccessFlag_Read | OS_AccessFlag_Write | OS_AccessFlag_Append, column->disk_path);
+      // tec: cached in column->file for the column's whole lifetime
+      file = os_file_open(OS_AccessFlag_Read | OS_AccessFlag_Write | OS_AccessFlag_Append | OS_AccessFlag_ShareRead | OS_AccessFlag_ShareWrite, column->disk_path);
       column->file = file;
     }
-    
+
     U64 var_reserved = 0;
     os_file_read(file, r1u64(0, sizeof(U64)), &var_reserved);
     
@@ -1466,18 +1467,16 @@ gdb_column_get_string_chunk(Arena* arena, GDB_Column* column, Rng1U64 row_range)
   
   if (column->is_disk_backed)
   {
-    // tec: ShareRead
-    // map_backing_file (once created) stays open for column's whole lifetime
-    // so without ShareRead it would  lock this file against every other readerwith a sharing-violation failure.
+    // tec: ShareRead+ShareWrite
     OS_Handle file = column->file;
     if (os_handle_match(os_handle_zero(), file))
     {
-      file = os_file_open(OS_AccessFlag_Read | OS_AccessFlag_ShareRead, column->disk_path);
+      file = os_file_open(OS_AccessFlag_Read | OS_AccessFlag_ShareRead | OS_AccessFlag_ShareWrite, column->disk_path);
     }
     OS_Handle file_map = column->file_map;
     if (os_handle_match(os_handle_zero(), file_map))
     {
-      OS_Handle map_backing_file = os_file_open(OS_AccessFlag_Read | OS_AccessFlag_ShareRead, column->disk_path);
+      OS_Handle map_backing_file = os_file_open(OS_AccessFlag_Read | OS_AccessFlag_ShareRead | OS_AccessFlag_ShareWrite, column->disk_path);
       file_map = os_file_map_open(OS_AccessFlag_Read, map_backing_file);
       column->file_map = file_map;
       column->file_map_backing_file = map_backing_file;
@@ -1618,7 +1617,8 @@ gdb_column_convert_to_disk_backed(GDB_Column* column)
   
   Temp scratch = scratch_begin(0, 0);
   String8 column_path = gdb_generate_disk_path_for_column(scratch.arena, column);
-  OS_Handle file = os_file_open(OS_AccessFlag_Read | OS_AccessFlag_Write | OS_AccessFlag_Append, column_path);
+  // tec: this handle is cached in column->file and kept open for the column's whole lifetime
+  OS_Handle file = os_file_open(OS_AccessFlag_Read | OS_AccessFlag_Write | OS_AccessFlag_Append | OS_AccessFlag_ShareRead | OS_AccessFlag_ShareWrite, column_path);
   
   if (column->type == GDB_ColumnType_String8)
   {

@@ -7,6 +7,7 @@
 
 #define GPU_VULKAN_MAX_BOUND_BUFFERS 16
 #define GPU_VULKAN_PUSH_CONSTANT_COUNT 8
+#define GPU_VULKAN_MAX_CACHED_KERNELS 16
 
 struct GPU_Buffer
 {
@@ -49,6 +50,10 @@ struct GPU_State
   VkDescriptorPool descriptor_pool;
   VkDescriptorSetLayout shared_descriptor_set_layout;
   VkPipelineLayout shared_pipeline_layout;
+
+  // tec: gpu_kernel_alloc caches by name
+  GPU_Kernel* kernel_cache[GPU_VULKAN_MAX_CACHED_KERNELS];
+  U32 kernel_cache_count;
   
   VkQueryPool timestamp_query_pool;
   F32 timestamp_period_ns;
