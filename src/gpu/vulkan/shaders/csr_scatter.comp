@@ -7,7 +7,7 @@
 //
 // NOTE: binding layout MUST stay in sync with qe_aggregate/qe_hash_join
 
-layout(local_size_x = 1) in;
+layout(local_size_x = 256) in;
 
 layout(std430, binding = 0) readonly buffer RowSlotBuf { uint row_slot[]; };
 layout(std430, binding = 1) buffer CursorBuf           { uint slot_cursor[]; };

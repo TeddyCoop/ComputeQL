@@ -504,10 +504,124 @@ bench_sqlite_bulk_insert(sqlite3* db, String8 table_name, Bench_Row* rows, U64 r
   scratch_end(scratch);
 }
 
-//~ tec: console report table
+//~ tec: markdown report
+
+typedef struct Bench_Report Bench_Report;
+struct Bench_Report
+{
+  Arena* arena;
+  String8List lines;
+  String8List row_cells;
+  U64 row_cell_count;
+};
+
+internal Bench_Report*
+bench_report_alloc(Arena* arena, char* title)
+{
+  Bench_Report* report = push_array(arena, Bench_Report, 1);
+  report->arena = arena;
+
+  DateTime universal = os_now_universal_time();
+  DateTime local = os_local_time_from_universal(&universal);
+  String8 timestamp = push_date_time_string(arena, &local);
+
+  str8_list_pushf(arena, &report->lines, "# %s\n\n", title);
+  str8_list_pushf(arena, &report->lines, "generated %.*s\n\n", str8_varg(timestamp));
+  return report;
+}
 
 internal void
-bench_print_table_header(char* title)
+bench_report_section(Bench_Report* report, char* fmt, ...)
+{
+  va_list args;
+  va_start(args, fmt);
+  String8 title = push_str8fv(report->arena, fmt, args);
+  va_end(args);
+  str8_list_pushf(report->arena, &report->lines, "\n## %.*s\n\n", str8_varg(title));
+}
+
+internal void
+bench_report_text(Bench_Report* report, char* fmt, ...)
+{
+  va_list args;
+  va_start(args, fmt);
+  String8 text = push_str8fv(report->arena, fmt, args);
+  va_end(args);
+  str8_list_pushf(report->arena, &report->lines, "%.*s\n\n", str8_varg(text));
+}
+
+internal void
+bench_report_warn(Bench_Report* report, char* fmt, ...)
+{
+  va_list args;
+  va_start(args, fmt);
+  String8 text = push_str8fv(report->arena, fmt, args);
+  va_end(args);
+  str8_list_pushf(report->arena, &report->lines, "> :warning: %.*s\n\n", str8_varg(text));
+}
+
+internal void
+bench_report_row_begin(Bench_Report* report)
+{
+  report->row_cells = (String8List){0};
+  report->row_cell_count = 0;
+}
+
+internal void
+bench_report_cellf(Bench_Report* report, char* fmt, ...)
+{
+  va_list args;
+  va_start(args, fmt);
+  String8 cell = push_str8fv(report->arena, fmt, args);
+  va_end(args);
+  str8_list_push(report->arena, &report->row_cells, cell);
+  report->row_cell_count += 1;
+}
+
+internal void
+bench_report_row_end(Bench_Report* report)
+{
+  str8_list_pushf(report->arena, &report->lines, "|");
+  for (String8Node* n = report->row_cells.first; n != NULL; n = n->next)
+  {
+    str8_list_pushf(report->arena, &report->lines, " %.*s |", str8_varg(n->string));
+  }
+  str8_list_pushf(report->arena, &report->lines, "\n");
+}
+
+// tec: call instead of bench_report_row_end for the header row
+// also emits the markdown separator row required right after it
+internal void
+bench_report_table_header_end(Bench_Report* report)
+{
+  U64 column_count = report->row_cell_count;
+  bench_report_row_end(report);
+
+  str8_list_pushf(report->arena, &report->lines, "|");
+  for (U64 i = 0; i < column_count; i++)
+  {
+    str8_list_pushf(report->arena, &report->lines, " --- |");
+  }
+  str8_list_pushf(report->arena, &report->lines, "\n");
+}
+
+internal void
+bench_report_write(Bench_Report* report, String8 path)
+{
+  if (!os_write_data_list_to_file_path(path, report->lines))
+  {
+    log_error("failed to write bench report to '%.*s'", str8_varg(path));
+  }
+  else
+  {
+    printf("\nreport written to %.*s\n", str8_varg(path));
+  }
+}
+
+//~ tec: console + report table helpers
+
+internal void
+bench_print_table_header(Bench_Report* report, char* title)
 {
   printf("\n=== %s ===\n", title);
   printf("%-28s %-8s %10s %10s %10s %10s %10s %10s %10s %10s %10s\n",
@@ -515,25 +629,55 @@ bench_print_table_header(char* title)
          "prep min", "prep med", "prep avg",
          "exec min", "exec med", "exec avg",
          "tot avg");
+
+  bench_report_row_begin(report);
+  bench_report_cellf(report, "query");
+  bench_report_cellf(report, "engine");
+  bench_report_cellf(report, "rows");
+  bench_report_cellf(report, "checksum");
+  bench_report_cellf(report, "prep min (ms)");
+  bench_report_cellf(report, "prep med (ms)");
+  bench_report_cellf(report, "prep avg (ms)");
+  bench_report_cellf(report, "exec min (ms)");
+  bench_report_cellf(report, "exec med (ms)");
+  bench_report_cellf(report, "exec avg (ms)");
+  bench_report_cellf(report, "total avg (ms)");
+  bench_report_table_header_end(report);
 }
 
 internal void
-bench_print_table_row(String8 query_label, char* engine, U64 row_count, U64 checksum, Bench_Stats* s)
+bench_print_table_row(Bench_Report* report, String8 query_label, char* engine, U64 row_count, U64 checksum, Bench_Stats* s)
 {
   printf("%-28.*s %-8s %10llu %10llu %10.4f %10.4f %10.4f %10.4f %10.4f %10.4f %10.4f\n",
          str8_varg(query_label), engine, row_count, checksum,
          s->prepare_min, s->prepare_median, s->prepare_avg,
          s->execute_min, s->execute_median, s->execute_avg,
          s->total_avg);
+
+  bench_report_row_begin(report);
+  bench_report_cellf(report, "%.*s", str8_varg(query_label));
+  bench_report_cellf(report, "%s", engine);
+  bench_report_cellf(report, "%llu", row_count);
+  bench_report_cellf(report, "%llu", checksum);
+  bench_report_cellf(report, "%.4f", s->prepare_min);
+  bench_report_cellf(report, "%.4f", s->prepare_median);
+  bench_report_cellf(report, "%.4f", s->prepare_avg);
+  bench_report_cellf(report, "%.4f", s->execute_min);
+  bench_report_cellf(report, "%.4f", s->execute_median);
+  bench_report_cellf(report, "%.4f", s->execute_avg);
+  bench_report_cellf(report, "%.4f", s->total_avg);
+  bench_report_row_end(report);
 }
 
 internal void
-bench_check_match(String8 query_label, U64 gdb_rows, U64 gdb_checksum, U64 sqlite_rows, U64 sqlite_checksum)
+bench_check_match(Bench_Report* report, String8 query_label, U64 gdb_rows, U64 gdb_checksum, U64 sqlite_rows, U64 sqlite_checksum)
 {
   if (gdb_rows != sqlite_rows || gdb_checksum != sqlite_checksum)
   {
     printf("  !! MISMATCH on '%.*s': compute_ql rows=%llu checksum=%llu vs sqlite rows=%llu checksum=%llu\n",
            str8_varg(query_label), gdb_rows, gdb_checksum, sqlite_rows, sqlite_checksum);
+    bench_report_warn(report, "MISMATCH on '%.*s': compute_ql rows=%llu checksum=%llu vs sqlite rows=%llu checksum=%llu",
+                       str8_varg(query_label), gdb_rows, gdb_checksum, sqlite_rows, sqlite_checksum);
   }
 }
 
@@ -548,9 +692,10 @@ struct Bench_QueryCase
 };
 
 internal void
-bench_run_query_suite(Arena* arena, U64 row_count, char* label)
+bench_run_query_suite(Arena* arena, Bench_Report* report, U64 row_count, char* label)
 {
   printf("\n########## query suite: %s (%llu rows) ##########\n", label, row_count);
+  bench_report_section(report, "query suite: %s (%llu rows)", label, row_count);
 
   String8 table_name = str8_lit("bench");
   Bench_Row* rows = bench_generate_rows(arena, row_count);
@@ -599,18 +744,18 @@ bench_run_query_suite(Arena* arena, U64 row_count, char* label)
   cases[3].gdb_sql = push_str8f(scratch.arena, "SELECT * FROM %.*s WHERE name contains '%.*s';", str8_varg(table_name), str8_varg(substr));
   cases[3].sqlite_sql = push_str8f(scratch.arena, "SELECT * FROM %.*s WHERE name LIKE '%%%.*s%%';", str8_varg(table_name), str8_varg(substr));
 
-  bench_print_table_header(label);
+  bench_print_table_header(report, label);
   for (U64 i = 0; i < ArrayCount(cases); i++)
   {
     U64 gdb_rows = 0, gdb_checksum = 0;
     Bench_Stats gdb_stats = bench_run_gdb_query(database, cases[i].gdb_sql, &gdb_rows, &gdb_checksum);
-    bench_print_table_row(cases[i].label, "gdb", gdb_rows, gdb_checksum, &gdb_stats);
+    bench_print_table_row(report, cases[i].label, "gdb", gdb_rows, gdb_checksum, &gdb_stats);
 
     U64 sqlite_rows = 0, sqlite_checksum = 0;
     Bench_Stats sqlite_stats = bench_run_sqlite_query(sqlite_db, cases[i].sqlite_sql, &sqlite_rows, &sqlite_checksum);
-    bench_print_table_row(cases[i].label, "sqlite", sqlite_rows, sqlite_checksum, &sqlite_stats);
+    bench_print_table_row(report, cases[i].label, "sqlite", sqlite_rows, sqlite_checksum, &sqlite_stats);
 
-    bench_check_match(cases[i].label, gdb_rows, gdb_checksum, sqlite_rows, sqlite_checksum);
+    bench_check_match(report, cases[i].label, gdb_rows, gdb_checksum, sqlite_rows, sqlite_checksum);
   }
 
   sqlite3_close(sqlite_db);

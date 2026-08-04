@@ -13,7 +13,7 @@
 //
 // NOTE: binding layout/push-constant slot order MUST stay in sync with qe_aggregate
 
-layout(local_size_x = 1) in;
+layout(local_size_x = 256) in;
 
 layout(std430, binding = 0) buffer OwnerBuf    { uint owner_row_index[]; };
 layout(std430, binding = 1) buffer CountBuf    { uint slot_row_count[]; };

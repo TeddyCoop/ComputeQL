@@ -98,6 +98,11 @@ entry_point(CmdLine* cmdline)
   printf("\n########## csv import: %llu rows ##########\n", row_count);
 
   Arena* arena = arena_alloc(.reserve_size = GB(1), .commit_size = MB(64));
+
+  Bench_Report* report = bench_report_alloc(arena, "compute_ql vs sqlite - csv import");
+  bench_report_text(report, "engine startup (gdb_init + gpu_init, one-time): %.4f ms", (F64)(t1 - t0) / 1000.0);
+  bench_report_section(report, "csv import: %llu rows", row_count);
+
   Bench_Row* rows = bench_generate_rows(arena, row_count);
 
   if (!os_file_path_exists(str8_lit("bench_data/")))
@@ -184,13 +189,46 @@ entry_point(CmdLine* cmdline)
   printf("%-10s %10llu %10.4f %10.4f %10.4f\n", "gdb", gdb_last_row_count, gdb_min, gdb_med, gdb_avg);
   printf("%-10s %10llu %10.4f %10.4f %10.4f\n", "sqlite", sqlite_last_row_count, sqlite_min, sqlite_med, sqlite_avg);
 
+  bench_report_row_begin(report);
+  bench_report_cellf(report, "engine");
+  bench_report_cellf(report, "rows");
+  bench_report_cellf(report, "min (ms)");
+  bench_report_cellf(report, "median (ms)");
+  bench_report_cellf(report, "avg (ms)");
+  bench_report_table_header_end(report);
+
+  bench_report_row_begin(report);
+  bench_report_cellf(report, "gdb");
+  bench_report_cellf(report, "%llu", gdb_last_row_count);
+  bench_report_cellf(report, "%.4f", gdb_min);
+  bench_report_cellf(report, "%.4f", gdb_med);
+  bench_report_cellf(report, "%.4f", gdb_avg);
+  bench_report_row_end(report);
+
+  bench_report_row_begin(report);
+  bench_report_cellf(report, "sqlite");
+  bench_report_cellf(report, "%llu", sqlite_last_row_count);
+  bench_report_cellf(report, "%.4f", sqlite_min);
+  bench_report_cellf(report, "%.4f", sqlite_med);
+  bench_report_cellf(report, "%.4f", sqlite_avg);
+  bench_report_row_end(report);
+
   if (gdb_last_row_count != row_count || sqlite_last_row_count != row_count)
   {
     printf("  !! row count mismatch: expected %llu, gdb imported %llu, sqlite imported %llu\n",
            row_count, gdb_last_row_count, sqlite_last_row_count);
+    bench_report_warn(report, "row count mismatch: expected %llu, gdb imported %llu, sqlite imported %llu",
+                       row_count, gdb_last_row_count, sqlite_last_row_count);
   }
 
   printf("(sqlite has no native CSV loader via the C API - this times the idiomatic bulk-load path: one transaction, one prepared INSERT, bind+step+reset per parsed row)\n");
+  bench_report_text(report, "(sqlite has no native CSV loader via the C API - this times the idiomatic bulk-load path: one transaction, one prepared INSERT, bind+step+reset per parsed row)");
+
+  if (!os_file_path_exists(str8_lit("bench_reports/")))
+  {
+    os_make_directory(str8_lit("bench_reports/"));
+  }
+  bench_report_write(report, str8_lit("bench_reports/csv_import_report.md"));
 
   arena_release(arena);
   log_release();

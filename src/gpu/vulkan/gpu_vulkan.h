@@ -8,7 +8,7 @@
 #define GPU_VULKAN_MAX_BOUND_BUFFERS 16
 #define GPU_VULKAN_PUSH_CONSTANT_COUNT 8
 #define GPU_VULKAN_MAX_CACHED_KERNELS 16
-#define GPU_VULKAN_MAX_POOLED_BUFFERS 16
+#define GPU_VULKAN_MAX_POOLED_BUFFERS 64
 
 struct GPU_Buffer
 {
@@ -40,6 +40,7 @@ struct GPU_PooledBuffer
   String8 name;
   GPU_Buffer* buffer;
   U64 capacity;
+  void* imported_host_ptr;
 };
 
 struct GPU_State

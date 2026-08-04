@@ -15,7 +15,7 @@
 //
 // NOTE: binding layout/push-constant slot order MUST stay in sync with qe_sort_rows
 
-layout(local_size_x = 1) in;
+layout(local_size_x = 256) in;
 
 #define QE_SORT_MAX_KEYS   4
 #define QE_SORT_MAX_TABLES 4

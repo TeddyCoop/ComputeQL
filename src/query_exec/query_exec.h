@@ -25,6 +25,9 @@
 #define QE_MAX_NUMERIC_CONSTS   256
 #define QE_STRING_CONST_POOL_SIZE KB(64)
 
+// tec: must match every kernel .comp's `layout(local_size_x = ...)` - all of them use this same workgroup size
+#define QE_GPU_WORKGROUP_SIZE 256
+
 #define QE_PUSH_CONSTANT_ROW_COUNT 0
 
 typedef enum QE_Opcode

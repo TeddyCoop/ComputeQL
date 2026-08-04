@@ -612,13 +612,9 @@ gpu_buffer_alloc(U64 size, GPU_BufferFlags flags, void* data)
   
   B32 host_visible = (flags & GPU_BufferFlag_HostVisible) != 0;
   B32 device_local = (flags & GPU_BufferFlag_DeviceLocal) != 0;
-  
-  // tec: every buffer that isn't explicitly host-visible-only falls through to the
-  // device-local branch below, which historically always meant "staged upload". on a
-  // Resizable BAR system we can instead map VRAM directly and skip that round trip
-  // try it first here; mapped_ptr ends up set either way, so gpu_buffer_write/read's
-  // existing mapped_ptr fast path picks this up for free.
-  if (!host_visible && g_vulkan_state->rebar_supported && size <= g_vulkan_state->rebar_heap_size)
+  B32 cpu_reads = (flags & (GPU_BufferFlag_Read | GPU_BufferFlag_ReadWrite)) != 0;
+
+  if (!host_visible && !cpu_reads && g_vulkan_state->rebar_supported && size <= g_vulkan_state->rebar_heap_size)
   {
     VkMemoryPropertyFlags rebar_props = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
     if (gpu_vulkan_alloc_raw_buffer(size, usage, rebar_props, &result->buffer, &result->memory))
@@ -791,6 +787,49 @@ gpu_buffer_import_host_readonly(void* host_ptr, U64 size)
   result->size = size;
   result->bind_offset = front_pad;
   return result;
+}
+
+internal GPU_Buffer*
+gpu_buffer_import_host_readonly_pooled(String8 name, void* host_ptr, U64 size)
+{
+  for (U32 i = 0; i < g_vulkan_state->pooled_buffer_count; i++)
+  {
+    GPU_PooledBuffer* slot = &g_vulkan_state->pooled_buffers[i];
+    if (!str8_match(slot->name, name, 0)) continue;
+
+    if (slot->imported_host_ptr == host_ptr && slot->capacity == size)
+    {
+      return slot->buffer;
+    }
+
+    GPU_Buffer* fresh = gpu_buffer_import_host_readonly(host_ptr, size);
+    if (fresh)
+    {
+      gpu_buffer_release(slot->buffer);
+      slot->buffer = fresh;
+      slot->capacity = size;
+      slot->imported_host_ptr = host_ptr;
+    }
+    return slot->buffer;
+  }
+
+  GPU_Buffer* buffer = gpu_buffer_import_host_readonly(host_ptr, size);
+  if (buffer)
+  {
+    if (g_vulkan_state->pooled_buffer_count < GPU_VULKAN_MAX_POOLED_BUFFERS)
+    {
+      GPU_PooledBuffer* slot = &g_vulkan_state->pooled_buffers[g_vulkan_state->pooled_buffer_count++];
+      slot->name = name;
+      slot->buffer = buffer;
+      slot->capacity = size;
+      slot->imported_host_ptr = host_ptr;
+    }
+    else
+    {
+      log_error("gpu_buffer_import_host_readonly_pooled: pool full, '%.*s' will not be cached", str8_varg(name));
+    }
+  }
+  return buffer;
 }
 
 internal void

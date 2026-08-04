@@ -121,7 +121,9 @@ struct GDB_Column
   U64 mapped_size;
   void* mapped_ptr;
   Rng1U64 current_mapped_range;
-  
+  U64 write_generation;
+  U64 mapped_generation;
+
   GDB_Table* parent_table;
 };
 

@@ -396,12 +396,12 @@ internal QE_ScanResult
 qe_scan_filter(Arena* arena, GDB_Database* database, GDB_Table* table, IR_Node* where_clause)
 {
   ProfBeginFunction();
-  
+
   QE_ScanResult result = {0};
-  
+
   QE_BytecodeProgram* prog = push_array(arena, QE_BytecodeProgram, 1);
   qe_bytecode_program_build(prog, database, table, NULL, where_clause);
-  
+
   GPU_Kernel* kernel = gpu_kernel_alloc(str8_lit("scan_filter"));
   if (!kernel)
   {
@@ -451,7 +451,6 @@ qe_scan_filter(Arena* arena, GDB_Database* database, GDB_Table* table, IR_Node* 
   U64 load_data_from_disk_time = 0;
   U64 prefetch_stall_time = 0;
   U64 buffer_alloc_time = 0;
-  U64 buffer_release_time = 0;
   U64 submit_wait_time = 0;
   
   B32 needs_chunking = largest_column_size > GPU_MAX_BUFFER_SIZE;
@@ -521,7 +520,6 @@ qe_scan_filter(Arena* arena, GDB_Database* database, GDB_Table* table, IR_Node* 
     
     ProfBegin("allocating column GPU buffers");
     U64 buffer_alloc_start = os_now_microseconds();
-    GPU_Buffer* column_gpu_buffers[QE_MAX_COLUMN_BINDINGS] = {0};
 
     for (U32 i = 0; i < prog->binding_count; i++)
     {
@@ -529,48 +527,43 @@ qe_scan_filter(Arena* arena, GDB_Database* database, GDB_Table* table, IR_Node* 
       QE_PrefetchBindingResult* in = &slot->bindings[i];
       U32 descriptor_binding = QE_BINDING_COLUMN_BASE + binding->first_slot;
       
+      String8 col_pool_key = push_str8f(g_vulkan_state->arena, "scan_col:%.*s.%.*s", str8_varg(table->name), str8_varg(binding->name));
+
       if (binding->type == GDB_ColumnType_String8)
       {
         if (in->valid)
         {
-          GPU_Buffer* data_buf = gpu_buffer_alloc(in->str_chunk.size, GPU_BufferFlag_Write | GPU_BufferFlag_HostVisible, 0);
-          gpu_buffer_write(data_buf, in->str_chunk.data, in->str_chunk.size);
-          column_gpu_buffers[binding->first_slot + 0] = data_buf;
+          String8 data_key = push_str8f(g_vulkan_state->arena, "%.*s.data", str8_varg(col_pool_key));
+          GPU_Buffer* data_buf = gpu_buffer_alloc_pooled(data_key, in->str_chunk.size, GPU_BufferFlag_Write | GPU_BufferFlag_HostVisible, in->str_chunk.data);
           gpu_kernel_set_arg_buffer(kernel, descriptor_binding + 0, data_buf);
-          
+
           // tec: +1 row for the trailing offset used to compute the last strings size
           U64 offsets_size = (in->str_chunk.row_count + 1) * sizeof(U64);
-          GPU_Buffer* offsets_buf = gpu_buffer_alloc(offsets_size, GPU_BufferFlag_Write | GPU_BufferFlag_CopyHostPointer, in->str_chunk.offsets);
-          column_gpu_buffers[binding->first_slot + 1] = offsets_buf;
+          String8 offsets_key = push_str8f(g_vulkan_state->arena, "%.*s.offsets", str8_varg(col_pool_key));
+          GPU_Buffer* offsets_buf = gpu_buffer_alloc_pooled(offsets_key, offsets_size, GPU_BufferFlag_Write | GPU_BufferFlag_CopyHostPointer, in->str_chunk.offsets);
           gpu_kernel_set_arg_buffer(kernel, descriptor_binding + 1, offsets_buf);
         }
         else
         {
           log_error("qe_scan_filter: failed to load string data/offsets for column '%.*s'", str8_varg(binding->name));
         }
-        
+
         // tec: safe to close now, the data's already been copyed into the GPU buffer above
         gdb_column_close_string_chunk(binding->column);
       }
       else if (in->valid)
       {
-        // tec: for a disk-backed column, in->data_ptr already points into an OS file mapping
-        // (see gdb_column_get_data_range) with real committed pages behind it - safe to hand
-        // straight to Vulkan via VK_EXT_external_memory_host and skip the copy entirely. Not
-        // attempted for in-memory columns: in->data_ptr there points into a plain heap/arena
-        // allocation with no guarantee of extra readable bytes past it, which the alignment
-        // rounding in gpu_buffer_import_host_readonly relies on being safe to touch.
         GPU_Buffer* data_buf = 0;
         if (binding->column->is_disk_backed)
         {
-          data_buf = gpu_buffer_import_host_readonly(in->data_ptr, in->size);
+          data_buf = gpu_buffer_import_host_readonly_pooled(col_pool_key, in->data_ptr, in->size);
         }
         if (!data_buf)
         {
-          data_buf = gpu_buffer_alloc(in->size, GPU_BufferFlag_Write, 0);
-          gpu_buffer_write(data_buf, in->data_ptr, in->size);
+          // tec: distinct key from the import path above
+          String8 fallback_key = push_str8f(g_vulkan_state->arena, "%.*s.alloc_fallback", str8_varg(col_pool_key));
+          data_buf = gpu_buffer_alloc_pooled(fallback_key, in->size, GPU_BufferFlag_Write, in->data_ptr);
         }
-        column_gpu_buffers[binding->first_slot] = data_buf;
         gpu_kernel_set_arg_buffer(kernel, descriptor_binding, data_buf);
       }
     }
@@ -595,42 +588,31 @@ qe_scan_filter(Arena* arena, GDB_Database* database, GDB_Table* table, IR_Node* 
       qe_prefetch_request(prefetch, (U32)((chunk_index + 1) % 2), next_range, next_rows);
     }
     
-    // tec: TODO fix local size. one workgroup per row for now, revisit for performance later
     U64 submit_wait_start = os_now_microseconds();
-    gpu_kernel_execute(kernel, (U32)chunk_rows, 1);
+    gpu_kernel_execute(kernel, (U32)chunk_rows, QE_GPU_WORKGROUP_SIZE);
     gpu_kernel_execution_time += gpu_get_executed_kernel_time_microseconds();
-
-    gpu_wait();
     submit_wait_time += os_now_microseconds() - submit_wait_start;
 
     U32 result_count32[2] = {0, 0};
     gpu_buffer_read(result_counter_buffer, result_count32, sizeof(result_count32));
     U64 result_count = result_count32[0];
     
-    U64 buffer_release_start = os_now_microseconds();
-    for (U32 i = 0; i < prog->binding_count; i++)
-    {
-      QE_ColumnBinding* binding = &prog->bindings[i];
-      if (column_gpu_buffers[binding->first_slot]) gpu_buffer_release(column_gpu_buffers[binding->first_slot]);
-      if (binding->slot_count == 2 && column_gpu_buffers[binding->first_slot + 1]) gpu_buffer_release(column_gpu_buffers[binding->first_slot + 1]);
-    }
-    buffer_release_time += os_now_microseconds() - buffer_release_start;
     if (!using_prefetch)
     {
       temp_end(fallback_arena);
     }
-    
+
     if (result_count != 0)
     {
       U32* raw_indices = push_array(arena, U32, result_count * 2);
       gpu_buffer_read(output_buffer, raw_indices, result_count * 2 * sizeof(U32));
-      
+
       U64* chunk_data = push_array(arena, U64, result_count);
       for (U64 i = 0; i < result_count; i++)
       {
         chunk_data[i] = chunk_row_start + raw_indices[i * 2 + 0];
       }
-      
+
       QE_ResultChunk* rc = push_array(arena, QE_ResultChunk, 1);
       rc->indices = chunk_data;
       rc->count = result_count;
@@ -650,8 +632,7 @@ qe_scan_filter(Arena* arena, GDB_Database* database, GDB_Table* table, IR_Node* 
   log_info("gpu kernel total execution time: %llu microseconds", gpu_kernel_execution_time);
   log_info("load from disk total time: %llu microseconds", load_data_from_disk_time);
   log_info("buffer alloc total time: %llu microseconds", buffer_alloc_time);
-  log_info("buffer release total time: %llu microseconds", buffer_release_time);
-  log_info("submit+wait (gpu_kernel_execute + gpu_wait) total time: %llu microseconds", submit_wait_time);
+  log_info("submit+wait (gpu_kernel_execute) total time: %llu microseconds", submit_wait_time);
   if (chunk_count > 1)
   {
     log_info("prefetch stall time (time the GPU sat idle waiting on disk I/O the pipeline failed to hide): %llu microseconds", prefetch_stall_time);
@@ -666,7 +647,7 @@ qe_scan_filter(Arena* arena, GDB_Database* database, GDB_Table* table, IR_Node* 
     }
     result.indices = push_array(arena, U64, Max(total_count, 1));
     result.count = total_count;
-    
+
     U64* out_ptr = result.indices;
     for (QE_ResultChunk* chunk = result_chunks; chunk; chunk = chunk->next)
     {
@@ -675,7 +656,7 @@ qe_scan_filter(Arena* arena, GDB_Database* database, GDB_Table* table, IR_Node* 
     }
   }
   ProfEnd();
-  
+
   ProfEnd();
   return result;
 }
@@ -1063,8 +1044,7 @@ qe_sort_rows(Arena* arena, PLAN_RowSet* rows, IR_Node* order_by_ir)
       gpu_kernel_set_arg_u64(kernel, 3, stage);
       gpu_kernel_set_arg_u64(kernel, 4, pass_);
       
-      gpu_kernel_execute(kernel, (U32)(padded_count / 2), 1);
-      gpu_wait();
+      gpu_kernel_execute(kernel, (U32)(padded_count / 2), QE_GPU_WORKGROUP_SIZE);
     }
   }
   
@@ -1506,8 +1486,7 @@ qe_aggregate(Arena* arena, GDB_Database* database, PLAN_RowSet* input, IR_Node* 
   gpu_kernel_set_arg_u64(assign_kernel, 3, num_group_cols);
   gpu_kernel_set_arg_u64(assign_kernel, 4, group_string_mask);
   
-  gpu_kernel_execute(assign_kernel, (U32)row_count, 1);
-  gpu_wait();
+  gpu_kernel_execute(assign_kernel, (U32)row_count, QE_GPU_WORKGROUP_SIZE);
   
   U32* owner_readback = push_array(scratch.arena, U32, num_slots);
   U32* count_readback = push_array(scratch.arena, U32, num_slots);
@@ -1570,8 +1549,7 @@ qe_aggregate(Arena* arena, GDB_Database* database, PLAN_RowSet* input, IR_Node* 
   gpu_kernel_set_arg_buffer(scatter_kernel, 2, members_buf);
   gpu_kernel_set_arg_u64(scatter_kernel, 0, row_count);
   
-  gpu_kernel_execute(scatter_kernel, (U32)row_count, 1);
-  gpu_wait();
+  gpu_kernel_execute(scatter_kernel, (U32)row_count, QE_GPU_WORKGROUP_SIZE);
   
   gpu_buffer_release(row_slot_buf);
   gpu_buffer_release(cursor_buf);
@@ -1608,8 +1586,7 @@ qe_aggregate(Arena* arena, GDB_Database* database, PLAN_RowSet* input, IR_Node* 
   gpu_kernel_set_arg_u64(reduce_kernel, 1, num_exprs);
   gpu_kernel_set_arg_u64(reduce_kernel, 2, func_codes_packed);
   
-  gpu_kernel_execute(reduce_kernel, (U32)Max(num_groups, 1), 1);
-  gpu_wait();
+  gpu_kernel_execute(reduce_kernel, (U32)Max(num_groups, 1), QE_GPU_WORKGROUP_SIZE);
   
   U64* representative_readback = push_array(scratch.arena, U64, Max(num_groups, 1));
   {
@@ -2108,8 +2085,7 @@ qe_hash_join(Arena* arena, PLAN_RowSet* left, GDB_Table* right_table, String8 jo
   
   if (build_row_count > 0)
   {
-    gpu_kernel_execute(build_kernel, (U32)build_row_count, 1);
-    gpu_wait();
+    gpu_kernel_execute(build_kernel, (U32)build_row_count, QE_GPU_WORKGROUP_SIZE);
   }
   
   U32* bucket_count_readback = push_array(scratch.arena, U32, num_buckets);
@@ -2139,8 +2115,7 @@ qe_hash_join(Arena* arena, PLAN_RowSet* left, GDB_Table* right_table, String8 jo
   
   if (build_row_count > 0)
   {
-    gpu_kernel_execute(scatter_kernel, (U32)build_row_count, 1);
-    gpu_wait();
+    gpu_kernel_execute(scatter_kernel, (U32)build_row_count, QE_GPU_WORKGROUP_SIZE);
   }
   
   gpu_buffer_release(row_bucket_buf);
@@ -2181,8 +2156,7 @@ qe_hash_join(Arena* arena, PLAN_RowSet* left, GDB_Table* right_table, String8 jo
   
   if (probe_row_count > 0)
   {
-    gpu_kernel_execute(probe_kernel, (U32)probe_row_count, 1);
-    gpu_wait();
+    gpu_kernel_execute(probe_kernel, (U32)probe_row_count, QE_GPU_WORKGROUP_SIZE);
   }
   
   U32 match_count32 = 0;

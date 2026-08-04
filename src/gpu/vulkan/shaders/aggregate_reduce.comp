@@ -9,7 +9,7 @@
 //
 // NOTE: binding layout/push-constant slot order/func codes MUST stay in sync with qe_aggregate
 
-layout(local_size_x = 1) in;
+layout(local_size_x = 256) in;
 
 #define FUNC_COUNT 0u
 #define FUNC_SUM   1u

@@ -55,16 +55,23 @@ app_execute_query(String8 sql_query)
         }
         else if (create_ir_node->type == IR_NodeType_Table)
         {
-          GDB_Table* table = gdb_table_alloc(create_ir_node->value);
-          
-          for (IR_Node* column_node = create_ir_node->first; column_node != 0; column_node = column_node->next)
+          if (gdb_database_contains_table(database, create_ir_node->value))
           {
-            GDB_ColumnType column_type = gdb_column_type_from_string(column_node->first->value);
-            GDB_ColumnSchema column_schema = gdb_column_schema_create(column_node->value, column_type);
-            gdb_table_add_column(table, column_schema);
+            log_error("table '%.*s' already exists", str8_varg(create_ir_node->value));
           }
-          
-          gdb_database_add_table(database, table);
+          else
+          {
+            GDB_Table* table = gdb_table_alloc(create_ir_node->value);
+
+            for (IR_Node* column_node = create_ir_node->first; column_node != 0; column_node = column_node->next)
+            {
+              GDB_ColumnType column_type = gdb_column_type_from_string(column_node->first->value);
+              GDB_ColumnSchema column_schema = gdb_column_schema_create(column_node->value, column_type);
+              gdb_table_add_column(table, column_schema);
+            }
+
+            gdb_database_add_table(database, table);
+          }
         }
         
       } break;

@@ -121,7 +121,7 @@ gdb_database_save(GDB_Database* database, String8 directory)
     log_error("failed to create/open database directory: %s", directory.str);
     return 0;
   }
-  
+
   for (U64 i = 0; i < database->table_count; i++)
   {
     GDB_Table* table = database->tables[i];
@@ -358,7 +358,7 @@ gdb_table_save(GDB_Table* table, String8 table_dir)
   for (U64 i = 0; i < table->column_count; i++)
   {
     GDB_Column* column = table->columns[i];
-    
+
     if (!column->is_disk_backed)
     {
       String8 column_path = push_str8f(scratch.arena, "%.*s/%.*s.dat", str8_varg(table_dir), str8_varg(column->name));
@@ -1192,6 +1192,28 @@ gdb_column_add_data(GDB_Column* column, void* data)
     }
   }
   column->row_count++;
+  column->write_generation++;
+
+  // tec: drop the cached mapping
+  // file mapping bakes in the file size at open time, so a stale mapping cant see bytes this write just appended
+  if (column->is_disk_backed)
+  {
+    if (column->mapped_ptr)
+    {
+      os_file_map_view_close(column->file_map, column->mapped_ptr, column->current_mapped_range);
+      column->mapped_ptr = 0;
+    }
+    if (!os_handle_match(os_handle_zero(), column->file_map))
+    {
+      os_file_map_close(column->file_map);
+      column->file_map = os_handle_zero();
+    }
+    if (!os_handle_match(os_handle_zero(), column->file_map_backing_file))
+    {
+      os_file_close(column->file_map_backing_file);
+      column->file_map_backing_file = os_handle_zero();
+    }
+  }
 }
 
 internal void
@@ -1227,8 +1249,9 @@ gdb_column_remove_data(GDB_Column* column, U64 row_index)
     U64 size_to_move = (column->row_count - row_index - 1) * column->size;
     MemoryCopy(column->data + row_index * column->size, column->data + (row_index + 1) * column->size, size_to_move);
   }
-  
+
   column->row_count--;
+  column->write_generation++;
 }
 
 internal void*
@@ -1402,7 +1425,7 @@ gdb_column_get_data_range(Arena* arena, GDB_Column* column, Rng1U64 row_range, U
   // tec: create io handles
   if (os_handle_match(os_handle_zero(), column->file))
   {
-    column->file = os_file_open(OS_AccessFlag_Read, column->disk_path);
+    column->file = os_file_open(OS_AccessFlag_Read | OS_AccessFlag_ShareRead | OS_AccessFlag_ShareWrite, column->disk_path);
     if (os_handle_match(os_handle_zero(), column->file))
     {
       log_error("failed to open disk-backed column: %.*s", str8_varg(column->disk_path));
@@ -1425,12 +1448,23 @@ gdb_column_get_data_range(Arena* arena, GDB_Column* column, Rng1U64 row_range, U
   
   U64 byte_offset = row_range.min * column->size;
   Rng1U64 byte_range = r1u64(byte_offset, byte_offset + size);
-  
+
   if (byte_range.max > os_properties_from_file(column->file).size)
   {
     byte_range.max = os_properties_from_file(column->file).size;
   }
-  
+
+  // tec: reuse the mapped view if it covers this range and no write has landed since
+  // avoids a fresh os_file_map_view_open on repeated scans of the same range
+  if (column->mapped_ptr
+      && column->mapped_generation == column->write_generation
+      && byte_range.min >= column->current_mapped_range.min
+      && byte_range.max <= column->current_mapped_range.max)
+  {
+    ProfEnd();
+    return (U8*)column->mapped_ptr + (byte_offset - column->current_mapped_range.min);
+  }
+
   void* mapped_ptr = os_file_map_view_open(column->file_map, OS_AccessFlag_Read, byte_range);
   if (!mapped_ptr)
   {
@@ -1439,10 +1473,11 @@ gdb_column_get_data_range(Arena* arena, GDB_Column* column, Rng1U64 row_range, U
     ProfEnd();
     return NULL;
   }
-  
+
   column->mapped_ptr = mapped_ptr;
   column->current_mapped_range = byte_range;
-  
+  column->mapped_generation = column->write_generation;
+
   ProfEnd();
   return mapped_ptr;
 }

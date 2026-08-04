@@ -6,7 +6,7 @@
 //
 // NOTE: binding layout/opcode values MUST stay in sync with query_exec.h
 
-layout(local_size_x = 1) in;
+layout(local_size_x = 256) in;
 
 #define OP_PUSH_TRUE     0
 #define OP_LOAD_NUM_COL  1

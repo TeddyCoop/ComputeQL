@@ -39,7 +39,18 @@ entry_point(CmdLine* cmdline)
   printf("engine startup (gdb_init + gpu_init, one-time): %.4f ms\n", (F64)(t1 - t0) / 1000.0);
 
   Arena* arena = arena_alloc(.reserve_size = GB(1), .commit_size = MB(64));
-  bench_run_query_suite(arena, 100000, "large");
+
+  Bench_Report* report = bench_report_alloc(arena, "compute_ql vs sqlite - large dataset query suite");
+  bench_report_text(report, "engine startup (gdb_init + gpu_init, one-time): %.4f ms", (F64)(t1 - t0) / 1000.0);
+
+  bench_run_query_suite(arena, report, 100000, "large");
+
+  if (!os_file_path_exists(str8_lit("bench_reports/")))
+  {
+    os_make_directory(str8_lit("bench_reports/"));
+  }
+  bench_report_write(report, str8_lit("bench_reports/large_report.md"));
+
   arena_release(arena);
 
   log_release();
