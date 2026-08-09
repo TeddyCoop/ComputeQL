@@ -56,6 +56,7 @@ global String8 g_sql_keywords[] =
   str8_lit_comp("values"),
   str8_lit_comp("alter"),
   str8_lit_comp("add"),
+  str8_lit_comp("rename"),
   str8_lit_comp("column"),
   str8_lit_comp("as"),
   str8_lit_comp("inner"),

@@ -36,6 +36,7 @@ struct PLAN_Node
   
   String8 value;     // tec: Scan = table name, Join = join type ("inner"/"left"/"cross")
   GDB_Table* table;  // tec: Scan only - resolved at plan-build time, NULL if the table lookup failed
+  String8 alias;     // tec: Scan only - the "AS x" alias from FROM/JOIN, or {0} if unaliased
   
   // tec: these all point back into the IR tree rather than owning a copy - the IR outlives
   // the plan (same arena, and the plan is only ever built and consumed within one query).

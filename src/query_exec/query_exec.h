@@ -83,12 +83,11 @@ struct QE_ScanResult
 };
 
 internal void qe_bytecode_program_build(QE_BytecodeProgram* prog, GDB_Database* database, GDB_Table* table, IR_Node* root_node, IR_Node* where_clause);
-// tec: where_clause is the IR_NodeType_Where wrapper node (its->first is the actual condition
-// tree) - pass NULL for an unfiltered scan (eg a Scan that's just one side of a Join, where the
+// tec: where_clause is the IR_NodeType_Where wrapper node (its->first is the actual condition tree) pass NULL for an unfiltered scan (eg a Scan that's just one side of a Join, where the
 // query's WHERE, if any, must NOT be applied here. see plan_execute's Scan/Filter cases)
 internal QE_ScanResult qe_scan_filter(Arena* arena, GDB_Database* database, GDB_Table* table, IR_Node* where_clause);
 
-//~ tec: shared query-result representation - produced by qe_scan_filter,qe_sort_rows,qe_hash_join (row-index based) or qe_aggregate (materialized, no base-table rows involved)
+//~ tec: shared query-result representation
 // lives here because the unity build
 #define PLAN_NULL_ROW max_U64 // tec: unmatched side of a LEFT JOIN - treat a column read against this as NULL
 
@@ -96,6 +95,7 @@ typedef struct PLAN_RowSet PLAN_RowSet;
 struct PLAN_RowSet
 {
   GDB_Table** tables;  // tec: contributing tables, stable left-to-right order (as folded by the FROM/JOIN tree)
+  String8* aliases;
   U64 table_count;
   U64** row_indices;   // tec: row_indices[t][i] = row index of tables[t] contributing to output row i (or PLAN_NULL_ROW)
   U64 count;           // tec: number of output rows (same for every row_indices[t])
@@ -136,17 +136,25 @@ internal String8 qe_column_list_item_display_name(Arena* arena, IR_Node* item);
 //~ tec: multi-table column qualifier resolution
 // shared by Join/Filter-over-Join/output printing.
 // splits an optional 'table.column' qualifier out of column_name and finds which of rows->tables[]
-// it belongs to (searches all tables if unqualified; errors on ambiguity/not-found)
-internal GDB_Table* qe_resolve_column_table(PLAN_RowSet* rows, String8 column_name, String8* out_bare_name);
+// it belongs to (searches all tables if unqualified; errors on ambiguity/not-found). a qualifier is
+// matched against that slot's alias first (if it has one), falling back to the real table name -
+// this is what lets a self-join's two "AS" aliases resolve to distinct slots even though both
+// slots point at the same GDB_Table*. out_slot (may be NULL) receives the resolved slot index,
+// which callers should use directly instead of re-deriving it via qe_rowset_table_slot(), since
+// table-pointer identity alone can't distinguish a self-join's two sides
+internal GDB_Table* qe_resolve_column_table(PLAN_RowSet* rows, String8 column_name, String8* out_bare_name, U64* out_slot);
 
-// tec: which of rows->tables[] a table pointer is, or max_U64 if it's not part of this row set
+// tec: which of rows->tables[] a table pointer is, or max_U64 if it's not part of this row set.
+// NOTE: ambiguous for a self-join (returns the first matching slot) - prefer the out_slot from
+// qe_resolve_column_table wherever a specific column reference is available
 internal U64 qe_rowset_table_slot(PLAN_RowSet* rows, GDB_Table* table);
 
 //~ tec: gather a column's values for an arbitrary (possibly multi-table) row set into a dense,
 // arena-allocated array sized rows->count - used by Sort/Aggregate/chained-Join so those kernels
-// never need to know whether their input was a bare table scan or a join's output
-internal F64* qe_gather_numeric_column(Arena* arena, PLAN_RowSet* rows, GDB_Table* table, GDB_Column* column);
-internal GDB_StringDataChunk qe_gather_string_column(Arena* arena, PLAN_RowSet* rows, GDB_Table* table, GDB_Column* column);
+// never need to know whether their input was a bare table scan or a join's output. takes the
+// already-resolved row-set slot (not a table pointer) so self-joins address the correct side
+internal F64* qe_gather_numeric_column(Arena* arena, PLAN_RowSet* rows, U64 table_slot, GDB_Column* column);
+internal GDB_StringDataChunk qe_gather_string_column(Arena* arena, PLAN_RowSet* rows, U64 table_slot, GDB_Column* column);
 
 //~ tec: sort
 #define QE_SORT_MAX_KEYS   4
@@ -162,16 +170,20 @@ internal PLAN_Materialized qe_aggregate(Arena* arena, GDB_Database* database, PL
 internal PLAN_Materialized qe_apply_having(Arena* arena, PLAN_Materialized* m, IR_Node* having_ir);
 
 //~ tec: GPU build/probe equi-join. 'right_table' must be a bare table 'left' may be any prior PLAN_RowSet.
-internal PLAN_RowSet qe_hash_join(Arena* arena, PLAN_RowSet* left, GDB_Table* right_table, String8 join_type, IR_Node* condition);
+// 'right_alias' is the "AS x" alias the FROM/JOIN clause gave right_table (or {0} if unaliased) -
+// needed so a self-join's two sides (same GDB_Table*, different aliases) resolve distinctly.
+internal PLAN_RowSet qe_hash_join(Arena* arena, PLAN_RowSet* left, GDB_Table* right_table, String8 right_alias, String8 join_type, IR_Node* condition);
 
-// tec: does `column_name` (bare or qualified) belong to 'table'?
-internal B32 qe_column_belongs_to_table(GDB_Table* table, String8 column_name);
+// tec: does `column_name` (bare or qualified) belong to 'table'? a qualifier is matched against
+// 'alias' first (if non-empty), falling back to table->name
+internal B32 qe_column_belongs_to_table(GDB_Table* table, String8 alias, String8 column_name);
 
 // tec: finds the first 'a = b' clause (top-level, or AND-chained) where one side resolves to
-// right_table and the other to some table in left_rows - this is what turns an explicit ON
-// condition (already this shape) and a comma-join's WHERE clause (searched for this shape) into
-// the same equi-join condition qe_hash_join needs. Returns NULL if no such clause exists.
-internal IR_Node* qe_find_equi_condition(PLAN_RowSet* left_rows, GDB_Table* right_table, IR_Node* condition);
+// right_table (addressed as right_alias, or its real name if unaliased) and the other to some
+// table in left_rows - this is what turns an explicit ON condition (already this shape) and a
+// comma-join's WHERE clause (searched for this shape) into the same equi-join condition
+// qe_hash_join needs. Returns NULL if no such clause exists.
+internal IR_Node* qe_find_equi_condition(PLAN_RowSet* left_rows, GDB_Table* right_table, String8 right_alias, IR_Node* condition);
 
 // tec: residual WHERE filter evaluated directly in C against an already-joined row set
 // reuses the WHERE-clause condition tree verbatim, including any join-equality clause it contains

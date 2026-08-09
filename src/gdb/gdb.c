@@ -276,7 +276,50 @@ gdb_table_add_column(GDB_Table* table, GDB_ColumnSchema schema)
   GDB_Column* column = gdb_column_alloc(schema.name, schema.type, schema.size);
   column->parent_table = table;
   table->columns[table->column_count++] = column;
-  
+
+  ProfEnd();
+}
+
+internal void
+gdb_table_remove_column(GDB_Table* table, GDB_Column* column)
+{
+  ProfBeginFunction();
+
+  U64 slot = 0;
+  for (; slot < table->column_count; slot++)
+  {
+    if (table->columns[slot] == column) break;
+  }
+
+  if (slot >= table->column_count)
+  {
+    log_error("gdb_table_remove_column: column '%.*s' does not belong to table '%.*s'",
+              str8_varg(column->name), str8_varg(table->name));
+    ProfEnd();
+    return;
+  }
+
+  gdb_column_close(column);
+  if (column->is_disk_backed)
+  {
+    os_delete_file_at_path(column->disk_path);
+  }
+  else if (table->parent_database)
+  {
+    // tec: is_disk_backed only reflects this process's in-memory state, it could be stale
+    Temp scratch = scratch_begin(0, 0);
+    String8 stale_path = gdb_generate_disk_path_for_column(scratch.arena, column);
+    os_delete_file_at_path(stale_path);
+    scratch_end(scratch);
+  }
+  gdb_column_release(column);
+
+  for (U64 i = slot; i + 1 < table->column_count; i++)
+  {
+    table->columns[i] = table->columns[i + 1];
+  }
+  table->column_count--;
+
   ProfEnd();
 }
 

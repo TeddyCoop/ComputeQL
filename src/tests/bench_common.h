@@ -235,23 +235,24 @@ bench_gdb_consume_result(PLAN_ExecResult* result, IR_Node* select_node, U64* out
       for (IR_Node* column_node = select_output_columns->first; column_node != NULL; column_node = column_node->next, ci++)
       {
         String8 bare_name = {0};
-        GDB_Table* col_table = qe_resolve_column_table(&result->rows, column_node->value, &bare_name);
+        U64 table_slot = max_U64;
+        GDB_Table* col_table = qe_resolve_column_table(&result->rows, column_node->value, &bare_name, &table_slot);
         if (!col_table) continue;
 
         GDB_Column* column = gdb_table_find_column(col_table, bare_name);
         if (!column) continue;
 
         gathered[ci].resolved = 1;
-        gathered[ci].table_slot = qe_rowset_table_slot(&result->rows, col_table);
+        gathered[ci].table_slot = table_slot;
         gathered[ci].type = column->type;
 
         if (column->type == GDB_ColumnType_String8)
         {
-          gathered[ci].strings = qe_gather_string_column(scratch.arena, &result->rows, col_table, column);
+          gathered[ci].strings = qe_gather_string_column(scratch.arena, &result->rows, table_slot, column);
         }
         else
         {
-          gathered[ci].numeric_values = qe_gather_numeric_column(scratch.arena, &result->rows, col_table, column);
+          gathered[ci].numeric_values = qe_gather_numeric_column(scratch.arena, &result->rows, table_slot, column);
         }
       }
 

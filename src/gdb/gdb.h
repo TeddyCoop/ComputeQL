@@ -206,6 +206,7 @@ internal GDB_Table* gdb_database_find_table(GDB_Database* database, String8 tabl
 internal GDB_Table* gdb_table_alloc(String8 name);
 internal void gdb_table_release(GDB_Table* table);
 internal void gdb_table_add_column(GDB_Table* table, GDB_ColumnSchema schema);
+internal void gdb_table_remove_column(GDB_Table* table, GDB_Column* column);
 internal void gdb_table_add_row(GDB_Table* table, void** row_data);
 internal void gdb_table_remove_row(GDB_Table* table, U64 row_index);
 internal B32 gdb_table_save(GDB_Table* table, String8 table_dir);

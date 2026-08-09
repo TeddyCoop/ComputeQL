@@ -682,13 +682,13 @@ qe_column_list_item_display_name(Arena* arena, IR_Node* item)
 //~ tec: multi-table column qualifier resolution
 
 internal GDB_Table*
-qe_resolve_column_table(PLAN_RowSet* rows, String8 column_name, String8* out_bare_name)
+qe_resolve_column_table(PLAN_RowSet* rows, String8 column_name, String8* out_bare_name, U64* out_slot)
 {
   String8 qualifier = {0};
   String8 bare_name = column_name;
   B32 has_dot = 0;
   U64 dot_pos = 0;
-  
+
   for (U64 i = 0; i < column_name.size; i++)
   {
     if (column_name.str[i] == '.')
@@ -698,29 +698,35 @@ qe_resolve_column_table(PLAN_RowSet* rows, String8 column_name, String8* out_bar
       break;
     }
   }
-  
+
   if (has_dot)
   {
     qualifier = str8_prefix(column_name, dot_pos);
     bare_name = str8_skip(column_name, dot_pos + 1);
   }
-  
+
   if (out_bare_name) *out_bare_name = bare_name;
-  
+  if (out_slot) *out_slot = max_U64;
+
   if (has_dot)
   {
     for (U64 t = 0; t < rows->table_count; t++)
     {
-      if (str8_match(rows->tables[t]->name, qualifier, StringMatchFlag_CaseInsensitive))
+	  // tec: prefer a slots alias over the real table name
+      String8 alias = rows->aliases ? rows->aliases[t] : (String8){0};
+      String8 name_to_match = alias.size ? alias : rows->tables[t]->name;
+      if (str8_match(name_to_match, qualifier, StringMatchFlag_CaseInsensitive))
       {
+        if (out_slot) *out_slot = t;
         return rows->tables[t];
       }
     }
     log_error("qe_resolve_column_table: no table '%.*s' in scope (column '%.*s')", str8_varg(qualifier), str8_varg(column_name));
     return NULL;
   }
-  
+
   GDB_Table* found = NULL;
+  U64 found_slot = max_U64;
   for (U64 t = 0; t < rows->table_count; t++)
   {
     if (gdb_table_find_column(rows->tables[t], bare_name))
@@ -731,12 +737,17 @@ qe_resolve_column_table(PLAN_RowSet* rows, String8 column_name, String8* out_bar
         return NULL;
       }
       found = rows->tables[t];
+      found_slot = t;
     }
   }
-  
+
   if (!found)
   {
     log_error("qe_resolve_column_table: unknown column '%.*s'", str8_varg(bare_name));
+  }
+  else if (out_slot)
+  {
+    *out_slot = found_slot;
   }
   return found;
 }
@@ -769,16 +780,15 @@ qe_rowset_table_slot(PLAN_RowSet* rows, GDB_Table* table)
 }
 
 internal F64*
-qe_gather_numeric_column(Arena* arena, PLAN_RowSet* rows, GDB_Table* table, GDB_Column* column)
+qe_gather_numeric_column(Arena* arena, PLAN_RowSet* rows, U64 table_slot, GDB_Column* column)
 {
   ProfBeginFunction();
 
   F64* values = push_array(arena, F64, Max(rows->count, 1));
 
-  U64 table_slot = qe_rowset_table_slot(rows, table);
-  if (table_slot == max_U64)
+  if (table_slot >= rows->table_count)
   {
-    log_error("qe_gather_numeric_column: table '%.*s' not part of this row set", str8_varg(table->name));
+    log_error("qe_gather_numeric_column: slot %llu is not part of this row set", table_slot);
     ProfEnd();
     return values;
   }
@@ -828,7 +838,7 @@ qe_gather_numeric_column(Arena* arena, PLAN_RowSet* rows, GDB_Table* table, GDB_
 }
 
 internal GDB_StringDataChunk
-qe_gather_string_column(Arena* arena, PLAN_RowSet* rows, GDB_Table* table, GDB_Column* column)
+qe_gather_string_column(Arena* arena, PLAN_RowSet* rows, U64 table_slot, GDB_Column* column)
 {
   ProfBeginFunction();
 
@@ -836,10 +846,9 @@ qe_gather_string_column(Arena* arena, PLAN_RowSet* rows, GDB_Table* table, GDB_C
   chunk.row_count = rows->count;
   chunk.offsets = push_array(arena, U64, rows->count + 1);
 
-  U64 table_slot = qe_rowset_table_slot(rows, table);
-  if (table_slot == max_U64)
+  if (table_slot >= rows->table_count)
   {
-    log_error("qe_gather_string_column: table '%.*s' not part of this row set", str8_varg(table->name));
+    log_error("qe_gather_string_column: slot %llu is not part of this row set", table_slot);
     ProfEnd();
     return chunk;
   }
@@ -917,6 +926,48 @@ qe_str8_compare(String8 a, String8 b)
   return 0;
 }
 
+typedef struct QE_SortRowsCtx QE_SortRowsCtx;
+struct QE_SortRowsCtx
+{
+  U32 num_keys;
+  B32 key_is_string[QE_SORT_MAX_KEYS];
+  B32 key_desc[QE_SORT_MAX_KEYS];
+  F64* numeric_keys[QE_SORT_MAX_KEYS];        // tec: dense, indexed by output-row position (0..count-1)
+  GDB_StringDataChunk string_keys[QE_SORT_MAX_KEYS];
+};
+
+global QE_SortRowsCtx* g_qe_sort_rows_ctx = 0;
+
+internal int
+qe_sort_rows_compare(const void* a, const void* b)
+{
+  U64 ia = *(const U64*)a;
+  U64 ib = *(const U64*)b;
+  QE_SortRowsCtx* ctx = g_qe_sort_rows_ctx;
+
+  for (U32 k = 0; k < ctx->num_keys; k++)
+  {
+    S32 cmp = 0;
+
+    if (ctx->key_is_string[k])
+    {
+      GDB_StringDataChunk* chunk = &ctx->string_keys[k];
+      String8 sa = str8((U8*)chunk->data + chunk->offsets[ia], chunk->offsets[ia + 1] - chunk->offsets[ia]);
+      String8 sb = str8((U8*)chunk->data + chunk->offsets[ib], chunk->offsets[ib + 1] - chunk->offsets[ib]);
+      cmp = qe_str8_compare(sa, sb);
+    }
+    else
+    {
+      F64 va = ctx->numeric_keys[k][ia];
+      F64 vb = ctx->numeric_keys[k][ib];
+      cmp = (va < vb) ? -1 : (va > vb) ? 1 : 0;
+    }
+
+    if (cmp != 0) return ctx->key_desc[k] ? -cmp : cmp;
+  }
+  return 0;
+}
+
 internal PLAN_RowSet
 qe_sort_rows(Arena* arena, PLAN_RowSet* rows, IR_Node* order_by_ir)
 {
@@ -938,10 +989,12 @@ qe_sort_rows(Arena* arena, PLAN_RowSet* rows, IR_Node* order_by_ir)
   }
   
   GDB_Column* key_columns[QE_SORT_MAX_KEYS];
-  GDB_Table* key_tables[QE_SORT_MAX_KEYS];
+  U64 key_slots[QE_SORT_MAX_KEYS];
   B32 key_desc[QE_SORT_MAX_KEYS];
+  B32 key_is_string[QE_SORT_MAX_KEYS];
   U32 num_keys = 0;
-  
+  B32 any_string_key = 0;
+
   for (IR_Node* col_node = order_by_ir->first; col_node != NULL; col_node = col_node->next)
   {
     if (num_keys >= QE_SORT_MAX_KEYS)
@@ -949,36 +1002,80 @@ qe_sort_rows(Arena* arena, PLAN_RowSet* rows, IR_Node* order_by_ir)
       log_error("qe_sort_rows: more than %u ORDER BY columns is not supported, ignoring the rest", (U32)QE_SORT_MAX_KEYS);
       break;
     }
-    
+
     String8 bare_name = {0};
-    GDB_Table* table = qe_resolve_column_table(rows, col_node->value, &bare_name);
+    U64 slot = max_U64;
+    GDB_Table* table = qe_resolve_column_table(rows, col_node->value, &bare_name, &slot);
     if (!table) continue; // tec: already logged by qe_resolve_column_table
-    
+
     GDB_Column* column = gdb_table_find_column(table, bare_name);
     if (!column) continue;
-    
-    if (column->type == GDB_ColumnType_String8)
-    {
-      log_error("qe_sort_rows: ORDER BY on string column '%.*s' is not supported yet (task #6 scope cut)", str8_varg(bare_name));
-      continue;
-    }
-    
+
     B32 desc = (col_node->first && col_node->first->type == IR_NodeType_Descending);
-    
-    key_tables[num_keys] = table;
+    B32 is_string = (column->type == GDB_ColumnType_String8);
+    any_string_key |= is_string;
+
+    key_slots[num_keys] = slot;
     key_columns[num_keys] = column;
     key_desc[num_keys] = desc;
+    key_is_string[num_keys] = is_string;
     num_keys++;
   }
-  
+
   if (num_keys == 0)
   {
-    log_error("qe_sort_rows: no usable numeric ORDER BY columns, returning input unsorted");
+    log_error("qe_sort_rows: no usable ORDER BY columns, returning input unsorted");
     ProfEnd();
     return result;
   }
-  
+
   U64 real_count = rows->count;
+
+  // tec: no GPU string-comparison kernel exists, so a string key (alone or mixed with numeric
+  // keys) sorts a plain row-index array on the CPU instead of going through the bitonic path below
+  if (any_string_key)
+  {
+    Temp scratch = scratch_begin(&arena, 1);
+
+    QE_SortRowsCtx ctx = {0};
+    ctx.num_keys = num_keys;
+    for (U32 k = 0; k < num_keys; k++)
+    {
+      ctx.key_is_string[k] = key_is_string[k];
+      ctx.key_desc[k] = key_desc[k];
+      if (key_is_string[k])
+      {
+        ctx.string_keys[k] = qe_gather_string_column(scratch.arena, rows, key_slots[k], key_columns[k]);
+      }
+      else
+      {
+        ctx.numeric_keys[k] = qe_gather_numeric_column(scratch.arena, rows, key_slots[k], key_columns[k]);
+      }
+    }
+
+    U64* order = push_array(scratch.arena, U64, real_count);
+    for (U64 i = 0; i < real_count; i++) order[i] = i;
+
+    QE_SortRowsCtx* prev_ctx = g_qe_sort_rows_ctx;
+    g_qe_sort_rows_ctx = &ctx;
+    quick_sort(order, real_count, sizeof(U64), qe_sort_rows_compare);
+    g_qe_sort_rows_ctx = prev_ctx;
+
+    result.row_indices = push_array(arena, U64*, rows->table_count);
+    for (U64 t = 0; t < rows->table_count; t++)
+    {
+      result.row_indices[t] = push_array(arena, U64, real_count);
+      for (U64 i = 0; i < real_count; i++)
+      {
+        result.row_indices[t][i] = rows->row_indices[t][order[i]];
+      }
+    }
+
+    scratch_end(scratch);
+    ProfEnd();
+    return result;
+  }
+
   U64 padded_count = 2;
   while (padded_count < real_count) padded_count <<= 1;
   
@@ -990,7 +1087,7 @@ qe_sort_rows(Arena* arena, PLAN_RowSet* rows, IR_Node* order_by_ir)
   F64* gathered[QE_SORT_MAX_KEYS] = {0};
   for (U32 k = 0; k < num_keys; k++)
   {
-    gathered[k] = qe_gather_numeric_column(scratch.arena, rows, key_tables[k], key_columns[k]);
+    gathered[k] = qe_gather_numeric_column(scratch.arena, rows, key_slots[k], key_columns[k]);
   }
   
   F64* keys = push_array(scratch.arena, F64, padded_count * QE_SORT_MAX_KEYS);
@@ -1172,6 +1269,7 @@ struct QE_AggExprInfo
   String8 display_name;
   U32 func_code;          // 0 COUNT, 1 SUM, 2 AVG, 3 MIN, 4 MAX
   GDB_Table* arg_table;   // NULL for COUNT(*)/COUNT(col) - counting never needs the argument's value
+  U64 arg_slot;           // tec: input row-set slot arg_table was resolved to (see qe_resolve_column_table)
   GDB_Column* arg_column;
 };
 
@@ -1222,13 +1320,16 @@ qe_aggregate_collect_exprs(Arena* arena, PLAN_RowSet* input, IR_Node* node, QE_A
           if (is_star || info->func_code == 0)
           {
             info->arg_table = NULL;
+            info->arg_slot = max_U64;
             info->arg_column = NULL;
           }
           else
           {
             String8 bare_name = {0};
-            GDB_Table* table = qe_resolve_column_table(input, arg->value, &bare_name);
+            U64 slot = max_U64;
+            GDB_Table* table = qe_resolve_column_table(input, arg->value, &bare_name, &slot);
             info->arg_table = table;
+            info->arg_slot = slot;
             info->arg_column = table ? gdb_table_find_column(table, bare_name) : NULL;
           }
           
@@ -1278,11 +1379,10 @@ qe_aggregate_build_output(Arena* arena, PLAN_RowSet* input, IR_Node* column_list
     else if (item->type == IR_NodeType_Column)
     {
       String8 bare_name = {0};
-      GDB_Table* table = qe_resolve_column_table(input, item->value, &bare_name);
+      U64 table_slot = max_U64;
+      GDB_Table* table = qe_resolve_column_table(input, item->value, &bare_name, &table_slot);
       GDB_Column* column = table ? gdb_table_find_column(table, bare_name) : NULL;
       if (!column) continue;
-      
-      U64 table_slot = qe_rowset_table_slot(input, table);
       
       dst->name = name;
       dst->type = column->type;
@@ -1340,10 +1440,10 @@ qe_aggregate(Arena* arena, GDB_Database* database, PLAN_RowSet* input, IR_Node* 
   U64 row_count = input->count;
   
   //- tec: resolve GROUP BY key columns (0 means one global group)
-  GDB_Table* group_tables[QE_AGG_MAX_GROUP_COLS];
+  U64 group_slots[QE_AGG_MAX_GROUP_COLS];
   GDB_Column* group_columns[QE_AGG_MAX_GROUP_COLS];
   U32 num_group_cols = 0;
-  
+
   for (IR_Node* col_node = group_by_ir ? group_by_ir->first : NULL; col_node != NULL; col_node = col_node->next)
   {
     if (num_group_cols >= QE_AGG_MAX_GROUP_COLS)
@@ -1351,14 +1451,15 @@ qe_aggregate(Arena* arena, GDB_Database* database, PLAN_RowSet* input, IR_Node* 
       log_error("qe_aggregate: more than %u GROUP BY columns is not supported, ignoring the rest", (U32)QE_AGG_MAX_GROUP_COLS);
       break;
     }
-    
+
     String8 bare_name = {0};
-    GDB_Table* table = qe_resolve_column_table(input, col_node->value, &bare_name);
+    U64 slot = max_U64;
+    GDB_Table* table = qe_resolve_column_table(input, col_node->value, &bare_name, &slot);
     if (!table) continue;
     GDB_Column* column = gdb_table_find_column(table, bare_name);
     if (!column) continue;
-    
-    group_tables[num_group_cols] = table;
+
+    group_slots[num_group_cols] = slot;
     group_columns[num_group_cols] = column;
     num_group_cols++;
   }
@@ -1393,22 +1494,22 @@ qe_aggregate(Arena* arena, GDB_Database* database, PLAN_RowSet* input, IR_Node* 
   {
     if (group_columns[c]->type == GDB_ColumnType_String8)
     {
-      group_string[c] = qe_gather_string_column(arena, input, group_tables[c], group_columns[c]);
+      group_string[c] = qe_gather_string_column(arena, input, group_slots[c], group_columns[c]);
       group_string_mask |= (1u << c);
     }
     else
     {
-      group_numeric[c] = qe_gather_numeric_column(arena, input, group_tables[c], group_columns[c]);
+      group_numeric[c] = qe_gather_numeric_column(arena, input, group_slots[c], group_columns[c]);
     }
   }
-  
+
   //- tec: gather aggregate argument columns (dense F64, one per expr that needs a real column)
   F64* expr_args[QE_AGG_MAX_EXPRS] = {0};
   for (U32 e = 0; e < num_exprs; e++)
   {
     if (exprs[e].arg_column)
     {
-      expr_args[e] = qe_gather_numeric_column(arena, input, exprs[e].arg_table, exprs[e].arg_column);
+      expr_args[e] = qe_gather_numeric_column(arena, input, exprs[e].arg_slot, exprs[e].arg_column);
     }
   }
   
@@ -1784,21 +1885,22 @@ qe_bare_column_name(String8 name)
 }
 
 internal B32
-qe_column_belongs_to_table(GDB_Table* table, String8 column_name)
+qe_column_belongs_to_table(GDB_Table* table, String8 alias, String8 column_name)
 {
   String8 bare = column_name;
-  
+
   for (U64 i = 0; i < column_name.size; i++)
   {
     if (column_name.str[i] == '.')
     {
       String8 qualifier = str8_prefix(column_name, i);
-      if (!str8_match(qualifier, table->name, StringMatchFlag_CaseInsensitive)) return 0;
+      String8 name_to_match = alias.size ? alias : table->name;
+      if (!str8_match(qualifier, name_to_match, StringMatchFlag_CaseInsensitive)) return 0;
       bare = str8_skip(column_name, i + 1);
       break;
     }
   }
-  
+
   return gdb_table_find_column(table, bare) != NULL;
 }
 
@@ -1807,46 +1909,47 @@ qe_column_belongs_to_rowset(PLAN_RowSet* rows, String8 column_name)
 {
   for (U64 t = 0; t < rows->table_count; t++)
   {
-    if (qe_column_belongs_to_table(rows->tables[t], column_name)) return 1;
+    String8 alias = rows->aliases ? rows->aliases[t] : (String8){0};
+    if (qe_column_belongs_to_table(rows->tables[t], alias, column_name)) return 1;
   }
   return 0;
 }
 
 internal IR_Node*
-qe_validate_equi_condition(PLAN_RowSet* left_rows, GDB_Table* right_table, IR_Node* condition)
+qe_validate_equi_condition(PLAN_RowSet* left_rows, GDB_Table* right_table, String8 right_alias, IR_Node* condition)
 {
   if (!condition || condition->type != IR_NodeType_Operator) return NULL;
   if (!(str8_match(condition->value, str8_lit("="), 0) || str8_match(condition->value, str8_lit("=="), 0))) return NULL;
-  
+
   IR_Node* left = condition->first;
   IR_Node* right = left ? left->next : NULL;
   if (!left || !right || left->type != IR_NodeType_Column || right->type != IR_NodeType_Column) return NULL;
-  
-  B32 left_is_right = qe_column_belongs_to_table(right_table, left->value);
-  B32 right_is_right = qe_column_belongs_to_table(right_table, right->value);
+
+  B32 left_is_right = qe_column_belongs_to_table(right_table, right_alias, left->value);
+  B32 right_is_right = qe_column_belongs_to_table(right_table, right_alias, right->value);
   B32 left_is_left = qe_column_belongs_to_rowset(left_rows, left->value);
   B32 right_is_left = qe_column_belongs_to_rowset(left_rows, right->value);
-  
+
   B32 valid = (left_is_left && right_is_right) || (left_is_right && right_is_left);
   return valid ? condition : NULL;
 }
 
 internal IR_Node*
-qe_find_equi_condition(PLAN_RowSet* left_rows, GDB_Table* right_table, IR_Node* condition)
+qe_find_equi_condition(PLAN_RowSet* left_rows, GDB_Table* right_table, String8 right_alias, IR_Node* condition)
 {
   if (!condition) return NULL;
-  
+
   if (condition->type == IR_NodeType_Operator && str8_match(condition->value, str8_lit("and"), StringMatchFlag_CaseInsensitive))
   {
     IR_Node* left = condition->first;
     IR_Node* right = left ? left->next : NULL;
-    
-    IR_Node* found = qe_find_equi_condition(left_rows, right_table, left);
+
+    IR_Node* found = qe_find_equi_condition(left_rows, right_table, right_alias, left);
     if (found) return found;
-    return qe_find_equi_condition(left_rows, right_table, right);
+    return qe_find_equi_condition(left_rows, right_table, right_alias, right);
   }
-  
-  return qe_validate_equi_condition(left_rows, right_table, condition);
+
+  return qe_validate_equi_condition(left_rows, right_table, right_alias, condition);
 }
 
 internal F64
@@ -1858,10 +1961,10 @@ qe_row_load_value(Arena* arena, PLAN_RowSet* rows, IR_Node* node, U64 output_row
   if (node->type == IR_NodeType_Column)
   {
     String8 bare = {0};
-    GDB_Table* table = qe_resolve_column_table(rows, node->value, &bare);
+    U64 slot = max_U64;
+    GDB_Table* table = qe_resolve_column_table(rows, node->value, &bare, &slot);
     if (!table) return 0.0;
-    
-    U64 slot = qe_rowset_table_slot(rows, table);
+
     U64 row = rows->row_indices[slot][output_row];
     if (row == PLAN_NULL_ROW) { *out_is_null = 1; return 0.0; }
     
@@ -1974,28 +2077,29 @@ qe_filter_joined_rows(Arena* arena, PLAN_RowSet* rows, IR_Node* condition)
 }
 
 internal PLAN_RowSet
-qe_hash_join(Arena* arena, PLAN_RowSet* left, GDB_Table* right_table, String8 join_type, IR_Node* condition)
+qe_hash_join(Arena* arena, PLAN_RowSet* left, GDB_Table* right_table, String8 right_alias, String8 join_type, IR_Node* condition)
 {
   ProfBeginFunction();
   PLAN_RowSet result = {0};
-  
+
   if (!condition || condition->type != IR_NodeType_Operator || !condition->first || !condition->first->next)
   {
     log_error("qe_hash_join: malformed or missing equi-join condition");
     ProfEnd();
     return result;
   }
-  
+
   IR_Node* cond_left = condition->first;
   IR_Node* cond_right = cond_left->next;
-  
-  B32 left_side_is_right_table = qe_column_belongs_to_table(right_table, cond_left->value);
+
+  B32 left_side_is_right_table = qe_column_belongs_to_table(right_table, right_alias, cond_left->value);
   IR_Node* right_key_node = left_side_is_right_table ? cond_left : cond_right;
   IR_Node* left_key_node = left_side_is_right_table ? cond_right : cond_left;
-  
+
   GDB_Column* right_key_column = gdb_table_find_column(right_table, qe_bare_column_name(right_key_node->value));
   String8 left_bare = {0};
-  GDB_Table* left_key_table = qe_resolve_column_table(left, left_key_node->value, &left_bare);
+  U64 left_key_slot = max_U64;
+  GDB_Table* left_key_table = qe_resolve_column_table(left, left_key_node->value, &left_bare, &left_key_slot);
   GDB_Column* left_key_column = left_key_table ? gdb_table_find_column(left_key_table, left_bare) : NULL;
   
   if (!right_key_column || !left_key_column)
@@ -2057,14 +2161,14 @@ qe_hash_join(Arena* arena, PLAN_RowSet* left, GDB_Table* right_table, String8 jo
   
   if (is_string_key)
   {
-    GDB_StringDataChunk chunk = qe_gather_string_column(scratch.arena, left, left_key_table, left_key_column);
+    GDB_StringDataChunk chunk = qe_gather_string_column(scratch.arena, left, left_key_slot, left_key_column);
     probe_data = chunk.data;
     probe_offsets = chunk.offsets;
     probe_data_size = Max(chunk.size, 4);
   }
   else
   {
-    probe_data = qe_gather_numeric_column(scratch.arena, left, left_key_table, left_key_column);
+    probe_data = qe_gather_numeric_column(scratch.arena, left, left_key_slot, left_key_column);
     probe_data_size = Max(probe_row_count, 1) * sizeof(F64);
   }
   
@@ -2192,7 +2296,14 @@ qe_hash_join(Arena* arena, PLAN_RowSet* left, GDB_Table* right_table, String8 jo
   result.tables = push_array(arena, GDB_Table*, result.table_count);
   MemoryCopy(result.tables, left->tables, left->table_count * sizeof(GDB_Table*));
   result.tables[left->table_count] = right_table;
-  
+
+  result.aliases = push_array(arena, String8, result.table_count);
+  if (left->aliases)
+  {
+    MemoryCopy(result.aliases, left->aliases, left->table_count * sizeof(String8));
+  }
+  result.aliases[left->table_count] = right_alias;
+
   result.count = match_count;
   result.row_indices = push_array(arena, U64*, result.table_count);
   for (U64 t = 0; t < result.table_count; t++)

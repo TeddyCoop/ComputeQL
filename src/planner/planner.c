@@ -17,6 +17,13 @@ plan_ir_contains_aggregate(IR_Node* node)
   return 0;
 }
 
+internal String8
+plan_alias_from_table_ir(IR_Node* table_ir)
+{
+  IR_Node* alias_ir = ir_node_find_child(table_ir, IR_NodeType_Alias);
+  return alias_ir ? alias_ir->value : (String8){0};
+}
+
 internal PLAN_Node*
 plan_build_from_select(Arena* arena, GDB_Database* database, IR_Node* select_ir_node)
 {
@@ -33,7 +40,8 @@ plan_build_from_select(Arena* arena, GDB_Database* database, IR_Node* select_ir_
       PLAN_Node* scan = plan_node_make(arena, PLAN_NodeType_Scan);
       scan->value = child->value;
       scan->table = gdb_database_find_table(database, child->value);
-      
+      scan->alias = plan_alias_from_table_ir(child);
+
       if (!from_plan)
       {
         from_plan = scan;
@@ -56,7 +64,8 @@ plan_build_from_select(Arena* arena, GDB_Database* database, IR_Node* select_ir_
       PLAN_Node* scan = plan_node_make(arena, PLAN_NodeType_Scan);
       scan->value = joined_table_ir->value;
       scan->table = gdb_database_find_table(database, joined_table_ir->value);
-      
+      scan->alias = plan_alias_from_table_ir(joined_table_ir);
+
       PLAN_Node* join = plan_node_make(arena, PLAN_NodeType_Join);
       join->value = child->value; // "inner" / "left"
       join->input = from_plan;
@@ -142,11 +151,13 @@ plan_build_from_select(Arena* arena, GDB_Database* database, IR_Node* select_ir_
 internal PLAN_ExecResult plan_execute_join(Arena* arena, GDB_Database* database, PLAN_Node* join_plan, IR_Node* select_ir_node, IR_Node* residual_where_root);
 
 internal PLAN_ExecResult
-plan_wrap_scan_result(Arena* arena, GDB_Table* table, QE_ScanResult scan_result)
+plan_wrap_scan_result(Arena* arena, GDB_Table* table, String8 alias, QE_ScanResult scan_result)
 {
   PLAN_ExecResult result = {0};
   result.rows.tables = push_array(arena, GDB_Table*, 1);
   result.rows.tables[0] = table;
+  result.rows.aliases = push_array(arena, String8, 1);
+  result.rows.aliases[0] = alias;
   result.rows.table_count = 1;
   result.rows.row_indices = push_array(arena, U64*, 1);
   result.rows.row_indices[0] = scan_result.indices;
@@ -176,9 +187,9 @@ plan_execute(Arena* arena, GDB_Database* database, PLAN_Node* plan, IR_Node* sel
       // regardless of what the query's WHERE says about *other* tables. WHERE is applied
       // explicitly by the Filter case below (Filter-over-Scan) or as a post-join residual filter
       QE_ScanResult scan_result = qe_scan_filter(arena, database, plan->table, NULL);
-      result = plan_wrap_scan_result(arena, plan->table, scan_result);
+      result = plan_wrap_scan_result(arena, plan->table, plan->alias, scan_result);
     } break;
-    
+
     case PLAN_NodeType_Filter:
     {
       if (plan->input && plan->input->type == PLAN_NodeType_Scan)
@@ -187,7 +198,7 @@ plan_execute(Arena* arena, GDB_Database* database, PLAN_Node* plan, IR_Node* sel
         // (which does the scan and the filter in one GPU dispatch) rather than through the
         // generic unfiltered Scan case above
         QE_ScanResult scan_result = qe_scan_filter(arena, database, plan->input->table, plan->condition);
-        result = plan_wrap_scan_result(arena, plan->input->table, scan_result);
+        result = plan_wrap_scan_result(arena, plan->input->table, plan->input->alias, scan_result);
       }
       else if (plan->input && plan->input->type == PLAN_NodeType_Join)
       {
@@ -338,27 +349,28 @@ plan_execute_join(Arena* arena, GDB_Database* database, PLAN_Node* join_plan, IR
     return result;
   }
   
+  String8 right_alias = join_plan->input2 ? join_plan->input2->alias : (String8){0};
   String8 join_type = join_plan->value;
   IR_Node* equi_condition = NULL;
   B32 is_cross = str8_match(join_plan->value, str8_lit("cross"), 0);
-  
+
   if (!is_cross)
   {
-    equi_condition = qe_find_equi_condition(&left_result.rows, right_table, join_plan->condition);
+    equi_condition = qe_find_equi_condition(&left_result.rows, right_table, right_alias, join_plan->condition);
   }
   else
   {
     join_type = str8_lit("inner"); // tec: a comma-join's real predicate lives in WHERE, not here
-    equi_condition = residual_where_root ? qe_find_equi_condition(&left_result.rows, right_table, residual_where_root) : NULL;
+    equi_condition = residual_where_root ? qe_find_equi_condition(&left_result.rows, right_table, right_alias, residual_where_root) : NULL;
   }
-  
+
   if (!equi_condition)
   {
     log_error("plan_execute: only equi-joins are supported (no usable 'a = b' clause found between the joined tables)");
     return result;
   }
-  
-  PLAN_RowSet joined_rows = qe_hash_join(arena, &left_result.rows, right_table, join_type, equi_condition);
+
+  PLAN_RowSet joined_rows = qe_hash_join(arena, &left_result.rows, right_table, right_alias, join_type, equi_condition);
   
   result.rows = residual_where_root ? qe_filter_joined_rows(arena, &joined_rows, residual_where_root) : joined_rows;
   result.supported = 1;
