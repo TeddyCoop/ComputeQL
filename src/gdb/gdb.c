@@ -372,17 +372,25 @@ gdb_table_save(GDB_Table* table, String8 table_dir)
       GDB_Column* column = table->columns[i];
       meta_size += sizeof(GDB_ColumnType) + (sizeof(U64) * 3) + column->name.size;
     }
-    
+
+    // tec: trailing, optional index declaration section
+    meta_size += sizeof(U64);
+    for (U64 i = 0; i < table->index_count; i++)
+    {
+      GDB_Index* index = table->indexes[i];
+      meta_size += sizeof(U64) + index->name.size + sizeof(U64) + index->column_name.size;
+    }
+
     U8* meta_buffer = push_array(scratch.arena, U8, meta_size);
     U8* meta_ptr = meta_buffer;
-    
+
     *(U64*)meta_ptr = table->column_count; meta_ptr += sizeof(U64);
     *(U64*)meta_ptr = table->row_count; meta_ptr += sizeof(U64);
-    
+
     for (U64 i = 0; i < table->column_count; i++)
     {
       GDB_Column* column = table->columns[i];
-      
+
       *(GDB_ColumnType*)meta_ptr = column->type; meta_ptr += sizeof(GDB_ColumnType);
       *(U64*)meta_ptr = column->size; meta_ptr += sizeof(U64);
       *(U64*)meta_ptr = column->capacity; meta_ptr += sizeof(U64);
@@ -390,7 +398,21 @@ gdb_table_save(GDB_Table* table, String8 table_dir)
       MemoryCopy(meta_ptr, column->name.str, column->name.size);
       meta_ptr += column->name.size;
     }
-    
+
+    *(U64*)meta_ptr = table->index_count; meta_ptr += sizeof(U64);
+    for (U64 i = 0; i < table->index_count; i++)
+    {
+      GDB_Index* index = table->indexes[i];
+
+      *(U64*)meta_ptr = index->name.size; meta_ptr += sizeof(U64);
+      MemoryCopy(meta_ptr, index->name.str, index->name.size);
+      meta_ptr += index->name.size;
+
+      *(U64*)meta_ptr = index->column_name.size; meta_ptr += sizeof(U64);
+      MemoryCopy(meta_ptr, index->column_name.str, index->column_name.size);
+      meta_ptr += index->column_name.size;
+    }
+
     os_file_write(meta_file, r1u64(0, meta_size), meta_buffer);
     os_file_close(meta_file);
   }
@@ -575,9 +597,8 @@ gdb_table_load(String8 table_dir, String8 meta_path)
     column->row_count = table->row_count;
     
     // tec: bind into the table immediately (rather than at the end of this loop body) so that
-    // early 'continue'/'break' paths below (e.g. a freshly-created 0-row column whose .dat file
-    // is legitimately empty) still leave table->columns[i] populated instead of NULL - a NULL
-    // column here previously crashed any later INSERT into a table that had been saved with 0 rows.
+    // early 'continue'/'break' paths below (e.g. a freshly-created 0-row column whose .dat file is legitimately empty) 
+	// still leave table->columns[i] populated instead of NULL
     table->columns[i] = column;
     column->parent_table = table;
     
@@ -651,12 +672,48 @@ gdb_table_load(String8 table_dir, String8 meta_path)
     }
     os_file_close(file);
   }
-  
+
+  //- tec: optional trailing index declaration
+  if (read_ptr + sizeof(U64) <= meta_data.str + meta_data.size)
+  {
+    U64 index_count = *(U64*)read_ptr; read_ptr += sizeof(U64);
+
+    for (U64 i = 0; i < index_count; i++)
+    {
+      if (read_ptr + sizeof(U64) > meta_data.str + meta_data.size) break;
+      String8 index_name = {0};
+      index_name.size = *(U64*)read_ptr; read_ptr += sizeof(U64);
+      if (read_ptr + index_name.size > meta_data.str + meta_data.size) break;
+      index_name.str = push_array(table->arena, U8, index_name.size);
+      MemoryCopy(index_name.str, read_ptr, index_name.size);
+      read_ptr += index_name.size;
+
+      if (read_ptr + sizeof(U64) > meta_data.str + meta_data.size) break;
+      String8 column_name = {0};
+      column_name.size = *(U64*)read_ptr; read_ptr += sizeof(U64);
+      if (read_ptr + column_name.size > meta_data.str + meta_data.size) break;
+      column_name.str = push_array(table->arena, U8, column_name.size);
+      MemoryCopy(column_name.str, read_ptr, column_name.size);
+      read_ptr += column_name.size;
+
+      GDB_Column* column = gdb_table_find_column(table, column_name);
+      if (column)
+      {
+        gdb_table_create_index(table, index_name, column);
+      }
+      else
+      {
+        log_error("gdb_table_load: index '%.*s' refers to missing column '%.*s' - dropping it",
+                  str8_varg(index_name), str8_varg(column_name));
+      }
+    }
+  }
+
   table->name = push_str8_copy(table->arena, str8_skip_last_slash(table_dir));
   temp_end(scratch);
-  
+
   ProfEnd();
-  
+
   return table;
 }
 
@@ -978,6 +1035,82 @@ gdb_table_find_column(GDB_Table* table, String8 column_name)
   log_error("failed to find column '%.*s' in table '%.*s", column_name.size, column_name.str,
             table->name.size, table->name.str);
   return NULL;
+}
+
+//~ tec: indexes
+
+internal GDB_Index*
+gdb_table_find_index(GDB_Table* table, String8 index_name)
+{
+  for (U64 i = 0; i < table->index_count; i++)
+  {
+    if (str8_match(table->indexes[i]->name, index_name, StringMatchFlag_CaseInsensitive))
+    {
+      return table->indexes[i];
+    }
+  }
+  return NULL;
+}
+
+internal GDB_Index*
+gdb_table_find_index_on_column(GDB_Table* table, GDB_Column* column)
+{
+  for (U64 i = 0; i < table->index_count; i++)
+  {
+    if (table->indexes[i]->column == column)
+    {
+      return table->indexes[i];
+    }
+  }
+  return NULL;
+}
+
+internal GDB_Index*
+gdb_table_create_index(GDB_Table* table, String8 index_name, GDB_Column* column)
+{
+  if (table->index_count == 0)
+  {
+    table->indexes = push_array(table->arena, GDB_Index*, 2);
+    table->index_capacity = 2;
+  }
+  else if (table->index_count >= table->index_capacity)
+  {
+    U64 new_capacity = table->index_capacity * 2;
+    GDB_Index** new_indexes = push_array(table->arena, GDB_Index*, new_capacity);
+    MemoryCopy(new_indexes, table->indexes, sizeof(GDB_Index*) * table->index_count);
+    table->indexes = new_indexes;
+    table->index_capacity = new_capacity;
+  }
+
+  GDB_Index* index = push_array(table->arena, GDB_Index, 1);
+  index->name = push_str8_copy(table->arena, index_name);
+  index->column_name = push_str8_copy(table->arena, column->name);
+  index->column = column;
+
+  table->indexes[table->index_count++] = index;
+  return index;
+}
+
+internal void
+gdb_table_drop_index(GDB_Table* table, String8 index_name)
+{
+  U64 slot = 0;
+  for (; slot < table->index_count; slot++)
+  {
+    if (str8_match(table->indexes[slot]->name, index_name, StringMatchFlag_CaseInsensitive)) break;
+  }
+
+  if (slot >= table->index_count)
+  {
+    log_error("gdb_table_drop_index: no index '%.*s' on table '%.*s'", str8_varg(index_name), str8_varg(table->name));
+    return;
+  }
+
+  for (U64 i = slot; i + 1 < table->index_count; i++)
+  {
+    table->indexes[i] = table->indexes[i + 1];
+  }
+  table->index_count--;
 }
 
 //~ tec: column

@@ -37,6 +37,8 @@ typedef enum IR_NodeType
   IR_NodeType_Limit,
   IR_NodeType_Offset,
   IR_NodeType_AggregateCall,
+  IR_NodeType_Index,
+  IR_NodeType_DropIndex,
 } IR_NodeType;
 
 typedef struct IR_Node IR_Node;

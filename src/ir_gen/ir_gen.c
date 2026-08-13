@@ -102,7 +102,9 @@ ir_type_from_sql_node_type(SQL_NodeType sql_type)
     case SQL_NodeType_Limit:         return IR_NodeType_Limit;
     case SQL_NodeType_Offset:        return IR_NodeType_Offset;
     case SQL_NodeType_AggregateCall: return IR_NodeType_AggregateCall;
-    
+    case SQL_NodeType_Index:        return IR_NodeType_Index;
+    case SQL_NodeType_DropIndex:    return IR_NodeType_DropIndex;
+
     // special cases
     case SQL_NodeType_Row:           return IR_NodeType_ValueGroup;
     case SQL_NodeType_Type:          return IR_NodeType_Type;
@@ -155,6 +157,8 @@ ir_node_type_to_string(IR_NodeType type)
     case IR_NodeType_Limit: result = str8_lit("IR_NodeType_Limit"); break;
     case IR_NodeType_Offset: result = str8_lit("IR_NodeType_Offset"); break;
     case IR_NodeType_AggregateCall: result = str8_lit("IR_NodeType_AggregateCall"); break;
+    case IR_NodeType_Index: result = str8_lit("IR_NodeType_Index"); break;
+    case IR_NodeType_DropIndex: result = str8_lit("IR_NodeType_DropIndex"); break;
   }
   
   return result;

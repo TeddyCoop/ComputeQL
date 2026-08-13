@@ -87,6 +87,12 @@ internal void qe_bytecode_program_build(QE_BytecodeProgram* prog, GDB_Database* 
 // query's WHERE, if any, must NOT be applied here. see plan_execute's Scan/Filter cases)
 internal QE_ScanResult qe_scan_filter(Arena* arena, GDB_Database* database, GDB_Table* table, IR_Node* where_clause);
 
+// tec: tries to answer where_clause entirely from an index instead of a GPU scan
+// only recognizes a single "Column <op> Literal/Numeric" comparison against an indexed column
+// returns 0 for anything else (compound WHERE, no index, etc) so the caller
+// falls back to qe_scan_filter. on success, fills out_result and returns 1.
+internal B32 qe_try_index_scan(Arena* arena, GDB_Table* table, IR_Node* where_clause, QE_ScanResult* out_result);
+
 //~ tec: shared query-result representation
 // lives here because the unity build
 #define PLAN_NULL_ROW max_U64 // tec: unmatched side of a LEFT JOIN - treat a column read against this as NULL

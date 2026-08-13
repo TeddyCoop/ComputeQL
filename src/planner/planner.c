@@ -194,10 +194,12 @@ plan_execute(Arena* arena, GDB_Database* database, PLAN_Node* plan, IR_Node* sel
     {
       if (plan->input && plan->input->type == PLAN_NodeType_Scan)
       {
-        // tec: plan->condition is the Where IR node itself, passed straight to qe_scan_filter
-        // (which does the scan and the filter in one GPU dispatch) rather than through the
-        // generic unfiltered Scan case above
-        QE_ScanResult scan_result = qe_scan_filter(arena, database, plan->input->table, plan->condition);
+        // tec: try an index lookup first
+        QE_ScanResult scan_result = {0};
+        if (!qe_try_index_scan(arena, plan->input->table, plan->condition, &scan_result))
+        {
+          scan_result = qe_scan_filter(arena, database, plan->input->table, plan->condition);
+        }
         result = plan_wrap_scan_result(arena, plan->input->table, plan->input->alias, scan_result);
       }
       else if (plan->input && plan->input->type == PLAN_NodeType_Join)

@@ -127,16 +127,28 @@ struct GDB_Column
   GDB_Table* parent_table;
 };
 
+typedef struct GDB_Index GDB_Index;
+struct GDB_Index
+{
+  String8 name;
+  String8 column_name;
+  GDB_Column* column;
+};
+
 struct GDB_Table
 {
   Arena* arena;
-  
+
   String8 name;
   U64 column_count;
   U64 column_capacity;
   U64 row_count;
   GDB_Column** columns;
-  
+
+  U64 index_count;
+  U64 index_capacity;
+  GDB_Index** indexes;
+
   GDB_Database* parent_database;
 };
 
@@ -215,6 +227,12 @@ internal GDB_Table* gdb_table_load(String8 table_dir, String8 meta_path);
 internal GDB_Table* gdb_table_import_csv(GDB_Database* database, String8 path);
 internal GDB_Table* gdb_table_import_csv_streaming(GDB_Database *db, String8 table_name, String8 path);
 internal GDB_Column* gdb_table_find_column(GDB_Table* table, String8 column_name);
+
+//~ tec: indexes
+internal GDB_Index* gdb_table_create_index(GDB_Table* table, String8 index_name, GDB_Column* column);
+internal void gdb_table_drop_index(GDB_Table* table, String8 index_name);
+internal GDB_Index* gdb_table_find_index(GDB_Table* table, String8 index_name);
+internal GDB_Index* gdb_table_find_index_on_column(GDB_Table* table, GDB_Column* column);
 
 //~ tec: columns
 internal GDB_Column* gdb_column_alloc(String8 name, GDB_ColumnType type, U64 size);

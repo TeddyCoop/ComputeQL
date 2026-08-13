@@ -353,6 +353,11 @@ sql_parse(Arena* arena, SQL_Token* tokens, U64 token_count, String8 source_text)
       {
         new_node = sql_parse_alter_clause(arena, &tokens, &token_index, token_count);
       }
+      else if (str8_match(token->value, str8_lit("drop"), StringMatchFlag_CaseInsensitive))
+      {
+        // tec: only DROP INDEX is implemented, but DROP TABLE/DATABASE don't exist yet
+        new_node = sql_parse_drop_index_clause(arena, &tokens, &token_index, token_count);
+      }
       else if (str8_match(token->value, str8_lit("delete"), StringMatchFlag_CaseInsensitive))
       {
         new_node = sql_parse_delete_clause(arena, &tokens, &token_index, token_count);
@@ -1439,15 +1444,156 @@ sql_parse_create_clause(Arena* arena, SQL_Token **tokens, U64 *token_index, U64 
     (*token_index)++; // tec: move past ')'
     
   }
+  else if (str8_match(keyword, str8_lit("index"), StringMatchFlag_CaseInsensitive))
+  {
+    // tec: CREATE INDEX idx_name ON table_name (column_name);
+    if (*token_index >= token_count || (*tokens)[*token_index].type != SQL_TokenType_Identifier)
+    {
+      sql_parse_error_at(sql_token_range_at(*tokens, *token_index, token_count),
+                         "expected index name in 'create index' statement, found '%.*s'",
+                         str8_varg(sql_token_text_or_eof(*tokens, *token_index, token_count)));
+      return NULL;
+    }
+
+    SQL_Node* index_node = push_array(arena, SQL_Node, 1);
+    index_node->type = SQL_NodeType_Index;
+    index_node->value = (*tokens)[*token_index].value;
+    (*token_index)++;
+
+    create_node->first = index_node;
+    create_node->last = index_node;
+    index_node->parent = create_node;
+
+    if (*token_index >= token_count || (*tokens)[*token_index].type != SQL_TokenType_Keyword ||
+        !str8_match((*tokens)[*token_index].value, str8_lit("on"), StringMatchFlag_CaseInsensitive))
+    {
+      sql_parse_error_at(sql_token_range_at(*tokens, *token_index, token_count),
+                         "expected 'on' in 'create index' statement, found '%.*s'",
+                         str8_varg(sql_token_text_or_eof(*tokens, *token_index, token_count)));
+      return NULL;
+    }
+    (*token_index)++; // tec: move past 'on'
+
+    if (*token_index >= token_count || (*tokens)[*token_index].type != SQL_TokenType_Identifier)
+    {
+      sql_parse_error_at(sql_token_range_at(*tokens, *token_index, token_count),
+                         "expected table name in 'create index' statement, found '%.*s'",
+                         str8_varg(sql_token_text_or_eof(*tokens, *token_index, token_count)));
+      return NULL;
+    }
+
+    SQL_Node* table_node = push_array(arena, SQL_Node, 1);
+    table_node->type = SQL_NodeType_Table;
+    table_node->value = (*tokens)[*token_index].value;
+    table_node->parent = index_node;
+    index_node->first = table_node;
+    index_node->last = table_node;
+    (*token_index)++;
+
+    if (*token_index >= token_count || (*tokens)[*token_index].type != SQL_TokenType_Symbol ||
+        !str8_match((*tokens)[*token_index].value, str8_lit("("), 0))
+    {
+      sql_parse_error_at(sql_token_range_at(*tokens, *token_index, token_count),
+                         "expected '(' in 'create index' statement, found '%.*s'",
+                         str8_varg(sql_token_text_or_eof(*tokens, *token_index, token_count)));
+      return NULL;
+    }
+    (*token_index)++; // tec: move past '('
+
+    if (*token_index >= token_count || (*tokens)[*token_index].type != SQL_TokenType_Identifier)
+    {
+      sql_parse_error_at(sql_token_range_at(*tokens, *token_index, token_count),
+                         "expected column name in 'create index' statement, found '%.*s'",
+                         str8_varg(sql_token_text_or_eof(*tokens, *token_index, token_count)));
+      return NULL;
+    }
+
+    SQL_Node* column_node = push_array(arena, SQL_Node, 1);
+    column_node->type = SQL_NodeType_Column;
+    column_node->value = (*tokens)[*token_index].value;
+    column_node->parent = index_node;
+    table_node->next = column_node;
+    column_node->prev = table_node;
+    index_node->last = column_node;
+    (*token_index)++;
+
+    if (*token_index >= token_count || (*tokens)[*token_index].type != SQL_TokenType_Symbol ||
+        !str8_match((*tokens)[*token_index].value, str8_lit(")"), 0))
+    {
+      sql_parse_error_at(sql_token_range_at(*tokens, *token_index, token_count),
+                         "expected closing ')' in 'create index' statement, found '%.*s'",
+                         str8_varg(sql_token_text_or_eof(*tokens, *token_index, token_count)));
+      return NULL;
+    }
+    (*token_index)++; // tec: move past ')'
+  }
   else
   {
     sql_parse_error_at(sql_token_range_at(*tokens, *token_index - 1, token_count),
-                       "unexpected keyword '%.*s' in 'create' statement, expected 'table' or 'database'",
+                       "unexpected keyword '%.*s' in 'create' statement, expected 'table', 'database', or 'index'",
                        str8_varg(keyword));
     return NULL;
   }
-  
+
   return create_node;
+}
+
+internal SQL_Node*
+sql_parse_drop_index_clause(Arena* arena, SQL_Token **tokens, U64 *token_index, U64 token_count)
+{
+  // tec: DROP INDEX idx_name ON table_name;
+  (*token_index)++; // tec: move past 'drop'
+
+  if (*token_index >= token_count || (*tokens)[*token_index].type != SQL_TokenType_Keyword ||
+      !str8_match((*tokens)[*token_index].value, str8_lit("index"), StringMatchFlag_CaseInsensitive))
+  {
+    sql_parse_error_at(sql_token_range_at(*tokens, *token_index, token_count),
+                       "expected 'index' after 'drop', found '%.*s'",
+                       str8_varg(sql_token_text_or_eof(*tokens, *token_index, token_count)));
+    return NULL;
+  }
+  (*token_index)++; // tec: move past 'index'
+
+  if (*token_index >= token_count || (*tokens)[*token_index].type != SQL_TokenType_Identifier)
+  {
+    sql_parse_error_at(sql_token_range_at(*tokens, *token_index, token_count),
+                       "expected index name in 'drop index' statement, found '%.*s'",
+                       str8_varg(sql_token_text_or_eof(*tokens, *token_index, token_count)));
+    return NULL;
+  }
+
+  SQL_Node* drop_index_node = push_array(arena, SQL_Node, 1);
+  drop_index_node->type = SQL_NodeType_DropIndex;
+  drop_index_node->value = (*tokens)[*token_index].value;
+  (*token_index)++;
+
+  if (*token_index >= token_count || (*tokens)[*token_index].type != SQL_TokenType_Keyword ||
+      !str8_match((*tokens)[*token_index].value, str8_lit("on"), StringMatchFlag_CaseInsensitive))
+  {
+    sql_parse_error_at(sql_token_range_at(*tokens, *token_index, token_count),
+                       "expected 'on' in 'drop index' statement, found '%.*s'",
+                       str8_varg(sql_token_text_or_eof(*tokens, *token_index, token_count)));
+    return NULL;
+  }
+  (*token_index)++; // tec: move past 'on'
+
+  if (*token_index >= token_count || (*tokens)[*token_index].type != SQL_TokenType_Identifier)
+  {
+    sql_parse_error_at(sql_token_range_at(*tokens, *token_index, token_count),
+                       "expected table name in 'drop index' statement, found '%.*s'",
+                       str8_varg(sql_token_text_or_eof(*tokens, *token_index, token_count)));
+    return NULL;
+  }
+
+  SQL_Node* table_node = push_array(arena, SQL_Node, 1);
+  table_node->type = SQL_NodeType_Table;
+  table_node->value = (*tokens)[*token_index].value;
+  table_node->parent = drop_index_node;
+  drop_index_node->first = table_node;
+  drop_index_node->last = table_node;
+  (*token_index)++;
+
+  return drop_index_node;
 }
 
 internal SQL_Node*
@@ -1945,6 +2091,8 @@ sql_node_type_to_string(SQL_NodeType type)
     case SQL_NodeType_Delete: result = str8_lit("SQL_NodeType_Delete"); break;
     case SQL_NodeType_Create: result = str8_lit("SQL_NodeType_Create"); break;
     case SQL_NodeType_Drop: result = str8_lit("SQL_NodeType_Drop"); break;
+    case SQL_NodeType_Index: result = str8_lit("SQL_NodeType_Index"); break;
+    case SQL_NodeType_DropIndex: result = str8_lit("SQL_NodeType_DropIndex"); break;
     case SQL_NodeType_Alter: result = str8_lit("SQL_NodeType_Alter"); break;
     case SQL_NodeType_Row: result = str8_lit("SQL_NodeType_Row"); break;
     case SQL_NodeType_Value: result = str8_lit("SQL_NodeType_Value"); break;

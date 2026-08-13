@@ -58,6 +58,7 @@ global String8 g_sql_keywords[] =
   str8_lit_comp("add"),
   str8_lit_comp("rename"),
   str8_lit_comp("column"),
+  str8_lit_comp("index"),
   str8_lit_comp("as"),
   str8_lit_comp("inner"),
   str8_lit_comp("left"),
@@ -144,6 +145,8 @@ typedef enum SQL_NodeType
   SQL_NodeType_Delete,
   SQL_NodeType_Create,
   SQL_NodeType_Drop,
+  SQL_NodeType_Index,
+  SQL_NodeType_DropIndex,
   SQL_NodeType_Alter,
   SQL_NodeType_Row,
   SQL_NodeType_Value,
@@ -191,6 +194,7 @@ internal SQL_Node* sql_parse_import_clause(Arena* arena, SQL_Token **tokens, U64
 internal SQL_Node* sql_parse_create_clause(Arena* arena, SQL_Token **tokens, U64 *token_index, U64 token_count);
 internal SQL_Node* sql_parse_alter_clause(Arena* arena, SQL_Token **tokens, U64 *token_index, U64 token_count);
 internal SQL_Node* sql_parse_delete_clause(Arena* arena, SQL_Token **tokens, U64 *token_index, U64 token_count);
+internal SQL_Node* sql_parse_drop_index_clause(Arena* arena, SQL_Token **tokens, U64 *token_index, U64 token_count);
 internal SQL_Node* sql_parse_values_clause(Arena* arena, SQL_Token **tokens, U64 *token_index, U64 token_count);
 internal SQL_Node* sql_parse_expression(Arena* arena, SQL_Token **tokens, U64 *token_index, U64 token_count);
 internal SQL_Node* sql_parse_comparison_expression(Arena* arena, SQL_Token **tokens, U64 *token_index, U64 token_count);

@@ -83,7 +83,40 @@ app_execute_query(String8 sql_query)
             gdb_database_add_table(database, table);
           }
         }
-        
+        else if (create_ir_node->type == IR_NodeType_Index)
+        {
+          IR_Node* table_node = create_ir_node->first;
+          IR_Node* column_node = table_node ? table_node->next : NULL;
+
+          GDB_Table* table = gdb_database_find_table(database, table_node->value);
+          if (!table)
+          {
+            log_error("create index: unknown table '%.*s'", str8_varg(table_node->value));
+          }
+          else if (gdb_table_find_index(table, create_ir_node->value))
+          {
+            log_error("create index: index '%.*s' already exists on table '%.*s'",
+                       str8_varg(create_ir_node->value), str8_varg(table->name));
+          }
+          else
+          {
+            GDB_Column* column = gdb_table_find_column(table, column_node->value);
+            if (column)
+            {
+              gdb_table_create_index(table, create_ir_node->value, column);
+            }
+          }
+        }
+
+      } break;
+      case IR_NodeType_DropIndex:
+      {
+        IR_Node* table_node = ir_node_find_child(ir_execution_node, IR_NodeType_Table);
+        GDB_Table* table = gdb_database_find_table(database, table_node->value);
+        if (table)
+        {
+          gdb_table_drop_index(table, ir_execution_node->value);
+        }
       } break;
       case IR_NodeType_Insert:
       {
