@@ -39,6 +39,13 @@ typedef enum IR_NodeType
   IR_NodeType_AggregateCall,
   IR_NodeType_Index,
   IR_NodeType_DropIndex,
+  IR_NodeType_Null,
+  IR_NodeType_NotNull,
+  IR_NodeType_Unique,
+  IR_NodeType_PrimaryKey,
+  IR_NodeType_ForeignKey,
+  IR_NodeType_Check,
+  IR_NodeType_Describe,
 } IR_NodeType;
 
 typedef struct IR_Node IR_Node;

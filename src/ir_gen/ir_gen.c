@@ -72,6 +72,7 @@ ir_type_from_sql_node_type(SQL_NodeType sql_type)
   switch (sql_type)
   {
     case SQL_NodeType_Use:           return IR_NodeType_Use;
+    case SQL_NodeType_Describe:      return IR_NodeType_Describe;
     case SQL_NodeType_Select:        return IR_NodeType_Select;
     case SQL_NodeType_Column:        return IR_NodeType_Column;
     case SQL_NodeType_Table:         return IR_NodeType_Table;
@@ -104,6 +105,12 @@ ir_type_from_sql_node_type(SQL_NodeType sql_type)
     case SQL_NodeType_AggregateCall: return IR_NodeType_AggregateCall;
     case SQL_NodeType_Index:        return IR_NodeType_Index;
     case SQL_NodeType_DropIndex:    return IR_NodeType_DropIndex;
+    case SQL_NodeType_Null:         return IR_NodeType_Null;
+    case SQL_NodeType_NotNull:      return IR_NodeType_NotNull;
+    case SQL_NodeType_Unique:       return IR_NodeType_Unique;
+    case SQL_NodeType_PrimaryKey:   return IR_NodeType_PrimaryKey;
+    case SQL_NodeType_ForeignKey:   return IR_NodeType_ForeignKey;
+    case SQL_NodeType_Check:        return IR_NodeType_Check;
 
     // special cases
     case SQL_NodeType_Row:           return IR_NodeType_ValueGroup;
@@ -126,6 +133,7 @@ ir_node_type_to_string(IR_NodeType type)
   switch (type)
   {
     case IR_NodeType_Use: result = str8_lit("IR_NodeType_Use"); break;
+    case IR_NodeType_Describe: result = str8_lit("IR_NodeType_Describe"); break;
     case IR_NodeType_Select: result = str8_lit("IR_NodeType_Select"); break;
     case IR_NodeType_Column: result = str8_lit("IR_NodeType_Column"); break;
     case IR_NodeType_Table: result = str8_lit("IR_NodeType_Table"); break;
@@ -159,6 +167,12 @@ ir_node_type_to_string(IR_NodeType type)
     case IR_NodeType_AggregateCall: result = str8_lit("IR_NodeType_AggregateCall"); break;
     case IR_NodeType_Index: result = str8_lit("IR_NodeType_Index"); break;
     case IR_NodeType_DropIndex: result = str8_lit("IR_NodeType_DropIndex"); break;
+    case IR_NodeType_Null: result = str8_lit("IR_NodeType_Null"); break;
+    case IR_NodeType_NotNull: result = str8_lit("IR_NodeType_NotNull"); break;
+    case IR_NodeType_Unique: result = str8_lit("IR_NodeType_Unique"); break;
+    case IR_NodeType_PrimaryKey: result = str8_lit("IR_NodeType_PrimaryKey"); break;
+    case IR_NodeType_ForeignKey: result = str8_lit("IR_NodeType_ForeignKey"); break;
+    case IR_NodeType_Check: result = str8_lit("IR_NodeType_Check"); break;
   }
   
   return result;
@@ -236,7 +250,7 @@ ir_expand_star_to_columns(Arena *arena, GDB_Database *db, IR_Node *select_node)
   
   column_list->first = column_list->last = NULL;
   
-  GDB_Table *table = gdb_database_find_table(db, table_node->value);
+  GDB_Table *table = gdb_database_find_table_or_catalog(db, table_node->value);
   
   for (U64 i = 0; i < table->column_count; i++)
   {

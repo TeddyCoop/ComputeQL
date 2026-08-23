@@ -39,7 +39,7 @@ plan_build_from_select(Arena* arena, GDB_Database* database, IR_Node* select_ir_
     {
       PLAN_Node* scan = plan_node_make(arena, PLAN_NodeType_Scan);
       scan->value = child->value;
-      scan->table = gdb_database_find_table(database, child->value);
+      scan->table = gdb_database_find_table_or_catalog(database, child->value);
       scan->alias = plan_alias_from_table_ir(child);
 
       if (!from_plan)
@@ -63,7 +63,7 @@ plan_build_from_select(Arena* arena, GDB_Database* database, IR_Node* select_ir_
       
       PLAN_Node* scan = plan_node_make(arena, PLAN_NodeType_Scan);
       scan->value = joined_table_ir->value;
-      scan->table = gdb_database_find_table(database, joined_table_ir->value);
+      scan->table = gdb_database_find_table_or_catalog(database, joined_table_ir->value);
       scan->alias = plan_alias_from_table_ir(joined_table_ir);
 
       PLAN_Node* join = plan_node_make(arena, PLAN_NodeType_Join);
@@ -196,7 +196,17 @@ plan_execute(Arena* arena, GDB_Database* database, PLAN_Node* plan, IR_Node* sel
       {
         // tec: try an index lookup first
         QE_ScanResult scan_result = {0};
-        if (!qe_try_index_scan(arena, plan->input->table, plan->condition, &scan_result))
+        if (qe_try_index_scan(arena, plan->input->table, plan->condition, &scan_result))
+        {
+          // tec: index hit
+        }
+		// tec: then a NULL-aware CPU scan if the table has any NULLs
+        else if (gdb_table_may_have_nulls(plan->input->table))
+        {
+          scan_result = qe_cpu_scan_filter(arena, plan->input->table, plan->condition);
+        }
+        // tec: and then fall back to the normal GPU scan
+        else
         {
           scan_result = qe_scan_filter(arena, database, plan->input->table, plan->condition);
         }

@@ -300,9 +300,7 @@ sql_parse(Arena* arena, SQL_Token* tokens, U64 token_count, String8 source_text)
         }
         else
         {
-          // tec: sql_parse_from_clause attaches the primary table, any comma-separated
-          // tables, and any join clauses directly onto last_select_node itself, since a
-          // FROM clause can introduce more than one sibling node.
+          // tec: attaches tables/joins directly onto last_select_node - a FROM clause can add more than one sibling node
           sql_parse_from_clause(arena, &tokens, &token_index, token_count, last_select_node);
         }
         attach_to_select = 1;
@@ -362,6 +360,10 @@ sql_parse(Arena* arena, SQL_Token* tokens, U64 token_count, String8 source_text)
       {
         new_node = sql_parse_delete_clause(arena, &tokens, &token_index, token_count);
         last_select_node = new_node;
+      }
+      else if (str8_match(token->value, str8_lit("describe"), StringMatchFlag_CaseInsensitive))
+      {
+        new_node = sql_parse_describe_clause(arena, &tokens, &token_index, token_count);
       }
       else
       {
@@ -467,6 +469,33 @@ sql_parse_use_clause(Arena* arena, SQL_Token **tokens, U64 *token_index, U64 tok
   }
   
   return use_node;
+}
+
+internal SQL_Node*
+sql_parse_describe_clause(Arena* arena, SQL_Token **tokens, U64 *token_index, U64 token_count)
+{
+  (*token_index)++; // move past 'describe'
+
+  if (*token_index >= token_count || (*tokens)[*token_index].type != SQL_TokenType_Identifier)
+  {
+    sql_parse_error_at(sql_token_range_at(*tokens, *token_index, token_count),
+                       "expected table name after 'describe', found '%.*s'",
+                       str8_varg(sql_token_text_or_eof(*tokens, *token_index, token_count)));
+    return NULL;
+  }
+
+  SQL_Node* describe_node = push_array(arena, SQL_Node, 1);
+  describe_node->type = SQL_NodeType_Describe;
+
+  SQL_Node* table_node = push_array(arena, SQL_Node, 1);
+  table_node->type = SQL_NodeType_Table;
+  table_node->value = (*tokens)[*token_index].value;
+  table_node->parent = describe_node;
+  describe_node->first = describe_node->last = table_node;
+
+  (*token_index)++;
+
+  return describe_node;
 }
 
 //~ tec: shared helpers used by SELECT / FROM / WHERE / GROUP BY / ORDER BY
@@ -765,9 +794,6 @@ sql_parse_from_clause(Arena* arena, SQL_Token **tokens, U64 *token_index, U64 to
   }
   (*token_index)++; // move past 'from'
   
-  // tec: the primary table is attached to select_node exactly like the old single-table
-  // parser did, so single-table SELECT ... FROM ... WHERE queries produce an identical
-  // AST shape to before (Table node is a direct child of Select).
   SQL_Node *primary_table = sql_parse_table_ref(arena, tokens, token_index, token_count);
   if (!primary_table) return NULL;
   
@@ -846,7 +872,41 @@ sql_parse_comparison_expression(Arena* arena, SQL_Token **tokens, U64 *token_ind
   {
     return NULL;
   }
-  
+
+  // tec: 'IS NULL' / 'IS NOT NULL'
+  if (*token_index < token_count && (*tokens)[*token_index].type == SQL_TokenType_Keyword &&
+      str8_match((*tokens)[*token_index].value, str8_lit("is"), StringMatchFlag_CaseInsensitive))
+  {
+    (*token_index)++; // tec: move past 'is'
+
+    B32 negate = 0;
+    if (*token_index < token_count && (*tokens)[*token_index].type == SQL_TokenType_Keyword &&
+        str8_match((*tokens)[*token_index].value, str8_lit("not"), StringMatchFlag_CaseInsensitive))
+    {
+      negate = 1;
+      (*token_index)++; // tec: move past 'not'
+    }
+
+    if (*token_index >= token_count || (*tokens)[*token_index].type != SQL_TokenType_Keyword ||
+        !str8_match((*tokens)[*token_index].value, str8_lit("null"), StringMatchFlag_CaseInsensitive))
+    {
+      sql_parse_error_at(sql_token_range_at(*tokens, *token_index, token_count),
+                         "expected 'null' after 'is%s', found '%.*s'", negate ? " not" : "",
+                         str8_varg(sql_token_text_or_eof(*tokens, *token_index, token_count)));
+      return NULL;
+    }
+    (*token_index)++; // tec: move past 'null'
+
+    SQL_Node *is_null_node = push_array(arena, SQL_Node, 1);
+    is_null_node->type = SQL_NodeType_Operator;
+    is_null_node->value = negate ? str8_lit("is not null") : str8_lit("is null");
+    is_null_node->first = left;
+    is_null_node->last = left;
+    left->parent = is_null_node;
+
+    return is_null_node;
+  }
+
   // Expect comparison operator
   if (*token_index >= token_count || !((*tokens)[*token_index].type == SQL_TokenType_Operator ||
                                        (*tokens)[*token_index].type == SQL_TokenType_Keyword))
@@ -921,9 +981,7 @@ sql_parse_and_expression(Arena* arena, SQL_Token **tokens, U64 *token_index, U64
 internal SQL_Node*
 sql_parse_logical_expression(Arena* arena, SQL_Token **tokens, U64 *token_index, U64 token_count)
 {
-  // tec: 'and' binds tighter than 'or' (standard SQL precedence) - this is why 'or' is
-  // the outer loop here and delegates each operand to sql_parse_and_expression rather
-  // than treating 'and'/'or' as one flat, equal-precedence chain.
+  // tec: 'and' binds tighter than 'or', so 'or' is the outer loop here rather than one flat equal-precedence chain
   SQL_Node *left = sql_parse_and_expression(arena, tokens, token_index, token_count);
   if (!left)
   {
@@ -1408,7 +1466,162 @@ sql_parse_create_clause(Arena* arena, SQL_Token **tokens, U64 *token_index, U64 
       column_node->first = type_node;
       column_node->last = type_node;
       type_node->parent = column_node;
-      
+
+      // tec: zero or more column constraints, in any order, until a ',' or ')'
+      for (;;)
+      {
+        if (*token_index >= token_count || (*tokens)[*token_index].type != SQL_TokenType_Keyword) break;
+        String8 constraint_kw = (*tokens)[*token_index].value;
+
+        if (str8_match(constraint_kw, str8_lit("not"), StringMatchFlag_CaseInsensitive))
+        {
+          (*token_index)++; // tec: move past 'not'
+          if (*token_index >= token_count || (*tokens)[*token_index].type != SQL_TokenType_Keyword ||
+              !str8_match((*tokens)[*token_index].value, str8_lit("null"), StringMatchFlag_CaseInsensitive))
+          {
+            sql_parse_error_at(sql_token_range_at(*tokens, *token_index, token_count),
+                               "expected 'null' after 'not' in column constraint, found '%.*s'",
+                               str8_varg(sql_token_text_or_eof(*tokens, *token_index, token_count)));
+            return NULL;
+          }
+          (*token_index)++; // tec: move past 'null'
+
+          SQL_Node* c = push_array(arena, SQL_Node, 1);
+          c->type = SQL_NodeType_NotNull;
+          c->parent = column_node;
+          DLLPushBack(column_node->first, column_node->last, c);
+        }
+        else if (str8_match(constraint_kw, str8_lit("unique"), StringMatchFlag_CaseInsensitive))
+        {
+          (*token_index)++; // tec: move past 'unique'
+
+          SQL_Node* c = push_array(arena, SQL_Node, 1);
+          c->type = SQL_NodeType_Unique;
+          c->parent = column_node;
+          DLLPushBack(column_node->first, column_node->last, c);
+        }
+        else if (str8_match(constraint_kw, str8_lit("primary"), StringMatchFlag_CaseInsensitive))
+        {
+          (*token_index)++; // tec: move past 'primary'
+          if (*token_index >= token_count || (*tokens)[*token_index].type != SQL_TokenType_Keyword ||
+              !str8_match((*tokens)[*token_index].value, str8_lit("key"), StringMatchFlag_CaseInsensitive))
+          {
+            sql_parse_error_at(sql_token_range_at(*tokens, *token_index, token_count),
+                               "expected 'key' after 'primary' in column constraint, found '%.*s'",
+                               str8_varg(sql_token_text_or_eof(*tokens, *token_index, token_count)));
+            return NULL;
+          }
+          (*token_index)++; // tec: move past 'key'
+
+          SQL_Node* c = push_array(arena, SQL_Node, 1);
+          c->type = SQL_NodeType_PrimaryKey;
+          c->parent = column_node;
+          DLLPushBack(column_node->first, column_node->last, c);
+        }
+        else if (str8_match(constraint_kw, str8_lit("references"), StringMatchFlag_CaseInsensitive))
+        {
+          (*token_index)++; // tec: move past 'references'
+          if (*token_index >= token_count || (*tokens)[*token_index].type != SQL_TokenType_Identifier)
+          {
+            sql_parse_error_at(sql_token_range_at(*tokens, *token_index, token_count),
+                               "expected referenced table name after 'references', found '%.*s'",
+                               str8_varg(sql_token_text_or_eof(*tokens, *token_index, token_count)));
+            return NULL;
+          }
+          String8 ref_table = (*tokens)[*token_index].value;
+          (*token_index)++;
+
+          if (*token_index >= token_count || (*tokens)[*token_index].type != SQL_TokenType_Symbol ||
+              !str8_match((*tokens)[*token_index].value, str8_lit("("), 0))
+          {
+            sql_parse_error_at(sql_token_range_at(*tokens, *token_index, token_count),
+                               "expected '(' after referenced table name, found '%.*s'",
+                               str8_varg(sql_token_text_or_eof(*tokens, *token_index, token_count)));
+            return NULL;
+          }
+          (*token_index)++; // tec: move past '('
+
+          if (*token_index >= token_count || (*tokens)[*token_index].type != SQL_TokenType_Identifier)
+          {
+            sql_parse_error_at(sql_token_range_at(*tokens, *token_index, token_count),
+                               "expected referenced column name, found '%.*s'",
+                               str8_varg(sql_token_text_or_eof(*tokens, *token_index, token_count)));
+            return NULL;
+          }
+          String8 ref_column = (*tokens)[*token_index].value;
+          (*token_index)++;
+
+          if (*token_index >= token_count || (*tokens)[*token_index].type != SQL_TokenType_Symbol ||
+              !str8_match((*tokens)[*token_index].value, str8_lit(")"), 0))
+          {
+            sql_parse_error_at(sql_token_range_at(*tokens, *token_index, token_count),
+                               "expected ')' after referenced column name, found '%.*s'",
+                               str8_varg(sql_token_text_or_eof(*tokens, *token_index, token_count)));
+            return NULL;
+          }
+          (*token_index)++; // tec: move past ')'
+
+          SQL_Node* c = push_array(arena, SQL_Node, 1);
+          c->type = SQL_NodeType_ForeignKey;
+          c->value = ref_table;
+          c->parent = column_node;
+
+          SQL_Node* ref_col_node = push_array(arena, SQL_Node, 1);
+          ref_col_node->type = SQL_NodeType_Column;
+          ref_col_node->value = ref_column;
+          ref_col_node->parent = c;
+          c->first = c->last = ref_col_node;
+
+          DLLPushBack(column_node->first, column_node->last, c);
+        }
+        else if (str8_match(constraint_kw, str8_lit("check"), StringMatchFlag_CaseInsensitive))
+        {
+          (*token_index)++; // tec: move past 'check'
+          if (*token_index >= token_count || (*tokens)[*token_index].type != SQL_TokenType_Symbol ||
+              !str8_match((*tokens)[*token_index].value, str8_lit("("), 0))
+          {
+            sql_parse_error_at(sql_token_range_at(*tokens, *token_index, token_count),
+                               "expected '(' after 'check', found '%.*s'",
+                               str8_varg(sql_token_text_or_eof(*tokens, *token_index, token_count)));
+            return NULL;
+          }
+          (*token_index)++; // tec: move past '('
+
+          // tec: capture the raw source text (not just the parsed tree) so it can be saved and reparsed on table load
+          U64 expr_start_token = *token_index;
+          Rng1U64 expr_start_range = sql_token_range_at(*tokens, expr_start_token, token_count);
+
+          SQL_Node* expr = sql_parse_logical_expression(arena, tokens, token_index, token_count);
+          if (!expr) return NULL;
+
+          Rng1U64 expr_end_range = sql_token_range_at(*tokens, *token_index > 0 ? *token_index - 1 : 0, token_count);
+          String8 expr_text = str8_substr(g_sql_source_text, r1u64(expr_start_range.min, expr_end_range.max));
+
+          if (*token_index >= token_count || (*tokens)[*token_index].type != SQL_TokenType_Symbol ||
+              !str8_match((*tokens)[*token_index].value, str8_lit(")"), 0))
+          {
+            sql_parse_error_at(sql_token_range_at(*tokens, *token_index, token_count),
+                               "expected ')' after 'check' expression, found '%.*s'",
+                               str8_varg(sql_token_text_or_eof(*tokens, *token_index, token_count)));
+            return NULL;
+          }
+          (*token_index)++; // tec: move past ')'
+
+          SQL_Node* c = push_array(arena, SQL_Node, 1);
+          c->type = SQL_NodeType_Check;
+          c->value = expr_text;
+          c->parent = column_node;
+          c->first = c->last = expr;
+          expr->parent = c;
+
+          DLLPushBack(column_node->first, column_node->last, c);
+        }
+        else
+        {
+          break;
+        }
+      }
+
       column_node->parent = table_node;
       
       if (prev_column)
@@ -1784,17 +1997,22 @@ sql_parse_values_clause(Arena* arena, SQL_Token **tokens, U64 *token_index, U64 
            (*tokens)[*token_index].type != SQL_TokenType_Symbol &&
            !str8_match((*tokens)[*token_index].value, str8_lit(")"), 0))
     {
+      B32 is_null_token = (*tokens)[*token_index].type == SQL_TokenType_Keyword &&
+                          str8_match((*tokens)[*token_index].value, str8_lit("null"), StringMatchFlag_CaseInsensitive);
+
       if ((*tokens)[*token_index].type != SQL_TokenType_Number &&
-          (*tokens)[*token_index].type != SQL_TokenType_String)
+          (*tokens)[*token_index].type != SQL_TokenType_String &&
+          !is_null_token)
       {
         sql_parse_error_at((*tokens)[*token_index].range,
                            "expected a literal value in 'values' clause, found '%.*s'",
                            str8_varg((*tokens)[*token_index].value));
         return NULL;
       }
-      
+
       SQL_Node* value_node = push_array(arena, SQL_Node, 1);
-      value_node->type = (*tokens)[*token_index].type == SQL_TokenType_Number ? SQL_NodeType_Numeric : SQL_NodeType_Literal;
+      value_node->type = is_null_token ? SQL_NodeType_Null :
+        ((*tokens)[*token_index].type == SQL_TokenType_Number ? SQL_NodeType_Numeric : SQL_NodeType_Literal);
       value_node->value = (*tokens)[*token_index].value;
       (*token_index)++;
       
@@ -2007,8 +2225,7 @@ sql_parse_expression(Arena* arena, SQL_Token **tokens, U64 *token_index, U64 tok
   
   if (token->type == SQL_TokenType_Identifier)
   {
-    // tec: identifier immediately followed by '(' -> aggregate/function call, e.g.
-    // HAVING COUNT(*) > 1 - mirrors sql_parse_select_item's handling of the same shape.
+    // tec: identifier immediately followed by '(' -> aggregate/function call, e.g. HAVING COUNT(*) > 1
     if (*token_index + 1 < token_count &&
         (*tokens)[*token_index + 1].type == SQL_TokenType_Symbol &&
         str8_match((*tokens)[*token_index + 1].value, str8_lit("("), 0))
@@ -2076,6 +2293,7 @@ sql_node_type_to_string(SQL_NodeType type)
   switch (type)
   {
     case SQL_NodeType_Use: result = str8_lit("SQL_NodeType_Use"); break;
+    case SQL_NodeType_Describe: result = str8_lit("SQL_NodeType_Describe"); break;
     case SQL_NodeType_Select: result = str8_lit("SQL_NodeType_Select"); break;
     case SQL_NodeType_Column: result = str8_lit("SQL_NodeType_Column"); break;
     case SQL_NodeType_ColumnList: result = str8_lit("SQL_NodeType_ColumnList"); break;
@@ -2093,6 +2311,12 @@ sql_node_type_to_string(SQL_NodeType type)
     case SQL_NodeType_Drop: result = str8_lit("SQL_NodeType_Drop"); break;
     case SQL_NodeType_Index: result = str8_lit("SQL_NodeType_Index"); break;
     case SQL_NodeType_DropIndex: result = str8_lit("SQL_NodeType_DropIndex"); break;
+    case SQL_NodeType_Null: result = str8_lit("SQL_NodeType_Null"); break;
+    case SQL_NodeType_NotNull: result = str8_lit("SQL_NodeType_NotNull"); break;
+    case SQL_NodeType_Unique: result = str8_lit("SQL_NodeType_Unique"); break;
+    case SQL_NodeType_PrimaryKey: result = str8_lit("SQL_NodeType_PrimaryKey"); break;
+    case SQL_NodeType_ForeignKey: result = str8_lit("SQL_NodeType_ForeignKey"); break;
+    case SQL_NodeType_Check: result = str8_lit("SQL_NodeType_Check"); break;
     case SQL_NodeType_Alter: result = str8_lit("SQL_NodeType_Alter"); break;
     case SQL_NodeType_Row: result = str8_lit("SQL_NodeType_Row"); break;
     case SQL_NodeType_Value: result = str8_lit("SQL_NodeType_Value"); break;

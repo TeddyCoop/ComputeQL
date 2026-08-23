@@ -207,8 +207,7 @@ qe_compile_condition(QE_BytecodeProgram* prog, GDB_Table* table, IR_Node* condit
     return;
   }
   
-  // tec: string comparisons
-  // column op 'literal', where the column is a String8 column.
+  // tec: string comparisons - column op 'literal', where the column is a String8 column
   if (left->type == IR_NodeType_Column && right->type == IR_NodeType_Literal)
   {
     QE_ColumnBinding* binding = qe_bind_column(prog, table, left->value);
@@ -1469,7 +1468,31 @@ qe_aggregate(Arena* arena, GDB_Database* database, PLAN_RowSet* input, IR_Node* 
   U32 num_exprs = 0;
   qe_aggregate_collect_exprs(arena, input, column_list_ir ? column_list_ir->first : NULL, exprs, &num_exprs);
   qe_aggregate_collect_exprs(arena, input, having_ir ? having_ir->first : NULL, exprs, &num_exprs);
-  
+
+  // tec: GROUP BY/aggregate kernels dont know about NULL yet, so a NULL cell is grouped/summed using its placeholder value instead of being excluded
+  {
+    B32 warned = 0;
+    for (U32 c = 0; c < num_group_cols && !warned; c++)
+    {
+      if (group_columns[c]->null_flags)
+      {
+        log_error("qe_aggregate: GROUP BY column '%.*s' has NULLs - they are not excluded/grouped per standard SQL semantics yet",
+                  str8_varg(group_columns[c]->name));
+        warned = 1;
+      }
+    }
+    for (U32 e = 0; e < num_exprs && !warned; e++)
+    {
+      if (exprs[e].arg_column && exprs[e].arg_column->null_flags)
+      {
+        log_error("qe_aggregate: aggregate argument column '%.*s' has NULLs - they are not excluded from SUM/AVG/MIN/MAX/COUNT yet",
+                  str8_varg(exprs[e].arg_column->name));
+        warned = 1;
+      }
+    }
+  }
+
+
   //- tec: no point spinning up a GPU dispatch for zero rows.
   if (row_count == 0)
   {
@@ -1980,6 +2003,9 @@ qe_try_index_scan(Arena* arena, GDB_Table* table, IR_Node* where_clause, QE_Scan
   GDB_Column* column = gdb_table_find_column(table, qe_bare_column_name(left->value));
   if (!column) return 0;
 
+  // tec: the sorted (key,row) array has no room for NULLs to sort correctly against a real value, so fall back rather than risk treating a NULL as its placeholder value
+  if (column->null_flags) return 0;
+
   GDB_Index* index = gdb_table_find_index_on_column(table, column);
   if (!index) return 0;
 
@@ -2156,10 +2182,12 @@ qe_row_load_value(Arena* arena, PLAN_RowSet* rows, IR_Node* node, U64 output_row
 
     U64 row = rows->row_indices[slot][output_row];
     if (row == PLAN_NULL_ROW) { *out_is_null = 1; return 0.0; }
-    
+
     GDB_Column* column = gdb_table_find_column(table, bare);
     if (!column) return 0.0;
-    
+
+    if (gdb_column_is_null(column, row)) { *out_is_null = 1; return 0.0; }
+
     if (column->type == GDB_ColumnType_String8)
     {
       *out_is_string = 1;
@@ -2204,7 +2232,24 @@ qe_row_condition_eval(Arena* arena, PLAN_RowSet* rows, IR_Node* condition, U64 o
   {
     return qe_row_condition_eval(arena, rows, left, output_row) || qe_row_condition_eval(arena, rows, right, output_row);
   }
-  
+
+  if (str8_match(op, str8_lit("is null"), StringMatchFlag_CaseInsensitive) ||
+      str8_match(op, str8_lit("is not null"), StringMatchFlag_CaseInsensitive))
+  {
+    if (!left)
+    {
+      log_error("qe_row_condition_eval: malformed 'is null', missing operand");
+      return 1;
+    }
+
+    B32 lstr = 0, lnull = 0;
+    String8 ls = {0};
+    qe_row_load_value(arena, rows, left, output_row, &lstr, &ls, &lnull);
+
+    B32 is_not = str8_match(op, str8_lit("is not null"), StringMatchFlag_CaseInsensitive);
+    return is_not ? !lnull : lnull;
+  }
+
   if (!left || !right)
   {
     log_error("qe_row_condition_eval: malformed comparison, missing operand(s)");
@@ -2236,6 +2281,44 @@ qe_row_condition_eval(Arena* arena, PLAN_RowSet* rows, IR_Node* condition, U64 o
   
   log_error("qe_row_condition_eval: unsupported operator '%.*s'", str8_varg(op));
   return 1;
+}
+
+internal QE_ScanResult
+qe_cpu_scan_filter(Arena* arena, GDB_Table* table, IR_Node* where_clause)
+{
+  QE_ScanResult result = {0};
+  U64 row_count = table->row_count;
+
+  Temp scratch = scratch_begin(&arena, 1);
+
+  GDB_Table* tables_arr[1] = { table };
+  U64* all_rows = push_array(scratch.arena, U64, Max(row_count, 1));
+  for (U64 i = 0; i < row_count; i++) all_rows[i] = i;
+  U64* row_indices_arr[1] = { all_rows };
+
+  PLAN_RowSet rows = {0};
+  rows.tables = tables_arr;
+  rows.table_count = 1;
+  rows.row_indices = row_indices_arr;
+  rows.count = row_count;
+
+  IR_Node* condition_root = where_clause ? where_clause->first : NULL;
+
+  U64* matched = push_array(arena, U64, Max(row_count, 1));
+  U64 matched_count = 0;
+  for (U64 i = 0; i < row_count; i++)
+  {
+    if (qe_row_condition_eval(arena, &rows, condition_root, i))
+    {
+      matched[matched_count++] = i;
+    }
+  }
+
+  result.indices = matched;
+  result.count = matched_count;
+
+  scratch_end(scratch);
+  return result;
 }
 
 internal PLAN_RowSet

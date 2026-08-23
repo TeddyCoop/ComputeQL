@@ -47,6 +47,7 @@ global String8 g_sql_keywords[] =
   str8_lit_comp("insert"),
   str8_lit_comp("import"),
   str8_lit_comp("create"),
+  str8_lit_comp("describe"),
   str8_lit_comp("contains"),
   str8_lit_comp("equals"),
   str8_lit_comp("drop"),
@@ -59,6 +60,14 @@ global String8 g_sql_keywords[] =
   str8_lit_comp("rename"),
   str8_lit_comp("column"),
   str8_lit_comp("index"),
+  str8_lit_comp("null"),
+  str8_lit_comp("is"),
+  str8_lit_comp("not"),
+  str8_lit_comp("unique"),
+  str8_lit_comp("primary"),
+  str8_lit_comp("key"),
+  str8_lit_comp("references"),
+  str8_lit_comp("check"),
   str8_lit_comp("as"),
   str8_lit_comp("inner"),
   str8_lit_comp("left"),
@@ -105,13 +114,7 @@ struct SQL_TokenizeResult
 internal SQL_TokenizeResult sql_tokenize_from_text(Arena* arena, String8 text);
 internal void sql_tokens_print(SQL_TokenizeResult tokens);
 
-//~ tec: parse error reporting
-//
-// The parser keeps only the first error it hits (later ones are usually
-// cascades from the same root cause once the token stream is out of sync).
-// sql_parse() resets this at the start of every parse, so it's only ever
-// meaningful for the parse currently in flight (this codebase runs one
-// query at a time on a single thread - see app_execute_query)
+//~ tec: parse error reporting - only the first error is kept, since later ones are usually cascades once the token stream is out of sync
 
 typedef struct SQL_ParseError SQL_ParseError;
 struct SQL_ParseError
@@ -147,6 +150,12 @@ typedef enum SQL_NodeType
   SQL_NodeType_Drop,
   SQL_NodeType_Index,
   SQL_NodeType_DropIndex,
+  SQL_NodeType_Null,
+  SQL_NodeType_NotNull,
+  SQL_NodeType_Unique,
+  SQL_NodeType_PrimaryKey,
+  SQL_NodeType_ForeignKey,
+  SQL_NodeType_Check,
   SQL_NodeType_Alter,
   SQL_NodeType_Row,
   SQL_NodeType_Value,
@@ -166,6 +175,7 @@ typedef enum SQL_NodeType
   SQL_NodeType_Limit,
   SQL_NodeType_Offset,
   SQL_NodeType_AggregateCall,
+  SQL_NodeType_Describe,
 } SQL_NodeType;
 
 typedef struct SQL_Node SQL_Node;
@@ -205,6 +215,7 @@ internal SQL_Node* sql_parse_group_by_clause(Arena* arena, SQL_Token **tokens, U
 internal SQL_Node* sql_parse_having_clause(Arena* arena, SQL_Token **tokens, U64 *token_index, U64 token_count);
 internal SQL_Node* sql_parse_limit_clause(Arena* arena, SQL_Token **tokens, U64 *token_index, U64 token_count);
 internal SQL_Node* sql_parse_offset_clause(Arena* arena, SQL_Token **tokens, U64 *token_index, U64 token_count);
+internal SQL_Node* sql_parse_describe_clause(Arena* arena, SQL_Token **tokens, U64 *token_index, U64 token_count);
 internal SQL_Node* sql_parse(Arena* arena, SQL_Token* tokens, U64 token_count, String8 source_text);
 
 internal String8 sql_node_type_to_string(SQL_NodeType type);

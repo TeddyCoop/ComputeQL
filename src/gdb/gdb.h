@@ -50,6 +50,9 @@
 #define GDB_DISK_BACKED_THRESHOLD_SIZE KB(4)
 #endif
 
+// tec: reserved name for the column catalog table
+#define GDB_COLUMN_CATALOG_TABLE_NAME str8_lit("column_catalog")
+
 //~ tec: column information 
 typedef U32 GDB_ColumnType;
 enum
@@ -95,6 +98,8 @@ typedef struct GDB_Column GDB_Column;
 typedef struct GDB_Table GDB_Table;
 typedef struct GDB_Database GDB_Database;
 
+typedef struct IR_Node IR_Node;
+
 struct GDB_Column
 {
   Arena* arena;
@@ -109,7 +114,25 @@ struct GDB_Column
   // tec: data storage
   U8 *data;
   U64 *offsets;
-  
+
+  // tec: NULL tracking
+  U8* null_flags;
+  U64 null_flags_capacity;
+
+  //- tec: constraints, single-column only
+  B32 not_null;        // tec: NOT NULL or PRIMARY KEY
+  B32 is_unique;       // tec: UNIQUE or PRIMARY KEY
+  B32 is_primary_key;  // tec: implies not_null && is_unique
+
+  B32 has_foreign_key;
+  String8 fk_ref_table_name;
+  String8 fk_ref_column_name;
+
+  // tec: CHECK(...), check_text is saved and reparsed into check_expr on table load
+  B32 has_check;
+  String8 check_text;
+  IR_Node* check_expr;
+
   //- tec: io
   B32 is_disk_backed;
   B32 disk_backed_offset_initialized;
@@ -213,14 +236,17 @@ internal B32 gdb_database_save(GDB_Database* database, String8 directory);
 internal GDB_Database* gdb_database_load(String8 directory);
 internal void gdb_database_close(GDB_Database* database);
 internal GDB_Table* gdb_database_find_table(GDB_Database* database, String8 table_name);
+internal GDB_Table* gdb_database_build_column_catalog(GDB_Database* database);
+internal GDB_Table* gdb_database_find_table_or_catalog(GDB_Database* database, String8 name);
 
 //~ tec: tables
 internal GDB_Table* gdb_table_alloc(String8 name);
 internal void gdb_table_release(GDB_Table* table);
 internal void gdb_table_add_column(GDB_Table* table, GDB_ColumnSchema schema);
 internal void gdb_table_remove_column(GDB_Table* table, GDB_Column* column);
-internal void gdb_table_add_row(GDB_Table* table, void** row_data);
+internal void gdb_table_add_row(GDB_Table* table, void** row_data, B32* null_flags);
 internal void gdb_table_remove_row(GDB_Table* table, U64 row_index);
+internal B32 gdb_table_may_have_nulls(GDB_Table* table);
 internal B32 gdb_table_save(GDB_Table* table, String8 table_dir);
 internal B32 gdb_table_export_csv(GDB_Table* table, String8 path);
 internal GDB_Table* gdb_table_load(String8 table_dir, String8 meta_path);
@@ -234,6 +260,9 @@ internal void gdb_table_drop_index(GDB_Table* table, String8 index_name);
 internal GDB_Index* gdb_table_find_index(GDB_Table* table, String8 index_name);
 internal GDB_Index* gdb_table_find_index_on_column(GDB_Table* table, GDB_Column* column);
 
+//~ tec: constraints
+internal B32 gdb_column_has_any_constraint(GDB_Column* column);
+
 //~ tec: columns
 internal GDB_Column* gdb_column_alloc(String8 name, GDB_ColumnType type, U64 size);
 internal void gdb_column_release(GDB_Column* column);
@@ -244,8 +273,10 @@ internal U64 gdb_column_get_total_size(GDB_Column* column);
 
 internal void gdb_column_add_data_disk_backed(GDB_Column* column, void* data);
 internal void gdb_column_add_data(GDB_Column* column, void* data);
+internal void gdb_column_add_data_maybe_null(GDB_Column* column, void* data, B32 is_null);
 internal void* gdb_column_get_data(GDB_Column* column, U64 index);
 internal void gdb_column_remove_data(GDB_Column* column, U64 row_index);
+internal B32 gdb_column_is_null(GDB_Column* column, U64 row_index);
 internal void* gdb_column_get_data_range(Arena* arena, GDB_Column* column, Rng1U64 row_range, U64* out_size);
 internal GDB_StringDataChunk gdb_column_get_string_chunk(Arena* arena, GDB_Column* column, Rng1U64 row_range);
 
@@ -258,5 +289,6 @@ internal String8 string_from_gdb_column_type(GDB_ColumnType type);
 internal GDB_ColumnSchema gdb_column_schema_create(String8 name, GDB_ColumnType type);
 internal GDB_ColumnType gdb_infer_column_type(String8 value);
 internal GDB_ColumnType gdb_promote_type(GDB_ColumnType existing, GDB_ColumnType new_type);
+internal String8 gdb_column_type_display_name(GDB_ColumnType type);
 
 #endif //GDB_H

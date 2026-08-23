@@ -93,8 +93,9 @@ internal QE_ScanResult qe_scan_filter(Arena* arena, GDB_Database* database, GDB_
 // falls back to qe_scan_filter. on success, fills out_result and returns 1.
 internal B32 qe_try_index_scan(Arena* arena, GDB_Table* table, IR_Node* where_clause, QE_ScanResult* out_result);
 
+internal QE_ScanResult qe_cpu_scan_filter(Arena* arena, GDB_Table* table, IR_Node* where_clause);
+
 //~ tec: shared query-result representation
-// lives here because the unity build
 #define PLAN_NULL_ROW max_U64 // tec: unmatched side of a LEFT JOIN - treat a column read against this as NULL
 
 typedef struct PLAN_RowSet PLAN_RowSet;
