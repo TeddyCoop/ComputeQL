@@ -127,7 +127,34 @@ global SQL_ParseError g_sql_parse_error;
 global String8 g_sql_source_text;
 
 internal void sql_parse_error_at(Rng1U64 range, char *fmt, ...);
-internal Rng1U64 sql_token_range_at(SQL_Token *tokens, U64 token_index, U64 token_count);
+
+//~ tec: parse context
+typedef struct SQL_ParseCtx SQL_ParseCtx;
+struct SQL_ParseCtx
+{
+  Arena     *arena;
+  SQL_Token *tokens;
+  U64        count;
+  U64        pos;
+};
+
+internal SQL_ParseCtx sql_parse_ctx_make(Arena *arena, SQL_Token *tokens, U64 count);
+
+internal SQL_Token sql_peek(SQL_ParseCtx *ctx, U64 lookahead); 
+internal SQL_Token sql_take(SQL_ParseCtx *ctx);
+internal void      sql_advance(SQL_ParseCtx *ctx, U64 n);
+internal B32       sql_at_end(SQL_ParseCtx *ctx);
+
+// tec: value == {0} means "any value of this type"
+internal B32 sql_check(SQL_ParseCtx *ctx, SQL_TokenType type, String8 value); // peek match, doesn't consume
+internal B32 sql_match(SQL_ParseCtx *ctx, SQL_TokenType type, String8 value); // check + consume if it matched
+
+// tec: scans forward from ctx->pos for a depth-0 match (respects '(' ')' nesting), without consuming
+internal B32 sql_find(SQL_ParseCtx *ctx, SQL_TokenType type, String8 value, U64 *out_pos);
+
+internal Rng1U64 sql_ctx_range_at(SQL_ParseCtx *ctx, U64 pos);
+internal Rng1U64 sql_ctx_error_range(SQL_ParseCtx *ctx);
+internal String8  sql_ctx_text_or_eof(SQL_ParseCtx *ctx);
 
 //~ tec: sql ast
 typedef enum SQL_NodeType
@@ -191,31 +218,31 @@ struct SQL_Node
   SQL_NodeType type;
 };
 
-internal SQL_Node* sql_parse_use_clause(Arena* arena, SQL_Token **tokens, U64 *token_index, U64 token_count);
-internal SQL_Node* sql_parse_select_clause(Arena* arena, SQL_Token **tokens, U64 *token_index, U64 token_count);
-internal SQL_Node* sql_parse_select_item(Arena* arena, SQL_Token **tokens, U64 *token_index, U64 token_count);
-internal SQL_Node* sql_parse_column_ref(Arena* arena, SQL_Token **tokens, U64 *token_index, U64 token_count);
-internal SQL_Node* sql_parse_table_ref(Arena* arena, SQL_Token **tokens, U64 *token_index, U64 token_count);
-internal SQL_Node* sql_parse_from_clause(Arena* arena, SQL_Token **tokens, U64 *token_index, U64 token_count, SQL_Node *select_node);
-internal SQL_Node* sql_parse_join_clause(Arena* arena, SQL_Token **tokens, U64 *token_index, U64 token_count);
-internal SQL_Node* sql_parse_where_clause(Arena* arena, SQL_Token **tokens, U64 *token_index, U64 token_count);
-internal SQL_Node* sql_parse_insert_clause(Arena* arena, SQL_Token **tokens, U64 *token_index, U64 token_count);
-internal SQL_Node* sql_parse_import_clause(Arena* arena, SQL_Token **tokens, U64 *token_index, U64 token_count);
-internal SQL_Node* sql_parse_create_clause(Arena* arena, SQL_Token **tokens, U64 *token_index, U64 token_count);
-internal SQL_Node* sql_parse_alter_clause(Arena* arena, SQL_Token **tokens, U64 *token_index, U64 token_count);
-internal SQL_Node* sql_parse_delete_clause(Arena* arena, SQL_Token **tokens, U64 *token_index, U64 token_count);
-internal SQL_Node* sql_parse_drop_index_clause(Arena* arena, SQL_Token **tokens, U64 *token_index, U64 token_count);
-internal SQL_Node* sql_parse_values_clause(Arena* arena, SQL_Token **tokens, U64 *token_index, U64 token_count);
-internal SQL_Node* sql_parse_expression(Arena* arena, SQL_Token **tokens, U64 *token_index, U64 token_count);
-internal SQL_Node* sql_parse_comparison_expression(Arena* arena, SQL_Token **tokens, U64 *token_index, U64 token_count);
-internal SQL_Node* sql_parse_and_expression(Arena* arena, SQL_Token **tokens, U64 *token_index, U64 token_count);
-internal SQL_Node* sql_parse_logical_expression(Arena* arena, SQL_Token **tokens, U64 *token_index, U64 token_count);
-internal SQL_Node* sql_parse_order_by_clause(Arena* arena, SQL_Token **tokens, U64 *token_index, U64 token_count);
-internal SQL_Node* sql_parse_group_by_clause(Arena* arena, SQL_Token **tokens, U64 *token_index, U64 token_count);
-internal SQL_Node* sql_parse_having_clause(Arena* arena, SQL_Token **tokens, U64 *token_index, U64 token_count);
-internal SQL_Node* sql_parse_limit_clause(Arena* arena, SQL_Token **tokens, U64 *token_index, U64 token_count);
-internal SQL_Node* sql_parse_offset_clause(Arena* arena, SQL_Token **tokens, U64 *token_index, U64 token_count);
-internal SQL_Node* sql_parse_describe_clause(Arena* arena, SQL_Token **tokens, U64 *token_index, U64 token_count);
+internal SQL_Node* sql_parse_use_clause(SQL_ParseCtx *ctx);
+internal SQL_Node* sql_parse_select_clause(SQL_ParseCtx *ctx);
+internal SQL_Node* sql_parse_select_item(SQL_ParseCtx *ctx);
+internal SQL_Node* sql_parse_column_ref(SQL_ParseCtx *ctx);
+internal SQL_Node* sql_parse_table_ref(SQL_ParseCtx *ctx);
+internal SQL_Node* sql_parse_from_clause(SQL_ParseCtx *ctx, SQL_Node *select_node);
+internal SQL_Node* sql_parse_join_clause(SQL_ParseCtx *ctx);
+internal SQL_Node* sql_parse_where_clause(SQL_ParseCtx *ctx);
+internal SQL_Node* sql_parse_insert_clause(SQL_ParseCtx *ctx);
+internal SQL_Node* sql_parse_import_clause(SQL_ParseCtx *ctx);
+internal SQL_Node* sql_parse_create_clause(SQL_ParseCtx *ctx);
+internal SQL_Node* sql_parse_alter_clause(SQL_ParseCtx *ctx);
+internal SQL_Node* sql_parse_delete_clause(SQL_ParseCtx *ctx);
+internal SQL_Node* sql_parse_drop_index_clause(SQL_ParseCtx *ctx);
+internal SQL_Node* sql_parse_values_clause(SQL_ParseCtx *ctx);
+internal SQL_Node* sql_parse_expression(SQL_ParseCtx *ctx);
+internal SQL_Node* sql_parse_comparison_expression(SQL_ParseCtx *ctx);
+internal SQL_Node* sql_parse_and_expression(SQL_ParseCtx *ctx);
+internal SQL_Node* sql_parse_logical_expression(SQL_ParseCtx *ctx);
+internal SQL_Node* sql_parse_order_by_clause(SQL_ParseCtx *ctx);
+internal SQL_Node* sql_parse_group_by_clause(SQL_ParseCtx *ctx);
+internal SQL_Node* sql_parse_having_clause(SQL_ParseCtx *ctx);
+internal SQL_Node* sql_parse_limit_clause(SQL_ParseCtx *ctx);
+internal SQL_Node* sql_parse_offset_clause(SQL_ParseCtx *ctx);
+internal SQL_Node* sql_parse_describe_clause(SQL_ParseCtx *ctx);
 internal SQL_Node* sql_parse(Arena* arena, SQL_Token* tokens, U64 token_count, String8 source_text);
 
 internal String8 sql_node_type_to_string(SQL_NodeType type);

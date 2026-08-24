@@ -687,8 +687,8 @@ gdb_parse_check_expression(Arena* arena, String8 check_text)
   g_sql_source_text = check_text;
 
   SQL_TokenizeResult tok = sql_tokenize_from_text(arena, check_text);
-  U64 token_index = 0;
-  SQL_Node* expr_sql = sql_parse_logical_expression(arena, &tok.tokens, &token_index, tok.count);
+  SQL_ParseCtx ctx = sql_parse_ctx_make(arena, tok.tokens, tok.count);
+  SQL_Node* expr_sql = sql_parse_logical_expression(&ctx);
 
   if (!expr_sql || g_sql_parse_error.has_error)
   {
