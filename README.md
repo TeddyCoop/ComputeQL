@@ -2,14 +2,15 @@
 
 ComputeQL is a from-scratch, columnar SQL database written in C99 that executes queries as **GPU compute kernels** instead of on the CPU. Rather than compiling a bespoke shader per query, it interprets a compact **bytecode VM** inside a small library of precompiled Vulkan compute shaders - so arbitrary WHERE-clause expressions can be evaluated on the GPU without any runtime shader compilation.
 
-> **Status:** ComputeQL is the successor of a previous project GDB. The storage engine, Vulkan execution backend, and SQL parser are functional; query planning and multi-operator GPU execution (joins, sorts, aggregates) are in progress. See [Roadmap](#roadmap) below for exactly what's implemented today versus planned.
+> **Status:** ComputeQL is the successor of a previous project GDB. The storage engine, SQL parser, query planner, and multi-operator GPU execution (joins, sorts, aggregates) are all functional end-to-end. Current work is focused on constraints/indexing and closing the performance gap with CPU databases on small/selective queries. See [Roadmap](#roadmap) below for exactly what's implemented today versus planned.
 
 ## How it works
 
 1. **Storage** - Data lives in a hand-rolled columnar format (`GDB_Database` -> `GDB_Table` -> `GDB_Column`), one file per column, memory-mapped on load. Small columns are loaded fully into memory; columns past a size threshold are streamed/disk-backed automatically.
 2. **Parsing** - A hand-rolled recursive-descent SQL tokenizer/parser turns query text into an AST, with position-aware syntax error reporting (line, column, and a caret pointing at the offending token).
 3. **IR lowering** - The AST is lowered into an intermediate representation (IR) tree that the execution layer walks directly.
-4. **GPU execution** - WHERE-clause expressions are compiled to a small stack-based bytecode ISA. The CPU uploads column data and the bytecode program to fixed GPU descriptor bindings, dispatches a Vulkan compute shader that interprets the bytecode per-row, and reads back matching row indices. Tables larger than the configured GPU buffer size are automatically chunked across multiple dispatches.
+4. **Planning** - The IR for a `SELECT` is lowered into a plan tree (`Limit(Sort(Project(Having(Aggregate(Filter(Join-tree))))))`) that composes fixed physical operators - there's no cost-based optimizer yet (no join reordering or predicate pushdown), so today there's exactly one plan per query.
+5. **GPU execution** - Each physical operator (scan+filter, hash join, bitonic sort, group-by/aggregate) is backed by a Vulkan compute shader. WHERE/ON/HAVING-style expressions are compiled to a small stack-based bytecode ISA and interpreted per-row/per-group on the GPU; the CPU uploads column data and the bytecode program to fixed descriptor bindings, dispatches, and reads back results. Tables larger than the configured GPU buffer size are automatically chunked across multiple dispatches. An equality/range predicate on an indexed column can instead be served by a CPU-side binary search over that column, skipping the GPU dispatch entirely.
 
 ## Current capabilities
 
@@ -18,38 +19,53 @@ ComputeQL is a from-scratch, columnar SQL database written in C99 that executes 
 - Supported column types: `u32`, `u64`, `f32`, `f64`, `string8`
 - Automatic in-memory vs. disk-backed storage depending on column size
 - CSV import (streaming, for datasets larger than memory) and CSV export
+- Per-column NULL tracking
+- Single-column constraints: `NOT NULL`, `UNIQUE`, `PRIMARY KEY`, `FOREIGN KEY ... REFERENCES table(column)`, `CHECK(...)` - enforced on `INSERT`
+- `CREATE INDEX ... ON table(column)` / `DROP INDEX` - index metadata persists with the table; the sorted scan order itself is built on demand at query time
+- A reserved `column_catalog` system table exposing per-column metadata (type, constraints, index membership), queryable like any other table, plus `DESCRIBE <table>`
 
 **SQL support**
-- `USE`, `CREATE DATABASE`, `CREATE TABLE`, `ALTER TABLE` (add/drop column, rename), `DROP`
-- `INSERT INTO ... (columns) VALUES (...), (...), ...` (multi-row)
+- `USE`, `CREATE DATABASE`, `CREATE TABLE` (with column constraints), `CREATE INDEX`, `ALTER TABLE` (add/drop column, rename), `DROP INDEX`
+- `INSERT INTO ... (columns) VALUES (...), (...), ...` (multi-row), constraint-checked against `NOT NULL`/`UNIQUE`/`PRIMARY KEY`/`FOREIGN KEY`/`CHECK`
 - `IMPORT INTO <table> FROM '<csv path>'`
 - `SELECT` with:
-  - Multi-table `FROM t1, t2` and explicit `INNER JOIN` / `LEFT [OUTER] JOIN ... ON`
+  - Multi-table `FROM t1, t2` and explicit `INNER JOIN` / `LEFT [OUTER] JOIN ... ON` (equi-joins, numeric or string keys)
   - Qualified column references (`table.column`) and `AS` aliases on tables and columns
-  - `WHERE` with full operator precedence: `AND`/`OR` (correct binding, parenthesized sub-expressions), comparisons (`=`, `==`, `!=`, `<`, `>`, `<=`, `>=`), and string `contains`/`equals`
-  - `GROUP BY`, `HAVING`, and aggregate calls (`COUNT(*)`, `SUM(col)`, etc.) in both the SELECT list and HAVING expressions
-  - `ORDER BY` (`ASC`/`DESC`), `LIMIT`, `OFFSET`
+  - `WHERE`/`ON`/`HAVING` with full operator precedence: `AND`/`OR` (correct binding, parenthesized sub-expressions), comparisons (`=`, `==`, `!=`, `<`, `>`, `<=`, `>=`), `IS [NOT] NULL`, and string `contains`/`equals`
+  - `GROUP BY`, `HAVING`, and aggregate calls (`COUNT(*)`, `SUM`, `AVG`, `MIN`, `MAX`) in both the SELECT list and HAVING expressions
+  - `ORDER BY` (`ASC`/`DESC`, up to 4 numeric columns), `LIMIT`, `OFFSET`
+  - `DESCRIBE <table>`
 - Real syntax error messages with source position (line/column + caret)
 
 **GPU execution**
 - Vulkan compute backend with double-precision (`shaderFloat64`) comparisons for exact numeric semantics
-- A reusable per-row bytecode VM (comparisons, boolean logic, string equality/`contains`) interpreted by a single scan+filter shader
+- A reusable bytecode VM (comparisons, boolean logic, string equality/`contains`) shared across operators, interpreted by dedicated compute shaders for scan+filter, hash join (build/probe), bitonic sort, and group-by/aggregate (hash + CSR scatter + per-group reduction)
+- Cached shader modules/pipelines/descriptor sets and a pooled GPU buffer allocator, so steady-state queries don't pay pipeline/allocation setup cost repeatedly
+- Bulk column materialization for `SELECT` output (one gather pass per column instead of a syscall per row/column)
 - Automatic chunking for tables that exceed the GPU's max buffer size
 
 **Platform**
 - Windows x64 (MSVC or Clang), Vulkan 1.x required. Linux/macOS are not currently supported.
 
+## Performance
+
+A benchmark harness (`src/tests/`, run via `build_and_run_tests.bat`) compares ComputeQL against SQLite on small (50-row) and large (100k-row) tables, reporting prepare/execute/total timings and cross-checking row counts and a checksum between engines. Bulk column materialization and GPU resource pooling/caching (see [Current capabilities](#current-capabilities) above) keep large scans and large result sets efficient. The next performance focus is reducing fixed per-query overhead on small, highly selective queries, where ComputeQL still trails an in-memory CPU engine like SQLite.
+
 ## Roadmap
 
 Ordered from "next" to "later":
 
-- [ ] **Query planner** - introduce a logical -> physical planning stage between IR generation and execution (predicate pushdown, column pruning, join ordering), replacing today's direct single-shot scan+filter dispatch.
-- [ ] **GPU join kernel** - hash join for the inner/left equi-joins the parser already accepts.
-- [ ] **GPU sort kernel** - for `ORDER BY` (a GPU bitonic sort is the natural fit).
-- [ ] **GPU group-by/aggregate kernel** - `SUM`/`COUNT`/`AVG`/`MIN`/`MAX`, keyed by group.
-- [ ] **GPU projection kernel** - move column projection off the CPU path and into the same operator pipeline as scan/filter/join/sort.
-- [ ] **`INSERT`/`ALTER`/`DELETE` execution hardening** - `DELETE` currently parses but isn't executed yet, and `INSERT` without an explicit column list has a known crash (tracked internally); both need attention alongside the planner work.
-- [ ] **Cross-engine benchmarking** - driver scripts to run head-to-head comparisons and publish results.
+- [ ] **Reduce fixed per-query GPU overhead** - batch a query's buffer uploads/dispatch/readback into a single submission instead of several round trips, so small/selective queries approach CPU-engine latency.
+- [ ] **`INSERT`/`ALTER`/`DELETE` execution hardening** - finish `DELETE` execution and `ALTER TABLE` execution, and support `INSERT` without an explicit column list.
+- [ ] **Self-joins via alias** - support `FROM t AS a JOIN t AS b ON ...` by resolving qualifiers against table aliases rather than table identity.
+- [ ] **`ORDER BY` on string columns** - extend the sort kernel beyond numeric columns.
+- [ ] **GPU projection kernel** - move column projection for `SELECT` off the CPU and into the GPU operator pipeline.
+- [ ] **`EXPLAIN <query>`** - print the planner's plan tree for a query, for understanding and tuning how a query will execute.
+- [ ] **Chunked cross-bucket hashing** - support `GROUP BY`/hash-join tables larger than the GPU's max buffer size.
+- [ ] **Persistent/sorted index storage** - maintain index sort order on disk instead of rebuilding it on demand each query.
+- [ ] **Cross-engine benchmarking against more engines** - extend the current SQLite-only harness to DuckDB/ClickHouse/Postgres and publish results.
+- [ ] **Client-server mode** - a long-running server process that keeps databases and the GPU context loaded and accepts queries over a network connection, instead of today's one-shot CLI invocation. A natural fit is speaking the Postgres wire protocol, so existing clients, ORMs, and BI tools work against it out of the box.
+- [ ] **Users & access control** - accounts and authentication for network connections, plus a role/permission model (`GRANT`/`REVOKE`) scoped to databases and tables, so a shared server isn't all-or-nothing access.
 - [ ] **Multi-GPU support**
 - [ ] **Additional GPU backends** (e.g. CUDA) alongside Vulkan
 - [ ] **Cross-platform support** (Linux/macOS)
@@ -77,7 +93,7 @@ On success, `build\gdb.exe` is produced, along with compiled shaders under `buil
 ### Run a query
 
 ```
-build\gdb.exe --query="CREATE DATABASE shop; USE shop; CREATE TABLE products (id u32, price f64, name string8); INSERT INTO products (id, price, name) VALUES (1, 9.99, 'widget'), (2, 19.99, 'gadget');"
+build\gdb.exe --query="CREATE DATABASE shop; USE shop; CREATE TABLE products (id u32 PRIMARY KEY, price f64 NOT NULL, name string8); CREATE INDEX idx_price ON products (price); INSERT INTO products (id, price, name) VALUES (1, 9.99, 'widget'), (2, 19.99, 'gadget');"
 build\gdb.exe --query="USE shop; SELECT id, name, price FROM products WHERE price > 5.00;"
 ```
 
@@ -89,12 +105,14 @@ Each invocation of `gdb.exe` runs the queries passed via `--query`, loading and 
 src/
   main.c              - unity build entry point (includes every .c in dependency order)
   application.c/h     - top-level query execution loop, dispatches parsed statements
-  gdb/                - columnar storage engine (databases, tables, columns, disk I/O, CSV)
+  gdb/                - columnar storage engine (databases, tables, columns, disk I/O, CSV, constraints, indexes)
   ir_gen/
     sql_parser.c/h    - SQL tokenizer + recursive-descent parser -> AST
     ir_gen.c/h        - AST -> IR lowering
-  query_exec/         - bytecode compiler (IR -> GPU bytecode) + GPU dispatch orchestration
+  planner/            - IR -> physical plan tree (join/filter/aggregate/having/project/sort/limit)
+  query_exec/         - bytecode compiler (IR -> GPU bytecode) + per-operator GPU dispatch orchestration
   gpu/
     vulkan/           - Vulkan backend + compute shaders (GLSL, compiled to SPIR-V at build time)
   os/                 - OS abstraction layer (Windows only today)
+  tests/              - benchmark harness comparing against SQLite (build_and_run_tests.bat)
 ```
