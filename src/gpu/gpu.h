@@ -26,6 +26,7 @@ typedef enum GPU_BufferFlags
 typedef struct GPU_State GPU_State;
 typedef struct GPU_Buffer GPU_Buffer;
 typedef struct GPU_Kernel GPU_Kernel;
+typedef struct GPU_Batch GPU_Batch;
 
 internal void gpu_init(void);
 internal void gpu_release(void);
@@ -51,5 +52,13 @@ internal void gpu_kernel_release(GPU_Kernel *kernel);
 internal void gpu_kernel_execute(GPU_Kernel* kernel, U32 global_work_size, U32 local_work_size);
 internal void gpu_kernel_set_arg_buffer(GPU_Kernel* kernel, U32 index, GPU_Buffer* buffer);
 internal void gpu_kernel_set_arg_u64(GPU_Kernel* kernel, U32 index, U64 value);
+
+//~ tec: batching
+internal GPU_Batch* gpu_batch_begin(U64 upload_bytes_needed, U64 download_bytes_needed);
+internal void gpu_batch_buffer_write(GPU_Batch* batch, GPU_Buffer* buffer, void* data, U64 size);
+internal void gpu_batch_buffer_zero(GPU_Batch* batch, GPU_Buffer* buffer, U64 size);
+internal void gpu_batch_kernel_execute(GPU_Batch* batch, GPU_Kernel* kernel, U32 global_work_size, U32 local_work_size);
+internal void gpu_batch_buffer_read(GPU_Batch* batch, GPU_Buffer* buffer, void* out_data, U64 size);
+internal void gpu_batch_end(GPU_Batch* batch);
 
 #endif //GPU_H

@@ -43,6 +43,33 @@ struct GPU_PooledBuffer
   void* imported_host_ptr;
 };
 
+#define GPU_BATCH_MAX_PENDING_READS 8
+
+typedef struct GPU_PendingRead GPU_PendingRead;
+struct GPU_PendingRead
+{
+  B32 from_staging;   
+  U64 staging_offset;
+  void* mapped_src;
+  void* out_data;
+  U64 size;
+};
+
+struct GPU_Batch
+{
+  VkCommandBuffer cmd;
+  U64 upload_cursor;
+  U64 download_cursor;
+
+  B32 wrote_since_barrier;
+  B32 dispatched_since_barrier;
+  B32 had_dispatch;
+  B32 has_commands;
+
+  GPU_PendingRead pending_reads[GPU_BATCH_MAX_PENDING_READS];
+  U32 pending_read_count;
+};
+
 struct GPU_State
 {
   Arena* arena;
@@ -98,6 +125,8 @@ struct GPU_State
   VkDeviceMemory download_staging_memory;
   void* download_staging_mapped;
   U64 download_staging_capacity;
+
+  GPU_Batch active_batch;
 };
 
 global GPU_State* g_vulkan_state = 0;

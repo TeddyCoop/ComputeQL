@@ -49,13 +49,14 @@ ComputeQL is a from-scratch, columnar SQL database written in C99 that executes 
 
 ## Performance
 
-A benchmark harness (`src/tests/`, run via `build_and_run_tests.bat`) compares ComputeQL against SQLite on small (50-row) and large (100k-row) tables, reporting prepare/execute/total timings and cross-checking row counts and a checksum between engines. Bulk column materialization and GPU resource pooling/caching (see [Current capabilities](#current-capabilities) above) keep large scans and large result sets efficient. The next performance focus is reducing fixed per-query overhead on small, highly selective queries, where ComputeQL still trails an in-memory CPU engine like SQLite.
+A benchmark harness (`src/tests/`, run via `build_and_run_tests.bat`) compares ComputeQL against SQLite on small (50-row) and large (100k-row) tables, reporting prepare/execute/total timings and cross-checking row counts and a checksum between engines. Bulk column materialization, GPU resource pooling/caching, and batched GPU submission for the scan+filter path (see [Roadmap](#roadmap)) keep per-query overhead low for the common case. The remaining performance focus is extending that same submission batching to the join/sort/aggregate kernels, and continuing to close the gap with in-memory CPU engines like SQLite on small, highly selective queries.
 
 ## Roadmap
 
 Ordered from "next" to "later":
 
-- [ ] **Reduce fixed per-query GPU overhead** - batch a query's buffer uploads/dispatch/readback into a single submission instead of several round trips, so small/selective queries approach CPU-engine latency.
+- [x] **Reduce fixed per-query GPU overhead (scan+filter)** - the scan+filter path now batches its buffer uploads, dispatch, and count readback into a single submission instead of several round trips.
+- [ ] **Reduce fixed per-query GPU overhead (join/sort/aggregate)** - extend the same batching to the join, sort, and aggregate kernels, which still submit once per buffer upload/dispatch/readback.
 - [ ] **`INSERT`/`ALTER`/`DELETE` execution hardening** - finish `DELETE` execution and `ALTER TABLE` execution, and support `INSERT` without an explicit column list.
 - [ ] **Self-joins via alias** - support `FROM t AS a JOIN t AS b ON ...` by resolving qualifiers against table aliases rather than table identity.
 - [ ] **`ORDER BY` on string columns** - extend the sort kernel beyond numeric columns.

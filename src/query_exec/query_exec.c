@@ -409,22 +409,29 @@ qe_scan_filter(Arena* arena, GDB_Database* database, GDB_Table* table, IR_Node* 
     return result;
   }
   
-  //- tec: upload the (query-invariant) bytecode + constant pool buffers once, outside the chunk loop
+  //- tec: upload the (query invariant) bytecode + constant pool buffers
   GPU_Buffer* bytecode_buffer = gpu_buffer_alloc_pooled(str8_lit("scan_filter_bytecode"), Max(prog->word_count, 1) * sizeof(U32), GPU_BufferFlag_Write, 0);
-  gpu_buffer_write(bytecode_buffer, prog->words, prog->word_count * sizeof(U32));
-
   GPU_Buffer* num_consts_buffer = gpu_buffer_alloc_pooled(str8_lit("scan_filter_num_consts"), Max(prog->const_count * 2, 1) * sizeof(U32), GPU_BufferFlag_Write, 0);
-  if (prog->const_count > 0)
+  GPU_Buffer* str_consts_buffer = gpu_buffer_alloc_pooled(str8_lit("scan_filter_str_consts"), Max(prog->str_const_pool_size, 4), GPU_BufferFlag_Write, 0);
+
   {
-    gpu_buffer_write(num_consts_buffer, prog->consts, prog->const_count * 2 * sizeof(U32));
+    U64 word_bytes = prog->word_count * sizeof(U32);
+    U64 num_consts_bytes = prog->const_count * 2 * sizeof(U32);
+    U64 str_bytes = prog->str_const_pool_size;
+
+    GPU_Batch* prog_batch = gpu_batch_begin(word_bytes + num_consts_bytes + str_bytes, 0);
+    gpu_batch_buffer_write(prog_batch, bytecode_buffer, prog->words, word_bytes);
+    if (prog->const_count > 0)
+    {
+      gpu_batch_buffer_write(prog_batch, num_consts_buffer, prog->consts, num_consts_bytes);
+    }
+    if (prog->str_const_pool_size > 0)
+    {
+      gpu_batch_buffer_write(prog_batch, str_consts_buffer, prog->str_const_pool, str_bytes);
+    }
+    gpu_batch_end(prog_batch);
   }
 
-  GPU_Buffer* str_consts_buffer = gpu_buffer_alloc_pooled(str8_lit("scan_filter_str_consts"), Max(prog->str_const_pool_size, 4), GPU_BufferFlag_Write, 0);
-  if (prog->str_const_pool_size > 0)
-  {
-    gpu_buffer_write(str_consts_buffer, prog->str_const_pool, prog->str_const_pool_size);
-  }
-  
   gpu_kernel_set_arg_buffer(kernel, QE_BINDING_BYTECODE, bytecode_buffer);
   gpu_kernel_set_arg_buffer(kernel, QE_BINDING_NUM_CONSTS, num_consts_buffer);
   gpu_kernel_set_arg_buffer(kernel, QE_BINDING_STR_CONSTS, str_consts_buffer);
@@ -568,8 +575,7 @@ qe_scan_filter(Arena* arena, GDB_Database* database, GDB_Table* table, IR_Node* 
     }
     
     GPU_Buffer* output_buffer = gpu_buffer_alloc_pooled(str8_lit("scan_filter_output"), Max(chunk_rows, 1) * 2 * sizeof(U32), GPU_BufferFlag_Read, 0);
-    U32 zero_count[2] = {0, 0};
-    GPU_Buffer* result_counter_buffer = gpu_buffer_alloc_pooled(str8_lit("scan_filter_result_counter"), sizeof(zero_count), GPU_BufferFlag_ReadWrite | GPU_BufferFlag_HostCached, zero_count);
+    GPU_Buffer* result_counter_buffer = gpu_buffer_alloc_pooled(str8_lit("scan_filter_result_counter"), 2 * sizeof(U32), GPU_BufferFlag_ReadWrite | GPU_BufferFlag_HostCached, 0);
     buffer_alloc_time += os_now_microseconds() - buffer_alloc_start;
     ProfEnd();
 
@@ -587,13 +593,16 @@ qe_scan_filter(Arena* arena, GDB_Database* database, GDB_Table* table, IR_Node* 
       qe_prefetch_request(prefetch, (U32)((chunk_index + 1) % 2), next_range, next_rows);
     }
     
+    U32 result_count32[2] = {0, 0};
     U64 submit_wait_start = os_now_microseconds();
-    gpu_kernel_execute(kernel, (U32)chunk_rows, QE_GPU_WORKGROUP_SIZE);
+    GPU_Batch* dispatch_batch = gpu_batch_begin(0, sizeof(result_count32));
+    gpu_batch_buffer_zero(dispatch_batch, result_counter_buffer, 2 * sizeof(U32));
+    gpu_batch_kernel_execute(dispatch_batch, kernel, (U32)chunk_rows, QE_GPU_WORKGROUP_SIZE);
+    gpu_batch_buffer_read(dispatch_batch, result_counter_buffer, result_count32, sizeof(result_count32));
+    gpu_batch_end(dispatch_batch);
     gpu_kernel_execution_time += gpu_get_executed_kernel_time_microseconds();
     submit_wait_time += os_now_microseconds() - submit_wait_start;
 
-    U32 result_count32[2] = {0, 0};
-    gpu_buffer_read(result_counter_buffer, result_count32, sizeof(result_count32));
     U64 result_count = result_count32[0];
     
     if (!using_prefetch)

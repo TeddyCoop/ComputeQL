@@ -1091,3 +1091,185 @@ gpu_kernel_execute(GPU_Kernel* kernel, U32 global_work_size, U32 local_work_size
   F64 elapsed_ns = (F64)(timestamps[1] - timestamps[0]) * (F64)g_vulkan_state->timestamp_period_ns;
   g_vulkan_state->last_kernel_time_microseconds = (U64)(elapsed_ns / 1000.0);
 }
+
+//~ tec: batching
+
+internal GPU_Batch*
+gpu_batch_begin(U64 upload_bytes_needed, U64 download_bytes_needed)
+{
+  GPU_Batch* batch = &g_vulkan_state->active_batch;
+  MemoryZeroStruct(batch);
+
+  // tec: grow now. growing later could destory a recorded buffer
+  if (upload_bytes_needed > 0)
+  {
+    gpu_vulkan_ensure_staging_capacity(VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                                       &g_vulkan_state->upload_staging_buffer, &g_vulkan_state->upload_staging_memory,
+                                       &g_vulkan_state->upload_staging_mapped, &g_vulkan_state->upload_staging_capacity,
+                                       upload_bytes_needed);
+  }
+  if (download_bytes_needed > 0)
+  {
+    gpu_vulkan_ensure_staging_capacity(VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+                                       &g_vulkan_state->download_staging_buffer, &g_vulkan_state->download_staging_memory,
+                                       &g_vulkan_state->download_staging_mapped, &g_vulkan_state->download_staging_capacity,
+                                       download_bytes_needed);
+  }
+
+  batch->cmd = gpu_vulkan_begin_one_time_cmd();
+  return batch;
+}
+
+internal void
+gpu_batch_buffer_write(GPU_Batch* batch, GPU_Buffer* buffer, void* data, U64 size)
+{
+  if (size == 0 || !data) return;
+
+  if (buffer->mapped_ptr)
+  {
+    MemoryCopy(buffer->mapped_ptr, data, size);
+    return;
+  }
+
+  if (batch->upload_cursor + size > g_vulkan_state->upload_staging_capacity)
+  {
+    log_error("gpu_batch_buffer_write: exceeded reserved upload staging capacity, dropping write");
+    return;
+  }
+
+  MemoryCopy((U8*)g_vulkan_state->upload_staging_mapped + batch->upload_cursor, data, size);
+
+  VkBufferCopy copy_region = { .srcOffset = batch->upload_cursor, .dstOffset = buffer->bind_offset, .size = size };
+  vkCmdCopyBuffer(batch->cmd, g_vulkan_state->upload_staging_buffer, buffer->buffer, 1, &copy_region);
+
+  batch->upload_cursor += size;
+  batch->wrote_since_barrier = 1;
+  batch->has_commands = 1;
+}
+
+internal void
+gpu_batch_buffer_zero(GPU_Batch* batch, GPU_Buffer* buffer, U64 size)
+{
+  if (size == 0) return;
+
+  vkCmdFillBuffer(batch->cmd, buffer->buffer, buffer->bind_offset, size, 0);
+
+  batch->wrote_since_barrier = 1;
+  batch->has_commands = 1;
+}
+
+internal void
+gpu_batch_kernel_execute(GPU_Batch* batch, GPU_Kernel* kernel, U32 global_work_size, U32 local_work_size)
+{
+  if (batch->wrote_since_barrier)
+  {
+    VkMemoryBarrier barrier =
+    {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+      .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+      .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+    };
+    vkCmdPipelineBarrier(batch->cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, 0, 0, 0);
+    batch->wrote_since_barrier = 0;
+  }
+
+  U32 group_count = (global_work_size + local_work_size - 1) / local_work_size;
+
+  vkCmdResetQueryPool(batch->cmd, g_vulkan_state->timestamp_query_pool, 0, 2);
+  vkCmdWriteTimestamp(batch->cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g_vulkan_state->timestamp_query_pool, 0);
+
+  vkCmdBindPipeline(batch->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, kernel->pipeline);
+  vkCmdBindDescriptorSets(batch->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g_vulkan_state->shared_pipeline_layout, 0, 1, &kernel->descriptor_set, 0, 0);
+  vkCmdPushConstants(batch->cmd, g_vulkan_state->shared_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(kernel->push_constants), kernel->push_constants);
+
+  vkCmdDispatch(batch->cmd, group_count, 1, 1);
+
+  vkCmdWriteTimestamp(batch->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g_vulkan_state->timestamp_query_pool, 1);
+
+  batch->dispatched_since_barrier = 1;
+  batch->had_dispatch = 1;
+  batch->has_commands = 1;
+}
+
+internal void
+gpu_batch_buffer_read(GPU_Batch* batch, GPU_Buffer* buffer, void* out_data, U64 size)
+{
+  if (size == 0) return;
+  if (batch->pending_read_count >= GPU_BATCH_MAX_PENDING_READS)
+  {
+    log_error("gpu_batch_buffer_read: too many pending reads in one batch (max %u), dropping read", (U32)GPU_BATCH_MAX_PENDING_READS);
+    return;
+  }
+
+  GPU_PendingRead* pr = &batch->pending_reads[batch->pending_read_count];
+
+  if (buffer->mapped_ptr)
+  {
+    pr->from_staging = 0;
+    pr->mapped_src = buffer->mapped_ptr;
+    pr->out_data = out_data;
+    pr->size = size;
+    batch->pending_read_count++;
+    return;
+  }
+
+  if (batch->dispatched_since_barrier)
+  {
+    VkMemoryBarrier barrier =
+    {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+      .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+      .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+    };
+    vkCmdPipelineBarrier(batch->cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &barrier, 0, 0, 0, 0);
+    batch->dispatched_since_barrier = 0;
+  }
+
+  if (batch->download_cursor + size > g_vulkan_state->download_staging_capacity)
+  {
+    log_error("gpu_batch_buffer_read: exceeded reserved download staging capacity, dropping read");
+    return;
+  }
+
+  VkBufferCopy copy_region = { .srcOffset = buffer->bind_offset, .dstOffset = batch->download_cursor, .size = size };
+  vkCmdCopyBuffer(batch->cmd, buffer->buffer, g_vulkan_state->download_staging_buffer, 1, &copy_region);
+
+  pr->from_staging = 1;
+  pr->staging_offset = batch->download_cursor;
+  pr->out_data = out_data;
+  pr->size = size;
+  batch->pending_read_count++;
+
+  batch->download_cursor += size;
+  batch->has_commands = 1;
+}
+
+internal void
+gpu_batch_end(GPU_Batch* batch)
+{
+  if (batch->has_commands)
+  {
+    gpu_vulkan_end_and_submit_cmd(batch->cmd);
+
+    if (batch->had_dispatch)
+    {
+      U64 timestamps[2];
+      vkGetQueryPoolResults(g_vulkan_state->device, g_vulkan_state->timestamp_query_pool, 0, 2, sizeof(timestamps), timestamps, sizeof(U64), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+      F64 elapsed_ns = (F64)(timestamps[1] - timestamps[0]) * (F64)g_vulkan_state->timestamp_period_ns;
+      g_vulkan_state->last_kernel_time_microseconds = (U64)(elapsed_ns / 1000.0);
+    }
+  }
+  else
+  {
+    vkEndCommandBuffer(batch->cmd);
+  }
+
+  for (U32 i = 0; i < batch->pending_read_count; i++)
+  {
+    GPU_PendingRead* pr = &batch->pending_reads[i];
+    void* src = pr->from_staging ? (void*)((U8*)g_vulkan_state->download_staging_mapped + pr->staging_offset) : pr->mapped_src;
+    MemoryCopy(pr->out_data, src, pr->size);
+  }
+}
