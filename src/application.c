@@ -368,6 +368,28 @@ app_execute_query(String8 sql_query)
         }
       } break;
 
+      case IR_NodeType_Explain:
+      {
+        IR_Node* select_ir_node = ir_node_find_child(ir_execution_node, IR_NodeType_Select);
+
+        if (!database)
+        {
+          log_error("no database selected - run 'use <database>' first");
+        }
+        else if (!select_ir_node)
+        {
+          log_error("explain: only 'explain select ...' is supported");
+        }
+        else
+        {
+          ir_expand_star_to_columns(arena, database, select_ir_node);
+
+          PLAN_Node* plan = plan_build_from_select(arena, database, select_ir_node);
+          printf("Query plan:\n");
+          plan_print(plan, 0);
+        }
+      } break;
+
       case IR_NodeType_Create:
       {
         IR_Node* create_ir_node = ir_execution_node->first;

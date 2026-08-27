@@ -35,6 +35,7 @@ ComputeQL is a from-scratch, columnar SQL database written in C99 that executes 
   - `GROUP BY`, `HAVING`, and aggregate calls (`COUNT(*)`, `SUM`, `AVG`, `MIN`, `MAX`) in both the SELECT list and HAVING expressions
   - `ORDER BY` (`ASC`/`DESC`, up to 4 numeric columns), `LIMIT`, `OFFSET`
   - `DESCRIBE <table>`
+- `EXPLAIN <select>` - prints the query planner's plan tree without executing the query
 - Real syntax error messages with source position (line/column + caret)
 
 **GPU execution**
@@ -54,11 +55,6 @@ A benchmark harness (`src/tests/`, run via `build_and_run_tests.bat`) compares C
 ## Roadmap
 
 Ordered from "next" to "later":
-
-- [ ] **Self-joins via alias** - support `FROM t AS a JOIN t AS b ON ...` by resolving qualifiers against table aliases rather than table identity.
-- [ ] **`ORDER BY` on string columns** - extend the sort kernel beyond numeric columns.
-- [ ] **GPU projection kernel** - move column projection for `SELECT` off the CPU and into the GPU operator pipeline.
-- [ ] **`EXPLAIN <query>`** - print the planner's plan tree for a query, for understanding and tuning how a query will execute.
 - [ ] **Chunked cross-bucket hashing** - support `GROUP BY`/hash-join tables larger than the GPU's max buffer size.
 - [ ] **Persistent/sorted index storage** - maintain index sort order on disk instead of rebuilding it on demand each query.
 - [ ] **Cross-engine benchmarking against more engines** - extend the current SQLite-only harness to DuckDB/ClickHouse/Postgres and publish results.
@@ -68,6 +64,7 @@ Ordered from "next" to "later":
 - [ ] **Additional GPU backends** (e.g. CUDA) alongside Vulkan
 - [ ] **Cross-platform support** (Linux/macOS)
 - [ ] **Additional query languages** on top of the same execution engine
+- [ ] **GPU projection kernel** - move column projection for `SELECT` off the CPU and into the GPU operator pipeline.
 
 ## Building from source
 

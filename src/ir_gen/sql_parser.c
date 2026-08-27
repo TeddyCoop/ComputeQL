@@ -466,6 +466,11 @@ sql_parse(Arena* arena, SQL_Token* tokens, U64 token_count, String8 source_text)
       {
         new_node = sql_parse_describe_clause(ctx);
       }
+      else if (str8_match(token.value, str8_lit("explain"), StringMatchFlag_CaseInsensitive))
+      {
+        new_node = sql_parse_explain_clause(ctx);
+        last_select_node = new_node ? new_node->first : NULL;
+      }
       else
       {
         sql_parse_error_at(token.range, "unexpected keyword '%.*s'", str8_varg(token.value));
@@ -594,6 +599,30 @@ sql_parse_describe_clause(SQL_ParseCtx *ctx)
   describe_node->first = describe_node->last = table_node;
 
   return describe_node;
+}
+
+internal SQL_Node*
+sql_parse_explain_clause(SQL_ParseCtx *ctx)
+{
+  sql_advance(ctx, 1); // move past 'explain'
+
+  if (!sql_check(ctx, SQL_TokenType_Keyword, str8_lit("select")))
+  {
+    sql_parse_error_at(sql_ctx_error_range(ctx),
+                       "expected 'select' after 'explain', found '%.*s'",
+                       str8_varg(sql_ctx_text_or_eof(ctx)));
+    return NULL;
+  }
+
+  SQL_Node* select_node = sql_parse_select_clause(ctx);
+  if (!select_node) return NULL;
+
+  SQL_Node* explain_node = push_array(ctx->arena, SQL_Node, 1);
+  explain_node->type = SQL_NodeType_Explain;
+  explain_node->first = explain_node->last = select_node;
+  select_node->parent = explain_node;
+
+  return explain_node;
 }
 
 //~ tec: shared helpers used by SELECT / FROM / WHERE / GROUP BY / ORDER BY
@@ -2211,6 +2240,7 @@ sql_node_type_to_string(SQL_NodeType type)
   {
     case SQL_NodeType_Use: result = str8_lit("SQL_NodeType_Use"); break;
     case SQL_NodeType_Describe: result = str8_lit("SQL_NodeType_Describe"); break;
+    case SQL_NodeType_Explain: result = str8_lit("SQL_NodeType_Explain"); break;
     case SQL_NodeType_Select: result = str8_lit("SQL_NodeType_Select"); break;
     case SQL_NodeType_Column: result = str8_lit("SQL_NodeType_Column"); break;
     case SQL_NodeType_ColumnList: result = str8_lit("SQL_NodeType_ColumnList"); break;

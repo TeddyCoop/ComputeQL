@@ -48,6 +48,7 @@ global String8 g_sql_keywords[] =
   str8_lit_comp("import"),
   str8_lit_comp("create"),
   str8_lit_comp("describe"),
+  str8_lit_comp("explain"),
   str8_lit_comp("contains"),
   str8_lit_comp("equals"),
   str8_lit_comp("drop"),
@@ -203,6 +204,7 @@ typedef enum SQL_NodeType
   SQL_NodeType_Offset,
   SQL_NodeType_AggregateCall,
   SQL_NodeType_Describe,
+  SQL_NodeType_Explain,
 } SQL_NodeType;
 
 typedef struct SQL_Node SQL_Node;
@@ -243,6 +245,7 @@ internal SQL_Node* sql_parse_having_clause(SQL_ParseCtx *ctx);
 internal SQL_Node* sql_parse_limit_clause(SQL_ParseCtx *ctx);
 internal SQL_Node* sql_parse_offset_clause(SQL_ParseCtx *ctx);
 internal SQL_Node* sql_parse_describe_clause(SQL_ParseCtx *ctx);
+internal SQL_Node* sql_parse_explain_clause(SQL_ParseCtx *ctx);
 internal SQL_Node* sql_parse(Arena* arena, SQL_Token* tokens, U64 token_count, String8 source_text);
 
 internal String8 sql_node_type_to_string(SQL_NodeType type);

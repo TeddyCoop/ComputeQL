@@ -73,6 +73,7 @@ ir_type_from_sql_node_type(SQL_NodeType sql_type)
   {
     case SQL_NodeType_Use:           return IR_NodeType_Use;
     case SQL_NodeType_Describe:      return IR_NodeType_Describe;
+    case SQL_NodeType_Explain:       return IR_NodeType_Explain;
     case SQL_NodeType_Select:        return IR_NodeType_Select;
     case SQL_NodeType_Column:        return IR_NodeType_Column;
     case SQL_NodeType_Table:         return IR_NodeType_Table;
@@ -134,6 +135,7 @@ ir_node_type_to_string(IR_NodeType type)
   {
     case IR_NodeType_Use: result = str8_lit("IR_NodeType_Use"); break;
     case IR_NodeType_Describe: result = str8_lit("IR_NodeType_Describe"); break;
+    case IR_NodeType_Explain: result = str8_lit("IR_NodeType_Explain"); break;
     case IR_NodeType_Select: result = str8_lit("IR_NodeType_Select"); break;
     case IR_NodeType_Column: result = str8_lit("IR_NodeType_Column"); break;
     case IR_NodeType_Table: result = str8_lit("IR_NodeType_Table"); break;

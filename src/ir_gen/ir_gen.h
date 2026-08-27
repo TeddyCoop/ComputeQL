@@ -46,6 +46,7 @@ typedef enum IR_NodeType
   IR_NodeType_ForeignKey,
   IR_NodeType_Check,
   IR_NodeType_Describe,
+  IR_NodeType_Explain,
 } IR_NodeType;
 
 typedef struct IR_Node IR_Node;
