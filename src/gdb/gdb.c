@@ -765,9 +765,12 @@ gdb_table_load(String8 table_dir, String8 meta_path)
       column->disk_path = push_str8_copy(column->arena, column_path);
       if (column->type == GDB_ColumnType_String8)
       {
+        // tec: just peek the header
         OS_Handle map = os_file_map_open(OS_AccessFlag_Read, file);
         void* mapped_ptr = os_file_map_view_open(map, OS_AccessFlag_Read, r1u64(0, sizeof(U64)));
         column->variable_capacity = *(U64*)mapped_ptr;
+        os_file_map_view_close(map, mapped_ptr, r1u64(0, sizeof(U64)));
+        os_file_map_close(map);
       }
       else
       {
@@ -1688,22 +1691,26 @@ gdb_column_remove_data(GDB_Column* column, U64 row_index)
   
   if (column->is_disk_backed)
   {
-    log_error("removing data from disk-backed column is not supported");
-    return;
+    gdb_column_materialize_to_memory(column);
   }
-  
+
   if (column->type == GDB_ColumnType_String8)
   {
-    U64 start_offset = column->offsets[row_index];
-    U64 end_offset = column->offsets[row_index + 1];
+    // tec: offsets[k] is the end offset of row k (no leading zero entry)
+    // the removed row's byte range is [offsets[row_index-1] or 0, offsets[row_index]), not [offsets[row_index], offsets[row_index+1])
+    U64 start_offset = (row_index > 0) ? column->offsets[row_index - 1] : 0;
+    U64 end_offset = column->offsets[row_index];
+    U64 removed_size = end_offset - start_offset;
     U64 size_to_move = column->variable_capacity - end_offset;
-    
+
     MemoryCopy(column->data + start_offset, column->data + end_offset, size_to_move);
-    
-    for (U64 i = row_index + 1; i < column->row_count; ++i)
+
+    for (U64 i = row_index; i < column->row_count - 1; ++i)
     {
-      column->offsets[i] = column->offsets[i + 1] - (end_offset - start_offset);
+      column->offsets[i] = column->offsets[i + 1] - removed_size;
     }
+
+    column->variable_capacity -= removed_size;
   }
   else
   {
@@ -2140,9 +2147,79 @@ gdb_column_convert_to_disk_backed(GDB_Column* column)
   column->data = NULL;
   column->offsets = NULL;
   column->capacity = 0;
-  
+
   scratch_end(scratch);
-  
+
+  ProfEnd();
+}
+
+internal void
+gdb_column_materialize_to_memory(GDB_Column* column)
+{
+  if (!column->is_disk_backed) return;
+
+  ProfBeginFunction();
+
+  U64 row_count = column->row_count;
+
+  if (column->type == GDB_ColumnType_String8)
+  {
+    GDB_StringDataChunk chunk = gdb_column_get_string_chunk(column->arena, column, r1u64(0, row_count));
+
+	// tec: copy chunk.data before closing the mapping
+    U8* owned_data = push_array(column->arena, U8, Max(chunk.size, 1));
+    if (chunk.size > 0) MemoryCopy(owned_data, chunk.data, chunk.size);
+    gdb_column_close_string_chunk(column);
+    column->mapped_ptr = 0;
+
+    // tec: the chunk's offsets carry a leading 0 (row_count+1 entries);
+    // this column's own inmemory convention has no leading entry (offsets[k] = end offset of row k)
+    U64* owned_offsets = push_array(column->arena, U64, Max(row_count, 1));
+    for (U64 i = 0; i < row_count; i++) 
+	{
+		owned_offsets[i] = chunk.offsets[i + 1];
+	}
+	
+    column->data = owned_data;
+    column->offsets = owned_offsets;
+    column->variable_capacity = chunk.size;
+    column->capacity = Max(row_count, 1);
+  }
+  else
+  {
+    U64 size = 0;
+    void* data_ptr = gdb_column_get_data_range(column->arena, column, r1u64(0, row_count), &size);
+    U8* owned_data = push_array(column->arena, U8, Max(size, column->size));
+    if (size > 0) MemoryCopy(owned_data, data_ptr, size);
+
+    if (column->mapped_ptr)
+    {
+      os_file_map_view_close(column->file_map, column->mapped_ptr, column->current_mapped_range);
+      column->mapped_ptr = 0;
+    }
+
+    column->data = owned_data;
+    column->capacity = Max(row_count, 1);
+  }
+
+  if (!os_handle_match(os_handle_zero(), column->file_map))
+  {
+    os_file_map_close(column->file_map);
+    column->file_map = os_handle_zero();
+  }
+  if (!os_handle_match(os_handle_zero(), column->file_map_backing_file))
+  {
+    os_file_close(column->file_map_backing_file);
+    column->file_map_backing_file = os_handle_zero();
+  }
+  if (!os_handle_match(os_handle_zero(), column->file))
+  {
+    os_file_close(column->file);
+    column->file = os_handle_zero();
+  }
+
+  column->is_disk_backed = 0;
+
   ProfEnd();
 }
 

@@ -272,6 +272,7 @@ internal String8 gdb_column_get_string(Arena* arena, GDB_Column* column, U64 ind
 internal U64 gdb_column_get_total_size(GDB_Column* column);
 
 internal void gdb_column_add_data_disk_backed(GDB_Column* column, void* data);
+internal void gdb_column_materialize_to_memory(GDB_Column* column);
 internal void gdb_column_add_data(GDB_Column* column, void* data);
 internal void gdb_column_add_data_maybe_null(GDB_Column* column, void* data, B32 is_null);
 internal void* gdb_column_get_data(GDB_Column* column, U64 index);

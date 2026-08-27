@@ -55,8 +55,6 @@ A benchmark harness (`src/tests/`, run via `build_and_run_tests.bat`) compares C
 
 Ordered from "next" to "later":
 
-- [x] **Reduce fixed per-query GPU overhead** - every operator (scan+filter, hash join, bitonic sort, group-by/aggregate) now batches its buffer uploads, dispatch(es), and readback into a single submission instead of one submit+wait per step. A join with a sort dropped from ~15 blocking round trips to ~6; a `GROUP BY` from ~13 to ~4.
-- [ ] **`INSERT`/`ALTER`/`DELETE` execution hardening** - finish `DELETE` execution and `ALTER TABLE` execution, and support `INSERT` without an explicit column list.
 - [ ] **Self-joins via alias** - support `FROM t AS a JOIN t AS b ON ...` by resolving qualifiers against table aliases rather than table identity.
 - [ ] **`ORDER BY` on string columns** - extend the sort kernel beyond numeric columns.
 - [ ] **GPU projection kernel** - move column projection for `SELECT` off the CPU and into the GPU operator pipeline.

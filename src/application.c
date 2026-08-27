@@ -721,6 +721,11 @@ app_execute_query(String8 sql_query)
           log_info("alter table: renaming '%.*s' to '%.*s' - any already-saved on-disk directory for the old name is not removed",
                     str8_varg(table->name), str8_varg(operation_node->value));
 
+          for (U64 i = 0; i < table->column_count; i++)
+          {
+            gdb_column_materialize_to_memory(table->columns[i]);
+          }
+
           table->name = operation_node->value;
         }
         else
@@ -738,24 +743,6 @@ app_execute_query(String8 sql_query)
         if (!table)
         {
           log_error("delete: unknown table '%.*s'", str8_varg(table_node->value));
-          ProfEnd();
-          break;
-        }
-
-        B32 has_disk_backed_column = 0;
-        for (U64 i = 0; i < table->column_count; i++)
-        {
-          if (table->columns[i]->is_disk_backed)
-          {
-            has_disk_backed_column = 1;
-            break;
-          }
-        }
-
-        if (has_disk_backed_column)
-        {
-          log_error("delete: table '%.*s' has disk-backed columns - row removal is not yet supported for disk-backed tables",
-                     str8_varg(table->name));
           ProfEnd();
           break;
         }
