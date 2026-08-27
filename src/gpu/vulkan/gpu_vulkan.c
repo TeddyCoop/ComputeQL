@@ -1163,22 +1163,33 @@ gpu_batch_buffer_zero(GPU_Batch* batch, GPU_Buffer* buffer, U64 size)
 internal void
 gpu_batch_kernel_execute(GPU_Batch* batch, GPU_Kernel* kernel, U32 global_work_size, U32 local_work_size)
 {
-  if (batch->wrote_since_barrier)
+  if (batch->wrote_since_barrier || batch->dispatched_since_barrier)
   {
     VkMemoryBarrier barrier =
     {
       .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-      .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+      .srcAccessMask = (batch->wrote_since_barrier ? VK_ACCESS_TRANSFER_WRITE_BIT : 0) |
+                       (batch->dispatched_since_barrier ? VK_ACCESS_SHADER_WRITE_BIT : 0),
       .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
     };
-    vkCmdPipelineBarrier(batch->cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, 0, 0, 0);
+    VkPipelineStageFlags src_stage = (batch->wrote_since_barrier ? VK_PIPELINE_STAGE_TRANSFER_BIT : 0) |
+                                      (batch->dispatched_since_barrier ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT : 0);
+    vkCmdPipelineBarrier(batch->cmd, src_stage, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, 0, 0, 0);
     batch->wrote_since_barrier = 0;
+    batch->dispatched_since_barrier = 0;
   }
 
   U32 group_count = (global_work_size + local_work_size - 1) / local_work_size;
 
-  vkCmdResetQueryPool(batch->cmd, g_vulkan_state->timestamp_query_pool, 0, 2);
-  vkCmdWriteTimestamp(batch->cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g_vulkan_state->timestamp_query_pool, 0);
+  if (!batch->had_dispatch)
+  {
+    vkCmdResetQueryPool(batch->cmd, g_vulkan_state->timestamp_query_pool, 0, 2);
+    vkCmdWriteTimestamp(batch->cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g_vulkan_state->timestamp_query_pool, 0);
+  }
+  else
+  {
+    vkCmdResetQueryPool(batch->cmd, g_vulkan_state->timestamp_query_pool, 1, 1);
+  }
 
   vkCmdBindPipeline(batch->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, kernel->pipeline);
   vkCmdBindDescriptorSets(batch->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g_vulkan_state->shared_pipeline_layout, 0, 1, &kernel->descriptor_set, 0, 0);

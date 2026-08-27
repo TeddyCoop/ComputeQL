@@ -1128,34 +1128,42 @@ qe_sort_rows(Arena* arena, PLAN_RowSet* rows, IR_Node* order_by_ir)
     return result;
   }
   
-  GPU_Buffer* keys_buf = gpu_buffer_alloc(padded_count * QE_SORT_MAX_KEYS * sizeof(F64), GPU_BufferFlag_ReadWrite, keys);
-  GPU_Buffer* payload_buf = gpu_buffer_alloc(padded_count * 9 * sizeof(U32), GPU_BufferFlag_ReadWrite, payload);
-  
+  U64 keys_size = padded_count * QE_SORT_MAX_KEYS * sizeof(F64);
+  U64 payload_size = padded_count * 9 * sizeof(U32);
+
+  GPU_Buffer* keys_buf = gpu_buffer_alloc(keys_size, GPU_BufferFlag_ReadWrite, 0);
+  GPU_Buffer* payload_buf = gpu_buffer_alloc(payload_size, GPU_BufferFlag_ReadWrite, 0);
+
   gpu_kernel_set_arg_buffer(kernel, 0, keys_buf);
   gpu_kernel_set_arg_buffer(kernel, 1, payload_buf);
-  
+
   U32 num_stages = 0;
   while ((1ull << num_stages) < padded_count) num_stages++;
-  
+
+  GPU_Batch* sort_batch = gpu_batch_begin(keys_size + payload_size, payload_size);
+  gpu_batch_buffer_write(sort_batch, keys_buf, keys, keys_size);
+  gpu_batch_buffer_write(sort_batch, payload_buf, payload, payload_size);
+
   for (U32 stage = 0; stage < num_stages; stage++)
   {
     for (U32 pass_plus1 = stage + 1; pass_plus1 > 0; pass_plus1--)
     {
       U32 pass_ = pass_plus1 - 1;
-      
+
       gpu_kernel_set_arg_u64(kernel, 0, padded_count);
       gpu_kernel_set_arg_u64(kernel, 1, num_keys);
       gpu_kernel_set_arg_u64(kernel, 2, dir_mask);
       gpu_kernel_set_arg_u64(kernel, 3, stage);
       gpu_kernel_set_arg_u64(kernel, 4, pass_);
-      
-      gpu_kernel_execute(kernel, (U32)(padded_count / 2), QE_GPU_WORKGROUP_SIZE);
+
+      gpu_batch_kernel_execute(sort_batch, kernel, (U32)(padded_count / 2), QE_GPU_WORKGROUP_SIZE);
     }
   }
-  
+
   U32* sorted_payload = push_array(scratch.arena, U32, padded_count * 9);
-  gpu_buffer_read(payload_buf, sorted_payload, padded_count * 9 * sizeof(U32));
-  
+  gpu_batch_buffer_read(sort_batch, payload_buf, sorted_payload, payload_size);
+  gpu_batch_end(sort_batch);
+
   gpu_buffer_release(keys_buf);
   gpu_buffer_release(payload_buf);
   gpu_kernel_release(kernel);
@@ -1583,56 +1591,80 @@ qe_aggregate(Arena* arena, GDB_Database* database, PLAN_RowSet* input, IR_Node* 
     return result;
   }
   
-  GPU_Buffer* owner_buf = gpu_buffer_alloc(num_slots * sizeof(U32), GPU_BufferFlag_ReadWrite, owner_init);
-  GPU_Buffer* count_buf = gpu_buffer_alloc(num_slots * sizeof(U32), GPU_BufferFlag_ReadWrite, count_init);
+  GPU_Buffer* owner_buf = gpu_buffer_alloc(num_slots * sizeof(U32), GPU_BufferFlag_ReadWrite, 0);
+  GPU_Buffer* count_buf = gpu_buffer_alloc(num_slots * sizeof(U32), GPU_BufferFlag_ReadWrite, 0);
   GPU_Buffer* row_slot_buf = gpu_buffer_alloc(row_count * sizeof(U32), GPU_BufferFlag_ReadWrite, 0);
-  U32 zero1[1] = {0};
-  GPU_Buffer* overflow_buf = gpu_buffer_alloc(sizeof(U32), GPU_BufferFlag_ReadWrite, zero1);
-  
+  GPU_Buffer* overflow_buf = gpu_buffer_alloc(sizeof(U32), GPU_BufferFlag_ReadWrite, 0);
+
   gpu_kernel_set_arg_buffer(assign_kernel, 0, owner_buf);
   gpu_kernel_set_arg_buffer(assign_kernel, 1, count_buf);
   gpu_kernel_set_arg_buffer(assign_kernel, 2, row_slot_buf);
   gpu_kernel_set_arg_buffer(assign_kernel, 3, overflow_buf);
-  
+
   GPU_Buffer* group_col_bufs[QE_AGG_MAX_GROUP_COLS * 2] = {0};
+  U64 group_col_sizes[QE_AGG_MAX_GROUP_COLS * 2] = {0};
   for (U32 c = 0; c < num_group_cols; c++)
   {
     if (group_string_mask & (1u << c))
     {
-      GPU_Buffer* data_buf = gpu_buffer_alloc(Max(group_string[c].size, 4), GPU_BufferFlag_Write, group_string[c].data);
-      GPU_Buffer* off_buf = gpu_buffer_alloc((row_count + 1) * sizeof(U64), GPU_BufferFlag_Write, group_string[c].offsets);
-      group_col_bufs[c * 2 + 0] = data_buf;
-      group_col_bufs[c * 2 + 1] = off_buf;
+      U64 data_size = Max(group_string[c].size, 4);
+      U64 off_size = (row_count + 1) * sizeof(U64);
+      group_col_bufs[c * 2 + 0] = gpu_buffer_alloc(data_size, GPU_BufferFlag_Write, 0);
+      group_col_bufs[c * 2 + 1] = gpu_buffer_alloc(off_size, GPU_BufferFlag_Write, 0);
+      group_col_sizes[c * 2 + 0] = data_size;
+      group_col_sizes[c * 2 + 1] = off_size;
     }
     else
     {
-      GPU_Buffer* data_buf = gpu_buffer_alloc(row_count * sizeof(F64), GPU_BufferFlag_Write, group_numeric[c]);
-      group_col_bufs[c * 2 + 0] = data_buf;
+      U64 data_size = row_count * sizeof(F64);
+      group_col_bufs[c * 2 + 0] = gpu_buffer_alloc(data_size, GPU_BufferFlag_Write, 0);
+      group_col_sizes[c * 2 + 0] = data_size;
     }
     gpu_kernel_set_arg_buffer(assign_kernel, 4 + c * 2, group_col_bufs[c * 2 + 0]);
     if (group_col_bufs[c * 2 + 1]) gpu_kernel_set_arg_buffer(assign_kernel, 4 + c * 2 + 1, group_col_bufs[c * 2 + 1]);
   }
-  
+
   gpu_kernel_set_arg_u64(assign_kernel, 0, row_count);
   gpu_kernel_set_arg_u64(assign_kernel, 1, num_buckets);
   gpu_kernel_set_arg_u64(assign_kernel, 2, K);
   gpu_kernel_set_arg_u64(assign_kernel, 3, num_group_cols);
   gpu_kernel_set_arg_u64(assign_kernel, 4, group_string_mask);
-  
-  gpu_kernel_execute(assign_kernel, (U32)row_count, QE_GPU_WORKGROUP_SIZE);
-  
+
+  U64 assign_upload_bytes = (U64)num_slots * sizeof(U32) * 2;
+  for (U32 c = 0; c < num_group_cols * 2; c++) assign_upload_bytes += group_col_sizes[c];
+  U64 assign_download_bytes = (U64)num_slots * sizeof(U32) * 2 + sizeof(U32);
+
   U32* owner_readback = push_array(scratch.arena, U32, num_slots);
   U32* count_readback = push_array(scratch.arena, U32, num_slots);
-  gpu_buffer_read(owner_buf, owner_readback, num_slots * sizeof(U32));
-  gpu_buffer_read(count_buf, count_readback, num_slots * sizeof(U32));
-  
   U32 overflow_readback = 0;
-  gpu_buffer_read(overflow_buf, &overflow_readback, sizeof(U32));
+
+  GPU_Batch* assign_batch = gpu_batch_begin(assign_upload_bytes, assign_download_bytes);
+  gpu_batch_buffer_write(assign_batch, owner_buf, owner_init, num_slots * sizeof(U32));
+  gpu_batch_buffer_write(assign_batch, count_buf, count_init, num_slots * sizeof(U32));
+  gpu_batch_buffer_zero(assign_batch, overflow_buf, sizeof(U32));
+  for (U32 c = 0; c < num_group_cols; c++)
+  {
+    if (group_string_mask & (1u << c))
+    {
+      gpu_batch_buffer_write(assign_batch, group_col_bufs[c * 2 + 0], group_string[c].data, group_col_sizes[c * 2 + 0]);
+      gpu_batch_buffer_write(assign_batch, group_col_bufs[c * 2 + 1], group_string[c].offsets, group_col_sizes[c * 2 + 1]);
+    }
+    else
+    {
+      gpu_batch_buffer_write(assign_batch, group_col_bufs[c * 2 + 0], group_numeric[c], group_col_sizes[c * 2 + 0]);
+    }
+  }
+  gpu_batch_kernel_execute(assign_batch, assign_kernel, (U32)row_count, QE_GPU_WORKGROUP_SIZE);
+  gpu_batch_buffer_read(assign_batch, owner_buf, owner_readback, num_slots * sizeof(U32));
+  gpu_batch_buffer_read(assign_batch, count_buf, count_readback, num_slots * sizeof(U32));
+  gpu_batch_buffer_read(assign_batch, overflow_buf, &overflow_readback, sizeof(U32));
+  gpu_batch_end(assign_batch);
+
   if (overflow_readback > 0)
   {
     log_error("qe_aggregate: %u row(s) dropped due to hash-table probe exhaustion - GROUP BY result is incomplete", overflow_readback);
   }
-  
+
   gpu_buffer_release(owner_buf);
   gpu_buffer_release(count_buf);
   gpu_buffer_release(overflow_buf);
@@ -1672,65 +1704,83 @@ qe_aggregate(Arena* arena, GDB_Database* database, PLAN_RowSet* input, IR_Node* 
     for (U64 s = 0; s < num_slots; s++) if (owner_readback[s] != max_U32) group_ids[gi++] = (U32)s;
   }
   
-  //- tec: pass 2/3 - scatter rows into per slot CSR member lists (csr_scatter.comp, shared with qe_hash_join)
+  //- tec: pass 2/3 
+  // scatter rows into per slot CSR member lists
+  // and pass 3/3 - one thread per group, serial reduction over its own member rows
   GPU_Kernel* scatter_kernel = gpu_kernel_alloc(str8_lit("csr_scatter"));
-  GPU_Buffer* cursor_buf = gpu_buffer_alloc(num_slots * sizeof(U32), GPU_BufferFlag_ReadWrite, slot_offsets);
-  GPU_Buffer* members_buf = gpu_buffer_alloc(Max(row_count, 1) * sizeof(U32), GPU_BufferFlag_ReadWrite, 0);
-  
+  GPU_Kernel* reduce_kernel = gpu_kernel_alloc(str8_lit("aggregate_reduce"));
+
+  U64 cursor_size = num_slots * sizeof(U32);
+  U64 members_size = Max(row_count, 1) * sizeof(U32);
+  U64 offsets_size = (num_slots + 1) * sizeof(U32);
+  U64 group_ids_size = Max(num_groups, 1) * sizeof(U32);
+  U64 repr_size = Max(num_groups, 1) * sizeof(U32);
+  U64 results_size = Max(num_groups * Max(num_exprs, 1), 1) * sizeof(F64);
+
+  GPU_Buffer* cursor_buf = gpu_buffer_alloc(cursor_size, GPU_BufferFlag_ReadWrite, 0);
+  GPU_Buffer* members_buf = gpu_buffer_alloc(members_size, GPU_BufferFlag_ReadWrite, 0);
+
   gpu_kernel_set_arg_buffer(scatter_kernel, 0, row_slot_buf);
   gpu_kernel_set_arg_buffer(scatter_kernel, 1, cursor_buf);
   gpu_kernel_set_arg_buffer(scatter_kernel, 2, members_buf);
   gpu_kernel_set_arg_u64(scatter_kernel, 0, row_count);
-  
-  gpu_kernel_execute(scatter_kernel, (U32)row_count, QE_GPU_WORKGROUP_SIZE);
-  
-  gpu_buffer_release(row_slot_buf);
-  gpu_buffer_release(cursor_buf);
-  gpu_kernel_release(scatter_kernel);
-  
-  //- tec: pass 3/3 - one thread per group, serial reduction over its own member rows
-  GPU_Kernel* reduce_kernel = gpu_kernel_alloc(str8_lit("aggregate_reduce"));
-  
-  GPU_Buffer* offsets_buf = gpu_buffer_alloc((num_slots + 1) * sizeof(U32), GPU_BufferFlag_Write, slot_offsets);
-  GPU_Buffer* group_ids_buf = gpu_buffer_alloc(Max(num_groups, 1) * sizeof(U32), GPU_BufferFlag_Write, group_ids);
-  GPU_Buffer* repr_buf = gpu_buffer_alloc(Max(num_groups, 1) * sizeof(U32), GPU_BufferFlag_ReadWrite, 0);
-  GPU_Buffer* results_buf = gpu_buffer_alloc(Max(num_groups * Max(num_exprs, 1), 1) * sizeof(F64), GPU_BufferFlag_ReadWrite, 0);
-  
+
+  GPU_Buffer* offsets_buf = gpu_buffer_alloc(offsets_size, GPU_BufferFlag_Write, 0);
+  GPU_Buffer* group_ids_buf = gpu_buffer_alloc(group_ids_size, GPU_BufferFlag_Write, 0);
+  GPU_Buffer* repr_buf = gpu_buffer_alloc(repr_size, GPU_BufferFlag_ReadWrite, 0);
+  GPU_Buffer* results_buf = gpu_buffer_alloc(results_size, GPU_BufferFlag_ReadWrite, 0);
+
   gpu_kernel_set_arg_buffer(reduce_kernel, 0, members_buf);
   gpu_kernel_set_arg_buffer(reduce_kernel, 1, offsets_buf);
   gpu_kernel_set_arg_buffer(reduce_kernel, 2, group_ids_buf);
   gpu_kernel_set_arg_buffer(reduce_kernel, 3, repr_buf);
   gpu_kernel_set_arg_buffer(reduce_kernel, 4, results_buf);
-  
+
   GPU_Buffer* arg_bufs[QE_AGG_MAX_EXPRS] = {0};
   for (U32 e = 0; e < num_exprs; e++)
   {
     if (expr_args[e])
     {
-      arg_bufs[e] = gpu_buffer_alloc(row_count * sizeof(F64), GPU_BufferFlag_Write, expr_args[e]);
+      arg_bufs[e] = gpu_buffer_alloc(row_count * sizeof(F64), GPU_BufferFlag_Write, 0);
       gpu_kernel_set_arg_buffer(reduce_kernel, 5 + e, arg_bufs[e]);
     }
   }
-  
+
   U32 func_codes_packed = 0;
   for (U32 e = 0; e < num_exprs; e++) func_codes_packed |= (exprs[e].func_code & 0xfu) << (e * 4u);
-  
+
   gpu_kernel_set_arg_u64(reduce_kernel, 0, num_groups);
   gpu_kernel_set_arg_u64(reduce_kernel, 1, num_exprs);
   gpu_kernel_set_arg_u64(reduce_kernel, 2, func_codes_packed);
-  
-  gpu_kernel_execute(reduce_kernel, (U32)Max(num_groups, 1), QE_GPU_WORKGROUP_SIZE);
-  
-  U64* representative_readback = push_array(scratch.arena, U64, Max(num_groups, 1));
-  {
-    U32* repr32 = push_array(scratch.arena, U32, Max(num_groups, 1));
-    gpu_buffer_read(repr_buf, repr32, Max(num_groups, 1) * sizeof(U32));
-    for (U64 g = 0; g < num_groups; g++) representative_readback[g] = (repr32[g] == max_U32) ? max_U64 : repr32[g];
-  }
-  
+
+  U64 reduce_upload_bytes = cursor_size + offsets_size + group_ids_size;
+  for (U32 e = 0; e < num_exprs; e++) if (arg_bufs[e]) reduce_upload_bytes += row_count * sizeof(F64);
+  U64 reduce_download_bytes = repr_size + results_size;
+
+  U32* repr32 = push_array(scratch.arena, U32, Max(num_groups, 1));
   F64* results_readback = push_array(scratch.arena, F64, Max(num_groups * Max(num_exprs, 1), 1));
-  gpu_buffer_read(results_buf, results_readback, Max(num_groups * Max(num_exprs, 1), 1) * sizeof(F64));
-  
+
+  GPU_Batch* reduce_batch = gpu_batch_begin(reduce_upload_bytes, reduce_download_bytes);
+  gpu_batch_buffer_write(reduce_batch, cursor_buf, slot_offsets, cursor_size);
+  gpu_batch_buffer_write(reduce_batch, offsets_buf, slot_offsets, offsets_size);
+  gpu_batch_buffer_write(reduce_batch, group_ids_buf, group_ids, group_ids_size);
+  for (U32 e = 0; e < num_exprs; e++)
+  {
+    if (arg_bufs[e]) gpu_batch_buffer_write(reduce_batch, arg_bufs[e], expr_args[e], row_count * sizeof(F64));
+  }
+  gpu_batch_kernel_execute(reduce_batch, scatter_kernel, (U32)row_count, QE_GPU_WORKGROUP_SIZE);
+  gpu_batch_kernel_execute(reduce_batch, reduce_kernel, (U32)Max(num_groups, 1), QE_GPU_WORKGROUP_SIZE);
+  gpu_batch_buffer_read(reduce_batch, repr_buf, repr32, repr_size);
+  gpu_batch_buffer_read(reduce_batch, results_buf, results_readback, results_size);
+  gpu_batch_end(reduce_batch);
+
+  gpu_kernel_release(scatter_kernel);
+
+  U64* representative_readback = push_array(scratch.arena, U64, Max(num_groups, 1));
+  for (U64 g = 0; g < num_groups; g++) representative_readback[g] = (repr32[g] == max_U32) ? max_U64 : repr32[g];
+
+  gpu_buffer_release(row_slot_buf);
+  gpu_buffer_release(cursor_buf);
   gpu_buffer_release(members_buf);
   gpu_buffer_release(offsets_buf);
   gpu_buffer_release(group_ids_buf);
@@ -2453,13 +2503,15 @@ qe_hash_join(Arena* arena, PLAN_RowSet* left, GDB_Table* right_table, String8 ri
     probe_data_size = Max(probe_row_count, 1) * sizeof(F64);
   }
   
-  //- tec: pass 1/2 - hash the build side into a bucket histogram
+  //- tec: pass 1/2
+  // hash the build side into a bucket histogram. upload the build key data/offsets, dispatch, and read the bucket histogram back
   GPU_Kernel* build_kernel = gpu_kernel_alloc(str8_lit("hash_join_build_count"));
-  GPU_Buffer* build_data_buf = gpu_buffer_alloc(build_data_size, GPU_BufferFlag_Write, build_data);
-  GPU_Buffer* build_off_buf = gpu_buffer_alloc(is_string_key ? (build_row_count + 1) * sizeof(U64) : 4, GPU_BufferFlag_Write, is_string_key ? build_offsets : 0);
+  U64 build_off_size = is_string_key ? (build_row_count + 1) * sizeof(U64) : 4;
+  GPU_Buffer* build_data_buf = gpu_buffer_alloc(build_data_size, GPU_BufferFlag_Write, 0);
+  GPU_Buffer* build_off_buf = gpu_buffer_alloc(build_off_size, GPU_BufferFlag_Write, 0);
   GPU_Buffer* bucket_count_buf = gpu_buffer_alloc(num_buckets * sizeof(U32), GPU_BufferFlag_ReadWrite, 0);
   GPU_Buffer* row_bucket_buf = gpu_buffer_alloc(Max(build_row_count, 1) * sizeof(U32), GPU_BufferFlag_ReadWrite, 0);
-  
+
   gpu_kernel_set_arg_buffer(build_kernel, 0, build_data_buf);
   gpu_kernel_set_arg_buffer(build_kernel, 1, build_off_buf);
   gpu_kernel_set_arg_buffer(build_kernel, 2, bucket_count_buf);
@@ -2467,15 +2519,19 @@ qe_hash_join(Arena* arena, PLAN_RowSet* left, GDB_Table* right_table, String8 ri
   gpu_kernel_set_arg_u64(build_kernel, 0, build_row_count);
   gpu_kernel_set_arg_u64(build_kernel, 1, num_buckets);
   gpu_kernel_set_arg_u64(build_kernel, 2, is_string_key ? 1 : 0);
-  
+
+  U32* bucket_count_readback = push_array(scratch.arena, U32, num_buckets);
+
+  GPU_Batch* build_batch = gpu_batch_begin(build_data_size + build_off_size, num_buckets * sizeof(U32));
+  gpu_batch_buffer_write(build_batch, build_data_buf, build_data, build_data_size);
+  if (is_string_key) gpu_batch_buffer_write(build_batch, build_off_buf, build_offsets, build_off_size);
   if (build_row_count > 0)
   {
-    gpu_kernel_execute(build_kernel, (U32)build_row_count, QE_GPU_WORKGROUP_SIZE);
+    gpu_batch_kernel_execute(build_batch, build_kernel, (U32)build_row_count, QE_GPU_WORKGROUP_SIZE);
   }
-  
-  U32* bucket_count_readback = push_array(scratch.arena, U32, num_buckets);
-  gpu_buffer_read(bucket_count_buf, bucket_count_readback, num_buckets * sizeof(U32));
-  
+  gpu_batch_buffer_read(build_batch, bucket_count_buf, bucket_count_readback, num_buckets * sizeof(U32));
+  gpu_batch_end(build_batch);
+
   gpu_kernel_release(build_kernel);
   gpu_buffer_release(bucket_count_buf);
   
@@ -2488,42 +2544,36 @@ qe_hash_join(Arena* arena, PLAN_RowSet* left, GDB_Table* right_table, String8 ri
   }
   bucket_offsets[num_buckets] = running;
   
-  //- tec: pass 2/2 (build side). scatter build rows into per-bucket CSR lists
+  //- tec: pass 2/2
+  // scatter build rows into per-bucket CSR lists 
   GPU_Kernel* scatter_kernel = gpu_kernel_alloc(str8_lit("csr_scatter"));
-  GPU_Buffer* cursor_buf = gpu_buffer_alloc(num_buckets * sizeof(U32), GPU_BufferFlag_ReadWrite, bucket_offsets);
+  GPU_Buffer* cursor_buf = gpu_buffer_alloc(num_buckets * sizeof(U32), GPU_BufferFlag_ReadWrite, 0);
   GPU_Buffer* bucket_rows_buf = gpu_buffer_alloc(Max(build_row_count, 1) * sizeof(U32), GPU_BufferFlag_ReadWrite, 0);
-  
+
   gpu_kernel_set_arg_buffer(scatter_kernel, 0, row_bucket_buf);
   gpu_kernel_set_arg_buffer(scatter_kernel, 1, cursor_buf);
   gpu_kernel_set_arg_buffer(scatter_kernel, 2, bucket_rows_buf);
   gpu_kernel_set_arg_u64(scatter_kernel, 0, build_row_count);
-  
-  if (build_row_count > 0)
-  {
-    gpu_kernel_execute(scatter_kernel, (U32)build_row_count, QE_GPU_WORKGROUP_SIZE);
-  }
-  
-  gpu_buffer_release(row_bucket_buf);
-  gpu_buffer_release(cursor_buf);
-  gpu_kernel_release(scatter_kernel);
-  
+
   // tec: probe from the left side. output capacity is a bounded heuristic
-  // if the real match count exceeds it, thats detected below and reported rather than silently truncated
+  // if the real match count exceeds it, it is detected and reported below
   U64 out_capacity = Max(probe_row_count, build_row_count) * 64 + probe_row_count;
   U64 max_capacity = GPU_MAX_BUFFER_SIZE / (4 * sizeof(U32));
   if (out_capacity > max_capacity) out_capacity = max_capacity;
   if (out_capacity < 1) out_capacity = 1;
-  
+
   GPU_Kernel* probe_kernel = gpu_kernel_alloc(str8_lit("hash_join_probe"));
-  
-  GPU_Buffer* probe_data_buf = gpu_buffer_alloc(probe_data_size, GPU_BufferFlag_Write, probe_data);
-  GPU_Buffer* probe_off_buf = gpu_buffer_alloc(is_string_key ? (probe_row_count + 1) * sizeof(U64) : 4, GPU_BufferFlag_Write, is_string_key ? probe_offsets : 0);
-  GPU_Buffer* bucket_offsets_buf = gpu_buffer_alloc((num_buckets + 1) * sizeof(U32), GPU_BufferFlag_Write, bucket_offsets);
-  
-  U32 zero_count[1] = {0};
-  GPU_Buffer* out_count_buf = gpu_buffer_alloc(sizeof(U32), GPU_BufferFlag_ReadWrite, zero_count);
+
+  U64 probe_off_size = is_string_key ? (probe_row_count + 1) * sizeof(U64) : 4;
+  U64 bucket_offsets_size = (num_buckets + 1) * sizeof(U32);
+
+  GPU_Buffer* probe_data_buf = gpu_buffer_alloc(probe_data_size, GPU_BufferFlag_Write, 0);
+  GPU_Buffer* probe_off_buf = gpu_buffer_alloc(probe_off_size, GPU_BufferFlag_Write, 0);
+  GPU_Buffer* bucket_offsets_buf = gpu_buffer_alloc(bucket_offsets_size, GPU_BufferFlag_Write, 0);
+
+  GPU_Buffer* out_count_buf = gpu_buffer_alloc(sizeof(U32), GPU_BufferFlag_ReadWrite, 0);
   GPU_Buffer* out_pairs_buf = gpu_buffer_alloc(out_capacity * 4 * sizeof(U32), GPU_BufferFlag_ReadWrite, 0);
-  
+
   gpu_kernel_set_arg_buffer(probe_kernel, 0, build_data_buf);
   gpu_kernel_set_arg_buffer(probe_kernel, 1, build_off_buf);
   gpu_kernel_set_arg_buffer(probe_kernel, 2, bucket_offsets_buf);
@@ -2532,35 +2582,53 @@ qe_hash_join(Arena* arena, PLAN_RowSet* left, GDB_Table* right_table, String8 ri
   gpu_kernel_set_arg_buffer(probe_kernel, 5, probe_off_buf);
   gpu_kernel_set_arg_buffer(probe_kernel, 6, out_pairs_buf);
   gpu_kernel_set_arg_buffer(probe_kernel, 7, out_count_buf);
-  
+
   gpu_kernel_set_arg_u64(probe_kernel, 0, probe_row_count);
   gpu_kernel_set_arg_u64(probe_kernel, 1, num_buckets);
   gpu_kernel_set_arg_u64(probe_kernel, 2, is_left_join ? 1 : 0);
   gpu_kernel_set_arg_u64(probe_kernel, 3, is_string_key ? 1 : 0);
   gpu_kernel_set_arg_u64(probe_kernel, 4, out_capacity);
-  
+
+  U64 probe_upload_bytes = num_buckets * sizeof(U32) + probe_data_size + bucket_offsets_size;
+  if (is_string_key) probe_upload_bytes += probe_off_size;
+
+  U32 match_count32 = 0;
+  GPU_Batch* probe_batch = gpu_batch_begin(probe_upload_bytes, sizeof(U32));
+  gpu_batch_buffer_write(probe_batch, cursor_buf, bucket_offsets, num_buckets * sizeof(U32));
+  if (build_row_count > 0)
+  {
+    gpu_batch_kernel_execute(probe_batch, scatter_kernel, (U32)build_row_count, QE_GPU_WORKGROUP_SIZE);
+  }
+  gpu_batch_buffer_write(probe_batch, probe_data_buf, probe_data, probe_data_size);
+  if (is_string_key) gpu_batch_buffer_write(probe_batch, probe_off_buf, probe_offsets, probe_off_size);
+  gpu_batch_buffer_write(probe_batch, bucket_offsets_buf, bucket_offsets, bucket_offsets_size);
+  gpu_batch_buffer_zero(probe_batch, out_count_buf, sizeof(U32));
   if (probe_row_count > 0)
   {
-    gpu_kernel_execute(probe_kernel, (U32)probe_row_count, QE_GPU_WORKGROUP_SIZE);
+    gpu_batch_kernel_execute(probe_batch, probe_kernel, (U32)probe_row_count, QE_GPU_WORKGROUP_SIZE);
   }
-  
-  U32 match_count32 = 0;
-  gpu_buffer_read(out_count_buf, &match_count32, sizeof(U32));
+  gpu_batch_buffer_read(probe_batch, out_count_buf, &match_count32, sizeof(U32));
+  gpu_batch_end(probe_batch);
+
+  gpu_buffer_release(row_bucket_buf);
+  gpu_buffer_release(cursor_buf);
+  gpu_kernel_release(scatter_kernel);
+
   U64 match_count = match_count32;
-  
+
   if (match_count > out_capacity)
   {
     log_error("qe_hash_join: join produced %llu matches, exceeding the %llu-pair output capacity - result is truncated",
               match_count, out_capacity);
     match_count = out_capacity;
   }
-  
+
   U32* pairs_readback = push_array(scratch.arena, U32, Max(match_count, 1) * 4);
   if (match_count > 0)
   {
     gpu_buffer_read(out_pairs_buf, pairs_readback, match_count * 4 * sizeof(U32));
   }
-  
+
   gpu_buffer_release(build_data_buf);
   gpu_buffer_release(build_off_buf);
   gpu_buffer_release(bucket_offsets_buf);
