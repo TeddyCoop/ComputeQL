@@ -419,6 +419,14 @@ gpu_device_total_memory(void)
 }
 
 internal U64
+gpu_device_max_storage_buffer_range(void)
+{
+  VkPhysicalDeviceProperties device_props;
+  vkGetPhysicalDeviceProperties(g_vulkan_state->physical_device, &device_props);
+  return device_props.limits.maxStorageBufferRange;
+}
+
+internal U64
 gpu_device_free_memory(void)
 {
   if (!g_vulkan_state->has_memory_budget_ext)
@@ -1150,14 +1158,20 @@ gpu_batch_buffer_write(GPU_Batch* batch, GPU_Buffer* buffer, void* data, U64 siz
 }
 
 internal void
-gpu_batch_buffer_zero(GPU_Batch* batch, GPU_Buffer* buffer, U64 size)
+gpu_batch_buffer_fill(GPU_Batch* batch, GPU_Buffer* buffer, U64 size, U32 value)
 {
   if (size == 0) return;
 
-  vkCmdFillBuffer(batch->cmd, buffer->buffer, buffer->bind_offset, size, 0);
+  vkCmdFillBuffer(batch->cmd, buffer->buffer, buffer->bind_offset, size, value);
 
   batch->wrote_since_barrier = 1;
   batch->has_commands = 1;
+}
+
+internal void
+gpu_batch_buffer_zero(GPU_Batch* batch, GPU_Buffer* buffer, U64 size)
+{
+  gpu_batch_buffer_fill(batch, buffer, size, 0);
 }
 
 internal void

@@ -36,6 +36,7 @@ internal U64 gpu_get_executed_kernel_time_microseconds(void);
 // tec: returns total device memory in bytes
 internal U64 gpu_device_total_memory(void);
 internal U64 gpu_device_free_memory(void);
+internal U64 gpu_device_max_storage_buffer_range(void);
 
 internal GPU_Buffer* gpu_buffer_alloc(U64 size, GPU_BufferFlags flags, void* data);
 internal GPU_Buffer* gpu_buffer_alloc_pooled(String8 name, U64 size, GPU_BufferFlags flags, void* data);
@@ -57,6 +58,7 @@ internal void gpu_kernel_set_arg_u64(GPU_Kernel* kernel, U32 index, U64 value);
 internal GPU_Batch* gpu_batch_begin(U64 upload_bytes_needed, U64 download_bytes_needed);
 internal void gpu_batch_buffer_write(GPU_Batch* batch, GPU_Buffer* buffer, void* data, U64 size);
 internal void gpu_batch_buffer_zero(GPU_Batch* batch, GPU_Buffer* buffer, U64 size);
+internal void gpu_batch_buffer_fill(GPU_Batch* batch, GPU_Buffer* buffer, U64 size, U32 value);
 internal void gpu_batch_kernel_execute(GPU_Batch* batch, GPU_Kernel* kernel, U32 global_work_size, U32 local_work_size);
 internal void gpu_batch_buffer_read(GPU_Batch* batch, GPU_Buffer* buffer, void* out_data, U64 size);
 internal void gpu_batch_end(GPU_Batch* batch);

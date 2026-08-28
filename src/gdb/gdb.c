@@ -1099,7 +1099,8 @@ gdb_table_import_csv_streaming(GDB_Database *db, String8 table_name, String8 pat
       if (types[i] == GDB_ColumnType_Invalid)
         types[i] = GDB_ColumnType_String8;
       
-      GDB_ColumnSchema schema = gdb_column_schema_create(column_names[i], types[i]);
+      String8 column_name = push_str8_copy(table->arena, column_names[i]);
+      GDB_ColumnSchema schema = gdb_column_schema_create(column_name, types[i]);
       gdb_table_add_column(table, schema);
       //log_info("column type: %.*s", str8_varg(string_from_gdb_column_type(types[i])));
     }

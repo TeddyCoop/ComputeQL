@@ -1567,21 +1567,23 @@ qe_aggregate(Arena* arena, GDB_Database* database, PLAN_RowSet* input, IR_Node* 
     K = 8;
   }
   U64 num_slots = num_buckets * K;
-  
-  if (num_slots * sizeof(U32) > GPU_MAX_BUFFER_SIZE)
+
+  if (num_slots * sizeof(U32) > gpu_device_max_storage_buffer_range())
   {
-    log_error("qe_aggregate: group-by hash table too large for a single GPU buffer (row_count=%llu) - "
-              "chunked cross-bucket aggregation isn't supported yet", row_count);
+    log_error("qe_aggregate: group-by hash table (%llu bytes) exceeds this GPU's maxStorageBufferRange "
+              "(%llu bytes) - row_count=%llu is too large for a single hash table on this device",
+              num_slots * sizeof(U32), gpu_device_max_storage_buffer_range(), row_count);
     ProfEnd();
     return result;
   }
-  
+  if (num_slots * sizeof(U32) > GPU_MAX_BUFFER_SIZE)
+  {
+    log_info("qe_aggregate: group-by hash table (%llu bytes, row_count=%llu) exceeds GPU_MAX_BUFFER_SIZE - "
+              "allocating it as a single large buffer rather than chunking", num_slots * sizeof(U32), row_count);
+  }
+
   Temp scratch = scratch_begin(&arena, 1);
-  
-  U32* owner_init = push_array(scratch.arena, U32, num_slots);
-  for (U64 i = 0; i < num_slots; i++) owner_init[i] = max_U32;
-  U32* count_init = push_array(scratch.arena, U32, num_slots); // tec: push_array zero-inits
-  
+
   GPU_Kernel* assign_kernel = gpu_kernel_alloc(str8_lit("aggregate_assign"));
   if (!assign_kernel)
   {
@@ -1630,7 +1632,7 @@ qe_aggregate(Arena* arena, GDB_Database* database, PLAN_RowSet* input, IR_Node* 
   gpu_kernel_set_arg_u64(assign_kernel, 3, num_group_cols);
   gpu_kernel_set_arg_u64(assign_kernel, 4, group_string_mask);
 
-  U64 assign_upload_bytes = (U64)num_slots * sizeof(U32) * 2;
+  U64 assign_upload_bytes = 0;
   for (U32 c = 0; c < num_group_cols * 2; c++) assign_upload_bytes += group_col_sizes[c];
   U64 assign_download_bytes = (U64)num_slots * sizeof(U32) * 2 + sizeof(U32);
 
@@ -1639,8 +1641,8 @@ qe_aggregate(Arena* arena, GDB_Database* database, PLAN_RowSet* input, IR_Node* 
   U32 overflow_readback = 0;
 
   GPU_Batch* assign_batch = gpu_batch_begin(assign_upload_bytes, assign_download_bytes);
-  gpu_batch_buffer_write(assign_batch, owner_buf, owner_init, num_slots * sizeof(U32));
-  gpu_batch_buffer_write(assign_batch, count_buf, count_init, num_slots * sizeof(U32));
+  gpu_batch_buffer_fill(assign_batch, owner_buf, num_slots * sizeof(U32), max_U32);
+  gpu_batch_buffer_zero(assign_batch, count_buf, num_slots * sizeof(U32));
   gpu_batch_buffer_zero(assign_batch, overflow_buf, sizeof(U32));
   for (U32 c = 0; c < num_group_cols; c++)
   {
@@ -2454,15 +2456,21 @@ qe_hash_join(Arena* arena, PLAN_RowSet* left, GDB_Table* right_table, String8 ri
   
   U64 num_buckets = 1;
   while (num_buckets < build_row_count) num_buckets <<= 1;
-  
-  if (num_buckets * sizeof(U32) > GPU_MAX_BUFFER_SIZE)
+
+  if (num_buckets * sizeof(U32) > gpu_device_max_storage_buffer_range())
   {
-    log_error("qe_hash_join: build-side table too large for a single GPU hash table (row_count=%llu) - "
-              "chunked join isn't supported yet", build_row_count);
+    log_error("qe_hash_join: build-side hash table (%llu bytes) exceeds this GPU's maxStorageBufferRange "
+              "(%llu bytes) - build_row_count=%llu is too large for a single hash table on this device",
+              num_buckets * sizeof(U32), gpu_device_max_storage_buffer_range(), build_row_count);
     ProfEnd();
     return result;
   }
-  
+  if (num_buckets * sizeof(U32) > GPU_MAX_BUFFER_SIZE)
+  {
+    log_info("qe_hash_join: build-side hash table (%llu bytes, build_row_count=%llu) exceeds GPU_MAX_BUFFER_SIZE - "
+              "allocating it as a single large buffer rather than chunking", num_buckets * sizeof(U32), build_row_count);
+  }
+
   Temp scratch = scratch_begin(&arena, 1);
   
   //- tec: build-side key data
@@ -2525,6 +2533,7 @@ qe_hash_join(Arena* arena, PLAN_RowSet* left, GDB_Table* right_table, String8 ri
   GPU_Batch* build_batch = gpu_batch_begin(build_data_size + build_off_size, num_buckets * sizeof(U32));
   gpu_batch_buffer_write(build_batch, build_data_buf, build_data, build_data_size);
   if (is_string_key) gpu_batch_buffer_write(build_batch, build_off_buf, build_offsets, build_off_size);
+  gpu_batch_buffer_zero(build_batch, bucket_count_buf, num_buckets * sizeof(U32));
   if (build_row_count > 0)
   {
     gpu_batch_kernel_execute(build_batch, build_kernel, (U32)build_row_count, QE_GPU_WORKGROUP_SIZE);
