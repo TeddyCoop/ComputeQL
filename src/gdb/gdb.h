@@ -156,6 +156,10 @@ struct GDB_Index
   String8 name;
   String8 column_name;
   GDB_Column* column;
+
+  U64* order;
+  U64 order_count;
+  U64 order_capacity;
 };
 
 struct GDB_Table
@@ -256,9 +260,17 @@ internal GDB_Column* gdb_table_find_column(GDB_Table* table, String8 column_name
 
 //~ tec: indexes
 internal GDB_Index* gdb_table_create_index(GDB_Table* table, String8 index_name, GDB_Column* column);
+internal GDB_Index* gdb_table_register_index(GDB_Table* table, String8 index_name, GDB_Column* column);
 internal void gdb_table_drop_index(GDB_Table* table, String8 index_name);
 internal GDB_Index* gdb_table_find_index(GDB_Table* table, String8 index_name);
 internal GDB_Index* gdb_table_find_index_on_column(GDB_Table* table, GDB_Column* column);
+
+internal void gdb_index_build_order(GDB_Index* index);
+internal void gdb_index_insert_row(GDB_Index* index, U64 new_row_index);
+internal void gdb_index_remove_row(GDB_Index* index, U64 removed_row_index);
+internal void gdb_index_save(GDB_Index* index, String8 table_dir);
+internal B32 gdb_index_load(GDB_Index* index, String8 table_dir);
+internal String8 gdb_generate_disk_path_for_index(Arena* arena, GDB_Table* table, String8 index_name);
 
 //~ tec: constraints
 internal B32 gdb_column_has_any_constraint(GDB_Column* column);

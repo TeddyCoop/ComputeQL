@@ -297,6 +297,15 @@ gdb_table_remove_column(GDB_Table* table, GDB_Column* column)
     return;
   }
 
+  // tec: drop any index over this column first
+  for (S64 i = (S64)table->index_count - 1; i >= 0; i--)
+  {
+    if (table->indexes[i]->column == column)
+    {
+      gdb_table_drop_index(table, table->indexes[i]->name);
+    }
+  }
+
   gdb_column_close(column);
   if (column->is_disk_backed)
   {
@@ -328,7 +337,14 @@ gdb_table_add_row(GDB_Table* table, void** row_data, B32* null_flags)
   {
     gdb_column_add_data_maybe_null(table->columns[i], row_data[i], null_flags ? null_flags[i] : 0);
   }
+
+  U64 new_row_index = table->row_count;
   table->row_count++;
+
+  for (U64 i = 0; i < table->index_count; i++)
+  {
+    gdb_index_insert_row(table->indexes[i], new_row_index);
+  }
 }
 
 internal B32
@@ -354,7 +370,12 @@ gdb_table_remove_row(GDB_Table* table, U64 row_index)
   {
     gdb_column_remove_data(table->columns[i], row_index);
   }
-  
+
+  for (U64 i = 0; i < table->index_count; i++)
+  {
+    gdb_index_remove_row(table->indexes[i], row_index);
+  }
+
   table->row_count--;
 }
 
@@ -574,6 +595,12 @@ gdb_table_save(GDB_Table* table, String8 table_dir)
     }
   }
   scratch_end(scratch);
+
+  //- tec: index order files
+  for (U64 i = 0; i < table->index_count; i++)
+  {
+    gdb_index_save(table->indexes[i], table_dir);
+  }
 
   ProfEnd();
   return 1;
@@ -832,7 +859,11 @@ gdb_table_load(String8 table_dir, String8 meta_path)
       GDB_Column* column = gdb_table_find_column(table, column_name);
       if (column)
       {
-        gdb_table_create_index(table, index_name, column);
+        GDB_Index* index = gdb_table_register_index(table, index_name, column);
+        if (!gdb_index_load(index, table_dir))
+        {
+          gdb_index_build_order(index);
+        }
       }
       else
       {
@@ -1307,7 +1338,7 @@ gdb_table_find_index_on_column(GDB_Table* table, GDB_Column* column)
 }
 
 internal GDB_Index*
-gdb_table_create_index(GDB_Table* table, String8 index_name, GDB_Column* column)
+gdb_table_register_index(GDB_Table* table, String8 index_name, GDB_Column* column)
 {
   if (table->index_count == 0)
   {
@@ -1332,6 +1363,14 @@ gdb_table_create_index(GDB_Table* table, String8 index_name, GDB_Column* column)
   return index;
 }
 
+internal GDB_Index*
+gdb_table_create_index(GDB_Table* table, String8 index_name, GDB_Column* column)
+{
+  GDB_Index* index = gdb_table_register_index(table, index_name, column);
+  gdb_index_build_order(index);
+  return index;
+}
+
 internal void
 gdb_table_drop_index(GDB_Table* table, String8 index_name)
 {
@@ -1347,11 +1386,287 @@ gdb_table_drop_index(GDB_Table* table, String8 index_name)
     return;
   }
 
+  if (table->parent_database)
+  {
+    Temp scratch = scratch_begin(0, 0);
+    String8 idx_path = gdb_generate_disk_path_for_index(scratch.arena, table, table->indexes[slot]->name);
+    os_delete_file_at_path(idx_path);
+    scratch_end(scratch);
+  }
+
   for (U64 i = slot; i + 1 < table->index_count; i++)
   {
     table->indexes[i] = table->indexes[i + 1];
   }
   table->index_count--;
+}
+
+//~ tec: index order maintenance
+
+internal S32
+gdb_str8_compare(String8 a, String8 b)
+{
+  U64 min_size = Min(a.size, b.size);
+  S32 cmp = min_size ? (S32)MemoryCompare(a.str, b.str, min_size) : 0;
+  if (cmp != 0) return cmp;
+  if (a.size < b.size) return -1;
+  if (a.size > b.size) return 1;
+  return 0;
+}
+
+internal F64
+gdb_index_numeric_value(GDB_Column* column, U64 row_index)
+{
+  void* data = gdb_column_get_data(column, row_index);
+  switch (column->type)
+  {
+    case GDB_ColumnType_U32: return (F64)(*(U32*)data);
+    case GDB_ColumnType_U64: return (F64)(*(U64*)data);
+    case GDB_ColumnType_F32: return (F64)(*(F32*)data);
+    case GDB_ColumnType_F64: return *(F64*)data;
+    default: return 0.0;
+  }
+}
+
+typedef struct GDB_IndexBuildCtx GDB_IndexBuildCtx;
+struct GDB_IndexBuildCtx
+{
+  B32 is_string;
+  F64* numeric_keys; // tec: dense, indexed by row (0..row_count-1)
+  GDB_StringDataChunk string_keys;
+};
+
+global GDB_IndexBuildCtx* g_gdb_index_build_ctx = 0;
+
+internal int
+gdb_index_build_compare(const void* a, const void* b)
+{
+  U64 ra = *(const U64*)a;
+  U64 rb = *(const U64*)b;
+  GDB_IndexBuildCtx* ctx = g_gdb_index_build_ctx;
+
+  if (ctx->is_string)
+  {
+    GDB_StringDataChunk* chunk = &ctx->string_keys;
+    String8 sa = str8((U8*)chunk->data + chunk->offsets[ra], chunk->offsets[ra + 1] - chunk->offsets[ra]);
+    String8 sb = str8((U8*)chunk->data + chunk->offsets[rb], chunk->offsets[rb + 1] - chunk->offsets[rb]);
+    return gdb_str8_compare(sa, sb);
+  }
+
+  F64 va = ctx->numeric_keys[ra];
+  F64 vb = ctx->numeric_keys[rb];
+  return (va < vb) ? -1 : (va > vb) ? 1 : 0;
+}
+
+internal void
+gdb_index_build_order(GDB_Index* index)
+{
+  GDB_Column* column = index->column;
+  GDB_Table* table = column->parent_table;
+  U64 row_count = table->row_count;
+
+  index->order = row_count ? push_array(table->arena, U64, row_count) : NULL;
+  index->order_count = row_count;
+  index->order_capacity = row_count;
+
+  if (row_count == 0) return;
+
+  Temp scratch = scratch_begin(0, 0);
+
+  GDB_IndexBuildCtx ctx = {0};
+  ctx.is_string = (column->type == GDB_ColumnType_String8);
+
+  if (ctx.is_string)
+  {
+    ctx.string_keys = gdb_column_get_string_chunk(scratch.arena, column, r1u64(0, row_count));
+  }
+  else
+  {
+    U64 range_size = 0;
+    void* base_ptr = gdb_column_get_data_range(scratch.arena, column, r1u64(0, row_count), &range_size);
+    F64* numeric_keys = push_array(scratch.arena, F64, row_count);
+    for (U64 i = 0; i < row_count; i++)
+    {
+      void* data = (U8*)base_ptr + i * column->size;
+      switch (column->type)
+      {
+        case GDB_ColumnType_U32: numeric_keys[i] = (F64)(*(U32*)data); break;
+        case GDB_ColumnType_U64: numeric_keys[i] = (F64)(*(U64*)data); break;
+        case GDB_ColumnType_F32: numeric_keys[i] = (F64)(*(F32*)data); break;
+        case GDB_ColumnType_F64: numeric_keys[i] = *(F64*)data; break;
+        default: numeric_keys[i] = 0.0; break;
+      }
+    }
+    ctx.numeric_keys = numeric_keys;
+  }
+
+  for (U64 i = 0; i < row_count; i++) index->order[i] = i;
+
+  GDB_IndexBuildCtx* prev_ctx = g_gdb_index_build_ctx;
+  g_gdb_index_build_ctx = &ctx;
+  quick_sort(index->order, row_count, sizeof(U64), gdb_index_build_compare);
+  g_gdb_index_build_ctx = prev_ctx;
+
+  scratch_end(scratch);
+}
+
+internal void
+gdb_index_ensure_order_capacity(GDB_Index* index, GDB_Table* table)
+{
+  if (index->order_count < index->order_capacity) return;
+
+  U64 new_capacity = (index->order_capacity > 0) ? index->order_capacity * 2 : GDB_COLUMN_EXPAND_COUNT;
+  U64* new_order = push_array(table->arena, U64, new_capacity);
+  if (index->order)
+  {
+    MemoryCopy(new_order, index->order, index->order_count * sizeof(U64));
+  }
+  index->order = new_order;
+  index->order_capacity = new_capacity;
+}
+
+internal void
+gdb_index_insert_row(GDB_Index* index, U64 new_row_index)
+{
+  GDB_Column* column = index->column;
+  GDB_Table* table = column->parent_table;
+
+  gdb_index_ensure_order_capacity(index, table);
+
+  Temp scratch = scratch_begin(0, 0);
+
+  U64 lo = 0, hi = index->order_count;
+  if (column->type == GDB_ColumnType_String8)
+  {
+    String8 new_key = gdb_column_get_string(scratch.arena, column, new_row_index);
+    while (lo < hi)
+    {
+      U64 mid = lo + (hi - lo) / 2;
+      String8 mid_key = gdb_column_get_string(scratch.arena, column, index->order[mid]);
+      if (gdb_str8_compare(mid_key, new_key) < 0) lo = mid + 1;
+      else hi = mid;
+    }
+  }
+  else
+  {
+    F64 new_key = gdb_index_numeric_value(column, new_row_index);
+    while (lo < hi)
+    {
+      U64 mid = lo + (hi - lo) / 2;
+      F64 mid_key = gdb_index_numeric_value(column, index->order[mid]);
+      if (mid_key < new_key) lo = mid + 1;
+      else hi = mid;
+    }
+  }
+
+  MemoryCopy(index->order + lo + 1, index->order + lo, (index->order_count - lo) * sizeof(U64));
+  index->order[lo] = new_row_index;
+  index->order_count++;
+
+  scratch_end(scratch);
+}
+
+internal void
+gdb_index_remove_row(GDB_Index* index, U64 removed_row_index)
+{
+  U64 slot = index->order_count;
+  for (U64 i = 0; i < index->order_count; i++)
+  {
+    if (index->order[i] == removed_row_index) { slot = i; break; }
+  }
+
+  if (slot < index->order_count)
+  {
+    MemoryCopy(index->order + slot, index->order + slot + 1, (index->order_count - slot - 1) * sizeof(U64));
+    index->order_count--;
+  }
+
+  for (U64 i = 0; i < index->order_count; i++)
+  {
+    if (index->order[i] > removed_row_index) index->order[i]--;
+  }
+}
+
+internal String8
+gdb_generate_disk_path_for_index(Arena* arena, GDB_Table* table, String8 index_name)
+{
+  GDB_Database* database = table->parent_database;
+
+  {
+    Temp scratch = scratch_begin(0, 0);
+
+    String8 database_path = push_str8f(arena, "gdb_data/%.*s/", str8_varg(database->name));
+    if (!os_file_path_exists(database_path))
+    {
+      os_make_directory(database_path);
+    }
+
+    String8 table_path = push_str8f(arena, "gdb_data/%.*s/%.*s/", str8_varg(database->name), str8_varg(table->name));
+    if (!os_file_path_exists(table_path))
+    {
+      os_make_directory(table_path);
+    }
+
+    scratch_end(scratch);
+  }
+
+  return push_str8f(arena, "gdb_data/%.*s/%.*s/%.*s.idx", str8_varg(database->name), str8_varg(table->name), str8_varg(index_name));
+}
+
+internal void
+gdb_index_save(GDB_Index* index, String8 table_dir)
+{
+  Temp scratch = scratch_begin(0, 0);
+
+  String8 idx_path = push_str8f(scratch.arena, "%.*s/%.*s.idx", str8_varg(table_dir), str8_varg(index->name));
+  OS_Handle file = os_file_open(OS_AccessFlag_Write, idx_path);
+  if (os_handle_match(os_handle_zero(), file))
+  {
+    log_error("Failed to open index file for saving: %.*s", str8_varg(idx_path));
+    scratch_end(scratch);
+    return;
+  }
+
+  U64 data_size = index->order_count * sizeof(U64);
+  U64 total_size = sizeof(U64) + data_size;
+  U8* buffer = push_array(scratch.arena, U8, total_size);
+  *(U64*)buffer = index->order_count;
+  if (data_size)
+  {
+    MemoryCopy(buffer + sizeof(U64), index->order, data_size);
+  }
+
+  os_file_write(file, r1u64(0, total_size), buffer);
+  os_file_close(file);
+  scratch_end(scratch);
+}
+
+internal B32
+gdb_index_load(GDB_Index* index, String8 table_dir)
+{
+  Temp scratch = scratch_begin(0, 0);
+
+  String8 idx_path = push_str8f(scratch.arena, "%.*s/%.*s.idx", str8_varg(table_dir), str8_varg(index->name));
+  String8 idx_data = os_data_from_file_path(scratch.arena, idx_path);
+
+  B32 ok = 0;
+  if (idx_data.size >= sizeof(U64))
+  {
+    U64 count = *(U64*)idx_data.str;
+    U64 expected_size = sizeof(U64) + count * sizeof(U64);
+    GDB_Table* table = index->column->parent_table;
+    if (idx_data.size == expected_size && count == table->row_count)
+    {
+      index->order = count ? push_array(table->arena, U64, count) : NULL;
+      if (count) MemoryCopy(index->order, idx_data.str + sizeof(U64), count * sizeof(U64));
+      index->order_count = count;
+      index->order_capacity = count;
+      ok = 1;
+    }
+  }
+
+  scratch_end(scratch);
+  return ok;
 }
 
 //~ tec: constraints

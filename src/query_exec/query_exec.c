@@ -1969,58 +1969,28 @@ qe_bare_column_name(String8 name)
 }
 
 //~ tec: index scan
-typedef struct QE_IndexScanCtx QE_IndexScanCtx;
-struct QE_IndexScanCtx
-{
-  B32 is_string;
-  F64* numeric_keys; // tec: dense, indexed by row (0..row_count-1)
-  GDB_StringDataChunk string_keys;
-};
-
-global QE_IndexScanCtx* g_qe_index_scan_ctx = 0;
-
-internal int
-qe_index_scan_compare(const void* a, const void* b)
-{
-  U64 ra = *(const U64*)a;
-  U64 rb = *(const U64*)b;
-  QE_IndexScanCtx* ctx = g_qe_index_scan_ctx;
-
-  if (ctx->is_string)
-  {
-    GDB_StringDataChunk* chunk = &ctx->string_keys;
-    String8 sa = str8((U8*)chunk->data + chunk->offsets[ra], chunk->offsets[ra + 1] - chunk->offsets[ra]);
-    String8 sb = str8((U8*)chunk->data + chunk->offsets[rb], chunk->offsets[rb + 1] - chunk->offsets[rb]);
-    return qe_str8_compare(sa, sb);
-  }
-
-  F64 va = ctx->numeric_keys[ra];
-  F64 vb = ctx->numeric_keys[rb];
-  return (va < vb) ? -1 : (va > vb) ? 1 : 0;
-}
 
 internal S32
-qe_index_row_cmp_target(QE_IndexScanCtx* ctx, U64 row, F64 target_numeric, String8 target_string)
+qe_index_row_cmp_target(Arena* arena, GDB_Column* column, B32 is_string, U64 row, F64 target_numeric, String8 target_string)
 {
-  if (ctx->is_string)
+  if (is_string)
   {
-    U64 s = ctx->string_keys.offsets[row], e = ctx->string_keys.offsets[row + 1];
-    String8 sv = str8((U8*)ctx->string_keys.data + s, e - s);
+    String8 sv = gdb_column_get_string(arena, column, row);
     return qe_str8_compare(sv, target_string);
   }
-  F64 v = ctx->numeric_keys[row];
+  F64 v = qe_read_numeric_as_f64(column, row);
   return (v < target_numeric) ? -1 : (v > target_numeric) ? 1 : 0;
 }
 
 // tec: first index i in order[lo..count) such that order[i]'s key >= target (standard lower_bound)
 internal U64
-qe_index_lower_bound(QE_IndexScanCtx* ctx, U64* order, U64 count, F64 target_numeric, String8 target_string)
+qe_index_lower_bound(Arena* arena, GDB_Column* column, B32 is_string, U64* order, U64 count, F64 target_numeric, String8 target_string)
 {
   U64 lo = 0, hi = count;
   while (lo < hi)
   {
     U64 mid = lo + (hi - lo) / 2;
-    if (qe_index_row_cmp_target(ctx, order[mid], target_numeric, target_string) < 0) lo = mid + 1;
+    if (qe_index_row_cmp_target(arena, column, is_string, order[mid], target_numeric, target_string) < 0) lo = mid + 1;
     else hi = mid;
   }
   return lo;
@@ -2028,13 +1998,13 @@ qe_index_lower_bound(QE_IndexScanCtx* ctx, U64* order, U64 count, F64 target_num
 
 // tec: first index i such that order[i]'s key > target (standard upper_bound)
 internal U64
-qe_index_upper_bound(QE_IndexScanCtx* ctx, U64* order, U64 count, F64 target_numeric, String8 target_string)
+qe_index_upper_bound(Arena* arena, GDB_Column* column, B32 is_string, U64* order, U64 count, F64 target_numeric, String8 target_string)
 {
   U64 lo = 0, hi = count;
   while (lo < hi)
   {
     U64 mid = lo + (hi - lo) / 2;
-    if (qe_index_row_cmp_target(ctx, order[mid], target_numeric, target_string) <= 0) lo = mid + 1;
+    if (qe_index_row_cmp_target(arena, column, is_string, order[mid], target_numeric, target_string) <= 0) lo = mid + 1;
     else hi = mid;
   }
   return lo;
@@ -2081,42 +2051,13 @@ qe_try_index_scan(Arena* arena, GDB_Table* table, IR_Node* where_clause, QE_Scan
     return 1;
   }
 
+  // tec: recreate index if needed
+  if (index->order_count != row_count)
+  {
+    gdb_index_build_order(index);
+  }
+
   Temp scratch = scratch_begin(&arena, 1);
-
-  QE_IndexScanCtx ctx = {0};
-  ctx.is_string = is_string_key;
-
-  if (is_string_key)
-  {
-    ctx.string_keys = gdb_column_get_string_chunk(scratch.arena, column, r1u64(0, row_count));
-  }
-  else
-  {
-    U64 range_size = 0;
-    void* base_ptr = gdb_column_get_data_range(scratch.arena, column, r1u64(0, row_count), &range_size);
-    F64* numeric_keys = push_array(scratch.arena, F64, row_count);
-    for (U64 i = 0; i < row_count; i++)
-    {
-      void* data = (U8*)base_ptr + i * column->size;
-      switch (column->type)
-      {
-        case GDB_ColumnType_U32: numeric_keys[i] = (F64)(*(U32*)data); break;
-        case GDB_ColumnType_U64: numeric_keys[i] = (F64)(*(U64*)data); break;
-        case GDB_ColumnType_F32: numeric_keys[i] = (F64)(*(F32*)data); break;
-        case GDB_ColumnType_F64: numeric_keys[i] = *(F64*)data; break;
-        default: numeric_keys[i] = 0.0; break;
-      }
-    }
-    ctx.numeric_keys = numeric_keys;
-  }
-
-  U64* order = push_array(scratch.arena, U64, row_count);
-  for (U64 i = 0; i < row_count; i++) order[i] = i;
-
-  QE_IndexScanCtx* prev_ctx = g_qe_index_scan_ctx;
-  g_qe_index_scan_ctx = &ctx;
-  quick_sort(order, row_count, sizeof(U64), qe_index_scan_compare);
-  g_qe_index_scan_ctx = prev_ctx;
 
   F64 target_numeric = is_string_key ? 0.0 : f64_from_str8(right->value);
   String8 target_string = is_string_key ? right->value : (String8){0};
@@ -2124,27 +2065,27 @@ qe_try_index_scan(Arena* arena, GDB_Table* table, IR_Node* where_clause, QE_Scan
   U64 range_lo = 0, range_hi = 0;
   if (is_eq)
   {
-    range_lo = qe_index_lower_bound(&ctx, order, row_count, target_numeric, target_string);
-    range_hi = qe_index_upper_bound(&ctx, order, row_count, target_numeric, target_string);
+    range_lo = qe_index_lower_bound(scratch.arena, column, is_string_key, index->order, row_count, target_numeric, target_string);
+    range_hi = qe_index_upper_bound(scratch.arena, column, is_string_key, index->order, row_count, target_numeric, target_string);
   }
   else if (is_lt)
   {
     range_lo = 0;
-    range_hi = qe_index_lower_bound(&ctx, order, row_count, target_numeric, target_string);
+    range_hi = qe_index_lower_bound(scratch.arena, column, is_string_key, index->order, row_count, target_numeric, target_string);
   }
   else if (is_le)
   {
     range_lo = 0;
-    range_hi = qe_index_upper_bound(&ctx, order, row_count, target_numeric, target_string);
+    range_hi = qe_index_upper_bound(scratch.arena, column, is_string_key, index->order, row_count, target_numeric, target_string);
   }
   else if (is_gt)
   {
-    range_lo = qe_index_upper_bound(&ctx, order, row_count, target_numeric, target_string);
+    range_lo = qe_index_upper_bound(scratch.arena, column, is_string_key, index->order, row_count, target_numeric, target_string);
     range_hi = row_count;
   }
   else // tec: is_ge
   {
-    range_lo = qe_index_lower_bound(&ctx, order, row_count, target_numeric, target_string);
+    range_lo = qe_index_lower_bound(scratch.arena, column, is_string_key, index->order, row_count, target_numeric, target_string);
     range_hi = row_count;
   }
 
@@ -2153,7 +2094,7 @@ qe_try_index_scan(Arena* arena, GDB_Table* table, IR_Node* where_clause, QE_Scan
   out_result->count = match_count;
   for (U64 i = 0; i < match_count; i++)
   {
-    out_result->indices[i] = order[range_lo + i];
+    out_result->indices[i] = index->order[range_lo + i];
   }
 
   scratch_end(scratch);

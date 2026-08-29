@@ -2,8 +2,6 @@
 
 ComputeQL is a from-scratch, columnar SQL database written in C99 that executes queries as **GPU compute kernels** instead of on the CPU. Rather than compiling a bespoke shader per query, it interprets a compact **bytecode VM** inside a small library of precompiled Vulkan compute shaders - so arbitrary WHERE-clause expressions can be evaluated on the GPU without any runtime shader compilation.
 
-> **Status:** ComputeQL is the successor of a previous project GDB. The storage engine, SQL parser, query planner, and multi-operator GPU execution (joins, sorts, aggregates) are all functional end-to-end. Current work is focused on constraints/indexing and closing the performance gap with CPU databases on small/selective queries. See [Roadmap](#roadmap) below for exactly what's implemented today versus planned.
-
 ## How it works
 
 1. **Storage** - Data lives in a hand-rolled columnar format (`GDB_Database` -> `GDB_Table` -> `GDB_Column`), one file per column, memory-mapped on load. Small columns are loaded fully into memory; columns past a size threshold are streamed/disk-backed automatically.
@@ -21,7 +19,7 @@ ComputeQL is a from-scratch, columnar SQL database written in C99 that executes 
 - CSV import (streaming, for datasets larger than memory) and CSV export
 - Per-column NULL tracking
 - Single-column constraints: `NOT NULL`, `UNIQUE`, `PRIMARY KEY`, `FOREIGN KEY ... REFERENCES table(column)`, `CHECK(...)` - enforced on `INSERT`
-- `CREATE INDEX ... ON table(column)` / `DROP INDEX` - index metadata persists with the table; the sorted scan order itself is built on demand at query time
+- Single Column Index
 - A reserved `column_catalog` system table exposing per-column metadata (type, constraints, index membership), queryable like any other table, plus `DESCRIBE <table>`
 
 **SQL support**
@@ -55,8 +53,6 @@ A benchmark harness (`src/tests/`, run via `build_and_run_tests.bat`) compares C
 ## Roadmap
 
 Ordered from "next" to "later":
-- [ ] **Chunked cross-bucket hashing** - support `GROUP BY`/hash-join tables larger than the GPU's max buffer size.
-- [ ] **Persistent/sorted index storage** - maintain index sort order on disk instead of rebuilding it on demand each query.
 - [ ] **Cross-engine benchmarking against more engines** - extend the current SQLite-only harness to DuckDB/ClickHouse/Postgres and publish results.
 - [ ] **Client-server mode** - a long-running server process that keeps databases and the GPU context loaded and accepts queries over a network connection, instead of today's one-shot CLI invocation. A natural fit is speaking the Postgres wire protocol, so existing clients, ORMs, and BI tools work against it out of the box.
 - [ ] **Users & access control** - accounts and authentication for network connections, plus a role/permission model (`GRANT`/`REVOKE`) scoped to databases and tables, so a shared server isn't all-or-nothing access.
