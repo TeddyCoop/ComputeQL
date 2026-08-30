@@ -1595,6 +1595,11 @@ gdb_generate_disk_path_for_index(Arena* arena, GDB_Table* table, String8 index_n
   {
     Temp scratch = scratch_begin(0, 0);
 
+    if (!os_file_path_exists(str8_lit("gdb_data/")))
+    {
+      os_make_directory(str8_lit("gdb_data/"));
+    }
+
     String8 database_path = push_str8f(arena, "gdb_data/%.*s/", str8_varg(database->name));
     if (!os_file_path_exists(database_path))
     {
@@ -1773,12 +1778,21 @@ gdb_column_add_data_disk_backed(GDB_Column* column, void* data)
       
       U64 new_size = offset_array_offset + total_offsets_size;
       os_file_resize(file, new_size);
-      
-      U64 old_offset_array_size = total_offsets_size;
-      void *zero_buf = push_array(scratch.arena, U8, old_offset_array_size);
-      MemoryZero(zero_buf, old_offset_array_size);
-      os_file_write(file, r1u64(old_offset_pos, old_offset_pos + old_offset_array_size), zero_buf);
-      
+
+      // tec: clear the old offsets location
+      U64 old_offset_array_end = old_offset_pos + total_offsets_size;
+      if (old_offset_array_end > new_offset_pos)
+      {
+        old_offset_array_end = new_offset_pos;
+      }
+      if (old_offset_array_end > old_offset_pos)
+      {
+        U64 old_offset_array_size = old_offset_array_end - old_offset_pos;
+        void *zero_buf = push_array(scratch.arena, U8, old_offset_array_size);
+        MemoryZero(zero_buf, old_offset_array_size);
+        os_file_write(file, r1u64(old_offset_pos, old_offset_array_end), zero_buf);
+      }
+
       temp_end(scratch);
       ProfEnd();
     }
@@ -1798,7 +1812,9 @@ gdb_column_add_data_disk_backed(GDB_Column* column, void* data)
     OS_Handle file = column->file;
     if (os_handle_match(os_handle_zero(), file))
     {
-      file = os_file_open(OS_AccessFlag_Write | OS_AccessFlag_Append, column->disk_path);
+      // tec: cached in column->file for the column's whole lifetime
+      file = os_file_open(OS_AccessFlag_Read | OS_AccessFlag_Write | OS_AccessFlag_Append | OS_AccessFlag_ShareRead | OS_AccessFlag_ShareWrite, column->disk_path);
+      column->file = file;
     }
     U64 offset = column->row_count * column->size;
     os_file_write(file, r1u64(offset, offset + column->size), data);
@@ -2098,12 +2114,20 @@ gdb_column_get_string(Arena *arena, GDB_Column *column, U64 index)
     U64 var_reserved = 0;
     os_file_read(file, r1u64(0, sizeof(U64)), &var_reserved);
     
+    // tec: offsets[k] = end-of-row-k byte position (0-indexed, no leading zero stored)
     U64 offset_base = var_reserved + sizeof(U64);
     U64 offset_pos = offset_base + (index * sizeof(U64));
-    
+
     U64 start = 0, end = 0;
-    
-    os_file_read(file, r1u64(offset_pos - sizeof(U64), offset_pos), &start);
+
+    if (index == 0)
+    {
+      start = 0;
+    }
+    else
+    {
+      os_file_read(file, r1u64(offset_pos - sizeof(U64), offset_pos), &start);
+    }
     os_file_read(file, r1u64(offset_pos, offset_pos + sizeof(U64)), &end);
     
     if (end < start)
@@ -2410,23 +2434,28 @@ gdb_generate_disk_path_for_column(Arena* arena, GDB_Column* column)
   
   {
     Temp scratch = scratch_begin(0, 0);
-    
+
+    if (!os_file_path_exists(str8_lit("gdb_data/")))
+    {
+      os_make_directory(str8_lit("gdb_data/"));
+    }
+
     String8 database_path = push_str8f(arena, "gdb_data/%.*s/", str8_varg(database->name));
-    
+
     if (!os_file_path_exists(database_path))
     {
       os_make_directory(database_path);
     }
-    
+
     String8 table_path = push_str8f(arena, "gdb_data/%.*s/%.*s/", str8_varg(database->name), str8_varg(table->name));
     if (!os_file_path_exists(table_path))
     {
       os_make_directory(table_path);
     }
-    
+
     scratch_end(scratch);
   }
-  
+
   String8 column_path = push_str8f(arena, "gdb_data/%.*s/%.*s/%.*s.dat", str8_varg(database->name), str8_varg(table->name), str8_varg(column->name));
   return column_path;
 }

@@ -48,12 +48,12 @@ ComputeQL is a from-scratch, columnar SQL database written in C99 that executes 
 
 ## Performance
 
-A benchmark harness (`src/tests/`, run via `build_and_run_tests.bat`) compares ComputeQL against SQLite on small (50-row) and large (100k-row) tables, reporting prepare/execute/total timings and cross-checking row counts and a checksum between engines. Bulk column materialization, GPU resource pooling/caching, and batched GPU submission across every operator (scan+filter, join, sort, group-by/aggregate) keep per-query overhead low. The remaining performance focus is continuing to close the gap with in-memory CPU engines like SQLite on small, highly selective queries.
+A benchmark harness (`src/tests/`, run via `build_and_run_tests.bat`) compares ComputeQL against SQLite and DuckDB on small (50-row) and large (100k-row) tables, reporting prepare/execute/total timings and cross-checking row counts and a checksum between all three engines. Bulk column materialization, GPU resource pooling/caching, and batched GPU submission across every operator (scan+filter, join, sort, group-by/aggregate) keep per-query overhead low. The remaining performance focus is continuing to close the gap with in-memory CPU engines like SQLite and DuckDB on small, highly selective queries.
 
 ## Roadmap
 
 Ordered from "next" to "later":
-- [ ] **Cross-engine benchmarking against more engines** - extend the current SQLite-only harness to DuckDB/ClickHouse/Postgres and publish results.
+- [ ] **Cross-engine benchmarking against more engines** - extend to ClickHouse/Postgres (client-server engines, needing a running server + client library) and publish results.
 - [ ] **Client-server mode** - a long-running server process that keeps databases and the GPU context loaded and accepts queries over a network connection, instead of today's one-shot CLI invocation. A natural fit is speaking the Postgres wire protocol, so existing clients, ORMs, and BI tools work against it out of the box.
 - [ ] **Users & access control** - accounts and authentication for network connections, plus a role/permission model (`GRANT`/`REVOKE`) scoped to databases and tables, so a shared server isn't all-or-nothing access.
 - [ ] **Multi-GPU support**

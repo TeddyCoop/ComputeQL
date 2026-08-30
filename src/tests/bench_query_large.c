@@ -13,6 +13,7 @@
 #include "query_exec/query_exec.h"
 #include "planner/planner.h"
 #include "third_party/sqlite/sqlite3.h"
+#include "third_party/duckdb/duckdb.h"
 
 #include "base/base_inc.c"
 #include "os/os_inc.c"
@@ -40,7 +41,7 @@ entry_point(CmdLine* cmdline)
 
   Arena* arena = arena_alloc(.reserve_size = GB(1), .commit_size = MB(64));
 
-  Bench_Report* report = bench_report_alloc(arena, "compute_ql vs sqlite - large dataset query suite");
+  Bench_Report* report = bench_report_alloc(arena, "compute_ql vs sqlite vs duckdb - large dataset query suite");
   bench_report_text(report, "engine startup (gdb_init + gpu_init, one-time): %.4f ms", (F64)(t1 - t0) / 1000.0);
 
   bench_run_query_suite(arena, report, 100000, "large");

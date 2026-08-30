@@ -1,1 +1,5 @@
 /build
+
+# other query engines used for testing
+/src/third_party/duckdb/
+/src/third_party/sqlite/

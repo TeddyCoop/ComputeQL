@@ -12,6 +12,7 @@
 #include "query_exec/query_exec.h"
 #include "planner/planner.h"
 #include "third_party/sqlite/sqlite3.h"
+#include "third_party/duckdb/duckdb.h"
 
 #include "base/base_inc.c"
 #include "os/os_inc.c"
@@ -81,6 +82,23 @@ bench_sqlite_import_csv(sqlite3* db, String8 table_name, String8 csv_path)
 }
 
 internal void
+bench_duckdb_import_csv(duckdb_connection conn, String8 table_name, String8 csv_path)
+{
+  Temp scratch = scratch_begin(0, 0);
+
+  String8 sql = push_str8f(scratch.arena, "COPY %.*s FROM '%.*s' (FORMAT CSV, HEADER TRUE);",
+                            str8_varg(table_name), str8_varg(csv_path));
+  duckdb_result result = {0};
+  if (duckdb_query(conn, (const char*)sql.str, &result) != DuckDBSuccess)
+  {
+    log_error("duckdb COPY FROM failed: %s", duckdb_result_error(&result));
+  }
+  duckdb_destroy_result(&result);
+
+  scratch_end(scratch);
+}
+
+internal void
 entry_point(CmdLine* cmdline)
 {
   ProfBeginCapture();
@@ -99,7 +117,7 @@ entry_point(CmdLine* cmdline)
 
   Arena* arena = arena_alloc(.reserve_size = GB(1), .commit_size = MB(64));
 
-  Bench_Report* report = bench_report_alloc(arena, "compute_ql vs sqlite - csv import");
+  Bench_Report* report = bench_report_alloc(arena, "compute_ql vs sqlite vs duckdb - csv import");
   bench_report_text(report, "engine startup (gdb_init + gpu_init, one-time): %.4f ms", (F64)(t1 - t0) / 1000.0);
   bench_report_section(report, "csv import: %llu rows", row_count);
 
@@ -180,14 +198,58 @@ entry_point(CmdLine* cmdline)
     sqlite_samples[run] = (F64)(s1 - s0) / 1000.0;
   }
 
+  //- tec: duckdb import (native COPY FROM CSV loader - duckdb's idiomatic bulk-load path)
+  for (U64 run = 0; run < IMPORT_WARMUP_RUNS; run++)
+  {
+    duckdb_database db = NULL;
+    duckdb_connection conn = NULL;
+    duckdb_open(NULL, &db);
+    duckdb_connect(db, &conn);
+    bench_duckdb_create_schema(conn, table_name);
+    bench_duckdb_import_csv(conn, table_name, csv_path);
+    duckdb_disconnect(&conn);
+    duckdb_close(&db);
+  }
+
+  F64 duckdb_samples[IMPORT_TIMED_RUNS];
+  U64 duckdb_last_row_count = 0;
+  for (U64 run = 0; run < IMPORT_TIMED_RUNS; run++)
+  {
+    U64 s0 = os_now_microseconds();
+    duckdb_database db = NULL;
+    duckdb_connection conn = NULL;
+    duckdb_open(NULL, &db);
+    duckdb_connect(db, &conn);
+    bench_duckdb_create_schema(conn, table_name);
+    bench_duckdb_import_csv(conn, table_name, csv_path);
+    U64 s1 = os_now_microseconds();
+
+    Temp count_scratch = scratch_begin(&arena, 1);
+    String8 count_sql = push_str8f(count_scratch.arena, "SELECT COUNT(*) FROM %.*s;", str8_varg(table_name));
+    duckdb_result count_result = {0};
+    if (duckdb_query(conn, (const char*)count_sql.str, &count_result) == DuckDBSuccess)
+    {
+      duckdb_last_row_count = (U64)duckdb_value_int64(&count_result, 0, 0);
+    }
+    duckdb_destroy_result(&count_result);
+    scratch_end(count_scratch);
+
+    duckdb_disconnect(&conn);
+    duckdb_close(&db);
+    duckdb_samples[run] = (F64)(s1 - s0) / 1000.0;
+  }
+
   F64 gdb_min, gdb_med, gdb_avg;
   F64 sqlite_min, sqlite_med, sqlite_avg;
+  F64 duckdb_min, duckdb_med, duckdb_avg;
   bench_reduce(gdb_samples, IMPORT_TIMED_RUNS, &gdb_min, &gdb_med, &gdb_avg);
   bench_reduce(sqlite_samples, IMPORT_TIMED_RUNS, &sqlite_min, &sqlite_med, &sqlite_avg);
+  bench_reduce(duckdb_samples, IMPORT_TIMED_RUNS, &duckdb_min, &duckdb_med, &duckdb_avg);
 
   printf("\n%-10s %10s %10s %10s %10s\n", "engine", "rows", "min(ms)", "median(ms)", "avg(ms)");
   printf("%-10s %10llu %10.4f %10.4f %10.4f\n", "gdb", gdb_last_row_count, gdb_min, gdb_med, gdb_avg);
   printf("%-10s %10llu %10.4f %10.4f %10.4f\n", "sqlite", sqlite_last_row_count, sqlite_min, sqlite_med, sqlite_avg);
+  printf("%-10s %10llu %10.4f %10.4f %10.4f\n", "duckdb", duckdb_last_row_count, duckdb_min, duckdb_med, duckdb_avg);
 
   bench_report_row_begin(report);
   bench_report_cellf(report, "engine");
@@ -213,16 +275,24 @@ entry_point(CmdLine* cmdline)
   bench_report_cellf(report, "%.4f", sqlite_avg);
   bench_report_row_end(report);
 
-  if (gdb_last_row_count != row_count || sqlite_last_row_count != row_count)
+  bench_report_row_begin(report);
+  bench_report_cellf(report, "duckdb");
+  bench_report_cellf(report, "%llu", duckdb_last_row_count);
+  bench_report_cellf(report, "%.4f", duckdb_min);
+  bench_report_cellf(report, "%.4f", duckdb_med);
+  bench_report_cellf(report, "%.4f", duckdb_avg);
+  bench_report_row_end(report);
+
+  if (gdb_last_row_count != row_count || sqlite_last_row_count != row_count || duckdb_last_row_count != row_count)
   {
-    printf("  !! row count mismatch: expected %llu, gdb imported %llu, sqlite imported %llu\n",
-           row_count, gdb_last_row_count, sqlite_last_row_count);
-    bench_report_warn(report, "row count mismatch: expected %llu, gdb imported %llu, sqlite imported %llu",
-                       row_count, gdb_last_row_count, sqlite_last_row_count);
+    printf("  !! row count mismatch: expected %llu, gdb imported %llu, sqlite imported %llu, duckdb imported %llu\n",
+           row_count, gdb_last_row_count, sqlite_last_row_count, duckdb_last_row_count);
+    bench_report_warn(report, "row count mismatch: expected %llu, gdb imported %llu, sqlite imported %llu, duckdb imported %llu",
+                       row_count, gdb_last_row_count, sqlite_last_row_count, duckdb_last_row_count);
   }
 
-  printf("(sqlite has no native CSV loader via the C API - this times the idiomatic bulk-load path: one transaction, one prepared INSERT, bind+step+reset per parsed row)\n");
-  bench_report_text(report, "(sqlite has no native CSV loader via the C API - this times the idiomatic bulk-load path: one transaction, one prepared INSERT, bind+step+reset per parsed row)");
+  printf("(sqlite has no native CSV loader via the C API - this times the idiomatic bulk-load path: one transaction, one prepared INSERT, bind+step+reset per parsed row. duckdb instead uses its native COPY FROM CSV loader, its own idiomatic bulk-load path)\n");
+  bench_report_text(report, "(sqlite has no native CSV loader via the C API - this times the idiomatic bulk-load path: one transaction, one prepared INSERT, bind+step+reset per parsed row. duckdb instead uses its native COPY FROM CSV loader, its own idiomatic bulk-load path)");
 
   if (!os_file_path_exists(str8_lit("bench_reports/")))
   {

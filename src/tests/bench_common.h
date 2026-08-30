@@ -463,6 +463,112 @@ bench_run_sqlite_query(sqlite3* db, String8 sql_text, U64* out_row_count, U64* o
   return stats;
 }
 
+//~ tec: duckdb query runner
+// duckdb_prepare/duckdb_execute_prepared are timed as 'prepare'/'execute', mirroring the sqlite runner above
+internal U64
+bench_duckdb_consume_result(duckdb_result* result, U64* out_row_count)
+{
+  U64 checksum = 0;
+  U64 row_count = duckdb_row_count(result);
+  U64 col_count = duckdb_column_count(result);
+
+  for (U64 row = 0; row < row_count; row++)
+  {
+    U64 row_hash = BENCH_FNV_OFFSET_BASIS;
+
+    for (U64 col = 0; col < col_count; col++)
+    {
+      duckdb_type col_type = duckdb_column_type(result, col);
+      if (col_type == DUCKDB_TYPE_VARCHAR)
+      {
+        char* text = duckdb_value_varchar(result, col, row);
+        if (text)
+        {
+          row_hash = bench_fnv_mix_string(row_hash, str8_cstring(text));
+          duckdb_free(text);
+        }
+      }
+      else if (col_type == DUCKDB_TYPE_FLOAT || col_type == DUCKDB_TYPE_DOUBLE)
+      {
+        row_hash = bench_fnv_mix_u64(row_hash, bench_scaled_round(duckdb_value_double(result, col, row)));
+      }
+      else
+      {
+        row_hash = bench_fnv_mix_u64(row_hash, (U64)duckdb_value_int64(result, col, row));
+      }
+    }
+
+    checksum += row_hash;
+  }
+
+  *out_row_count = row_count;
+  return checksum;
+}
+
+internal Bench_Stats
+bench_run_duckdb_query(duckdb_connection conn, String8 sql_text, U64* out_row_count, U64* out_checksum)
+{
+  for (U64 run = 0; run < BENCH_WARMUP_RUNS; run++)
+  {
+    duckdb_prepared_statement stmt = NULL;
+    if (duckdb_prepare(conn, (const char*)sql_text.str, &stmt) == DuckDBSuccess)
+    {
+      duckdb_result result = {0};
+      if (duckdb_execute_prepared(stmt, &result) == DuckDBSuccess)
+      {
+        U64 row_count = 0;
+        bench_duckdb_consume_result(&result, &row_count);
+      }
+      duckdb_destroy_result(&result);
+    }
+    duckdb_destroy_prepare(&stmt);
+  }
+
+  F64 prepare_samples[BENCH_TIMED_RUNS];
+  F64 execute_samples[BENCH_TIMED_RUNS];
+  F64 total_samples[BENCH_TIMED_RUNS];
+  U64 last_row_count = 0;
+  U64 last_checksum = 0;
+
+  for (U64 run = 0; run < BENCH_TIMED_RUNS; run++)
+  {
+    U64 t0 = os_now_microseconds();
+
+    duckdb_prepared_statement stmt = NULL;
+    duckdb_state rc = duckdb_prepare(conn, (const char*)sql_text.str, &stmt);
+
+    U64 t1 = os_now_microseconds();
+
+    U64 row_count = 0;
+    U64 checksum = 0;
+    duckdb_result result = {0};
+    if (rc == DuckDBSuccess && duckdb_execute_prepared(stmt, &result) == DuckDBSuccess)
+    {
+      checksum = bench_duckdb_consume_result(&result, &row_count);
+    }
+
+    U64 t2 = os_now_microseconds();
+
+    duckdb_destroy_result(&result);
+    duckdb_destroy_prepare(&stmt);
+
+    prepare_samples[run] = (F64)(t1 - t0) / 1000.0;
+    execute_samples[run] = (F64)(t2 - t1) / 1000.0;
+    total_samples[run] = (F64)(t2 - t0) / 1000.0;
+    last_row_count = row_count;
+    last_checksum = checksum;
+  }
+
+  Bench_Stats stats = {0};
+  bench_reduce(prepare_samples, BENCH_TIMED_RUNS, &stats.prepare_min, &stats.prepare_median, &stats.prepare_avg);
+  bench_reduce(execute_samples, BENCH_TIMED_RUNS, &stats.execute_min, &stats.execute_median, &stats.execute_avg);
+  bench_reduce(total_samples, BENCH_TIMED_RUNS, &stats.total_min, &stats.total_median, &stats.total_avg);
+
+  *out_row_count = last_row_count;
+  *out_checksum = last_checksum;
+  return stats;
+}
+
 //~ tec: sqlite bulk load helper
 
 internal void
@@ -501,6 +607,44 @@ bench_sqlite_bulk_insert(sqlite3* db, String8 table_name, Bench_Row* rows, U64 r
 
   sqlite3_finalize(stmt);
   sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
+
+  scratch_end(scratch);
+}
+
+//~ tec: duckdb bulk load helper
+
+internal void
+bench_duckdb_create_schema(duckdb_connection conn, String8 table_name)
+{
+  Temp scratch = scratch_begin(0, 0);
+  String8 sql = push_str8f(scratch.arena, "CREATE TABLE %.*s (id INTEGER, name VARCHAR, value DOUBLE);", str8_varg(table_name));
+  duckdb_result result = {0};
+  if (duckdb_query(conn, (const char*)sql.str, &result) != DuckDBSuccess)
+  {
+    log_error("duckdb_query (CREATE TABLE) failed for '%.*s': %s", str8_varg(table_name), duckdb_result_error(&result));
+  }
+  duckdb_destroy_result(&result);
+  scratch_end(scratch);
+}
+
+internal void
+bench_duckdb_bulk_insert(duckdb_connection conn, String8 table_name, Bench_Row* rows, U64 row_count)
+{
+  Temp scratch = scratch_begin(0, 0);
+  char* table_cstr = (char*)push_str8_copy(scratch.arena, table_name).str;
+
+  duckdb_appender appender = NULL;
+  if (duckdb_appender_create(conn, NULL, table_cstr, &appender) == DuckDBSuccess)
+  {
+    for (U64 i = 0; i < row_count; i++)
+    {
+      duckdb_append_int32(appender, (S32)rows[i].id);
+      duckdb_append_varchar_length(appender, (const char*)rows[i].name.str, rows[i].name.size);
+      duckdb_append_double(appender, rows[i].value);
+      duckdb_appender_end_row(appender);
+    }
+  }
+  duckdb_appender_destroy(&appender);
 
   scratch_end(scratch);
 }
@@ -671,14 +815,16 @@ bench_print_table_row(Bench_Report* report, String8 query_label, char* engine, U
 }
 
 internal void
-bench_check_match(Bench_Report* report, String8 query_label, U64 gdb_rows, U64 gdb_checksum, U64 sqlite_rows, U64 sqlite_checksum)
+bench_check_match(Bench_Report* report, String8 query_label,
+                   char* base_engine, U64 base_rows, U64 base_checksum,
+                   char* other_engine, U64 other_rows, U64 other_checksum)
 {
-  if (gdb_rows != sqlite_rows || gdb_checksum != sqlite_checksum)
+  if (base_rows != other_rows || base_checksum != other_checksum)
   {
-    printf("  !! MISMATCH on '%.*s': compute_ql rows=%llu checksum=%llu vs sqlite rows=%llu checksum=%llu\n",
-           str8_varg(query_label), gdb_rows, gdb_checksum, sqlite_rows, sqlite_checksum);
-    bench_report_warn(report, "MISMATCH on '%.*s': compute_ql rows=%llu checksum=%llu vs sqlite rows=%llu checksum=%llu",
-                       str8_varg(query_label), gdb_rows, gdb_checksum, sqlite_rows, sqlite_checksum);
+    printf("  !! MISMATCH on '%.*s': %s rows=%llu checksum=%llu vs %s rows=%llu checksum=%llu\n",
+           str8_varg(query_label), base_engine, base_rows, base_checksum, other_engine, other_rows, other_checksum);
+    bench_report_warn(report, "MISMATCH on '%.*s': %s rows=%llu checksum=%llu vs %s rows=%llu checksum=%llu",
+                       str8_varg(query_label), base_engine, base_rows, base_checksum, other_engine, other_rows, other_checksum);
   }
 }
 
@@ -690,6 +836,7 @@ struct Bench_QueryCase
   String8 label;
   String8 gdb_sql;
   String8 sqlite_sql;
+  String8 duckdb_sql;
 };
 
 internal void
@@ -721,6 +868,14 @@ bench_run_query_suite(Arena* arena, Bench_Report* report, U64 row_count, char* l
   bench_sqlite_create_schema(sqlite_db, table_name);
   bench_sqlite_bulk_insert(sqlite_db, table_name, rows, row_count);
 
+  //- tec: seed duckdb with the exact same rows
+  duckdb_database duckdb_db = NULL;
+  duckdb_connection duckdb_conn = NULL;
+  duckdb_open(NULL, &duckdb_db);
+  duckdb_connect(duckdb_db, &duckdb_conn);
+  bench_duckdb_create_schema(duckdb_conn, table_name);
+  bench_duckdb_bulk_insert(duckdb_conn, table_name, rows, row_count);
+
   //- tec: build the 4 query cases from the actual generated data so theyre always resolvable
   U64 mid_index = row_count / 2;
   U32 mid_id = rows[mid_index].id;
@@ -732,18 +887,22 @@ bench_run_query_suite(Arena* arena, Bench_Report* report, U64 row_count, char* l
   cases[0].label = str8_lit("id = (int equality)");
   cases[0].gdb_sql = push_str8f(scratch.arena, "SELECT * FROM %.*s WHERE id = %u;", str8_varg(table_name), mid_id);
   cases[0].sqlite_sql = push_str8f(scratch.arena, "SELECT * FROM %.*s WHERE id = %u;", str8_varg(table_name), mid_id);
+  cases[0].duckdb_sql = cases[0].sqlite_sql;
 
   cases[1].label = str8_lit("id > (int range)");
   cases[1].gdb_sql = push_str8f(scratch.arena, "SELECT * FROM %.*s WHERE id > %u;", str8_varg(table_name), threshold_id);
   cases[1].sqlite_sql = push_str8f(scratch.arena, "SELECT * FROM %.*s WHERE id > %u;", str8_varg(table_name), threshold_id);
+  cases[1].duckdb_sql = cases[1].sqlite_sql;
 
   cases[2].label = str8_lit("name = (string equality)");
   cases[2].gdb_sql = push_str8f(scratch.arena, "SELECT * FROM %.*s WHERE name = '%.*s';", str8_varg(table_name), str8_varg(target_name));
   cases[2].sqlite_sql = push_str8f(scratch.arena, "SELECT * FROM %.*s WHERE name = '%.*s';", str8_varg(table_name), str8_varg(target_name));
+  cases[2].duckdb_sql = cases[2].sqlite_sql;
 
   cases[3].label = str8_lit("name contains (string search)");
   cases[3].gdb_sql = push_str8f(scratch.arena, "SELECT * FROM %.*s WHERE name contains '%.*s';", str8_varg(table_name), str8_varg(substr));
   cases[3].sqlite_sql = push_str8f(scratch.arena, "SELECT * FROM %.*s WHERE name LIKE '%%%.*s%%';", str8_varg(table_name), str8_varg(substr));
+  cases[3].duckdb_sql = cases[3].sqlite_sql; // tec: duckdb supports the same LIKE syntax as sqlite
 
   bench_print_table_header(report, label);
   for (U64 i = 0; i < ArrayCount(cases); i++)
@@ -756,10 +915,17 @@ bench_run_query_suite(Arena* arena, Bench_Report* report, U64 row_count, char* l
     Bench_Stats sqlite_stats = bench_run_sqlite_query(sqlite_db, cases[i].sqlite_sql, &sqlite_rows, &sqlite_checksum);
     bench_print_table_row(report, cases[i].label, "sqlite", sqlite_rows, sqlite_checksum, &sqlite_stats);
 
-    bench_check_match(report, cases[i].label, gdb_rows, gdb_checksum, sqlite_rows, sqlite_checksum);
+    U64 duckdb_rows = 0, duckdb_checksum = 0;
+    Bench_Stats duckdb_stats = bench_run_duckdb_query(duckdb_conn, cases[i].duckdb_sql, &duckdb_rows, &duckdb_checksum);
+    bench_print_table_row(report, cases[i].label, "duckdb", duckdb_rows, duckdb_checksum, &duckdb_stats);
+
+    bench_check_match(report, cases[i].label, "gdb", gdb_rows, gdb_checksum, "sqlite", sqlite_rows, sqlite_checksum);
+    bench_check_match(report, cases[i].label, "gdb", gdb_rows, gdb_checksum, "duckdb", duckdb_rows, duckdb_checksum);
   }
 
   sqlite3_close(sqlite_db);
+  duckdb_disconnect(&duckdb_conn);
+  duckdb_close(&duckdb_db);
   scratch_end(scratch);
 }
 

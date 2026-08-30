@@ -484,8 +484,24 @@ gpu_vulkan_end_and_submit_cmd(VkCommandBuffer cmd)
 
   U64 t0 = os_now_microseconds();
   vkResetFences(g_vulkan_state->device, 1, &g_vulkan_state->submit_fence);
-  vkQueueSubmit(g_vulkan_state->compute_queue, 1, &submit_info, g_vulkan_state->submit_fence);
-  vkWaitForFences(g_vulkan_state->device, 1, &g_vulkan_state->submit_fence, VK_TRUE, UINT64_MAX);
+
+  VkResult submit_result = vkQueueSubmit(g_vulkan_state->compute_queue, 1, &submit_info, g_vulkan_state->submit_fence);
+  if (submit_result != VK_SUCCESS)
+  {
+    // tec: the fence was never signaled if the submit itself failed
+    log_error("vkQueueSubmit failed with VkResult %d - not waiting on the fence", (int)submit_result);
+    return;
+  }
+
+  // tec: bounded instead of UINT64_MAX 
+  VkResult wait_result = vkWaitForFences(g_vulkan_state->device, 1, &g_vulkan_state->submit_fence, VK_TRUE, Billion(1));
+  if (wait_result != VK_SUCCESS)
+  {
+    log_error("vkWaitForFences failed/timed out with VkResult %d after %llu microseconds - GPU is likely hung or the device was lost",
+              (int)wait_result, os_now_microseconds() - t0);
+    return;
+  }
+
   log_info("submit+wait wall time: %llu microseconds", os_now_microseconds() - t0);
 }
 
