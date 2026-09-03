@@ -55,6 +55,6 @@ internal B32 plan_ir_contains_aggregate(IR_Node* node);
 internal PLAN_ExecResult plan_execute(Arena* arena, GDB_Database* database, PLAN_Node* plan, IR_Node* select_ir_node);
 
 internal String8 plan_node_type_to_string(PLAN_NodeType type);
-internal void plan_print(PLAN_Node* plan, U64 depth);
+internal void plan_print(Arena* arena, String8List* out, PLAN_Node* plan, U64 depth);
 
 #endif //PLANNER_H

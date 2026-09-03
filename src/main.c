@@ -51,10 +51,6 @@ entry_point(CmdLine* cmdline)
     {
       log_error("failed to initialize networking (os_net_init)");
     }
-    else if (!valid_query)
-    {
-      log_info("--connect requires --query");
-    }
     else
     {
       Temp scratch = scratch_begin(0, 0);
@@ -64,7 +60,15 @@ entry_point(CmdLine* cmdline)
       {
         String8 host = connect_parts.first->string;
         U16 port = (U16)u64_from_str8(connect_parts.first->next->string, 10);
-        client_run_one_shot(host, port, query_str);
+
+        if (valid_query) 
+		{ 
+	      client_run_one_shot(host, port, query_str); 
+		}
+        else
+		{ 
+	      client_run_interactive(host, port);
+		}
       }
       else
       {

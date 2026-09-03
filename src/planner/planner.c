@@ -408,27 +408,32 @@ plan_node_type_to_string(PLAN_NodeType type)
 }
 
 internal void
-plan_print(PLAN_Node* plan, U64 depth)
+plan_print(Arena* arena, String8List* out, PLAN_Node* plan, U64 depth)
 {
   if (!plan) return;
-  
-  for (U64 i = 0; i < depth; i++) printf("  ");
+
+  Temp scratch = scratch_begin(&arena, 1);
+  String8List indent_parts = {0};
+  for (U64 i = 0; i < depth; i++) str8_list_push(scratch.arena, &indent_parts, str8_lit("  "));
+  String8 indent = str8_list_join(scratch.arena, &indent_parts, 0);
+  scratch_end(scratch);
+
   String8 type_name = plan_node_type_to_string(plan->type);
-  
+
   if (plan->type == PLAN_NodeType_Scan)
   {
-    printf("- [%.*s] table='%.*s' (%s)\n", str8_varg(type_name), str8_varg(plan->value),
-           plan->table ? "resolved" : "NOT FOUND");
+    str8_list_push(arena, out, push_str8f(arena, "%.*s- [%.*s] table='%.*s' (%s)\n", str8_varg(indent), str8_varg(type_name), str8_varg(plan->value),
+                                          plan->table ? "resolved" : "NOT FOUND"));
   }
   else if (plan->type == PLAN_NodeType_Join)
   {
-    printf("- [%.*s] type='%.*s'\n", str8_varg(type_name), str8_varg(plan->value));
+    str8_list_push(arena, out, push_str8f(arena, "%.*s- [%.*s] type='%.*s'\n", str8_varg(indent), str8_varg(type_name), str8_varg(plan->value)));
   }
   else
   {
-    printf("- [%.*s]\n", str8_varg(type_name));
+    str8_list_push(arena, out, push_str8f(arena, "%.*s- [%.*s]\n", str8_varg(indent), str8_varg(type_name)));
   }
-  
-  if (plan->input) plan_print(plan->input, depth + 1);
-  if (plan->input2) plan_print(plan->input2, depth + 1);
+
+  if (plan->input) plan_print(arena, out, plan->input, depth + 1);
+  if (plan->input2) plan_print(arena, out, plan->input2, depth + 1);
 }

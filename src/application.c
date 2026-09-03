@@ -35,10 +35,10 @@ gdb_candidate_value_equals_row(Arena* arena, GDB_Column* column, void* candidate
     String8 existing = gdb_column_get_string(arena, column, existing_row);
     return str8_match(*(String8*)candidate, existing, 0);
   }
-
+  
   void* existing_data = gdb_column_get_data(column, existing_row);
   if (!existing_data) return 0;
-
+  
   switch (column->type)
   {
     case GDB_ColumnType_U32: return *(U32*)candidate == *(U32*)existing_data;
@@ -68,25 +68,32 @@ gdb_check_load_value(GDB_Table* table, void** row_data, B32* row_null, IR_Node* 
 {
   *out_is_null = 0;
   *out_is_string = 0;
-
+  
   if (node->type == IR_NodeType_Column)
   {
     GDB_Column* column = gdb_table_find_column(table, node->value);
     if (!column) return 0.0;
-
+    
     U64 slot = 0;
-    for (; slot < table->column_count; slot++) if (table->columns[slot] == column) break;
+    for (; slot < table->column_count; slot++)
+    {
+      if (table->columns[slot] == column) break;
+    }
     if (slot >= table->column_count) return 0.0;
-
-    if (row_null[slot]) { *out_is_null = 1; return 0.0; }
-
+    
+    if (row_null[slot]) 
+    { 
+      *out_is_null = 1;
+      return 0.0; 
+    }
+    
     if (column->type == GDB_ColumnType_String8)
     {
       *out_is_string = 1;
       *out_string = *(String8*)row_data[slot];
       return 0.0;
     }
-
+    
     switch (column->type)
     {
       case GDB_ColumnType_U32: return (F64)(*(U32*)row_data[slot]);
@@ -102,7 +109,7 @@ gdb_check_load_value(GDB_Table* table, void** row_data, B32* row_null, IR_Node* 
     *out_string = node->value;
     return 0.0;
   }
-
+  
   return f64_from_str8(node->value);
 }
 
@@ -110,7 +117,7 @@ internal B32
 gdb_check_eval(GDB_Table* table, void** row_data, B32* row_null, IR_Node* condition)
 {
   if (!condition) return 1;
-
+  
   if (condition->type != IR_NodeType_Operator)
   {
     B32 is_str = 0, is_null = 0;
@@ -119,11 +126,11 @@ gdb_check_eval(GDB_Table* table, void** row_data, B32* row_null, IR_Node* condit
     if (is_null) return 0;
     return is_str ? (s.size > 0) : (v != 0.0);
   }
-
+  
   String8 op = condition->value;
   IR_Node* left = condition->first;
   IR_Node* right = left ? left->next : NULL;
-
+  
   if (str8_match(op, str8_lit("and"), StringMatchFlag_CaseInsensitive))
   {
     return gdb_check_eval(table, row_data, row_null, left) && gdb_check_eval(table, row_data, row_null, right);
@@ -132,7 +139,7 @@ gdb_check_eval(GDB_Table* table, void** row_data, B32* row_null, IR_Node* condit
   {
     return gdb_check_eval(table, row_data, row_null, left) || gdb_check_eval(table, row_data, row_null, right);
   }
-
+  
   if (str8_match(op, str8_lit("is null"), StringMatchFlag_CaseInsensitive) ||
       str8_match(op, str8_lit("is not null"), StringMatchFlag_CaseInsensitive))
   {
@@ -142,20 +149,21 @@ gdb_check_eval(GDB_Table* table, void** row_data, B32* row_null, IR_Node* condit
     B32 is_not = str8_match(op, str8_lit("is not null"), StringMatchFlag_CaseInsensitive);
     return is_not ? !is_null : is_null;
   }
-
+  
   if (!left || !right)
   {
     log_error("gdb_check_eval: malformed CHECK expression, missing operand(s)");
     return 1;
   }
-
+  
   B32 lstr = 0, rstr = 0, lnull = 0, rnull = 0;
   String8 ls = {0}, rs = {0};
   F64 lv = gdb_check_load_value(table, row_data, row_null, left, &lstr, &ls, &lnull);
   F64 rv = gdb_check_load_value(table, row_data, row_null, right, &rstr, &rs, &rnull);
-
-  if (lnull || rnull) return 0; // tec: three-valued logic - a NULL operand makes CHECK neither true nor false, so the row is rejected just like a direct comparison would be
-
+  
+  // tec: three-valued logic - a NULL operand makes CHECK neither true nor false, so the row is rejected just like a direct comparison would be
+  if (lnull || rnull) return 0; 
+  
   if (lstr || rstr)
   {
     if (str8_match(op, str8_lit("contains"), StringMatchFlag_CaseInsensitive)) return qe_str8_contains(ls, rs);
@@ -163,14 +171,14 @@ gdb_check_eval(GDB_Table* table, void** row_data, B32* row_null, IR_Node* condit
     if (str8_match(op, str8_lit("!="), 0)) return !eq;
     return eq;
   }
-
+  
   if (str8_match(op, str8_lit("="), 0) || str8_match(op, str8_lit("=="), 0)) return lv == rv;
   if (str8_match(op, str8_lit("!="), 0)) return lv != rv;
   if (str8_match(op, str8_lit("<="), 0)) return lv <= rv;
   if (str8_match(op, str8_lit(">="), 0)) return lv >= rv;
   if (str8_match(op, str8_lit("<"), 0)) return lv < rv;
   if (str8_match(op, str8_lit(">"), 0)) return lv > rv;
-
+  
   log_error("gdb_check_eval: unsupported operator '%.*s'", str8_varg(op));
   return 1;
 }
@@ -183,15 +191,15 @@ gdb_table_validate_row_constraints(Arena* arena, GDB_Database* database, GDB_Tab
   {
     GDB_Column* column = table->columns[i];
     if (!gdb_column_has_any_constraint(column)) continue;
-
+    
     B32 is_null = row_null[i];
-
+    
     if (column->not_null && is_null)
     {
       log_error("insert: NOT NULL constraint violated on column '%.*s'", str8_varg(column->name));
       return 0;
     }
-
+    
     if (!is_null && (column->is_unique || column->is_primary_key))
     {
       for (U64 r = 0; r < column->row_count; r++)
@@ -204,30 +212,33 @@ gdb_table_validate_row_constraints(Arena* arena, GDB_Database* database, GDB_Tab
         }
       }
     }
-
+    
     if (!is_null && column->has_foreign_key)
     {
       GDB_Table* ref_table = gdb_database_find_table(database, column->fk_ref_table_name);
       GDB_Column* ref_column = ref_table ? gdb_table_find_column(ref_table, column->fk_ref_column_name) : NULL;
-
+      
       B32 found = 0;
       if (ref_column)
       {
         for (U64 r = 0; r < ref_column->row_count; r++)
         {
           if (gdb_column_is_null(ref_column, r)) continue;
-          if (gdb_candidate_value_equals_row(arena, ref_column, row_data[i], r)) { found = 1; break; }
+          if (gdb_candidate_value_equals_row(arena, ref_column, row_data[i], r))
+          { 
+            found = 1; break;
+          }
         }
       }
-
+      
       if (!found)
       {
         log_error("insert: FOREIGN KEY constraint violated on column '%.*s' - no matching row in '%.*s(%.*s)'",
-                   str8_varg(column->name), str8_varg(column->fk_ref_table_name), str8_varg(column->fk_ref_column_name));
+                  str8_varg(column->name), str8_varg(column->fk_ref_table_name), str8_varg(column->fk_ref_column_name));
         return 0;
       }
     }
-
+    
     if (column->has_check && column->check_expr)
     {
       if (!gdb_check_eval(table, row_data, row_null, column->check_expr))
@@ -237,7 +248,7 @@ gdb_table_validate_row_constraints(Arena* arena, GDB_Database* database, GDB_Tab
       }
     }
   }
-
+  
   return 1;
 }
 
@@ -248,17 +259,17 @@ gdb_row_has_referencing_children(Arena* arena, GDB_Database* database, GDB_Table
   {
     GDB_Table* other = database->tables[t];
     if (other == table) continue;
-
+    
     for (U64 c = 0; c < other->column_count; c++)
     {
       GDB_Column* fk_column = other->columns[c];
       if (!fk_column->has_foreign_key) continue;
       if (!str8_match(fk_column->fk_ref_table_name, table->name, 0)) continue;
-
+      
       GDB_Column* ref_column = gdb_table_find_column(table, fk_column->fk_ref_column_name);
       if (!ref_column) continue;
       if (gdb_column_is_null(ref_column, row_index)) continue; // tec: NULL is never referenced
-
+      
       for (U64 r = 0; r < fk_column->row_count; r++)
       {
         if (gdb_column_is_null(fk_column, r)) continue;
@@ -272,16 +283,16 @@ gdb_row_has_referencing_children(Arena* arena, GDB_Database* database, GDB_Table
 #define APP_EMIT(...) str8_list_push(arena, &out, push_str8f(arena, __VA_ARGS__))
 
 internal APP_QueryResult
-app_execute_query_capture(Arena* arena, String8 sql_query)
+app_execute_query_capture(Arena* arena, String8 sql_query, GDB_Database** io_database)
 {
   ProfBeginFunction();
-
+  
   APP_QueryResult result = {0};
   String8List out = {0};
-
+  
   SQL_TokenizeResult tokenize_result = sql_tokenize_from_text(arena, sql_query);
   SQL_Node* sql_root = sql_parse(arena, tokenize_result.tokens, tokenize_result.count, sql_query);
-
+  
   if (sql_root == NULL || g_sql_parse_error.has_error)
   {
     log_error("failed to parse query, aborting");
@@ -296,9 +307,10 @@ app_execute_query_capture(Arena* arena, String8 sql_query)
   //ir_print_query(ir_query);
   
   
-  GDB_Database* database = NULL;
+  GDB_Database* database = io_database ? *io_database : NULL;
   
-  for (IR_Node* ir_execution_node = ir_query->execution_nodes; ir_execution_node != NULL;
+  for (IR_Node* ir_execution_node = ir_query->execution_nodes; 
+       ir_execution_node != NULL;
        ir_execution_node = ir_execution_node->next)
   {
     switch (ir_execution_node->type)
@@ -319,12 +331,14 @@ app_execute_query_capture(Arena* arena, String8 sql_query)
             gdb_add_database(database);
           }
         }
+        
+        if (io_database) { *io_database = database; }
       } break;
       
       case IR_NodeType_Describe:
       {
         IR_Node* table_ir_node = ir_node_find_child(ir_execution_node, IR_NodeType_Table);
-
+        
         if (!database)
         {
           log_error("no database selected - run 'use <database>' first");
@@ -332,7 +346,7 @@ app_execute_query_capture(Arena* arena, String8 sql_query)
         else
         {
           GDB_Table* table = gdb_database_find_table(database, table_ir_node->value);
-
+          
           if (!table)
           {
             log_error("table '%.*s' does not exist", str8_varg(table_ir_node->value));
@@ -340,47 +354,62 @@ app_execute_query_capture(Arena* arena, String8 sql_query)
           else
           {
             APP_EMIT("Table: %.*s (%llu row%s)\n\n", str8_varg(table->name), table->row_count,
-                   table->row_count == 1 ? "" : "s");
+                     table->row_count == 1 ? "" : "s");
             APP_EMIT("%-24s %-10s %-5s %-5s %s\n", "Column", "Type", "Null", "Key", "Extra");
             APP_EMIT("%-24s %-10s %-5s %-5s %s\n", "------", "----", "----", "---", "-----");
-
+            
             for (U64 i = 0; i < table->column_count; i++)
             {
               GDB_Column* column = table->columns[i];
-
+              
               String8 type_name = gdb_column_type_display_name(column->type);
-
+              
               String8 key = str8_lit("");
               if (column->is_primary_key) key = str8_lit("PRI");
               else if (column->is_unique) key = str8_lit("UNI");
-
+              
               GDB_Index* index_on_column = gdb_table_find_index_on_column(table, column);
-
+              
               Temp scratch = scratch_begin(&arena, 1);
               String8List extra_parts = {0};
-              if (column->is_disk_backed) str8_list_push(scratch.arena, &extra_parts, str8_lit("disk-backed"));
-              if (index_on_column) str8_list_push(scratch.arena, &extra_parts, push_str8f(scratch.arena, "indexed(%.*s)", str8_varg(index_on_column->name)));
-              if (column->has_foreign_key) str8_list_push(scratch.arena, &extra_parts, push_str8f(scratch.arena, "references %.*s(%.*s)", str8_varg(column->fk_ref_table_name), str8_varg(column->fk_ref_column_name)));
-              if (column->has_check) str8_list_push(scratch.arena, &extra_parts, push_str8f(scratch.arena, "check(%.*s)", str8_varg(column->check_text)));
+              if (column->is_disk_backed)
+              {
+                str8_list_push(scratch.arena, &extra_parts, str8_lit("disk-backed"));
+              }
+              if (index_on_column) 
+              {
+                str8_list_push(scratch.arena, &extra_parts, 
+                               push_str8f(scratch.arena, "indexed(%.*s)", str8_varg(index_on_column->name)));
+              }
+              if (column->has_foreign_key) 
+              {
+                str8_list_push(scratch.arena, &extra_parts, 
+                               push_str8f(scratch.arena, "references %.*s(%.*s)", str8_varg(column->fk_ref_table_name), str8_varg(column->fk_ref_column_name)));
+              }
+              if (column->has_check) 
+              {
+                str8_list_push(scratch.arena, &extra_parts, 
+                               push_str8f(scratch.arena, "check(%.*s)", str8_varg(column->check_text)));
+              }
               String8 extra = str8_list_join(scratch.arena, &extra_parts, &(StringJoin){.sep = str8_lit(", ")});
-
+              
               APP_EMIT("%-24.*s %-10.*s %-5s %-5.*s %.*s\n",
-                     str8_varg(column->name),
-                     str8_varg(type_name),
-                     column->not_null ? "NO" : "YES",
-                     str8_varg(key),
-                     str8_varg(extra));
-
+                       str8_varg(column->name),
+                       str8_varg(type_name),
+                       column->not_null ? "NO" : "YES",
+                       str8_varg(key),
+                       str8_varg(extra));
+              
               scratch_end(scratch);
             }
           }
         }
       } break;
-
+      
       case IR_NodeType_Explain:
       {
         IR_Node* select_ir_node = ir_node_find_child(ir_execution_node, IR_NodeType_Select);
-
+        
         if (!database)
         {
           log_error("no database selected - run 'use <database>' first");
@@ -392,13 +421,13 @@ app_execute_query_capture(Arena* arena, String8 sql_query)
         else
         {
           ir_expand_star_to_columns(arena, database, select_ir_node);
-
+          
           PLAN_Node* plan = plan_build_from_select(arena, database, select_ir_node);
           APP_EMIT("Query plan:\n");
-          plan_print(plan, 0); // tec: still printf's directly - not captured into output_text (v1 gap: EXPLAIN's tree body doesn't reach a network client, only the server's own stdout)
+          plan_print(arena, &out, plan, 0);
         }
       } break;
-
+      
       case IR_NodeType_Create:
       {
         IR_Node* create_ir_node = ir_execution_node->first;
@@ -413,7 +442,13 @@ app_execute_query_capture(Arena* arena, String8 sql_query)
           {
             database = gdb_database_alloc(create_ir_node->value);
             gdb_add_database(database);
+            
+            if (io_database) { *io_database = database; }
           }
+        }
+        else if (!database)
+        {
+          log_error("no database selected - run 'use <database>' first");
         }
         else if (create_ir_node->type == IR_NodeType_Table)
         {
@@ -424,18 +459,18 @@ app_execute_query_capture(Arena* arena, String8 sql_query)
           else
           {
             GDB_Table* table = gdb_table_alloc(create_ir_node->value);
-
+            
             for (IR_Node* column_node = create_ir_node->first; column_node != 0; column_node = column_node->next)
             {
               GDB_ColumnType column_type = gdb_column_type_from_string(column_node->first->value);
               GDB_ColumnSchema column_schema = gdb_column_schema_create(column_node->value, column_type);
               gdb_table_add_column(table, column_schema);
-
+              
               GDB_Column* new_column = table->columns[table->column_count - 1];
-
+              
               // tec: column_node->first is the Type node
-			  // any constraint clauses (NOT NULL, UNIQUE, PRIMARY KEY, REFERENCES, CHECK) 
-			  // were appended as its siblings by the parser, in whatever order they appeared
+              // any constraint clauses (NOT NULL, UNIQUE, PRIMARY KEY, REFERENCES, CHECK) 
+              // were appended as its siblings by the parser, in whatever order they appeared
               for (IR_Node* c = column_node->first->next; c != 0; c = c->next)
               {
                 switch (c->type)
@@ -451,7 +486,7 @@ app_execute_query_capture(Arena* arena, String8 sql_query)
                   case IR_NodeType_PrimaryKey:
                   {
                     // tec: single column PRIMARY KEY only
-					// ted: TODO support composite keys
+                    // ted: TODO support composite keys
                     new_column->is_primary_key = 1;
                     new_column->not_null = 1;
                     new_column->is_unique = 1;
@@ -463,7 +498,7 @@ app_execute_query_capture(Arena* arena, String8 sql_query)
                     if (!ref_table || !ref_column)
                     {
                       log_error("create table: foreign key on column '%.*s' references unknown '%.*s(%.*s)' - ignoring it",
-                                 str8_varg(new_column->name), str8_varg(c->value), str8_varg(c->first->value));
+                                str8_varg(new_column->name), str8_varg(c->value), str8_varg(c->first->value));
                     }
                     else
                     {
@@ -482,7 +517,7 @@ app_execute_query_capture(Arena* arena, String8 sql_query)
                 }
               }
             }
-
+            
             gdb_database_add_table(database, table);
           }
         }
@@ -490,7 +525,7 @@ app_execute_query_capture(Arena* arena, String8 sql_query)
         {
           IR_Node* table_node = create_ir_node->first;
           IR_Node* column_node = table_node ? table_node->next : NULL;
-
+          
           GDB_Table* table = gdb_database_find_table(database, table_node->value);
           if (!table)
           {
@@ -499,7 +534,7 @@ app_execute_query_capture(Arena* arena, String8 sql_query)
           else if (gdb_table_find_index(table, create_ir_node->value))
           {
             log_error("create index: index '%.*s' already exists on table '%.*s'",
-                       str8_varg(create_ir_node->value), str8_varg(table->name));
+                      str8_varg(create_ir_node->value), str8_varg(table->name));
           }
           else
           {
@@ -510,10 +545,16 @@ app_execute_query_capture(Arena* arena, String8 sql_query)
             }
           }
         }
-
+        
       } break;
       case IR_NodeType_DropIndex:
       {
+        if (!database)
+        {
+          log_error("no database selected - run 'use <database>' first");
+          break;
+        }
+        
         IR_Node* table_node = ir_node_find_child(ir_execution_node, IR_NodeType_Table);
         GDB_Table* table = gdb_database_find_table(database, table_node->value);
         if (table)
@@ -523,41 +564,47 @@ app_execute_query_capture(Arena* arena, String8 sql_query)
       } break;
       case IR_NodeType_Insert:
       {
+        if (!database)
+        {
+          log_error("no database selected - run 'use <database>' first");
+          break;
+        }
+        
         // tec: table
         IR_Node* table_object = ir_node_find_child(ir_execution_node, IR_NodeType_Table);
         GDB_Table* table = gdb_database_find_table(database, table_object->value);
-
+        
         // tec: optional explicit column list
-		// if omitted, value positions map to all table columns in schema order
+        // if omitted, value positions map to all table columns in schema order
         IR_Node* next_object = table_object->next;
         IR_Node* columns_object = (next_object && next_object->type == IR_NodeType_ColumnList) ? next_object : NULL;
         IR_Node* values_object = columns_object ? columns_object->next : next_object;
-
+        
         if (!values_object)
         {
           log_error("missing 'values' clause in 'insert' statement");
           return result;
         }
-
+        
         //- tec: value group
         Temp scratch = scratch_begin(0, 0);
-
+        
         // tec: maps value-group position -> table->columns[] slot
         U64* column_slots = push_array(scratch.arena, U64, Max(table->column_count, 1));
-
+        
         U64 listed_count = table->column_count;
-
+        
         if (columns_object)
         {
           listed_count = 0;
           for (IR_Node* c = columns_object->first; c != 0; c = c->next) listed_count++;
-
+          
           if (listed_count > table->column_count)
           {
             log_error("insert column list names more columns than table '%.*s' has", str8_varg(table->name));
             return result;
           }
-
+          
           U64 ci = 0;
           for (IR_Node* c = columns_object->first; c != 0; c = c->next, ci++)
           {
@@ -567,7 +614,7 @@ app_execute_query_capture(Arena* arena, String8 sql_query)
               log_error("unknown column '%.*s' in 'insert' statement", str8_varg(c->value));
               return result;
             }
-
+            
             U64 slot = 0;
             for (; slot < table->column_count; slot++)
             {
@@ -580,16 +627,18 @@ app_execute_query_capture(Arena* arena, String8 sql_query)
         {
           for (U64 i = 0; i < table->column_count; i++) column_slots[i] = i;
         }
-
+        
         void** row_data = push_array(scratch.arena, void*, table->column_count);
         B32* row_null = push_array(scratch.arena, B32, table->column_count);
         B32* slot_was_set = push_array(scratch.arena, B32, table->column_count);
-
-        for (IR_Node* value_group_node = values_object->first; value_group_node != 0; value_group_node = value_group_node->next)
+        
+        for (IR_Node* value_group_node = values_object->first; 
+             value_group_node != 0;
+             value_group_node = value_group_node->next)
         {
           MemoryZero(slot_was_set, sizeof(B32) * table->column_count);
           U64 column_index = 0;
-
+          
           for (IR_Node* data_node = value_group_node->first; data_node != 0; data_node = data_node->next)
           {
             if (column_index >= listed_count)
@@ -597,14 +646,14 @@ app_execute_query_capture(Arena* arena, String8 sql_query)
               log_error("too many values in 'insert' statement");
               return result;
             }
-
+            
             U64 slot = column_slots[column_index];
             GDB_Column* column = table->columns[slot];
             B32 is_null = (data_node->type == IR_NodeType_Null);
             String8 value_str = data_node->value;
-
+            
             void* value_ptr = 0;
-
+            
             if (is_null)
             {
               value_ptr = gdb_zero_value_for_type(scratch.arena, column->type);
@@ -645,19 +694,19 @@ app_execute_query_capture(Arena* arena, String8 sql_query)
               log_error("unknown column type");
               return result;
             }
-
+            
             row_data[slot] = value_ptr;
             row_null[slot] = is_null;
             slot_was_set[slot] = 1;
             column_index++;
           }
-
+          
           if (column_index != listed_count)
           {
             log_error("mismatch in column count and value count in 'insert' statement");
             return result;
           }
-
+          
           // tec: any table column not named by a partial column list defaults to NULL
           for (U64 slot = 0; slot < table->column_count; slot++)
           {
@@ -665,37 +714,43 @@ app_execute_query_capture(Arena* arena, String8 sql_query)
             row_data[slot] = gdb_zero_value_for_type(scratch.arena, table->columns[slot]->type);
             row_null[slot] = 1;
           }
-
+          
           if (!gdb_table_validate_row_constraints(scratch.arena, database, table, row_data, row_null))
           {
             scratch_end(scratch);
             return result;
           }
-
+          
           gdb_table_add_row(table, row_data, row_null);
         }
-
+        
         scratch_end(scratch);
-
+        
       } break;
       case IR_NodeType_Alter:
       {
+        if (!database)
+        {
+          log_error("no database selected - run 'use <database>' first");
+          break;
+        }
+        
         IR_Node* table_node = ir_node_find_child(ir_execution_node, IR_NodeType_Table);
         GDB_Table* table = gdb_database_find_table(database, table_node->value);
-
+        
         if (!table)
         {
           log_error("alter table: unknown table '%.*s'", str8_varg(table_node->value));
           break;
         }
-
+        
         IR_Node* operation_node = table_node->next;
-
+        
         if (operation_node && operation_node->type == IR_NodeType_AddColumn)
         {
           IR_Node* column_name_node = operation_node->first;
           IR_Node* type_node = column_name_node ? column_name_node->next : NULL;
-
+          
           B32 column_exists = 0;
           for (U64 i = 0; i < table->column_count; i++)
           {
@@ -705,29 +760,29 @@ app_execute_query_capture(Arena* arena, String8 sql_query)
               break;
             }
           }
-
+          
           if (column_exists)
           {
             log_error("alter table: column '%.*s' already exists on table '%.*s'",
-                       str8_varg(column_name_node->value), str8_varg(table->name));
+                      str8_varg(column_name_node->value), str8_varg(table->name));
             break;
           }
-
+          
           if (!type_node)
           {
             log_error("alter table: 'add column' requires a column type");
             break;
           }
-
+          
           GDB_ColumnType column_type = gdb_column_type_from_string(type_node->value);
           GDB_ColumnSchema schema = gdb_column_schema_create(column_name_node->value, column_type);
           gdb_table_add_column(table, schema);
-
+          
           // tec: backfill existing rows as NULL so the new column's row count stays in sync
           // with the table (matches standard SQL ALTER TABLE ADD COLUMN semantics)
           GDB_Column* new_column = table->columns[table->column_count - 1];
           U64 existing_row_count = table->row_count;
-
+          
           Temp backfill_scratch = scratch_begin(0, 0);
           for (U64 i = 0; i < existing_row_count; i++)
           {
@@ -742,10 +797,10 @@ app_execute_query_capture(Arena* arena, String8 sql_query)
           if (!column)
           {
             log_error("alter table: unknown column '%.*s' on table '%.*s'",
-                       str8_varg(operation_node->value), str8_varg(table->name));
+                      str8_varg(operation_node->value), str8_varg(table->name));
             break;
           }
-
+          
           gdb_table_remove_column(table, column);
         }
         else if (operation_node && operation_node->type == IR_NodeType_Rename)
@@ -755,15 +810,15 @@ app_execute_query_capture(Arena* arena, String8 sql_query)
             log_error("alter table: table '%.*s' already exists", str8_varg(operation_node->value));
             break;
           }
-
+          
           log_info("alter table: renaming '%.*s' to '%.*s' - any already-saved on-disk directory for the old name is not removed",
-                    str8_varg(table->name), str8_varg(operation_node->value));
-
+                   str8_varg(table->name), str8_varg(operation_node->value));
+          
           for (U64 i = 0; i < table->column_count; i++)
           {
             gdb_column_materialize_to_memory(table->columns[i]);
           }
-
+          
           table->name = operation_node->value;
         }
         else
@@ -774,19 +829,26 @@ app_execute_query_capture(Arena* arena, String8 sql_query)
       case IR_NodeType_Delete:
       {
         ProfBegin("SQL: Delete");
-
+        
+        if (!database)
+        {
+          log_error("no database selected - run 'use <database>' first");
+          ProfEnd();
+          break;
+        }
+        
         IR_Node* table_node = ir_node_find_child(ir_execution_node, IR_NodeType_Table);
         GDB_Table* table = gdb_database_find_table(database, table_node->value);
-
+        
         if (!table)
         {
           log_error("delete: unknown table '%.*s'", str8_varg(table_node->value));
           ProfEnd();
           break;
         }
-
+        
         IR_Node* where_clause = ir_node_find_child(ir_execution_node, IR_NodeType_Where);
-
+        
         QE_ScanResult scan = {0};
         if (qe_try_index_scan(arena, table, where_clause, &scan))
         {
@@ -800,9 +862,9 @@ app_execute_query_capture(Arena* arena, String8 sql_query)
         {
           scan = qe_scan_filter(arena, database, table, where_clause);
         }
-
+        
         // tec: FOREIGN KEY RESTRICT 
-		// check every row before removing any of them, so a violation partway through doesnt leave the delete half applied
+        // check every row before removing any of them, so a violation partway through doesnt leave the delete half applied
         B32 restricted = 0;
         for (U64 i = 0; i < scan.count; i++)
         {
@@ -814,28 +876,35 @@ app_execute_query_capture(Arena* arena, String8 sql_query)
             break;
           }
         }
-
+        
         if (restricted)
         {
           ProfEnd();
           break;
         }
-
+        
         quick_sort(scan.indices, scan.count, sizeof(U64), delete_row_index_compare_descending);
-
+        
         for (U64 i = 0; i < scan.count; i++)
         {
           gdb_table_remove_row(table, scan.indices[i]);
         }
-
+        
         log_info("deleted %llu row(s) from '%.*s'", scan.count, str8_varg(table->name));
-
+        
         ProfEnd();
       } break;
       
       case IR_NodeType_Import:
       {
         ProfBegin("SQL: Import");
+        
+        if (!database)
+        {
+          log_error("no database selected - run 'use <database>' first");
+          ProfEnd();
+          break;
+        }
         
         IR_Node* table_node = ir_node_find_child(ir_execution_node, IR_NodeType_Table);
         IR_Node* import_file_node = ir_node_find_child(ir_execution_node, IR_NodeType_Literal);
@@ -858,6 +927,13 @@ app_execute_query_capture(Arena* arena, String8 sql_query)
         ProfBegin("SQL: Select");
         U64 start_time = os_now_microseconds();
         
+        if (!database)
+        {
+          log_error("no database selected - run 'use <database>' first");
+          ProfEnd();
+          break;
+        }
+        
         ir_expand_star_to_columns(arena, database, ir_execution_node);
         
         PLAN_ExecResult result = app_perform_kernel(arena, database, ir_execution_node);
@@ -870,7 +946,7 @@ app_execute_query_capture(Arena* arena, String8 sql_query)
         if (result.supported && select_output_columns)
         {
           Temp scratch = scratch_begin(0, 0);
-
+          
           if (result.is_materialized)
           {
             for (U64 i = 0; i < result_count; i++)
@@ -887,7 +963,7 @@ app_execute_query_capture(Arena* arena, String8 sql_query)
                     break;
                   }
                 }
-
+                
                 if (!col)
                 {
                   APP_EMIT("? ");
@@ -912,7 +988,7 @@ app_execute_query_capture(Arena* arena, String8 sql_query)
           {
             U64 column_count = 0;
             for (IR_Node* c = select_output_columns->first; c != NULL; c = c->next) column_count++;
-
+            
             typedef struct SelectColGather SelectColGather;
             struct SelectColGather
             {
@@ -924,26 +1000,28 @@ app_execute_query_capture(Arena* arena, String8 sql_query)
               F64* numeric_values;
               GDB_StringDataChunk strings;
             };
-
+            
             SelectColGather* gathered = push_array(scratch.arena, SelectColGather, Max(column_count, 1));
-
+            
             U64 ci = 0;
-            for (IR_Node* column_node = select_output_columns->first; column_node != NULL; column_node = column_node->next, ci++)
+            for (IR_Node* column_node = select_output_columns->first; 
+                 column_node != NULL; 
+                 column_node = column_node->next, ci++)
             {
               String8 bare_name = {0};
               U64 table_slot = max_U64;
               GDB_Table* col_table = qe_resolve_column_table(&result.rows, column_node->value, &bare_name, &table_slot);
               if (!col_table) continue;
-
+              
               GDB_Column* column = gdb_table_find_column(col_table, bare_name);
               if (!column) continue;
-
+              
               gathered[ci].resolved = 1;
               gathered[ci].col_table = col_table;
               gathered[ci].column = column;
               gathered[ci].table_slot = table_slot;
               gathered[ci].type = column->type;
-
+              
               if (column->type == GDB_ColumnType_String8)
               {
                 gathered[ci].strings = qe_gather_string_column(scratch.arena, &result.rows, table_slot, column);
@@ -953,7 +1031,7 @@ app_execute_query_capture(Arena* arena, String8 sql_query)
                 gathered[ci].numeric_values = qe_gather_numeric_column(scratch.arena, &result.rows, table_slot, column);
               }
             }
-
+            
             for (U64 i = 0; i < result_count; i++)
             {
               ci = 0;
@@ -964,14 +1042,14 @@ app_execute_query_capture(Arena* arena, String8 sql_query)
                   APP_EMIT("? ");
                   continue;
                 }
-
+                
                 U64 row_index = result.rows.row_indices[gathered[ci].table_slot][i];
                 if (row_index == PLAN_NULL_ROW || gdb_column_is_null(gathered[ci].column, row_index))
                 {
                   APP_EMIT("NULL ");
                   continue;
                 }
-
+                
                 switch (gathered[ci].type)
                 {
                   case GDB_ColumnType_U32:
@@ -1002,7 +1080,7 @@ app_execute_query_capture(Arena* arena, String8 sql_query)
               APP_EMIT("\n");
             }
           }
-
+          
           scratch_end(scratch);
         }
         
@@ -1019,16 +1097,16 @@ app_execute_query_capture(Arena* arena, String8 sql_query)
     String8 database_filepath = push_str8f(arena, "gdb_data/%.*s", (U32)database->name.size, database->name.str);
     gdb_database_save(database, database_filepath);
   }
-
+  
   //String8 table_filepath = push_str8f(arena, "gdb_data/benchmark/%.*s/", str8_varg(database->tables[0]->name));
   //gdb_table_save(database->tables[0], table_filepath);
-
+  
   //gdb_table_export_csv(database->tables[0], str8_lit("data/output.csv"));
-
+  
   //test_print_database(database);
-
+  
   result.output_text = str8_list_join(arena, &out, &(StringJoin){0});
-
+  
   ProfEnd();
   return result;
 }
@@ -1038,10 +1116,11 @@ internal void
 app_execute_query(String8 sql_query)
 {
   Arena* arena = arena_alloc(.reserve_size=Max(GB(1), GPU_MAX_BUFFER_SIZE), .commit_size=MB(64));
-
+  
   APP_QueryResult result = {0};
-  OS_MutexScope(g_query_exec_mutex) { result = app_execute_query_capture(arena, sql_query); }
-
+  GDB_Database* database = NULL;
+  OS_MutexScope(g_query_exec_mutex) { result = app_execute_query_capture(arena, sql_query, &database); }
+  
   if (result.output_text.size)
   {
     printf("%.*s", str8_varg(result.output_text));

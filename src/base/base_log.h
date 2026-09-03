@@ -7,6 +7,8 @@ internal void log_alloc(void);
 internal void log_release(void);
 
 internal void log_logf(const char* level, const char *file, int line, const char* fmt, ...);
+internal U64 log_error_count(void);
+internal String8 log_last_error(Arena* arena);
 
 #define log_info(fmt, ...)  log_logf("INFO",  __FILE__, __LINE__, fmt, ##__VA_ARGS__)
 #define log_error(fmt, ...) log_logf("ERROR", __FILE__, __LINE__, fmt, ##__VA_ARGS__)
