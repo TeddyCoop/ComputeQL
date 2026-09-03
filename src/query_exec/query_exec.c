@@ -527,12 +527,14 @@ qe_scan_filter(Arena* arena, GDB_Database* database, GDB_Table* table, IR_Node* 
     ProfBegin("allocating column GPU buffers");
     U64 buffer_alloc_start = os_now_microseconds();
 
+    B32 column_slot_used[QE_MAX_COLUMN_BINDINGS] = {0};
+
     for (U32 i = 0; i < prog->binding_count; i++)
     {
       QE_ColumnBinding* binding = &prog->bindings[i];
       QE_PrefetchBindingResult* in = &slot->bindings[i];
       U32 descriptor_binding = QE_BINDING_COLUMN_BASE + binding->first_slot;
-      
+
       String8 col_pool_key = push_str8f(g_vulkan_state->arena, "scan_col:%.*s.%.*s", str8_varg(table->name), str8_varg(binding->name));
 
       if (binding->type == GDB_ColumnType_String8)
@@ -548,6 +550,9 @@ qe_scan_filter(Arena* arena, GDB_Database* database, GDB_Table* table, IR_Node* 
           String8 offsets_key = push_str8f(g_vulkan_state->arena, "%.*s.offsets", str8_varg(col_pool_key));
           GPU_Buffer* offsets_buf = gpu_buffer_alloc_pooled(offsets_key, offsets_size, GPU_BufferFlag_Write | GPU_BufferFlag_CopyHostPointer, in->str_chunk.offsets);
           gpu_kernel_set_arg_buffer(kernel, descriptor_binding + 1, offsets_buf);
+
+          column_slot_used[binding->first_slot] = 1;
+          column_slot_used[binding->first_slot + 1] = 1;
         }
         else
         {
@@ -571,9 +576,19 @@ qe_scan_filter(Arena* arena, GDB_Database* database, GDB_Table* table, IR_Node* 
           data_buf = gpu_buffer_alloc_pooled(fallback_key, in->size, GPU_BufferFlag_Write, in->data_ptr);
         }
         gpu_kernel_set_arg_buffer(kernel, descriptor_binding, data_buf);
+
+        column_slot_used[binding->first_slot] = 1;
       }
     }
-    
+
+    for (U32 col_slot = 0; col_slot < QE_MAX_COLUMN_BINDINGS; col_slot++)
+    {
+      if (!column_slot_used[col_slot])
+      {
+        gpu_kernel_set_arg_buffer(kernel, QE_BINDING_COLUMN_BASE + col_slot, bytecode_buffer);
+      }
+    }
+
     GPU_Buffer* output_buffer = gpu_buffer_alloc_pooled(str8_lit("scan_filter_output"), Max(chunk_rows, 1) * 2 * sizeof(U32), GPU_BufferFlag_Read, 0);
     GPU_Buffer* result_counter_buffer = gpu_buffer_alloc_pooled(str8_lit("scan_filter_result_counter"), 2 * sizeof(U32), GPU_BufferFlag_ReadWrite | GPU_BufferFlag_HostCached, 0);
     buffer_alloc_time += os_now_microseconds() - buffer_alloc_start;
@@ -1553,34 +1568,17 @@ qe_aggregate(Arena* arena, GDB_Database* database, PLAN_RowSet* input, IR_Node* 
     }
   }
   
-  //- tec: size the open-addressing hash table
-  U64 num_buckets, K;
+  U64 num_buckets;
   if (num_group_cols == 0)
   {
     num_buckets = 1;
-    K = 1;
   }
   else
   {
     num_buckets = 16;
     while (num_buckets < row_count) num_buckets <<= 1;
-    K = 8;
   }
-  U64 num_slots = num_buckets * K;
-
-  if (num_slots * sizeof(U32) > gpu_device_max_storage_buffer_range())
-  {
-    log_error("qe_aggregate: group-by hash table (%llu bytes) exceeds this GPU's maxStorageBufferRange "
-              "(%llu bytes) - row_count=%llu is too large for a single hash table on this device",
-              num_slots * sizeof(U32), gpu_device_max_storage_buffer_range(), row_count);
-    ProfEnd();
-    return result;
-  }
-  if (num_slots * sizeof(U32) > GPU_MAX_BUFFER_SIZE)
-  {
-    log_info("qe_aggregate: group-by hash table (%llu bytes, row_count=%llu) exceeds GPU_MAX_BUFFER_SIZE - "
-              "allocating it as a single large buffer rather than chunking", num_slots * sizeof(U32), row_count);
-  }
+  U64 K = (num_group_cols == 0) ? 1 : 8;
 
   Temp scratch = scratch_begin(&arena, 1);
 
@@ -1592,16 +1590,6 @@ qe_aggregate(Arena* arena, GDB_Database* database, PLAN_RowSet* input, IR_Node* 
     ProfEnd();
     return result;
   }
-  
-  GPU_Buffer* owner_buf = gpu_buffer_alloc_pooled(str8_lit("agg_owner_buf"), num_slots * sizeof(U32), GPU_BufferFlag_ReadWrite, 0);
-  GPU_Buffer* count_buf = gpu_buffer_alloc_pooled(str8_lit("agg_count_buf"), num_slots * sizeof(U32), GPU_BufferFlag_ReadWrite, 0);
-  GPU_Buffer* row_slot_buf = gpu_buffer_alloc_pooled(str8_lit("agg_row_slot_buf"), row_count * sizeof(U32), GPU_BufferFlag_ReadWrite, 0);
-  GPU_Buffer* overflow_buf = gpu_buffer_alloc_pooled(str8_lit("agg_overflow_buf"), sizeof(U32), GPU_BufferFlag_ReadWrite, 0);
-
-  gpu_kernel_set_arg_buffer(assign_kernel, 0, owner_buf);
-  gpu_kernel_set_arg_buffer(assign_kernel, 1, count_buf);
-  gpu_kernel_set_arg_buffer(assign_kernel, 2, row_slot_buf);
-  gpu_kernel_set_arg_buffer(assign_kernel, 3, overflow_buf);
 
   GPU_Buffer* group_col_bufs[QE_AGG_MAX_GROUP_COLS * 2] = {0};
   U64 group_col_sizes[QE_AGG_MAX_GROUP_COLS * 2] = {0};
@@ -1622,49 +1610,123 @@ qe_aggregate(Arena* arena, GDB_Database* database, PLAN_RowSet* input, IR_Node* 
       group_col_bufs[c * 2 + 0] = gpu_buffer_alloc_pooled(push_str8f(g_vulkan_state->arena, "agg_group_col_data:%u", c), data_size, GPU_BufferFlag_Write, 0);
       group_col_sizes[c * 2 + 0] = data_size;
     }
-    gpu_kernel_set_arg_buffer(assign_kernel, 4 + c * 2, group_col_bufs[c * 2 + 0]);
-    if (group_col_bufs[c * 2 + 1]) gpu_kernel_set_arg_buffer(assign_kernel, 4 + c * 2 + 1, group_col_bufs[c * 2 + 1]);
   }
 
-  gpu_kernel_set_arg_u64(assign_kernel, 0, row_count);
-  gpu_kernel_set_arg_u64(assign_kernel, 1, num_buckets);
-  gpu_kernel_set_arg_u64(assign_kernel, 2, K);
-  gpu_kernel_set_arg_u64(assign_kernel, 3, num_group_cols);
-  gpu_kernel_set_arg_u64(assign_kernel, 4, group_string_mask);
+  if (!group_col_bufs[0] && num_group_cols > 0)
+  {
+    log_error("qe_aggregate: failed to allocate group-by key column GPU buffers (row_count=%llu)", row_count);
+    scratch_end(scratch);
+    ProfEnd();
+    return result;
+  }
 
   U64 assign_upload_bytes = 0;
   for (U32 c = 0; c < num_group_cols * 2; c++) assign_upload_bytes += group_col_sizes[c];
-  U64 assign_download_bytes = (U64)num_slots * sizeof(U32) * 2 + sizeof(U32);
 
-  U32* owner_readback = push_array(scratch.arena, U32, num_slots);
-  U32* count_readback = push_array(scratch.arena, U32, num_slots);
+  U64 num_slots = 0;
+  GPU_Buffer* owner_buf = 0;
+  GPU_Buffer* count_buf = 0;
+  GPU_Buffer* row_slot_buf = 0;
+  GPU_Buffer* overflow_buf = 0;
+  U32* owner_readback = 0;
+  U32* count_readback = 0;
   U32 overflow_readback = 0;
 
-  GPU_Batch* assign_batch = gpu_batch_begin(assign_upload_bytes, assign_download_bytes);
-  gpu_batch_buffer_fill(assign_batch, owner_buf, num_slots * sizeof(U32), max_U32);
-  gpu_batch_buffer_zero(assign_batch, count_buf, num_slots * sizeof(U32));
-  gpu_batch_buffer_zero(assign_batch, overflow_buf, sizeof(U32));
-  for (U32 c = 0; c < num_group_cols; c++)
+  for (;;)
   {
-    if (group_string_mask & (1u << c))
-    {
-      gpu_batch_buffer_write(assign_batch, group_col_bufs[c * 2 + 0], group_string[c].data, group_col_sizes[c * 2 + 0]);
-      gpu_batch_buffer_write(assign_batch, group_col_bufs[c * 2 + 1], group_string[c].offsets, group_col_sizes[c * 2 + 1]);
-    }
-    else
-    {
-      gpu_batch_buffer_write(assign_batch, group_col_bufs[c * 2 + 0], group_numeric[c], group_col_sizes[c * 2 + 0]);
-    }
-  }
-  gpu_batch_kernel_execute(assign_batch, assign_kernel, (U32)row_count, QE_GPU_WORKGROUP_SIZE);
-  gpu_batch_buffer_read(assign_batch, owner_buf, owner_readback, num_slots * sizeof(U32));
-  gpu_batch_buffer_read(assign_batch, count_buf, count_readback, num_slots * sizeof(U32));
-  gpu_batch_buffer_read(assign_batch, overflow_buf, &overflow_readback, sizeof(U32));
-  gpu_batch_end(assign_batch);
+    num_slots = num_buckets * K;
 
-  if (overflow_readback > 0)
-  {
-    log_error("qe_aggregate: %u row(s) dropped due to hash-table probe exhaustion - GROUP BY result is incomplete", overflow_readback);
+    if (num_slots * sizeof(U32) > gpu_device_max_storage_buffer_range())
+    {
+      log_error("qe_aggregate: group-by hash table (%llu bytes) exceeds this GPU's maxStorageBufferRange "
+                "(%llu bytes) - row_count=%llu is too large for a single hash table on this device",
+                num_slots * sizeof(U32), gpu_device_max_storage_buffer_range(), row_count);
+      scratch_end(scratch);
+      ProfEnd();
+      return result;
+    }
+    if (num_slots * sizeof(U32) > GPU_MAX_BUFFER_SIZE)
+    {
+      log_info("qe_aggregate: group-by hash table (%llu bytes, row_count=%llu) exceeds GPU_MAX_BUFFER_SIZE - "
+                "allocating it as a single large buffer rather than chunking", num_slots * sizeof(U32), row_count);
+    }
+
+    owner_buf = gpu_buffer_alloc_pooled(str8_lit("agg_owner_buf"), num_slots * sizeof(U32), GPU_BufferFlag_ReadWrite, 0);
+    count_buf = gpu_buffer_alloc_pooled(str8_lit("agg_count_buf"), num_slots * sizeof(U32), GPU_BufferFlag_ReadWrite, 0);
+    row_slot_buf = gpu_buffer_alloc_pooled(str8_lit("agg_row_slot_buf"), row_count * sizeof(U32), GPU_BufferFlag_ReadWrite, 0);
+    overflow_buf = gpu_buffer_alloc_pooled(str8_lit("agg_overflow_buf"), sizeof(U32), GPU_BufferFlag_ReadWrite, 0);
+
+    if (!owner_buf || !count_buf || !row_slot_buf || !overflow_buf)
+    {
+      log_error("qe_aggregate: failed to allocate group-by hash table GPU buffers (row_count=%llu, num_slots=%llu)",
+                row_count, num_slots);
+      scratch_end(scratch);
+      ProfEnd();
+      return result;
+    }
+
+    gpu_kernel_set_arg_buffer(assign_kernel, 0, owner_buf);
+    gpu_kernel_set_arg_buffer(assign_kernel, 1, count_buf);
+    gpu_kernel_set_arg_buffer(assign_kernel, 2, row_slot_buf);
+    gpu_kernel_set_arg_buffer(assign_kernel, 3, overflow_buf);
+
+    for (U32 c = 0; c < QE_AGG_MAX_GROUP_COLS; c++)
+    {
+      GPU_Buffer* data_buf = (c < num_group_cols) ? group_col_bufs[c * 2 + 0] : overflow_buf;
+      GPU_Buffer* off_buf = (c < num_group_cols && group_col_bufs[c * 2 + 1]) ? group_col_bufs[c * 2 + 1] : overflow_buf;
+      gpu_kernel_set_arg_buffer(assign_kernel, 4 + c * 2, data_buf);
+      gpu_kernel_set_arg_buffer(assign_kernel, 4 + c * 2 + 1, off_buf);
+    }
+
+    gpu_kernel_set_arg_u64(assign_kernel, 0, row_count);
+    gpu_kernel_set_arg_u64(assign_kernel, 1, num_buckets);
+    gpu_kernel_set_arg_u64(assign_kernel, 2, K);
+    gpu_kernel_set_arg_u64(assign_kernel, 3, num_group_cols);
+    gpu_kernel_set_arg_u64(assign_kernel, 4, group_string_mask);
+
+    U64 assign_download_bytes = (U64)num_slots * sizeof(U32) * 2 + sizeof(U32);
+
+    owner_readback = push_array(scratch.arena, U32, num_slots);
+    count_readback = push_array(scratch.arena, U32, num_slots);
+    overflow_readback = 0;
+
+    GPU_Batch* assign_batch = gpu_batch_begin(assign_upload_bytes, assign_download_bytes);
+    gpu_batch_buffer_fill(assign_batch, owner_buf, num_slots * sizeof(U32), max_U32);
+    gpu_batch_buffer_zero(assign_batch, count_buf, num_slots * sizeof(U32));
+    gpu_batch_buffer_zero(assign_batch, overflow_buf, sizeof(U32));
+    for (U32 c = 0; c < num_group_cols; c++)
+    {
+      if (group_string_mask & (1u << c))
+      {
+        gpu_batch_buffer_write(assign_batch, group_col_bufs[c * 2 + 0], group_string[c].data, group_col_sizes[c * 2 + 0]);
+        gpu_batch_buffer_write(assign_batch, group_col_bufs[c * 2 + 1], group_string[c].offsets, group_col_sizes[c * 2 + 1]);
+      }
+      else
+      {
+        gpu_batch_buffer_write(assign_batch, group_col_bufs[c * 2 + 0], group_numeric[c], group_col_sizes[c * 2 + 0]);
+      }
+    }
+    gpu_batch_kernel_execute(assign_batch, assign_kernel, (U32)row_count, QE_GPU_WORKGROUP_SIZE);
+    gpu_batch_buffer_read(assign_batch, owner_buf, owner_readback, num_slots * sizeof(U32));
+    gpu_batch_buffer_read(assign_batch, count_buf, count_readback, num_slots * sizeof(U32));
+    gpu_batch_buffer_read(assign_batch, overflow_buf, &overflow_readback, sizeof(U32));
+    if (!gpu_batch_end(assign_batch))
+    {
+      log_error("qe_aggregate: GPU dispatch failed (device lost?) while assigning group-by hash slots");
+      scratch_end(scratch);
+      ProfEnd();
+      return result;
+    }
+
+    if (overflow_readback == 0 || num_group_cols == 0)
+    {
+      break;
+    }
+
+    U64 next_K = K * 2;
+    log_info("qe_aggregate: %u row(s) overflowed the group-by hash table with K=%llu - retrying with K=%llu",
+             overflow_readback, K, next_K);
+    K = next_K;
   }
 
   gpu_kernel_release(assign_kernel);
@@ -1743,8 +1805,12 @@ qe_aggregate(Arena* arena, GDB_Database* database, PLAN_RowSet* input, IR_Node* 
     if (expr_args[e])
     {
       arg_bufs[e] = gpu_buffer_alloc_pooled(push_str8f(g_vulkan_state->arena, "agg_arg_buf:%u", e), row_count * sizeof(F64), GPU_BufferFlag_Write, 0);
-      gpu_kernel_set_arg_buffer(reduce_kernel, 5 + e, arg_bufs[e]);
     }
+  }
+  
+  for (U32 e = 0; e < QE_AGG_MAX_EXPRS; e++)
+  {
+    gpu_kernel_set_arg_buffer(reduce_kernel, 5 + e, arg_bufs[e] ? arg_bufs[e] : repr_buf);
   }
 
   U32 func_codes_packed = 0;
@@ -2460,6 +2526,15 @@ qe_hash_join(Arena* arena, PLAN_RowSet* left, GDB_Table* right_table, String8 ri
   GPU_Buffer* bucket_count_buf = gpu_buffer_alloc_pooled(str8_lit("hj_bucket_count_buf"), num_buckets * sizeof(U32), GPU_BufferFlag_ReadWrite, 0);
   GPU_Buffer* row_bucket_buf = gpu_buffer_alloc_pooled(str8_lit("hj_row_bucket_buf"), Max(build_row_count, 1) * sizeof(U32), GPU_BufferFlag_ReadWrite, 0);
 
+  if (!build_data_buf || !build_off_buf || !bucket_count_buf || !row_bucket_buf)
+  {
+    log_error("qe_hash_join: failed to allocate build-side GPU buffers (build_row_count=%llu, num_buckets=%llu)",
+              build_row_count, num_buckets);
+    scratch_end(scratch);
+    ProfEnd();
+    return result;
+  }
+
   gpu_kernel_set_arg_buffer(build_kernel, 0, build_data_buf);
   gpu_kernel_set_arg_buffer(build_kernel, 1, build_off_buf);
   gpu_kernel_set_arg_buffer(build_kernel, 2, bucket_count_buf);
@@ -2506,17 +2581,29 @@ qe_hash_join(Arena* arena, PLAN_RowSet* left, GDB_Table* right_table, String8 ri
   GPU_Buffer* cursor_buf = gpu_buffer_alloc_pooled(str8_lit("hj_cursor_buf"), num_buckets * sizeof(U32), GPU_BufferFlag_ReadWrite, 0);
   GPU_Buffer* bucket_rows_buf = gpu_buffer_alloc_pooled(str8_lit("hj_bucket_rows_buf"), Max(build_row_count, 1) * sizeof(U32), GPU_BufferFlag_ReadWrite, 0);
 
+  if (!cursor_buf || !bucket_rows_buf)
+  {
+    log_error("qe_hash_join: failed to allocate scatter-pass GPU buffers (num_buckets=%llu, build_row_count=%llu)",
+              num_buckets, build_row_count);
+    scratch_end(scratch);
+    ProfEnd();
+    return result;
+  }
+
   gpu_kernel_set_arg_buffer(scatter_kernel, 0, row_bucket_buf);
   gpu_kernel_set_arg_buffer(scatter_kernel, 1, cursor_buf);
   gpu_kernel_set_arg_buffer(scatter_kernel, 2, bucket_rows_buf);
   gpu_kernel_set_arg_u64(scatter_kernel, 0, build_row_count);
 
-  // tec: probe from the left side. output capacity is a bounded heuristic
-  // if the real match count exceeds it, it is detected and reported below
+  U64 out_hard_max_capacity = gpu_device_max_storage_buffer_range() / (4 * sizeof(U32));
   U64 out_capacity = Max(probe_row_count, build_row_count) * 64 + probe_row_count;
-  U64 max_capacity = GPU_MAX_BUFFER_SIZE / (4 * sizeof(U32));
-  if (out_capacity > max_capacity) out_capacity = max_capacity;
+  if (out_capacity > out_hard_max_capacity) out_capacity = out_hard_max_capacity;
   if (out_capacity < 1) out_capacity = 1;
+  if (out_capacity * 4 * sizeof(U32) > GPU_MAX_BUFFER_SIZE)
+  {
+    log_info("qe_hash_join: probe output buffer (%llu bytes, %llu-pair capacity) exceeds GPU_MAX_BUFFER_SIZE - "
+              "allocating it as a single large buffer rather than chunking", out_capacity * 4 * sizeof(U32), out_capacity);
+  }
 
   GPU_Kernel* probe_kernel = gpu_kernel_alloc(str8_lit("hash_join_probe"));
   if (!probe_kernel)
@@ -2537,6 +2624,15 @@ qe_hash_join(Arena* arena, PLAN_RowSet* left, GDB_Table* right_table, String8 ri
   GPU_Buffer* out_count_buf = gpu_buffer_alloc_pooled(str8_lit("hj_out_count_buf"), sizeof(U32), GPU_BufferFlag_ReadWrite, 0);
   GPU_Buffer* out_pairs_buf = gpu_buffer_alloc_pooled(str8_lit("hj_out_pairs_buf"), out_capacity * 4 * sizeof(U32), GPU_BufferFlag_ReadWrite, 0);
 
+  if (!probe_data_buf || !probe_off_buf || !bucket_offsets_buf || !out_count_buf || !out_pairs_buf)
+  {
+    log_error("qe_hash_join: failed to allocate probe-pass GPU buffers (probe_row_count=%llu, out_capacity=%llu)",
+              probe_row_count, out_capacity);
+    scratch_end(scratch);
+    ProfEnd();
+    return result;
+  }
+
   gpu_kernel_set_arg_buffer(probe_kernel, 0, build_data_buf);
   gpu_kernel_set_arg_buffer(probe_kernel, 1, build_off_buf);
   gpu_kernel_set_arg_buffer(probe_kernel, 2, bucket_offsets_buf);
@@ -2555,34 +2651,69 @@ qe_hash_join(Arena* arena, PLAN_RowSet* left, GDB_Table* right_table, String8 ri
   U64 probe_upload_bytes = num_buckets * sizeof(U32) + probe_data_size + bucket_offsets_size;
   if (is_string_key) probe_upload_bytes += probe_off_size;
 
-  U32 match_count32 = 0;
-  GPU_Batch* probe_batch = gpu_batch_begin(probe_upload_bytes, sizeof(U32));
-  gpu_batch_buffer_write(probe_batch, cursor_buf, bucket_offsets, num_buckets * sizeof(U32));
-  if (build_row_count > 0)
+  U64 match_count = 0;
+  for (;;)
   {
-    gpu_batch_kernel_execute(probe_batch, scatter_kernel, (U32)build_row_count, QE_GPU_WORKGROUP_SIZE);
+    U32 match_count32 = 0;
+    GPU_Batch* probe_batch = gpu_batch_begin(probe_upload_bytes, sizeof(U32));
+    gpu_batch_buffer_write(probe_batch, cursor_buf, bucket_offsets, num_buckets * sizeof(U32));
+    if (build_row_count > 0)
+    {
+      gpu_batch_kernel_execute(probe_batch, scatter_kernel, (U32)build_row_count, QE_GPU_WORKGROUP_SIZE);
+    }
+    gpu_batch_buffer_write(probe_batch, probe_data_buf, probe_data, probe_data_size);
+    if (is_string_key) gpu_batch_buffer_write(probe_batch, probe_off_buf, probe_offsets, probe_off_size);
+    gpu_batch_buffer_write(probe_batch, bucket_offsets_buf, bucket_offsets, bucket_offsets_size);
+    gpu_batch_buffer_zero(probe_batch, out_count_buf, sizeof(U32));
+    if (probe_row_count > 0)
+    {
+      gpu_batch_kernel_execute(probe_batch, probe_kernel, (U32)probe_row_count, QE_GPU_WORKGROUP_SIZE);
+    }
+    gpu_batch_buffer_read(probe_batch, out_count_buf, &match_count32, sizeof(U32));
+    if (!gpu_batch_end(probe_batch))
+    {
+      log_error("qe_hash_join: GPU dispatch failed (device lost?) during probe pass");
+      gpu_kernel_release(scatter_kernel);
+      gpu_kernel_release(probe_kernel);
+      scratch_end(scratch);
+      ProfEnd();
+      return result;
+    }
+
+    match_count = match_count32;
+
+    if (match_count <= out_capacity)
+    {
+      break;
+    }
+
+    U64 exact_capacity = Min(match_count, out_hard_max_capacity);
+    if (exact_capacity == out_capacity)
+    {
+      log_error("qe_hash_join: join produced %llu matches, exceeding this GPU's maximum output buffer "
+                "capacity (%llu pairs) - result is truncated", match_count, out_capacity);
+      match_count = out_capacity;
+      break;
+    }
+
+    log_info("qe_hash_join: probe output heuristic undercounted (%llu matches > %llu-pair capacity) - "
+             "retrying with exact capacity", match_count, out_capacity);
+    out_capacity = exact_capacity;
+    out_pairs_buf = gpu_buffer_alloc_pooled(str8_lit("hj_out_pairs_buf"), out_capacity * 4 * sizeof(U32), GPU_BufferFlag_ReadWrite, 0);
+    if (!out_pairs_buf)
+    {
+      log_error("qe_hash_join: failed to reallocate probe output buffer for exact capacity %llu", out_capacity);
+      gpu_kernel_release(scatter_kernel);
+      gpu_kernel_release(probe_kernel);
+      scratch_end(scratch);
+      ProfEnd();
+      return result;
+    }
+    gpu_kernel_set_arg_buffer(probe_kernel, 6, out_pairs_buf);
+    gpu_kernel_set_arg_u64(probe_kernel, 4, out_capacity);
   }
-  gpu_batch_buffer_write(probe_batch, probe_data_buf, probe_data, probe_data_size);
-  if (is_string_key) gpu_batch_buffer_write(probe_batch, probe_off_buf, probe_offsets, probe_off_size);
-  gpu_batch_buffer_write(probe_batch, bucket_offsets_buf, bucket_offsets, bucket_offsets_size);
-  gpu_batch_buffer_zero(probe_batch, out_count_buf, sizeof(U32));
-  if (probe_row_count > 0)
-  {
-    gpu_batch_kernel_execute(probe_batch, probe_kernel, (U32)probe_row_count, QE_GPU_WORKGROUP_SIZE);
-  }
-  gpu_batch_buffer_read(probe_batch, out_count_buf, &match_count32, sizeof(U32));
-  gpu_batch_end(probe_batch);
 
   gpu_kernel_release(scatter_kernel);
-
-  U64 match_count = match_count32;
-
-  if (match_count > out_capacity)
-  {
-    log_error("qe_hash_join: join produced %llu matches, exceeding the %llu-pair output capacity - result is truncated",
-              match_count, out_capacity);
-    match_count = out_capacity;
-  }
 
   U32* pairs_readback = push_array(scratch.arena, U32, Max(match_count, 1) * 4);
   if (match_count > 0)

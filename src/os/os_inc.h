@@ -12,6 +12,7 @@
 #endif
 
 #include "os/core/os_core.h"
+#include "os/net/os_net.h"
 #if OS_FEATURE_GRAPHICAL
 # include "os/gfx/os_gfx.h"
 #endif
@@ -22,6 +23,12 @@
 # include "os/core/linux/os_core_linux.h"
 #else
 # error OS core layer not implemented for this operating system.
+#endif
+
+#if OS_WINDOWS
+# include "os/net/win32/os_net_win32.h"
+#elif OS_LINUX
+# error OS net layer not implemented for this operating system.
 #endif
 
 #if OS_FEATURE_GRAPHICAL

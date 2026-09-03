@@ -54,7 +54,8 @@ A benchmark harness (`src/tests/`, run via `build_and_run_tests.bat`) compares C
 
 Ordered from "next" to "later":
 - [ ] **Cross-engine benchmarking against more engines** - extend to ClickHouse/Postgres (client-server engines, needing a running server + client library) and publish results.
-- [ ] **Client-server mode** - a long-running server process that keeps databases and the GPU context loaded and accepts queries over a network connection, instead of today's one-shot CLI invocation. A natural fit is speaking the Postgres wire protocol, so existing clients, ORMs, and BI tools work against it out of the box.
+- [ ] **Client-server mode** - a long-running server process that keeps databases and the GPU context loaded and accepts queries over a network connection, instead of today's one-shot CLI invocation. v1 uses a small custom protocol.
+- [ ] **Postgres wire protocol compatibility** - once client-server mode is proven out, speak the Postgres wire protocol so existing clients, ORMs, and BI tools work against it out of the box.
 - [ ] **Users & access control** - accounts and authentication for network connections, plus a role/permission model (`GRANT`/`REVOKE`) scoped to databases and tables, so a shared server isn't all-or-nothing access.
 - [ ] **Multi-GPU support**
 - [ ] **Additional GPU backends** (e.g. CUDA) alongside Vulkan

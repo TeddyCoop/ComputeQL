@@ -1,4 +1,5 @@
 #include "os/core/os_core.c"
+#include "os/net/os_net.c"
 #if OS_FEATURE_GRAPHICAL
 # include "os/gfx/os_gfx.c"
 #endif
@@ -9,6 +10,12 @@
 # include "os/core/linux/os_core_linux.c"
 #else
 # error OS core layer not implemented for this operating system.
+#endif
+
+#if OS_WINDOWS
+# include "os/net/win32/os_net_win32.c"
+#elif OS_LINUX
+# error OS net layer not implemented for this operating system.
 #endif
 
 #if OS_FEATURE_GRAPHICAL

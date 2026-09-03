@@ -61,6 +61,6 @@ internal void gpu_batch_buffer_zero(GPU_Batch* batch, GPU_Buffer* buffer, U64 si
 internal void gpu_batch_buffer_fill(GPU_Batch* batch, GPU_Buffer* buffer, U64 size, U32 value);
 internal void gpu_batch_kernel_execute(GPU_Batch* batch, GPU_Kernel* kernel, U32 global_work_size, U32 local_work_size);
 internal void gpu_batch_buffer_read(GPU_Batch* batch, GPU_Buffer* buffer, void* out_data, U64 size);
-internal void gpu_batch_end(GPU_Batch* batch);
+internal B32 gpu_batch_end(GPU_Batch* batch);
 
 #endif //GPU_H

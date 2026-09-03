@@ -470,7 +470,7 @@ gpu_vulkan_begin_one_time_cmd(void)
   return g_vulkan_state->command_buffer;
 }
 
-internal void
+internal B32
 gpu_vulkan_end_and_submit_cmd(VkCommandBuffer cmd)
 {
   vkEndCommandBuffer(cmd);
@@ -490,19 +490,20 @@ gpu_vulkan_end_and_submit_cmd(VkCommandBuffer cmd)
   {
     // tec: the fence was never signaled if the submit itself failed
     log_error("vkQueueSubmit failed with VkResult %d - not waiting on the fence", (int)submit_result);
-    return;
+    return 0;
   }
 
-  // tec: bounded instead of UINT64_MAX 
+  // tec: bounded instead of UINT64_MAX
   VkResult wait_result = vkWaitForFences(g_vulkan_state->device, 1, &g_vulkan_state->submit_fence, VK_TRUE, Billion(1));
   if (wait_result != VK_SUCCESS)
   {
     log_error("vkWaitForFences failed/timed out with VkResult %d after %llu microseconds - GPU is likely hung or the device was lost",
               (int)wait_result, os_now_microseconds() - t0);
-    return;
+    return 0;
   }
 
   log_info("submit+wait wall time: %llu microseconds", os_now_microseconds() - t0);
+  return 1;
 }
 
 internal B32
@@ -620,9 +621,16 @@ gpu_vulkan_staged_download(GPU_Buffer* src, void* data, U64 size)
   VkCommandBuffer cmd = gpu_vulkan_begin_one_time_cmd();
   VkBufferCopy copy_region = { .size = size };
   vkCmdCopyBuffer(cmd, src->buffer, g_vulkan_state->download_staging_buffer, 1, &copy_region);
-  gpu_vulkan_end_and_submit_cmd(cmd);
-  
-  MemoryCopy(data, g_vulkan_state->download_staging_mapped, size);
+
+  if (gpu_vulkan_end_and_submit_cmd(cmd))
+  {
+    MemoryCopy(data, g_vulkan_state->download_staging_mapped, size);
+  }
+  else
+  {
+    // tec: the copy never completed
+    MemoryZero(data, size);
+  }
 }
 
 internal GPU_Buffer*
@@ -696,10 +704,15 @@ gpu_buffer_alloc_pooled(String8 name, U64 size, GPU_BufferFlags flags, void* dat
     {
       gpu_buffer_release(slot->buffer);
       slot->buffer = gpu_buffer_alloc(size, flags, data);
-      slot->capacity = size;
+      // tec: only record the new capacity if the allocation actually succeeded
+      slot->capacity = slot->buffer ? size : 0;
     }
     else
     {
+      if (!slot->buffer)
+      {
+        return 0;
+      }
       slot->buffer->size = size;
       if (data) gpu_buffer_write(slot->buffer, data, size);
     }
@@ -859,6 +872,11 @@ gpu_buffer_import_host_readonly_pooled(String8 name, void* host_ptr, U64 size)
 internal void
 gpu_buffer_release(GPU_Buffer* buffer)
 {
+  if (!buffer)
+  {
+    return;
+  }
+
   if (buffer->mapped_ptr)
   {
     vkUnmapMemory(g_vulkan_state->device, buffer->memory);
@@ -1050,7 +1068,13 @@ gpu_kernel_set_arg_buffer(GPU_Kernel* kernel, U32 index, GPU_Buffer* buffer)
     log_error("gpu_kernel_set_arg_buffer: index %u exceeds GPU_VULKAN_MAX_BOUND_BUFFERS", index);
     return;
   }
-  
+
+  if (!buffer)
+  {
+    log_error("gpu_kernel_set_arg_buffer: buffer argument for index %u is NULL - a prior GPU buffer allocation failed", index);
+    return;
+  }
+
   VkDescriptorBufferInfo buffer_info =
   {
     .buffer = buffer->buffer,
@@ -1106,14 +1130,15 @@ gpu_kernel_execute(GPU_Kernel* kernel, U32 global_work_size, U32 local_work_size
   vkCmdDispatch(cmd, group_count, 1, 1);
   
   vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g_vulkan_state->timestamp_query_pool, 1);
-  
-  gpu_vulkan_end_and_submit_cmd(cmd);
-  
-  U64 timestamps[2];
-  vkGetQueryPoolResults(g_vulkan_state->device, g_vulkan_state->timestamp_query_pool, 0, 2, sizeof(timestamps), timestamps, sizeof(U64), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
-  
-  F64 elapsed_ns = (F64)(timestamps[1] - timestamps[0]) * (F64)g_vulkan_state->timestamp_period_ns;
-  g_vulkan_state->last_kernel_time_microseconds = (U64)(elapsed_ns / 1000.0);
+
+  if (gpu_vulkan_end_and_submit_cmd(cmd))
+  {
+    U64 timestamps[2];
+    vkGetQueryPoolResults(g_vulkan_state->device, g_vulkan_state->timestamp_query_pool, 0, 2, sizeof(timestamps), timestamps, sizeof(U64), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+
+    F64 elapsed_ns = (F64)(timestamps[1] - timestamps[0]) * (F64)g_vulkan_state->timestamp_period_ns;
+    g_vulkan_state->last_kernel_time_microseconds = (U64)(elapsed_ns / 1000.0);
+  }
 }
 
 //~ tec: batching
@@ -1287,14 +1312,16 @@ gpu_batch_buffer_read(GPU_Batch* batch, GPU_Buffer* buffer, void* out_data, U64 
   batch->has_commands = 1;
 }
 
-internal void
+internal B32
 gpu_batch_end(GPU_Batch* batch)
 {
+  B32 ok = 1;
+
   if (batch->has_commands)
   {
-    gpu_vulkan_end_and_submit_cmd(batch->cmd);
+    ok = gpu_vulkan_end_and_submit_cmd(batch->cmd);
 
-    if (batch->had_dispatch)
+    if (ok && batch->had_dispatch)
     {
       U64 timestamps[2];
       vkGetQueryPoolResults(g_vulkan_state->device, g_vulkan_state->timestamp_query_pool, 0, 2, sizeof(timestamps), timestamps, sizeof(U64), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
@@ -1310,7 +1337,17 @@ gpu_batch_end(GPU_Batch* batch)
   for (U32 i = 0; i < batch->pending_read_count; i++)
   {
     GPU_PendingRead* pr = &batch->pending_reads[i];
-    void* src = pr->from_staging ? (void*)((U8*)g_vulkan_state->download_staging_mapped + pr->staging_offset) : pr->mapped_src;
-    MemoryCopy(pr->out_data, src, pr->size);
+    if (ok)
+    {
+      void* src = pr->from_staging ? (void*)((U8*)g_vulkan_state->download_staging_mapped + pr->staging_offset) : pr->mapped_src;
+      MemoryCopy(pr->out_data, src, pr->size);
+    }
+    else
+    {
+      // tec: the copy/dispatch never completed
+      MemoryZero(pr->out_data, pr->size);
+    }
   }
+
+  return ok;
 }

@@ -1,4 +1,6 @@
 
+global OS_Handle g_query_exec_mutex = {0};
+
 internal int
 delete_row_index_compare_descending(const void* a, const void* b)
 {
@@ -267,22 +269,25 @@ gdb_row_has_referencing_children(Arena* arena, GDB_Database* database, GDB_Table
   return 0;
 }
 
-internal void
-app_execute_query(String8 sql_query)
+#define APP_EMIT(...) str8_list_push(arena, &out, push_str8f(arena, __VA_ARGS__))
+
+internal APP_QueryResult
+app_execute_query_capture(Arena* arena, String8 sql_query)
 {
   ProfBeginFunction();
-  
-  Arena* arena = arena_alloc(.reserve_size=Max(GB(1), GPU_MAX_BUFFER_SIZE), .commit_size=MB(64));
-  
+
+  APP_QueryResult result = {0};
+  String8List out = {0};
+
   SQL_TokenizeResult tokenize_result = sql_tokenize_from_text(arena, sql_query);
   SQL_Node* sql_root = sql_parse(arena, tokenize_result.tokens, tokenize_result.count, sql_query);
-  
+
   if (sql_root == NULL || g_sql_parse_error.has_error)
   {
     log_error("failed to parse query, aborting");
-    arena_release(arena);
+    result.had_parse_error = 1;
     ProfEnd();
-    return;
+    return result;
   }
   
   IR_Query* ir_query = ir_generate_from_ast(arena, sql_root);
@@ -306,9 +311,13 @@ app_execute_query(String8 sql_query)
         
         if (use_ir_node->type == IR_NodeType_Database)
         {
-          String8 database_path = push_str8f(arena, "gdb_data/%.*s", str8_varg(use_ir_node->value));
-          database = gdb_database_load(database_path);
-          gdb_add_database(database);
+          database = gdb_state_find_database_by_name(use_ir_node->value);
+          if (!database)
+          {
+            String8 database_path = push_str8f(arena, "gdb_data/%.*s", str8_varg(use_ir_node->value));
+            database = gdb_database_load(database_path);
+            gdb_add_database(database);
+          }
         }
       } break;
       
@@ -330,10 +339,10 @@ app_execute_query(String8 sql_query)
           }
           else
           {
-            printf("Table: %.*s (%llu row%s)\n\n", str8_varg(table->name), table->row_count,
+            APP_EMIT("Table: %.*s (%llu row%s)\n\n", str8_varg(table->name), table->row_count,
                    table->row_count == 1 ? "" : "s");
-            printf("%-24s %-10s %-5s %-5s %s\n", "Column", "Type", "Null", "Key", "Extra");
-            printf("%-24s %-10s %-5s %-5s %s\n", "------", "----", "----", "---", "-----");
+            APP_EMIT("%-24s %-10s %-5s %-5s %s\n", "Column", "Type", "Null", "Key", "Extra");
+            APP_EMIT("%-24s %-10s %-5s %-5s %s\n", "------", "----", "----", "---", "-----");
 
             for (U64 i = 0; i < table->column_count; i++)
             {
@@ -355,7 +364,7 @@ app_execute_query(String8 sql_query)
               if (column->has_check) str8_list_push(scratch.arena, &extra_parts, push_str8f(scratch.arena, "check(%.*s)", str8_varg(column->check_text)));
               String8 extra = str8_list_join(scratch.arena, &extra_parts, &(StringJoin){.sep = str8_lit(", ")});
 
-              printf("%-24.*s %-10.*s %-5s %-5.*s %.*s\n",
+              APP_EMIT("%-24.*s %-10.*s %-5s %-5.*s %.*s\n",
                      str8_varg(column->name),
                      str8_varg(type_name),
                      column->not_null ? "NO" : "YES",
@@ -385,8 +394,8 @@ app_execute_query(String8 sql_query)
           ir_expand_star_to_columns(arena, database, select_ir_node);
 
           PLAN_Node* plan = plan_build_from_select(arena, database, select_ir_node);
-          printf("Query plan:\n");
-          plan_print(plan, 0);
+          APP_EMIT("Query plan:\n");
+          plan_print(plan, 0); // tec: still printf's directly - not captured into output_text (v1 gap: EXPLAIN's tree body doesn't reach a network client, only the server's own stdout)
         }
       } break;
 
@@ -396,8 +405,15 @@ app_execute_query(String8 sql_query)
         
         if (create_ir_node->type == IR_NodeType_Database)
         {
-          database = gdb_database_alloc(create_ir_node->value);
-          gdb_add_database(database);
+          if (gdb_state_find_database_by_name(create_ir_node->value))
+          {
+            log_error("create database: '%.*s' is already loaded", str8_varg(create_ir_node->value));
+          }
+          else
+          {
+            database = gdb_database_alloc(create_ir_node->value);
+            gdb_add_database(database);
+          }
         }
         else if (create_ir_node->type == IR_NodeType_Table)
         {
@@ -520,7 +536,7 @@ app_execute_query(String8 sql_query)
         if (!values_object)
         {
           log_error("missing 'values' clause in 'insert' statement");
-          return;
+          return result;
         }
 
         //- tec: value group
@@ -539,7 +555,7 @@ app_execute_query(String8 sql_query)
           if (listed_count > table->column_count)
           {
             log_error("insert column list names more columns than table '%.*s' has", str8_varg(table->name));
-            return;
+            return result;
           }
 
           U64 ci = 0;
@@ -549,7 +565,7 @@ app_execute_query(String8 sql_query)
             if (!column)
             {
               log_error("unknown column '%.*s' in 'insert' statement", str8_varg(c->value));
-              return;
+              return result;
             }
 
             U64 slot = 0;
@@ -579,7 +595,7 @@ app_execute_query(String8 sql_query)
             if (column_index >= listed_count)
             {
               log_error("too many values in 'insert' statement");
-              return;
+              return result;
             }
 
             U64 slot = column_slots[column_index];
@@ -627,7 +643,7 @@ app_execute_query(String8 sql_query)
               } break;
               default:
               log_error("unknown column type");
-              return;
+              return result;
             }
 
             row_data[slot] = value_ptr;
@@ -639,7 +655,7 @@ app_execute_query(String8 sql_query)
           if (column_index != listed_count)
           {
             log_error("mismatch in column count and value count in 'insert' statement");
-            return;
+            return result;
           }
 
           // tec: any table column not named by a partial column list defaults to NULL
@@ -653,7 +669,7 @@ app_execute_query(String8 sql_query)
           if (!gdb_table_validate_row_constraints(scratch.arena, database, table, row_data, row_null))
           {
             scratch_end(scratch);
-            return;
+            return result;
           }
 
           gdb_table_add_row(table, row_data, row_null);
@@ -874,22 +890,22 @@ app_execute_query(String8 sql_query)
 
                 if (!col)
                 {
-                  printf("? ");
+                  APP_EMIT("? ");
                 }
                 else if (col->type == GDB_ColumnType_String8)
                 {
-                  printf("%.*s ", str8_varg(col->string_values[i]));
+                  APP_EMIT("%.*s ", str8_varg(col->string_values[i]));
                 }
                 else if (col->type == GDB_ColumnType_U32 || col->type == GDB_ColumnType_U64)
                 {
-                  printf("%llu ", (U64)col->numeric_values[i]);
+                  APP_EMIT("%llu ", (U64)col->numeric_values[i]);
                 }
                 else
                 {
-                  printf("%lf ", col->numeric_values[i]);
+                  APP_EMIT("%lf ", col->numeric_values[i]);
                 }
               }
-              printf("\n");
+              APP_EMIT("\n");
             }
           }
           else
@@ -945,30 +961,30 @@ app_execute_query(String8 sql_query)
               {
                 if (!gathered[ci].resolved)
                 {
-                  printf("? ");
+                  APP_EMIT("? ");
                   continue;
                 }
 
                 U64 row_index = result.rows.row_indices[gathered[ci].table_slot][i];
                 if (row_index == PLAN_NULL_ROW || gdb_column_is_null(gathered[ci].column, row_index))
                 {
-                  printf("NULL ");
+                  APP_EMIT("NULL ");
                   continue;
                 }
 
                 switch (gathered[ci].type)
                 {
                   case GDB_ColumnType_U32:
-                  printf("%u ", (U32)gathered[ci].numeric_values[i]);
+                  APP_EMIT("%u ", (U32)gathered[ci].numeric_values[i]);
                   break;
                   case GDB_ColumnType_U64:
-                  printf("%llu ", (U64)gathered[ci].numeric_values[i]);
+                  APP_EMIT("%llu ", (U64)gathered[ci].numeric_values[i]);
                   break;
                   case GDB_ColumnType_F32:
-                  printf("%f ", (F32)gathered[ci].numeric_values[i]);
+                  APP_EMIT("%f ", (F32)gathered[ci].numeric_values[i]);
                   break;
                   case GDB_ColumnType_F64:
-                  printf("%lf ", gathered[ci].numeric_values[i]);
+                  APP_EMIT("%lf ", gathered[ci].numeric_values[i]);
                   break;
                   case GDB_ColumnType_String8:
                   {
@@ -976,14 +992,14 @@ app_execute_query(String8 sql_query)
                     U64 start = chunk->offsets[i];
                     U64 end = chunk->offsets[i + 1];
                     String8 str = str8((U8*)chunk->data + start, end - start);
-                    printf("%.*s ", str8_varg(str));
+                    APP_EMIT("%.*s ", str8_varg(str));
                   } break;
                   default:
-                  printf("UNKNOWN ");
+                  APP_EMIT("UNKNOWN ");
                   break;
                 }
               }
-              printf("\n");
+              APP_EMIT("\n");
             }
           }
 
@@ -1003,16 +1019,34 @@ app_execute_query(String8 sql_query)
     String8 database_filepath = push_str8f(arena, "gdb_data/%.*s", (U32)database->name.size, database->name.str);
     gdb_database_save(database, database_filepath);
   }
-  
+
   //String8 table_filepath = push_str8f(arena, "gdb_data/benchmark/%.*s/", str8_varg(database->tables[0]->name));
   //gdb_table_save(database->tables[0], table_filepath);
-  
+
   //gdb_table_export_csv(database->tables[0], str8_lit("data/output.csv"));
-  
+
   //test_print_database(database);
-  
-  arena_release(arena);
+
+  result.output_text = str8_list_join(arena, &out, &(StringJoin){0});
+
   ProfEnd();
+  return result;
+}
+#undef APP_EMIT
+
+internal void
+app_execute_query(String8 sql_query)
+{
+  Arena* arena = arena_alloc(.reserve_size=Max(GB(1), GPU_MAX_BUFFER_SIZE), .commit_size=MB(64));
+
+  APP_QueryResult result = {0};
+  OS_MutexScope(g_query_exec_mutex) { result = app_execute_query_capture(arena, sql_query); }
+
+  if (result.output_text.size)
+  {
+    printf("%.*s", str8_varg(result.output_text));
+  }
+  arena_release(arena);
 }
 
 internal PLAN_ExecResult

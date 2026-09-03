@@ -24,23 +24,47 @@ internal void
 gdb_add_database(GDB_Database* database)
 {
   ProfBeginFunction();
-  
-  if (g_gdb_state->database_count == 0)
+
+  OS_MutexScopeW(g_gdb_state->rw_mutex)
   {
-    g_gdb_state->databases = push_array(g_gdb_state->arena, GDB_Database*, 2);
-    g_gdb_state->database_capacity = 2;
+    if (g_gdb_state->database_count == 0)
+    {
+      g_gdb_state->databases = push_array(g_gdb_state->arena, GDB_Database*, 2);
+      g_gdb_state->database_capacity = 2;
+    }
+    else if (g_gdb_state->database_count >= g_gdb_state->database_capacity)
+    {
+      U64 new_capacity = g_gdb_state->database_capacity * 2;
+      GDB_Database** new_databases = push_array(g_gdb_state->arena, GDB_Database*, new_capacity);
+      MemoryCopy(new_databases, g_gdb_state->databases, sizeof(GDB_Database*) * g_gdb_state->database_count);
+      g_gdb_state->databases = new_databases;
+      g_gdb_state->database_capacity = new_capacity;
+    }
+
+    g_gdb_state->databases[g_gdb_state->database_count++] = database;
   }
-  else if (g_gdb_state->database_count >= g_gdb_state->database_capacity)
-  {
-    U64 new_capacity = g_gdb_state->database_capacity * 2;
-    GDB_Database** new_databases = push_array(g_gdb_state->arena, GDB_Database*, new_capacity);
-    MemoryCopy(new_databases, g_gdb_state->databases, sizeof(GDB_Database*) * g_gdb_state->database_count);
-    g_gdb_state->databases = new_databases;
-    g_gdb_state->database_capacity = new_capacity;
-  }
-  
-  g_gdb_state->databases[g_gdb_state->database_count++] = database;
+
   ProfEnd();
+}
+
+internal GDB_Database*
+gdb_state_find_database_by_name(String8 name)
+{
+  GDB_Database* found = 0;
+
+  OS_MutexScopeR(g_gdb_state->rw_mutex)
+  {
+    for (U64 i = 0; i < g_gdb_state->database_count; i++)
+    {
+      if (str8_match(g_gdb_state->databases[i]->name, name, 0))
+      {
+        found = g_gdb_state->databases[i];
+        break;
+      }
+    }
+  }
+
+  return found;
 }
 
 //~ tec: database
@@ -49,8 +73,8 @@ gdb_database_alloc(String8 name)
 {
   Arena* arena = arena_alloc(.reserve_size=GDB_DATABASE_ARENA_RESERVE_SIZE, .commit_size=GDB_DATABASE_ARENA_COMMIT_SIZE);
   GDB_Database* database = push_array(arena, GDB_Database, 1);
-  
-  database->name = name;
+
+  database->name = push_str8_copy(arena, name);
   database->tables = NULL;
   database->arena = arena;
   
@@ -239,8 +263,8 @@ gdb_table_alloc(String8 name)
 {
   Arena* arena = arena_alloc(.reserve_size=GDB_TABLE_ARENA_RESERVE_SIZE, .commit_size=GDB_TABLE_ARENA_COMMIT_SIZE);
   GDB_Table* table = push_array(arena, GDB_Table, 1);
-  
-  table->name = name;
+
+  table->name = push_str8_copy(arena, name);
   table->arena = arena;
   
   return table;
@@ -1689,8 +1713,8 @@ gdb_column_alloc(String8 name, GDB_ColumnType type, U64 size)
 {
   Arena* arena = arena_alloc(.reserve_size=GDB_COLUMN_ARENA_RESERVE_SIZE, .commit_size=GDB_COLUMN_ARENA_COMMIT_SIZE);
   GDB_Column* column = push_array(arena, GDB_Column, 1);
-  
-  column->name = name;
+
+  column->name = push_str8_copy(arena, name);
   column->type = type;
   column->size = size;
   column->arena = arena;

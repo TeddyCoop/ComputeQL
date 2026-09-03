@@ -229,6 +229,7 @@ global GDB_State* g_gdb_state = 0;
 
 internal void gdb_init(void);
 internal void gdb_add_database(GDB_Database* database);
+internal GDB_Database* gdb_state_find_database_by_name(String8 name);
 
 //~ tec: databases
 

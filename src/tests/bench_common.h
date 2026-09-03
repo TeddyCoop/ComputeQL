@@ -204,6 +204,10 @@ bench_gdb_consume_result(PLAN_ExecResult* result, IR_Node* select_node, U64* out
           {
             row_hash = bench_fnv_mix_string(row_hash, col->string_values[i]);
           }
+          else if (col->type == GDB_ColumnType_U32 || col->type == GDB_ColumnType_U64)
+          {
+            row_hash = bench_fnv_mix_u64(row_hash, (U64)col->numeric_values[i]);
+          }
           else
           {
             row_hash = bench_fnv_mix_u64(row_hash, bench_scaled_round(col->numeric_values[i]));
