@@ -251,9 +251,14 @@ ir_expand_star_to_columns(Arena *arena, GDB_Database *db, IR_Node *select_node)
   if (!is_bare_star) return;
   
   column_list->first = column_list->last = NULL;
-  
+
   GDB_Table *table = gdb_database_find_table_or_catalog(db, table_node->value);
-  
+  if (!table)
+  {
+    // tec: leave the column list empty - the planner's Scan resolution reports the missing table
+    return;
+  }
+
   for (U64 i = 0; i < table->column_count; i++)
   {
     GDB_Column* col = table->columns[i];

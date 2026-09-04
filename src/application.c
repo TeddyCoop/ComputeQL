@@ -282,10 +282,26 @@ gdb_row_has_referencing_children(Arena* arena, GDB_Database* database, GDB_Table
 
 #define APP_EMIT(...) str8_list_push(arena, &out, push_str8f(arena, __VA_ARGS__))
 
+internal String8
+app_format_cell_text(Arena* arena, GDB_ColumnType type, F64 numeric_value, String8 string_value)
+{
+  switch (type)
+  {
+    case GDB_ColumnType_U32: return push_str8f(arena, "%u", (U32)numeric_value);
+    case GDB_ColumnType_U64: return push_str8f(arena, "%llu", (U64)numeric_value);
+    case GDB_ColumnType_F32: return push_str8f(arena, "%f", (F32)numeric_value);
+    case GDB_ColumnType_F64: return push_str8f(arena, "%lf", numeric_value);
+    case GDB_ColumnType_String8: return push_str8_copy(arena, string_value);
+    default: return str8_lit("UNKNOWN");
+  }
+}
+
 internal APP_QueryResult
-app_execute_query_capture(Arena* arena, String8 sql_query, GDB_Database** io_database)
+app_execute_query_capture(Arena* arena, String8 sql_query, GDB_Database** io_database, APP_ResultSet* out_result_set)
 {
   ProfBeginFunction();
+
+  if (out_result_set) { MemoryZeroStruct(out_result_set); }
   
   APP_QueryResult result = {0};
   String8List out = {0};
@@ -943,15 +959,53 @@ app_execute_query_capture(Arena* arena, String8 sql_query, GDB_Database** io_dat
         
         log_info("result count %llu", result_count);
         
+        B32 capture_structured = (out_result_set != 0) && (ir_execution_node->next == NULL);
+
         if (result.supported && select_output_columns)
         {
           Temp scratch = scratch_begin(0, 0);
-          
+
+          U64 out_column_count = 0;
+          if (capture_structured)
+          {
+            for (IR_Node* c = select_output_columns->first; c != NULL; c = c->next) out_column_count++;
+
+            out_result_set->valid = 1;
+            out_result_set->column_count = out_column_count;
+            out_result_set->row_count = result_count;
+            out_result_set->columns = push_array(arena, APP_ResultColumn, Max(out_column_count, 1));
+            out_result_set->cell_text = push_array(arena, String8, Max(out_column_count * Max(result_count, 1), 1));
+            out_result_set->cell_is_null = push_array(arena, B32, Max(out_column_count * Max(result_count, 1), 1));
+            out_result_set->cell_numeric = push_array(arena, F64, Max(out_column_count * Max(result_count, 1), 1));
+
+            U64 name_i = 0;
+            for (IR_Node* column_node = select_output_columns->first; column_node != NULL; column_node = column_node->next, name_i++)
+            {
+              out_result_set->columns[name_i].name = push_str8_copy(arena, qe_column_list_item_display_name(arena, column_node));
+            }
+          }
+
           if (result.is_materialized)
           {
+            if (capture_structured)
+            {
+              U64 col_i = 0;
+              for (IR_Node* column_node = select_output_columns->first; column_node != NULL; column_node = column_node->next, col_i++)
+              {
+                String8 name = qe_column_list_item_display_name(scratch.arena, column_node);
+                GDB_ColumnType col_type = GDB_ColumnType_String8; // tec: fallback for an unresolved ("?") column
+                for (U64 c = 0; c < result.materialized.column_count; c++)
+                {
+                  if (str8_match(result.materialized.columns[c].name, name, 0)) { col_type = result.materialized.columns[c].type; break; }
+                }
+                out_result_set->columns[col_i].type = col_type;
+              }
+            }
+
             for (U64 i = 0; i < result_count; i++)
             {
-              for (IR_Node* column_node = select_output_columns->first; column_node != NULL; column_node = column_node->next)
+              U64 col_i = 0;
+              for (IR_Node* column_node = select_output_columns->first; column_node != NULL; column_node = column_node->next, col_i++)
               {
                 String8 name = qe_column_list_item_display_name(scratch.arena, column_node);
                 PLAN_AggColumn* col = NULL;
@@ -963,22 +1017,36 @@ app_execute_query_capture(Arena* arena, String8 sql_query, GDB_Database** io_dat
                     break;
                   }
                 }
-                
+
+                U64 cell_i = i * out_column_count + col_i;
+
                 if (!col)
                 {
                   APP_EMIT("? ");
+                  if (capture_structured) { out_result_set->cell_is_null[cell_i] = 1; }
                 }
                 else if (col->type == GDB_ColumnType_String8)
                 {
                   APP_EMIT("%.*s ", str8_varg(col->string_values[i]));
+                  if (capture_structured) { out_result_set->cell_text[cell_i] = app_format_cell_text(arena, col->type, 0, col->string_values[i]); }
                 }
                 else if (col->type == GDB_ColumnType_U32 || col->type == GDB_ColumnType_U64)
                 {
                   APP_EMIT("%llu ", (U64)col->numeric_values[i]);
+                  if (capture_structured)
+                  {
+                    out_result_set->cell_text[cell_i] = app_format_cell_text(arena, col->type, col->numeric_values[i], (String8){0});
+                    out_result_set->cell_numeric[cell_i] = col->numeric_values[i];
+                  }
                 }
                 else
                 {
                   APP_EMIT("%lf ", col->numeric_values[i]);
+                  if (capture_structured)
+                  {
+                    out_result_set->cell_text[cell_i] = app_format_cell_text(arena, col->type, col->numeric_values[i], (String8){0});
+                    out_result_set->cell_numeric[cell_i] = col->numeric_values[i];
+                  }
                 }
               }
               APP_EMIT("\n");
@@ -1031,38 +1099,70 @@ app_execute_query_capture(Arena* arena, String8 sql_query, GDB_Database** io_dat
                 gathered[ci].numeric_values = qe_gather_numeric_column(scratch.arena, &result.rows, table_slot, column);
               }
             }
-            
+
+            if (capture_structured)
+            {
+              for (U64 c = 0; c < column_count; c++)
+              {
+                out_result_set->columns[c].type = gathered[c].resolved ? gathered[c].type : GDB_ColumnType_String8;
+              }
+            }
+
             for (U64 i = 0; i < result_count; i++)
             {
               ci = 0;
               for (IR_Node* column_node = select_output_columns->first; column_node != NULL; column_node = column_node->next, ci++)
               {
+                U64 cell_i = i * column_count + ci;
+
                 if (!gathered[ci].resolved)
                 {
                   APP_EMIT("? ");
+                  if (capture_structured) { out_result_set->cell_is_null[cell_i] = 1; }
                   continue;
                 }
-                
+
                 U64 row_index = result.rows.row_indices[gathered[ci].table_slot][i];
                 if (row_index == PLAN_NULL_ROW || gdb_column_is_null(gathered[ci].column, row_index))
                 {
                   APP_EMIT("NULL ");
+                  if (capture_structured) { out_result_set->cell_is_null[cell_i] = 1; }
                   continue;
                 }
-                
+
                 switch (gathered[ci].type)
                 {
                   case GDB_ColumnType_U32:
                   APP_EMIT("%u ", (U32)gathered[ci].numeric_values[i]);
+                  if (capture_structured)
+                  {
+                    out_result_set->cell_text[cell_i] = app_format_cell_text(arena, gathered[ci].type, gathered[ci].numeric_values[i], (String8){0});
+                    out_result_set->cell_numeric[cell_i] = gathered[ci].numeric_values[i];
+                  }
                   break;
                   case GDB_ColumnType_U64:
                   APP_EMIT("%llu ", (U64)gathered[ci].numeric_values[i]);
+                  if (capture_structured)
+                  {
+                    out_result_set->cell_text[cell_i] = app_format_cell_text(arena, gathered[ci].type, gathered[ci].numeric_values[i], (String8){0});
+                    out_result_set->cell_numeric[cell_i] = gathered[ci].numeric_values[i];
+                  }
                   break;
                   case GDB_ColumnType_F32:
                   APP_EMIT("%f ", (F32)gathered[ci].numeric_values[i]);
+                  if (capture_structured)
+                  {
+                    out_result_set->cell_text[cell_i] = app_format_cell_text(arena, gathered[ci].type, gathered[ci].numeric_values[i], (String8){0});
+                    out_result_set->cell_numeric[cell_i] = gathered[ci].numeric_values[i];
+                  }
                   break;
                   case GDB_ColumnType_F64:
                   APP_EMIT("%lf ", gathered[ci].numeric_values[i]);
+                  if (capture_structured)
+                  {
+                    out_result_set->cell_text[cell_i] = app_format_cell_text(arena, gathered[ci].type, gathered[ci].numeric_values[i], (String8){0});
+                    out_result_set->cell_numeric[cell_i] = gathered[ci].numeric_values[i];
+                  }
                   break;
                   case GDB_ColumnType_String8:
                   {
@@ -1071,6 +1171,7 @@ app_execute_query_capture(Arena* arena, String8 sql_query, GDB_Database** io_dat
                     U64 end = chunk->offsets[i + 1];
                     String8 str = str8((U8*)chunk->data + start, end - start);
                     APP_EMIT("%.*s ", str8_varg(str));
+                    if (capture_structured) { out_result_set->cell_text[cell_i] = app_format_cell_text(arena, gathered[ci].type, 0, str); }
                   } break;
                   default:
                   APP_EMIT("UNKNOWN ");
@@ -1119,7 +1220,7 @@ app_execute_query(String8 sql_query)
   
   APP_QueryResult result = {0};
   GDB_Database* database = NULL;
-  OS_MutexScope(g_query_exec_mutex) { result = app_execute_query_capture(arena, sql_query, &database); }
+  OS_MutexScope(g_query_exec_mutex) { result = app_execute_query_capture(arena, sql_query, &database, 0); }
   
   if (result.output_text.size)
   {

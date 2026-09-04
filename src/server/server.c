@@ -21,7 +21,6 @@ server_connection_thread_proc(void *ptr)
     U64 sql_len = 0;
     if (!os_net_recv_exact(socket, &sql_len, sizeof(sql_len)))
     {
-      // tec: end the session
       break;
     }
     if (sql_len == 0 || sql_len >= GB(1))
@@ -42,7 +41,7 @@ server_connection_thread_proc(void *ptr)
       U64 error_count_before = log_error_count();
       OS_MutexScope(g_query_exec_mutex)
       {
-        result = app_execute_query_capture(arena, sql_query, &current_database); 
+        result = app_execute_query_capture(arena, sql_query, &current_database, 0);
       }
       B32 had_runtime_error = log_error_count() > error_count_before;
       ok = !result.had_parse_error && !had_runtime_error;

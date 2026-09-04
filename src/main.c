@@ -16,6 +16,8 @@
 #include "application.h"
 #include "thread_pool/thread_pool.h"
 #include "server/server.h"
+#include "server/pg_protocol.h"
+#include "server/pg_server.h"
 #include "client/client.h"
 
 #include "base/base_inc.c"
@@ -28,7 +30,17 @@
 #include "application.c"
 #include "thread_pool/thread_pool.c"
 #include "server/server.c"
+#include "server/pg_protocol.c"
+#include "server/pg_server.c"
 #include "client/client.c"
+
+// tec: lets --serve and --serve-pg run at once
+internal void
+main_custom_server_thread_proc(void *ptr)
+{
+  U16 port = *(U16*)ptr;
+  server_run(port);
+}
 
 internal void
 entry_point(CmdLine* cmdline)
@@ -42,6 +54,7 @@ entry_point(CmdLine* cmdline)
   String8 query_str = cmd_line_string(cmdline, str8_lit("query"));
   B32 valid_query = query_str.size != 0;
   B32 should_serve = cmd_line_has_flag(cmdline, str8_lit("serve"));
+  B32 should_serve_pg = cmd_line_has_flag(cmdline, str8_lit("serve-pg"));
   String8 connect_str = cmd_line_string(cmdline, str8_lit("connect"));
 
   if (connect_str.size != 0)
@@ -93,19 +106,41 @@ entry_point(CmdLine* cmdline)
 
     log_info("total gpu memory: %llu (MB)", gpu_device_total_memory() >> 20);
 
-    if (should_serve)
+    if (should_serve || should_serve_pg)
     {
-      String8 port_str = cmd_line_string(cmdline, str8_lit("serve"));
-      U16 port = port_str.size ? (U16)u64_from_str8(port_str, 10) : 5432;
-
       if (!os_net_init())
       {
         log_error("failed to initialize networking (os_net_init)");
       }
-      else
+      else if (should_serve && should_serve_pg)
       {
-		// tec: blocking accept loop, does not return for now
-        server_run(port); 
+        String8 port_str = cmd_line_string(cmdline, str8_lit("serve"));
+        U16 port = port_str.size ? (U16)u64_from_str8(port_str, 10) : 5432;
+
+        OS_Handle custom_thread = os_thread_launch(main_custom_server_thread_proc, &port, 0);
+        os_thread_detach(custom_thread);
+
+        String8 pg_port_str = cmd_line_string(cmdline, str8_lit("serve-pg"));
+        U16 pg_port = pg_port_str.size ? (U16)u64_from_str8(pg_port_str, 10) : 5432;
+
+        // tec: blocking accept loop, does not return for now
+        server_run_pg(pg_port);
+      }
+      else if (should_serve)
+      {
+        String8 port_str = cmd_line_string(cmdline, str8_lit("serve"));
+        U16 port = port_str.size ? (U16)u64_from_str8(port_str, 10) : 5432;
+
+        // tec: blocking accept loop, does not return for now
+        server_run(port);
+      }
+      else // tec: should_serve_pg
+      {
+        String8 pg_port_str = cmd_line_string(cmdline, str8_lit("serve-pg"));
+        U16 pg_port = pg_port_str.size ? (U16)u64_from_str8(pg_port_str, 10) : 5432;
+
+        // tec: blocking accept loop, does not return for now
+        server_run_pg(pg_port);
       }
     }
     else if (valid_query)

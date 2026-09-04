@@ -816,12 +816,19 @@ gdb_table_load(String8 table_dir, String8 meta_path)
       column->disk_path = push_str8_copy(column->arena, column_path);
       if (column->type == GDB_ColumnType_String8)
       {
-        // tec: just peek the header
+		// tec: peek the header for reserved capacity, then read the last offset to find how many of the bytes are actually used
         OS_Handle map = os_file_map_open(OS_AccessFlag_Read, file);
         void* mapped_ptr = os_file_map_view_open(map, OS_AccessFlag_Read, r1u64(0, sizeof(U64)));
-        column->variable_capacity = *(U64*)mapped_ptr;
+        U64 reserved_capacity = *(U64*)mapped_ptr;
         os_file_map_view_close(map, mapped_ptr, r1u64(0, sizeof(U64)));
         os_file_map_close(map);
+
+        column->variable_capacity = 0;
+        if (column->row_count > 0)
+        {
+          U64 last_offset_pos = sizeof(U64) + reserved_capacity + (column->row_count - 1) * sizeof(U64);
+          os_file_read(file, r1u64(last_offset_pos, last_offset_pos + sizeof(U64)), &column->variable_capacity);
+        }
       }
       else
       {

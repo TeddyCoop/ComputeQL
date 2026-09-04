@@ -53,11 +53,10 @@ TODO
 ## Roadmap
 
 Ordered from "next" to "later":
-- [ ] **Postgres wire protocol compatibility** - once client-server mode is proven out, speak the Postgres wire protocol so existing clients, ORMs, and BI tools work against it out of the box.
 - [ ] **Cross-engine benchmarking against more engines** - extend to ClickHouse/Postgres (client-server engines, needing a running server + client library) and publish results.
 - [ ] **Users & access control** - accounts and authentication for network connections, plus a role/permission model (`GRANT`/`REVOKE`) scoped to databases and tables, so a shared server isn't all-or-nothing access.
 - [ ] **Multi-GPU support**
-- [ ] **Additional GPU backends** (e.g. CUDA) alongside Vulkan
+- [ ] **Additional GPU backends** (e.g. HIP / ROCm, DirectX12 Compute, CUDA) alongside Vulkan
 - [ ] **Cross-platform support** (Linux/macOS)
 - [ ] **Additional query languages** on top of the same execution engine
 - [ ] **GPU projection kernel** - move column projection for `SELECT` off the CPU and into the GPU operator pipeline.
@@ -81,39 +80,6 @@ build.bat
 
 On success, `build\gdb.exe` is produced, along with compiled shaders under `build\shaders\`.
 
-### Run a query
-
-```
-build\gdb.exe --query="CREATE DATABASE shop; USE shop; CREATE TABLE products (id u32 PRIMARY KEY, price f64 NOT NULL, name string8); CREATE INDEX idx_price ON products (price); INSERT INTO products (id, price, name) VALUES (1, 9.99, 'widget'), (2, 19.99, 'gadget');"
-build\gdb.exe --query="USE shop; SELECT id, name, price FROM products WHERE price > 5.00;"
-```
-
-Each invocation of `gdb.exe` runs the queries passed via `--query`, loading and saving the affected database(s) under `gdb_data/` in the working directory.
-
-### Client-server mode
-
-`gdb.exe --serve[=port]` starts a long-running server that keeps every loaded database and the GPU context resident, listening for queries over TCP (default port `5432`) instead of loading/saving on every invocation:
-
-```
-build\gdb.exe --serve=5432
-```
-
-`gdb.exe --connect=host:port` talks to a running server instead of opening the database locally. With `--query`, it sends one query and exits:
-
-```
-build\gdb.exe --connect=127.0.0.1:5432 --query="CREATE DATABASE shop; USE shop; CREATE TABLE products (id u32 PRIMARY KEY, price f64 NOT NULL, name string8); INSERT INTO products (id, price, name) VALUES (1, 9.99, 'widget');"
-```
-
-Without `--query`, it opens an interactive session instead - one statement (or `;`-separated statements) per line, `quit`/`exit` to disconnect:
-
-```
-build\gdb.exe --connect=127.0.0.1:5432
-gdb> USE shop;
-gdb> SELECT id, name, price FROM products;
-gdb> quit
-```
-
-
 ## Project layout
 
 ```
@@ -129,6 +95,8 @@ src/
   gpu/
     vulkan/           - Vulkan backend + compute shaders (GLSL, compiled to SPIR-V at build time)
   server/             - client-server mode: long-running server, one thread + session per connection
+    pg_protocol.c/h   - Postgres wire protocol (v3) message framing/encoding, OID mapping
+    pg_server.c/h     - Postgres wire protocol server: startup handshake, simple query loop, extended query protocol (prepared statements/portals per connection)
   client/             - client-server mode: one-shot and interactive (--connect) network clients
   os/                 - OS abstraction layer (Windows only today), including os/net for TCP sockets
   tests/              - benchmark harness comparing against SQLite/DuckDB, plus client-server smoke tests (build_and_run_tests.bat)

@@ -62,18 +62,51 @@ sql_tokenize_from_text(Arena* arena, String8 text)
       pos++;
       start = pos;
 
-      while (pos < text.size && text.str[pos] != '\'')
+      // tec: '' is an escaped literal quote, scan for the real terminator first
+      B32 has_escape = 0;
+      B32 terminated = 0;
+      U64 scan = pos;
+      while (scan < text.size)
       {
-        pos++;
+        if (text.str[scan] == '\'')
+        {
+          if (scan + 1 < text.size && text.str[scan + 1] == '\'')
+          {
+            has_escape = 1;
+            scan += 2;
+            continue;
+          }
+          terminated = 1;
+          break;
+        }
+        scan++;
       }
 
-      if (pos >= text.size)
+      if (!terminated)
       {
         log_error("Unterminated string literal.");
         break;
       }
 
-      String8 token_value = str8_substr(text, r1u64(start, pos));
+      pos = scan;
+
+      String8 token_value;
+      if (!has_escape)
+      {
+        token_value = str8_substr(text, r1u64(start, pos));
+      }
+      else
+      {
+        U8* buf = push_array_no_zero(arena, U8, pos - start);
+        U64 buf_len = 0;
+        for (U64 i = start; i < pos; i++)
+        {
+          buf[buf_len++] = text.str[i];
+          if (text.str[i] == '\'') { i++; } // tec: skip the paired escaping quote
+        }
+        token_value = str8(buf, buf_len);
+      }
+
       tokens[token_count++] = (SQL_Token)
       {
         .type = SQL_TokenType_String,

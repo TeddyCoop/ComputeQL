@@ -182,17 +182,18 @@ plan_execute(Arena* arena, GDB_Database* database, PLAN_Node* plan, IR_Node* sel
         break;
       }
       
-      // tec: a bare Scan is always unfiltered (no where_clause) - it's reached both directly
-      // (no WHERE at all) and as a Join's raw input, where it must return ALL of its rows
-      // regardless of what the query's WHERE says about *other* tables. WHERE is applied
-      // explicitly by the Filter case below (Filter-over-Scan) or as a post-join residual filter
+      // tec: a bare Scan is always unfiltered (no where_clause)
       QE_ScanResult scan_result = qe_scan_filter(arena, database, plan->table, NULL);
       result = plan_wrap_scan_result(arena, plan->table, plan->alias, scan_result);
     } break;
 
     case PLAN_NodeType_Filter:
     {
-      if (plan->input && plan->input->type == PLAN_NodeType_Scan)
+      if (plan->input && plan->input->type == PLAN_NodeType_Scan && !plan->input->table)
+      {
+        log_error("plan_execute: table '%.*s' not found", str8_varg(plan->input->value));
+      }
+      else if (plan->input && plan->input->type == PLAN_NodeType_Scan)
       {
         // tec: try an index lookup first
         QE_ScanResult scan_result = {0};
