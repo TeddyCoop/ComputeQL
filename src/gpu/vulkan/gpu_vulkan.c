@@ -732,7 +732,7 @@ gpu_vulkan_ensure_staging_capacity(VkBufferUsageFlags usage, VkMemoryPropertyFla
   {
     return;
   }
-  
+
   if (*capacity != 0)
   {
     vkUnmapMemory(g_vulkan_state->device, *memory);
@@ -740,13 +740,13 @@ gpu_vulkan_ensure_staging_capacity(VkBufferUsageFlags usage, VkMemoryPropertyFla
     vkFreeMemory(g_vulkan_state->device, *memory, 0);
     *capacity = 0;
   }
-  
+
   if (!gpu_vulkan_alloc_raw_buffer(needed_size, usage, mem_props, buffer, memory))
   {
     *mapped = 0;
     return;
   }
-  
+
   vkMapMemory(g_vulkan_state->device, *memory, 0, needed_size, 0, mapped);
   *capacity = needed_size;
 }

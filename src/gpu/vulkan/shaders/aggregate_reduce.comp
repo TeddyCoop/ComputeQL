@@ -1,13 +1,9 @@
 #version 450
 #extension GL_ARB_gpu_shader_fp64 : enable
 
-// tec: pass 3/3 of the group-by pipeline - one thread per GROUP (not per row), looping serially
-// over its own CSR member-row list. Serial-per-thread accumulation (rather than cross-thread
-// atomics) sidesteps the lack of 64-bit/double atomics with vulkan (unless the VK_KHR_shader_atomic_int64 extension is enabled) 
-// Up to QE_AGG_MAX_EXPRS aggregate expressions are computed per group in one pass
-//  each expression's function is packed 4 bits per slot into a single push-constant word
-//
 // NOTE: binding layout/push-constant slot order/func codes MUST stay in sync with qe_aggregate
+// NOTE: local_size_x MUST match QE_GPU_WORKGROUP_SIZE - the caller dispatches num_groups * QE_GPU_WORKGROUP_SIZE
+// threads so that gl_WorkGroupID.x is exactly the group index
 
 layout(local_size_x = 256) in;
 
@@ -54,6 +50,11 @@ read_arg(uint e, uint row)
   return 0.0LF;
 }
 
+shared double sh_acc[256];
+shared double sh_mn[256];
+shared double sh_mx[256];
+shared uint   sh_count[256];
+
 void
 main()
 {
@@ -61,14 +62,19 @@ main()
   uint num_exprs  = pc.words[2];
   uint func_codes = pc.words[4];
 
-  uint g = gl_GlobalInvocationID.x;
+  uint g = gl_WorkGroupID.x;
   if (g >= num_groups) return;
+
+  uint tid = gl_LocalInvocationID.x;
 
   uint slot = group_ids[g];
   uint start = slot_offsets[slot];
   uint end = slot_offsets[slot + 1u];
 
-  representative_row_out[g] = (end > start) ? group_member_rows[start] : 0xffffffffu;
+  if (tid == 0u)
+  {
+    representative_row_out[g] = (end > start) ? group_member_rows[start] : 0xffffffffu;
+  }
 
   for (uint e = 0u; e < num_exprs; e++)
   {
@@ -79,7 +85,7 @@ main()
     double mx = -1.0e300LF;
     uint count = 0u;
 
-    for (uint m = start; m < end; m++)
+    for (uint m = start + tid; m < end; m += 256u)
     {
       uint row = group_member_rows[m];
       count++;
@@ -100,13 +106,35 @@ main()
       }
     }
 
-    double result;
-    if (func == FUNC_COUNT) result = double(count);
-    else if (func == FUNC_SUM) result = acc;
-    else if (func == FUNC_AVG) result = (count > 0u) ? (acc / double(count)) : 0.0LF;
-    else if (func == FUNC_MIN) result = mn;
-    else result = mx;
+    sh_acc[tid] = acc;
+    sh_mn[tid] = mn;
+    sh_mx[tid] = mx;
+    sh_count[tid] = count;
+    barrier();
 
-    results_out[g * num_exprs + e] = result;
+    for (uint stride = 128u; stride > 0u; stride >>= 1u)
+    {
+      if (tid < stride)
+      {
+        sh_acc[tid] += sh_acc[tid + stride];
+        if (sh_mn[tid + stride] < sh_mn[tid]) sh_mn[tid] = sh_mn[tid + stride];
+        if (sh_mx[tid + stride] > sh_mx[tid]) sh_mx[tid] = sh_mx[tid + stride];
+        sh_count[tid] += sh_count[tid + stride];
+      }
+      barrier();
+    }
+
+    if (tid == 0u)
+    {
+      double result;
+      if (func == FUNC_COUNT) result = double(sh_count[0]);
+      else if (func == FUNC_SUM) result = sh_acc[0];
+      else if (func == FUNC_AVG) result = (sh_count[0] > 0u) ? (sh_acc[0] / double(sh_count[0])) : 0.0LF;
+      else if (func == FUNC_MIN) result = sh_mn[0];
+      else result = sh_mx[0];
+
+      results_out[g * num_exprs + e] = result;
+    }
+    barrier(); // tec: make sure thread 0's read of sh_* is done before the next expr overwrites it
   }
 }

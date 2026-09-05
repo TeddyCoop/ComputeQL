@@ -1575,15 +1575,24 @@ qe_aggregate(Arena* arena, GDB_Database* database, PLAN_RowSet* input, IR_Node* 
     }
   }
   
+  // tec: max_num_buckets is the worst-case
+  U64 max_num_buckets = 1;
+  while (max_num_buckets < row_count) max_num_buckets <<= 1;
+
   U64 num_buckets;
   if (num_group_cols == 0)
   {
     num_buckets = 1;
+    max_num_buckets = 1;
   }
   else
   {
+    // tec: most GROUP BYs aggregate many rows per group. 
+	// guess ~64 rows/group so the common case gets a table sized for its actual cardinality instead of one sized for row_count.
+    // if the guess is wrong the overflow retry loop below grows num_buckets back up towards max_num_buckets,
+	// at the cost of rerunning the assign dispatch over all rows each retry
     num_buckets = 16;
-    while (num_buckets < row_count) num_buckets <<= 1;
+    while (num_buckets < row_count / 64 && num_buckets < max_num_buckets) num_buckets <<= 1;
   }
   U64 K = (num_group_cols == 0) ? 1 : 8;
 
@@ -1635,7 +1644,6 @@ qe_aggregate(Arena* arena, GDB_Database* database, PLAN_RowSet* input, IR_Node* 
   GPU_Buffer* count_buf = 0;
   GPU_Buffer* row_slot_buf = 0;
   GPU_Buffer* overflow_buf = 0;
-  U32* owner_readback = 0;
   U32* count_readback = 0;
   U32 overflow_readback = 0;
 
@@ -1691,9 +1699,11 @@ qe_aggregate(Arena* arena, GDB_Database* database, PLAN_RowSet* input, IR_Node* 
     gpu_kernel_set_arg_u64(assign_kernel, 3, num_group_cols);
     gpu_kernel_set_arg_u64(assign_kernel, 4, group_string_mask);
 
-    U64 assign_download_bytes = (U64)num_slots * sizeof(U32) * 2 + sizeof(U32);
+    // tec: assign_download_bytes only covers count_buf now
+	// owner_buf never needs to come back to the CPU, its occupancy is fully recoverable from count_buf
+	// (a slot's count is nonzero iff some row claimed it), and owner_buf is only ever read by the assign kernel itself
+    U64 assign_download_bytes = (U64)num_slots * sizeof(U32) + sizeof(U32);
 
-    owner_readback = push_array(scratch.arena, U32, num_slots);
     count_readback = push_array(scratch.arena, U32, num_slots);
     overflow_readback = 0;
 
@@ -1714,7 +1724,6 @@ qe_aggregate(Arena* arena, GDB_Database* database, PLAN_RowSet* input, IR_Node* 
       }
     }
     gpu_batch_kernel_execute(assign_batch, assign_kernel, (U32)row_count, QE_GPU_WORKGROUP_SIZE);
-    gpu_batch_buffer_read(assign_batch, owner_buf, owner_readback, num_slots * sizeof(U32));
     gpu_batch_buffer_read(assign_batch, count_buf, count_readback, num_slots * sizeof(U32));
     gpu_batch_buffer_read(assign_batch, overflow_buf, &overflow_readback, sizeof(U32));
     if (!gpu_batch_end(assign_batch))
@@ -1724,31 +1733,44 @@ qe_aggregate(Arena* arena, GDB_Database* database, PLAN_RowSet* input, IR_Node* 
       ProfEnd();
       return result;
     }
-
     if (overflow_readback == 0 || num_group_cols == 0)
     {
       break;
     }
 
-    U64 next_K = K * 2;
-    log_info("qe_aggregate: %u row(s) overflowed the group-by hash table with K=%llu - retrying with K=%llu",
-             overflow_readback, K, next_K);
-    K = next_K;
+    // tec: prefer growing num_buckets
+    if (num_buckets < max_num_buckets)
+    {
+      U64 next_num_buckets = Min(num_buckets * 2, max_num_buckets);
+      log_info("qe_aggregate: %u row(s) overflowed the group-by hash table with num_buckets=%llu - retrying with num_buckets=%llu",
+               overflow_readback, num_buckets, next_num_buckets);
+      num_buckets = next_num_buckets;
+    }
+    else
+    {
+      U64 next_K = K * 2;
+      log_info("qe_aggregate: %u row(s) overflowed the group-by hash table with K=%llu - retrying with K=%llu",
+               overflow_readback, K, next_K);
+      K = next_K;
+    }
   }
 
   gpu_kernel_release(assign_kernel);
-  
+
   // tec: prefix-sum slot_row_count -> slot_offsets, and (for GROUP BY) compact occupied slots
-  // into group_ with no GROUP BY, slot 0 is always the one group regardless of occupancy
   U32* slot_offsets = push_array(scratch.arena, U32, num_slots + 1);
+  U32* group_ids_scratch = (num_group_cols == 0) ? 0 : push_array(scratch.arena, U32, num_slots);
   U32 running = 0;
+  U64 num_groups_found = 0;
   for (U64 s = 0; s < num_slots; s++)
   {
     slot_offsets[s] = running;
-    running += count_readback[s];
+    U32 c = count_readback[s];
+    running += c;
+    if (c != 0 && group_ids_scratch) group_ids_scratch[num_groups_found++] = (U32)s;
   }
   slot_offsets[num_slots] = running;
-  
+
   U64 num_groups;
   U32* group_ids;
   if (num_group_cols == 0)
@@ -1759,14 +1781,10 @@ qe_aggregate(Arena* arena, GDB_Database* database, PLAN_RowSet* input, IR_Node* 
   }
   else
   {
-    num_groups = 0;
-    for (U64 s = 0; s < num_slots; s++) if (owner_readback[s] != max_U32) num_groups++;
-    
-    group_ids = push_array(scratch.arena, U32, Max(num_groups, 1));
-    U64 gi = 0;
-    for (U64 s = 0; s < num_slots; s++) if (owner_readback[s] != max_U32) group_ids[gi++] = (U32)s;
+    num_groups = num_groups_found;
+    group_ids = group_ids_scratch;
   }
-  
+
   //- tec: pass 2/3 
   // scatter rows into per slot CSR member lists
   // and pass 3/3 - one thread per group, serial reduction over its own member rows
@@ -1843,7 +1861,8 @@ qe_aggregate(Arena* arena, GDB_Database* database, PLAN_RowSet* input, IR_Node* 
     if (arg_bufs[e]) gpu_batch_buffer_write(reduce_batch, arg_bufs[e], expr_args[e], row_count * sizeof(F64));
   }
   gpu_batch_kernel_execute(reduce_batch, scatter_kernel, (U32)row_count, QE_GPU_WORKGROUP_SIZE);
-  gpu_batch_kernel_execute(reduce_batch, reduce_kernel, (U32)Max(num_groups, 1), QE_GPU_WORKGROUP_SIZE);
+  // tec: one workgroup per group
+  gpu_batch_kernel_execute(reduce_batch, reduce_kernel, (U32)Max(num_groups, 1) * QE_GPU_WORKGROUP_SIZE, QE_GPU_WORKGROUP_SIZE);
   gpu_batch_buffer_read(reduce_batch, repr_buf, repr32, repr_size);
   gpu_batch_buffer_read(reduce_batch, results_buf, results_readback, results_size);
   gpu_batch_end(reduce_batch);
@@ -2499,8 +2518,22 @@ qe_hash_join(Arena* arena, PLAN_RowSet* left, GDB_Table* right_table, String8 ri
   }
   else
   {
+    // tec: bulk range read
     F64* values = push_array(scratch.arena, F64, Max(build_row_count, 1));
-    for (U64 i = 0; i < build_row_count; i++) values[i] = qe_read_numeric_as_f64(right_key_column, i);
+    U64 range_size = 0;
+    void* base_ptr = (build_row_count > 0) ? gdb_column_get_data_range(scratch.arena, right_key_column, r1u64(0, build_row_count), &range_size) : 0;
+    for (U64 i = 0; i < build_row_count; i++)
+    {
+      void* data = base_ptr ? (U8*)base_ptr + i * right_key_column->size : 0;
+      switch (data ? right_key_column->type : GDB_ColumnType_U32)
+      {
+        case GDB_ColumnType_U32: values[i] = (F64)(*(U32*)data); break;
+        case GDB_ColumnType_U64: values[i] = (F64)(*(U64*)data); break;
+        case GDB_ColumnType_F32: values[i] = (F64)(*(F32*)data); break;
+        case GDB_ColumnType_F64: values[i] = *(F64*)data; break;
+        default: values[i] = 0.0; break;
+      }
+    }
     build_data = values;
     build_data_size = Max(build_row_count, 1) * sizeof(F64);
   }
