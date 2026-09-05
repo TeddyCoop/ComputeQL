@@ -46,7 +46,8 @@ if not exist build\sqlite3.obj (
 copy /y src\third_party\duckdb\duckdb.dll build\duckdb.dll >nul
 
 :: tec: bench_query_chunked_hash causes a GPU crash that i havent fixed yet
-set skip_tests=bench_query_chunked_hash
+set skip_tests=
+::bench_query_chunked_hash
 
 echo.
 echo === compiling tests ===

@@ -1466,10 +1466,17 @@ internal PLAN_Materialized
 qe_aggregate(Arena* arena, GDB_Database* database, PLAN_RowSet* input, IR_Node* group_by_ir, IR_Node* column_list_ir, IR_Node* having_ir)
 {
   ProfBeginFunction();
-  
+
   PLAN_Materialized result = {0};
   U64 row_count = input->count;
-  
+
+  if (gpu_device_lost())
+  {
+    log_error("qe_aggregate: Vulkan device is lost - refusing to attempt any GPU work");
+    ProfEnd();
+    return result;
+  }
+
   //- tec: resolve GROUP BY key columns (0 means one global group)
   U64 group_slots[QE_AGG_MAX_GROUP_COLS];
   GDB_Column* group_columns[QE_AGG_MAX_GROUP_COLS];
@@ -2413,6 +2420,13 @@ qe_hash_join(Arena* arena, PLAN_RowSet* left, GDB_Table* right_table, String8 ri
   ProfBeginFunction();
   PLAN_RowSet result = {0};
 
+  if (gpu_device_lost())
+  {
+    log_error("qe_hash_join: Vulkan device is lost - refusing to attempt any GPU work");
+    ProfEnd();
+    return result;
+  }
+
   if (!condition || condition->type != IR_NodeType_Operator || !condition->first || !condition->first->next)
   {
     log_error("qe_hash_join: malformed or missing equi-join condition");
@@ -2596,7 +2610,7 @@ qe_hash_join(Arena* arena, PLAN_RowSet* left, GDB_Table* right_table, String8 ri
   gpu_kernel_set_arg_u64(scatter_kernel, 0, build_row_count);
 
   U64 out_hard_max_capacity = gpu_device_max_storage_buffer_range() / (4 * sizeof(U32));
-  U64 out_capacity = Max(probe_row_count, build_row_count) * 64 + probe_row_count;
+  U64 out_capacity = Max(probe_row_count, build_row_count) + probe_row_count;
   if (out_capacity > out_hard_max_capacity) out_capacity = out_hard_max_capacity;
   if (out_capacity < 1) out_capacity = 1;
   if (out_capacity * 4 * sizeof(U32) > GPU_MAX_BUFFER_SIZE)

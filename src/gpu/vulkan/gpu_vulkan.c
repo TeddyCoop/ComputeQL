@@ -1,3 +1,29 @@
+internal VkBool32 VKAPI_PTR
+gpu_vulkan_debug_callback(VkDebugUtilsMessageSeverityFlagBitsEXT severity, VkDebugUtilsMessageTypeFlagsEXT types,
+                           const VkDebugUtilsMessengerCallbackDataEXT* data, void* user_data)
+{
+  (void)types; (void)user_data;
+  if (severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT)
+  {
+    log_error("[vulkan validation] %s", data->pMessage);
+  }
+  else if (severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT)
+  {
+    log_warn("[vulkan validation] %s", data->pMessage);
+  }
+  else
+  {
+    log_info("[vulkan validation] %s", data->pMessage);
+  }
+  return VK_FALSE;
+}
+
+internal B32
+gpu_vulkan_validation_requested(void)
+{
+  return 1;
+}
+
 internal U32
 gpu_vulkan_find_memory_type(U32 type_bits, VkMemoryPropertyFlags props)
 {
@@ -43,14 +69,109 @@ gpu_init(void)
     .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
     .pApplicationInfo = &app_info,
   };
-  
+
+  const char* wanted_layer = "VK_LAYER_KHRONOS_validation";
+  B32 has_validation_layer = 0;
+  B32 has_debug_utils_ext = 0;
+  const char* enabled_instance_extensions[2];
+  U32 enabled_instance_extension_count = 0;
+  VkDebugUtilsMessengerCreateInfoEXT messenger_info =
+  {
+    .sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
+    .messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT,
+    .messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT,
+    .pfnUserCallback = gpu_vulkan_debug_callback,
+  };
+  VkValidationFeatureEnableEXT enabled_validation_features[] =
+  {
+    VK_VALIDATION_FEATURE_ENABLE_GPU_ASSISTED_EXT,
+    VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT,
+  };
+  VkValidationFeaturesEXT validation_features =
+  {
+    .sType = VK_STRUCTURE_TYPE_VALIDATION_FEATURES_EXT,
+    .enabledValidationFeatureCount = ArrayCount(enabled_validation_features),
+    .pEnabledValidationFeatures = enabled_validation_features,
+  };
+
+  if (gpu_vulkan_validation_requested())
+  {
+    U32 layer_count = 0;
+    vkEnumerateInstanceLayerProperties(&layer_count, 0);
+    VkLayerProperties* layers = push_array(arena, VkLayerProperties, layer_count);
+    vkEnumerateInstanceLayerProperties(&layer_count, layers);
+    for (U32 i = 0; i < layer_count; i++)
+    {
+      if (MemoryMatch(layers[i].layerName, wanted_layer, cstring8_length((U8*)wanted_layer) + 1))
+      {
+        has_validation_layer = 1;
+        break;
+      }
+    }
+
+    B32 has_validation_features_ext = 0;
+    U32 ext_count = 0;
+    vkEnumerateInstanceExtensionProperties(0, &ext_count, 0);
+    VkExtensionProperties* exts = push_array(arena, VkExtensionProperties, ext_count);
+    vkEnumerateInstanceExtensionProperties(0, &ext_count, exts);
+    for (U32 i = 0; i < ext_count; i++)
+    {
+      if (MemoryMatch(exts[i].extensionName, VK_EXT_DEBUG_UTILS_EXTENSION_NAME, cstring8_length((U8*)VK_EXT_DEBUG_UTILS_EXTENSION_NAME) + 1))
+      {
+        has_debug_utils_ext = 1;
+      }
+      else if (MemoryMatch(exts[i].extensionName, VK_EXT_VALIDATION_FEATURES_EXTENSION_NAME, cstring8_length((U8*)VK_EXT_VALIDATION_FEATURES_EXTENSION_NAME) + 1))
+      {
+        has_validation_features_ext = 1;
+      }
+    }
+
+    if (has_debug_utils_ext) enabled_instance_extensions[enabled_instance_extension_count++] = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
+    if (has_validation_features_ext) enabled_instance_extensions[enabled_instance_extension_count++] = VK_EXT_VALIDATION_FEATURES_EXTENSION_NAME;
+    validation_features.pNext = has_debug_utils_ext ? &messenger_info : 0;
+
+    if (has_validation_layer)
+    {
+      inst_info.enabledLayerCount = 1;
+      inst_info.ppEnabledLayerNames = &wanted_layer;
+    }
+    inst_info.enabledExtensionCount = enabled_instance_extension_count;
+    inst_info.ppEnabledExtensionNames = enabled_instance_extensions;
+    if (has_validation_layer && has_validation_features_ext)
+    {
+      inst_info.pNext = &validation_features;
+    }
+    else if (has_validation_layer && has_debug_utils_ext)
+    {
+      inst_info.pNext = &messenger_info;
+    }
+
+    if (!has_validation_layer)
+    {
+      log_info("GDB_VULKAN_VALIDATION requested but VK_LAYER_KHRONOS_validation was not found - install the Vulkan SDK's validation layer to enable it");
+    }
+  }
+
   res = vkCreateInstance(&inst_info, 0, &g_vulkan_state->instance);
   if (res != VK_SUCCESS)
   {
     log_error("failed to create Vulkan instance");
     return;
   }
-  
+
+  if (has_validation_layer && has_debug_utils_ext)
+  {
+    PFN_vkCreateDebugUtilsMessengerEXT create_messenger_fn =
+      (PFN_vkCreateDebugUtilsMessengerEXT)vkGetInstanceProcAddr(g_vulkan_state->instance, "vkCreateDebugUtilsMessengerEXT");
+    g_vulkan_state->vkDestroyDebugUtilsMessengerEXT_fn =
+      (PFN_vkDestroyDebugUtilsMessengerEXT)vkGetInstanceProcAddr(g_vulkan_state->instance, "vkDestroyDebugUtilsMessengerEXT");
+    if (create_messenger_fn)
+    {
+      create_messenger_fn(g_vulkan_state->instance, &messenger_info, 0, &g_vulkan_state->debug_messenger);
+    }
+    log_info("Vulkan validation layer active (GPU-Assisted Validation + synchronization validation enabled)");
+  }
+
   //- tec: physical device
   U32 dev_count = 0;
   vkEnumeratePhysicalDevices(g_vulkan_state->instance, &dev_count, 0);
@@ -174,7 +295,18 @@ gpu_init(void)
     .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
     .descriptorBindingPartiallyBound = VK_TRUE,
   };
-  
+
+  if (has_validation_layer)
+  {
+    VkPhysicalDeviceVulkan12Features features12_query = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES };
+    VkPhysicalDeviceFeatures2 features2_query = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &features12_query };
+    vkGetPhysicalDeviceFeatures2(selected, &features2_query);
+    if (features12_query.bufferDeviceAddress)
+    {
+      features12.bufferDeviceAddress = VK_TRUE;
+    }
+  }
+
   // tec: shaderFloat64 lets scan_filter.comp use GLSL 'double' for precision-safe numeric
   // comparisons (float alone can't exactly represent U64/large-integer column values).
   VkPhysicalDeviceFeatures supported_features;
@@ -391,6 +523,10 @@ gpu_release(void)
   vkDestroyDescriptorPool(g_vulkan_state->device, g_vulkan_state->descriptor_pool, 0);
   vkDestroyCommandPool(g_vulkan_state->device, g_vulkan_state->command_pool, 0);
   vkDestroyDevice(g_vulkan_state->device, 0);
+  if (g_vulkan_state->debug_messenger && g_vulkan_state->vkDestroyDebugUtilsMessengerEXT_fn)
+  {
+    g_vulkan_state->vkDestroyDebugUtilsMessengerEXT_fn(g_vulkan_state->instance, g_vulkan_state->debug_messenger, 0);
+  }
   vkDestroyInstance(g_vulkan_state->instance, 0);
   arena_release(g_vulkan_state->arena);
 }
@@ -457,6 +593,25 @@ gpu_get_executed_kernel_time_microseconds(void)
   return g_vulkan_state->last_kernel_time_microseconds;
 }
 
+internal void
+gpu_vulkan_note_result(VkResult result)
+{
+  if (result != VK_ERROR_DEVICE_LOST) return;
+  if (!g_vulkan_state->device_lost)
+  {
+    log_error("Vulkan device lost (VK_ERROR_DEVICE_LOST) - per the Vulkan spec the entire VkDevice "
+              "is now permanently unusable, and there is no device recreation path. All "
+              "further GPU allocations and dispatches will now fail immediately rather than retry.");
+  }
+  g_vulkan_state->device_lost = 1;
+}
+
+internal B32
+gpu_device_lost(void)
+{
+  return g_vulkan_state->device_lost;
+}
+
 internal VkCommandBuffer
 gpu_vulkan_begin_one_time_cmd(void)
 {
@@ -473,6 +628,11 @@ gpu_vulkan_begin_one_time_cmd(void)
 internal B32
 gpu_vulkan_end_and_submit_cmd(VkCommandBuffer cmd)
 {
+  if (g_vulkan_state->device_lost)
+  {
+    return 0;
+  }
+
   vkEndCommandBuffer(cmd);
 
   VkSubmitInfo submit_info =
@@ -489,17 +649,19 @@ gpu_vulkan_end_and_submit_cmd(VkCommandBuffer cmd)
   if (submit_result != VK_SUCCESS)
   {
     // tec: the fence was never signaled if the submit itself failed
+    gpu_vulkan_note_result(submit_result);
     log_error("vkQueueSubmit failed with VkResult %d - not waiting on the fence", (int)submit_result);
     return 0;
   }
 
-  // tec: bounded instead of UINT64_MAX
-  VkResult wait_result = vkWaitForFences(g_vulkan_state->device, 1, &g_vulkan_state->submit_fence, VK_TRUE, Billion(1));
+  VkResult wait_result = vkWaitForFences(g_vulkan_state->device, 1, &g_vulkan_state->submit_fence, VK_TRUE, Billion(30));
   if (wait_result != VK_SUCCESS)
   {
-    log_error("vkWaitForFences failed/timed out with VkResult %d after %llu microseconds - GPU is likely hung or the device was lost",
+    log_error("vkWaitForFences failed/timed out with VkResult %d after %llu microseconds - GPU is hung or the "
+              "device was lost. The command buffer/fence may still be pending; continuing would risk resetting/"
+              "resubmitting them while still in flight, corrupting further GPU work. Aborting.",
               (int)wait_result, os_now_microseconds() - t0);
-    return 0;
+    os_abort(1);
   }
 
   log_info("submit+wait wall time: %llu microseconds", os_now_microseconds() - t0);
@@ -509,6 +671,11 @@ gpu_vulkan_end_and_submit_cmd(VkCommandBuffer cmd)
 internal B32
 gpu_vulkan_alloc_raw_buffer(U64 size, VkBufferUsageFlags usage, VkMemoryPropertyFlags mem_props, VkBuffer* out_buffer, VkDeviceMemory* out_memory)
 {
+  if (g_vulkan_state->device_lost)
+  {
+    return 0;
+  }
+
   VkBufferCreateInfo buf_info =
   {
     .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
@@ -541,8 +708,10 @@ gpu_vulkan_alloc_raw_buffer(U64 size, VkBufferUsageFlags usage, VkMemoryProperty
     .memoryTypeIndex = mem_type,
   };
   
-  if (vkAllocateMemory(g_vulkan_state->device, &alloc_info, 0, out_memory) != VK_SUCCESS)
+  VkResult alloc_result = vkAllocateMemory(g_vulkan_state->device, &alloc_info, 0, out_memory);
+  if (alloc_result != VK_SUCCESS)
   {
+    gpu_vulkan_note_result(alloc_result);
     log_error("Failed to allocate Vulkan buffer memory.");
     vkDestroyBuffer(g_vulkan_state->device, *out_buffer, 0);
     return 0;

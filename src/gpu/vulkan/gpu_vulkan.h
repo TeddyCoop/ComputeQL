@@ -78,6 +78,9 @@ struct GPU_State
   VkPhysicalDevice physical_device;
   VkDevice device;
 
+  VkDebugUtilsMessengerEXT debug_messenger;
+  PFN_vkDestroyDebugUtilsMessengerEXT vkDestroyDebugUtilsMessengerEXT_fn;
+
   VkQueue compute_queue;
   U32 compute_queue_family_index;
 
@@ -101,7 +104,9 @@ struct GPU_State
   
   VkFence submit_fence;
   U64 last_kernel_time_microseconds;
-  
+
+  B32 device_lost;
+
   B32 has_memory_budget_ext;
   
   // tec: lets gpu_buffer_import_host_readonly import an OS mapped file view directly as a VkBuffer's backing memory, with no CPU copy at all
