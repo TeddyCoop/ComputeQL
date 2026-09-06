@@ -173,6 +173,7 @@ internal PLAN_Materialized qe_sort_materialized(Arena* arena, PLAN_Materialized*
 
 #define QE_AGG_MAX_GROUP_COLS 4
 #define QE_AGG_MAX_EXPRS      8
+#define QE_AGG_ROWS_PER_CHUNK 4096
 internal PLAN_Materialized qe_aggregate(Arena* arena, GDB_Database* database, PLAN_RowSet* input, IR_Node* group_by_ir, IR_Node* column_list_ir, IR_Node* having_ir);
 internal PLAN_Materialized qe_apply_having(Arena* arena, PLAN_Materialized* m, IR_Node* having_ir);
 
