@@ -535,19 +535,19 @@ qe_scan_filter(Arena* arena, GDB_Database* database, GDB_Table* table, IR_Node* 
       QE_PrefetchBindingResult* in = &slot->bindings[i];
       U32 descriptor_binding = QE_BINDING_COLUMN_BASE + binding->first_slot;
 
-      String8 col_pool_key = push_str8f(g_vulkan_state->arena, "scan_col:%.*s.%.*s", str8_varg(table->name), str8_varg(binding->name));
+      String8 col_pool_key = push_str8f(gpu_scratch_arena(), "scan_col:%.*s.%.*s", str8_varg(table->name), str8_varg(binding->name));
 
       if (binding->type == GDB_ColumnType_String8)
       {
         if (in->valid)
         {
-          String8 data_key = push_str8f(g_vulkan_state->arena, "%.*s.data", str8_varg(col_pool_key));
+          String8 data_key = push_str8f(gpu_scratch_arena(), "%.*s.data", str8_varg(col_pool_key));
           GPU_Buffer* data_buf = gpu_buffer_alloc_pooled(data_key, in->str_chunk.size, GPU_BufferFlag_Write | GPU_BufferFlag_HostVisible, in->str_chunk.data);
           gpu_kernel_set_arg_buffer(kernel, descriptor_binding + 0, data_buf);
 
           // tec: +1 row for the trailing offset used to compute the last strings size
           U64 offsets_size = (in->str_chunk.row_count + 1) * sizeof(U64);
-          String8 offsets_key = push_str8f(g_vulkan_state->arena, "%.*s.offsets", str8_varg(col_pool_key));
+          String8 offsets_key = push_str8f(gpu_scratch_arena(), "%.*s.offsets", str8_varg(col_pool_key));
           GPU_Buffer* offsets_buf = gpu_buffer_alloc_pooled(offsets_key, offsets_size, GPU_BufferFlag_Write | GPU_BufferFlag_CopyHostPointer, in->str_chunk.offsets);
           gpu_kernel_set_arg_buffer(kernel, descriptor_binding + 1, offsets_buf);
 
@@ -572,7 +572,7 @@ qe_scan_filter(Arena* arena, GDB_Database* database, GDB_Table* table, IR_Node* 
         if (!data_buf)
         {
           // tec: distinct key from the import path above
-          String8 fallback_key = push_str8f(g_vulkan_state->arena, "%.*s.alloc_fallback", str8_varg(col_pool_key));
+          String8 fallback_key = push_str8f(gpu_scratch_arena(), "%.*s.alloc_fallback", str8_varg(col_pool_key));
           data_buf = gpu_buffer_alloc_pooled(fallback_key, in->size, GPU_BufferFlag_Write, in->data_ptr);
         }
         gpu_kernel_set_arg_buffer(kernel, descriptor_binding, data_buf);
@@ -1668,15 +1668,15 @@ qe_aggregate(Arena* arena, GDB_Database* database, PLAN_RowSet* input, IR_Node* 
     {
       U64 data_size = Max(group_string[c].size, 4);
       U64 off_size = (row_count + 1) * sizeof(U64);
-      group_col_bufs[c * 2 + 0] = gpu_buffer_alloc_pooled(push_str8f(g_vulkan_state->arena, "agg_group_col_data:%u", c), data_size, GPU_BufferFlag_Write, 0);
-      group_col_bufs[c * 2 + 1] = gpu_buffer_alloc_pooled(push_str8f(g_vulkan_state->arena, "agg_group_col_off:%u", c), off_size, GPU_BufferFlag_Write, 0);
+      group_col_bufs[c * 2 + 0] = gpu_buffer_alloc_pooled(push_str8f(gpu_scratch_arena(), "agg_group_col_data:%u", c), data_size, GPU_BufferFlag_Write, 0);
+      group_col_bufs[c * 2 + 1] = gpu_buffer_alloc_pooled(push_str8f(gpu_scratch_arena(), "agg_group_col_off:%u", c), off_size, GPU_BufferFlag_Write, 0);
       group_col_sizes[c * 2 + 0] = data_size;
       group_col_sizes[c * 2 + 1] = off_size;
     }
     else
     {
       U64 data_size = row_count * sizeof(F64);
-      group_col_bufs[c * 2 + 0] = gpu_buffer_alloc_pooled(push_str8f(g_vulkan_state->arena, "agg_group_col_data:%u", c), data_size, GPU_BufferFlag_Write, 0);
+      group_col_bufs[c * 2 + 0] = gpu_buffer_alloc_pooled(push_str8f(gpu_scratch_arena(), "agg_group_col_data:%u", c), data_size, GPU_BufferFlag_Write, 0);
       group_col_sizes[c * 2 + 0] = data_size;
     }
   }
@@ -1936,7 +1936,7 @@ qe_aggregate(Arena* arena, GDB_Database* database, PLAN_RowSet* input, IR_Node* 
     }
 
     arg_bufs[e] = (same_as != e) ? arg_bufs[same_as]
-                                  : gpu_buffer_alloc_pooled(push_str8f(g_vulkan_state->arena, "agg_arg_buf:%u", e), row_count * sizeof(F64), GPU_BufferFlag_Write, 0);
+                                  : gpu_buffer_alloc_pooled(push_str8f(gpu_scratch_arena(), "agg_arg_buf:%u", e), row_count * sizeof(F64), GPU_BufferFlag_Write, 0);
   }
 
   for (U32 e = 0; e < QE_AGG_MAX_EXPRS; e++)

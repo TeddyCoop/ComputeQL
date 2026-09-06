@@ -43,7 +43,7 @@ gpu_vulkan_find_memory_type(U32 type_bits, VkMemoryPropertyFlags props)
 }
 
 internal void
-gpu_init(void)
+gpu_vulkan_init(void)
 {
   ProfBeginFunction();
   
@@ -494,7 +494,7 @@ gpu_init(void)
 }
 
 internal void
-gpu_release(void)
+gpu_vulkan_release(void)
 {
   if (g_vulkan_state->upload_staging_capacity != 0)
   {
@@ -532,13 +532,13 @@ gpu_release(void)
 }
 
 internal void
-gpu_wait(void)
+gpu_vulkan_wait(void)
 {
   vkQueueWaitIdle(g_vulkan_state->compute_queue);
 }
 
 internal U64
-gpu_device_total_memory(void)
+gpu_vulkan_device_total_memory(void)
 {
   VkPhysicalDeviceMemoryProperties mem_props;
   vkGetPhysicalDeviceMemoryProperties(g_vulkan_state->physical_device, &mem_props);
@@ -555,7 +555,7 @@ gpu_device_total_memory(void)
 }
 
 internal U64
-gpu_device_max_storage_buffer_range(void)
+gpu_vulkan_device_max_storage_buffer_range(void)
 {
   VkPhysicalDeviceProperties device_props;
   vkGetPhysicalDeviceProperties(g_vulkan_state->physical_device, &device_props);
@@ -563,11 +563,11 @@ gpu_device_max_storage_buffer_range(void)
 }
 
 internal U64
-gpu_device_free_memory(void)
+gpu_vulkan_device_free_memory(void)
 {
   if (!g_vulkan_state->has_memory_budget_ext)
   {
-    return gpu_device_total_memory();
+    return gpu_vulkan_device_total_memory();
   }
   
   VkPhysicalDeviceMemoryBudgetPropertiesEXT budget_props = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT };
@@ -588,7 +588,7 @@ gpu_device_free_memory(void)
 }
 
 internal U64
-gpu_get_executed_kernel_time_microseconds(void)
+gpu_vulkan_get_executed_kernel_time_microseconds(void)
 {
   return g_vulkan_state->last_kernel_time_microseconds;
 }
@@ -607,7 +607,7 @@ gpu_vulkan_note_result(VkResult result)
 }
 
 internal B32
-gpu_device_lost(void)
+gpu_vulkan_device_lost(void)
 {
   return g_vulkan_state->device_lost;
 }
@@ -803,7 +803,7 @@ gpu_vulkan_staged_download(GPU_Buffer* src, void* data, U64 size)
 }
 
 internal GPU_Buffer*
-gpu_buffer_alloc(U64 size, GPU_BufferFlags flags, void* data)
+gpu_vulkan_buffer_alloc(U64 size, GPU_BufferFlags flags, void* data)
 {
   GPU_Buffer* result = push_array(g_vulkan_state->arena, GPU_Buffer, 1);
   result->size = size;
@@ -861,8 +861,13 @@ gpu_buffer_alloc(U64 size, GPU_BufferFlags flags, void* data)
   return result;
 }
 
+// tec: forward decls - both are defined further down but called from the pooled
+// alloc/import functions above their definition
+internal void gpu_vulkan_buffer_release(GPU_Buffer* buffer);
+internal void gpu_vulkan_buffer_write(GPU_Buffer* buffer, void* data, U64 size);
+
 internal GPU_Buffer*
-gpu_buffer_alloc_pooled(String8 name, U64 size, GPU_BufferFlags flags, void* data)
+gpu_vulkan_buffer_alloc_pooled(String8 name, U64 size, GPU_BufferFlags flags, void* data)
 {
   for (U32 i = 0; i < g_vulkan_state->pooled_buffer_count; i++)
   {
@@ -871,8 +876,8 @@ gpu_buffer_alloc_pooled(String8 name, U64 size, GPU_BufferFlags flags, void* dat
 
     if (size > slot->capacity)
     {
-      gpu_buffer_release(slot->buffer);
-      slot->buffer = gpu_buffer_alloc(size, flags, data);
+      gpu_vulkan_buffer_release(slot->buffer);
+      slot->buffer = gpu_vulkan_buffer_alloc(size, flags, data);
       // tec: only record the new capacity if the allocation actually succeeded
       slot->capacity = slot->buffer ? size : 0;
     }
@@ -883,12 +888,12 @@ gpu_buffer_alloc_pooled(String8 name, U64 size, GPU_BufferFlags flags, void* dat
         return 0;
       }
       slot->buffer->size = size;
-      if (data) gpu_buffer_write(slot->buffer, data, size);
+      if (data) gpu_vulkan_buffer_write(slot->buffer, data, size);
     }
     return slot->buffer;
   }
 
-  GPU_Buffer* buffer = gpu_buffer_alloc(size, flags, data);
+  GPU_Buffer* buffer = gpu_vulkan_buffer_alloc(size, flags, data);
   if (g_vulkan_state->pooled_buffer_count < GPU_VULKAN_MAX_POOLED_BUFFERS)
   {
     GPU_PooledBuffer* slot = &g_vulkan_state->pooled_buffers[g_vulkan_state->pooled_buffer_count++];
@@ -898,14 +903,14 @@ gpu_buffer_alloc_pooled(String8 name, U64 size, GPU_BufferFlags flags, void* dat
   }
   else
   {
-    log_error("gpu_buffer_alloc_pooled: pool full, '%.*s' will not be cached", str8_varg(name));
+    log_error("gpu_vulkan_buffer_alloc_pooled: pool full, '%.*s' will not be cached", str8_varg(name));
   }
   return buffer;
 }
 
 // tec: imports an existing host pointer (such as an OS mapped file view) directly as a VkBuffer's backing memory via VK_EXT_external_memory_host
 internal GPU_Buffer*
-gpu_buffer_import_host_readonly(void* host_ptr, U64 size)
+gpu_vulkan_buffer_import_host_readonly(void* host_ptr, U64 size)
 {
   if (!g_vulkan_state->has_external_memory_host_ext || !host_ptr || size == 0)
   {
@@ -996,7 +1001,7 @@ gpu_buffer_import_host_readonly(void* host_ptr, U64 size)
 }
 
 internal GPU_Buffer*
-gpu_buffer_import_host_readonly_pooled(String8 name, void* host_ptr, U64 size)
+gpu_vulkan_buffer_import_host_readonly_pooled(String8 name, void* host_ptr, U64 size)
 {
   for (U32 i = 0; i < g_vulkan_state->pooled_buffer_count; i++)
   {
@@ -1008,10 +1013,10 @@ gpu_buffer_import_host_readonly_pooled(String8 name, void* host_ptr, U64 size)
       return slot->buffer;
     }
 
-    GPU_Buffer* fresh = gpu_buffer_import_host_readonly(host_ptr, size);
+    GPU_Buffer* fresh = gpu_vulkan_buffer_import_host_readonly(host_ptr, size);
     if (fresh)
     {
-      gpu_buffer_release(slot->buffer);
+      gpu_vulkan_buffer_release(slot->buffer);
       slot->buffer = fresh;
       slot->capacity = size;
       slot->imported_host_ptr = host_ptr;
@@ -1019,7 +1024,7 @@ gpu_buffer_import_host_readonly_pooled(String8 name, void* host_ptr, U64 size)
     return slot->buffer;
   }
 
-  GPU_Buffer* buffer = gpu_buffer_import_host_readonly(host_ptr, size);
+  GPU_Buffer* buffer = gpu_vulkan_buffer_import_host_readonly(host_ptr, size);
   if (buffer)
   {
     if (g_vulkan_state->pooled_buffer_count < GPU_VULKAN_MAX_POOLED_BUFFERS)
@@ -1032,14 +1037,14 @@ gpu_buffer_import_host_readonly_pooled(String8 name, void* host_ptr, U64 size)
     }
     else
     {
-      log_error("gpu_buffer_import_host_readonly_pooled: pool full, '%.*s' will not be cached", str8_varg(name));
+      log_error("gpu_vulkan_buffer_import_host_readonly_pooled: pool full, '%.*s' will not be cached", str8_varg(name));
     }
   }
   return buffer;
 }
 
 internal void
-gpu_buffer_release(GPU_Buffer* buffer)
+gpu_vulkan_buffer_release(GPU_Buffer* buffer)
 {
   if (!buffer)
   {
@@ -1056,11 +1061,11 @@ gpu_buffer_release(GPU_Buffer* buffer)
 }
 
 internal void
-gpu_buffer_write(GPU_Buffer* buffer, void* data, U64 size)
+gpu_vulkan_buffer_write(GPU_Buffer* buffer, void* data, U64 size)
 {
   if (size > buffer->size)
   {
-    log_error("gpu_buffer_write: write size exceeds buffer size.");
+    log_error("gpu_vulkan_buffer_write: write size exceeds buffer size.");
     return;
   }
   
@@ -1075,11 +1080,11 @@ gpu_buffer_write(GPU_Buffer* buffer, void* data, U64 size)
 }
 
 internal void
-gpu_buffer_read(GPU_Buffer* buffer, void* data, U64 size)
+gpu_vulkan_buffer_read(GPU_Buffer* buffer, void* data, U64 size)
 {
   if (size > buffer->size)
   {
-    log_error("gpu_buffer_read: read size exceeds buffer size.");
+    log_error("gpu_vulkan_buffer_read: read size exceeds buffer size.");
     return;
   }
   
@@ -1127,7 +1132,7 @@ gpu_vulkan_load_spirv_from_disk(Arena* arena, String8 kernel_name)
 }
 
 internal GPU_Kernel*
-gpu_kernel_alloc(String8 name)
+gpu_vulkan_kernel_alloc(String8 name)
 {
   ProfBeginFunction();
 
@@ -1215,7 +1220,7 @@ gpu_kernel_alloc(String8 name)
   }
   else
   {
-    log_error("gpu_kernel_alloc: kernel cache full (%u), '%.*s' will be recompiled every call",
+    log_error("gpu_vulkan_kernel_alloc: kernel cache full (%u), '%.*s' will be recompiled every call",
               (U32)GPU_VULKAN_MAX_CACHED_KERNELS, str8_varg(name));
   }
 
@@ -1224,23 +1229,23 @@ gpu_kernel_alloc(String8 name)
 }
 
 internal void
-gpu_kernel_release(GPU_Kernel *kernel)
+gpu_vulkan_kernel_release(GPU_Kernel *kernel)
 {
   // do nothing, kernels are cached
 }
 
 internal void
-gpu_kernel_set_arg_buffer(GPU_Kernel* kernel, U32 index, GPU_Buffer* buffer)
+gpu_vulkan_kernel_set_arg_buffer(GPU_Kernel* kernel, U32 index, GPU_Buffer* buffer)
 {
   if (index >= GPU_VULKAN_MAX_BOUND_BUFFERS)
   {
-    log_error("gpu_kernel_set_arg_buffer: index %u exceeds GPU_VULKAN_MAX_BOUND_BUFFERS", index);
+    log_error("gpu_vulkan_kernel_set_arg_buffer: index %u exceeds GPU_VULKAN_MAX_BOUND_BUFFERS", index);
     return;
   }
 
   if (!buffer)
   {
-    log_error("gpu_kernel_set_arg_buffer: buffer argument for index %u is NULL - a prior GPU buffer allocation failed", index);
+    log_error("gpu_vulkan_kernel_set_arg_buffer: buffer argument for index %u is NULL - a prior GPU buffer allocation failed", index);
     return;
   }
 
@@ -1271,11 +1276,11 @@ gpu_kernel_set_arg_buffer(GPU_Kernel* kernel, U32 index, GPU_Buffer* buffer)
 }
 
 internal void
-gpu_kernel_set_arg_u64(GPU_Kernel* kernel, U32 index, U64 value)
+gpu_vulkan_kernel_set_arg_u64(GPU_Kernel* kernel, U32 index, U64 value)
 {
   if (index >= GPU_VULKAN_PUSH_CONSTANT_COUNT)
   {
-    log_error("gpu_kernel_set_arg_u64: index %u exceeds GPU_VULKAN_PUSH_CONSTANT_COUNT", index);
+    log_error("gpu_vulkan_kernel_set_arg_u64: index %u exceeds GPU_VULKAN_PUSH_CONSTANT_COUNT", index);
     return;
   }
   
@@ -1283,7 +1288,7 @@ gpu_kernel_set_arg_u64(GPU_Kernel* kernel, U32 index, U64 value)
 }
 
 internal void
-gpu_kernel_execute(GPU_Kernel* kernel, U32 global_work_size, U32 local_work_size)
+gpu_vulkan_kernel_execute(GPU_Kernel* kernel, U32 global_work_size, U32 local_work_size)
 {
   U32 group_count = (global_work_size + local_work_size - 1) / local_work_size;
   
@@ -1313,7 +1318,7 @@ gpu_kernel_execute(GPU_Kernel* kernel, U32 global_work_size, U32 local_work_size
 //~ tec: batching
 
 internal GPU_Batch*
-gpu_batch_begin(U64 upload_bytes_needed, U64 download_bytes_needed)
+gpu_vulkan_batch_begin(U64 upload_bytes_needed, U64 download_bytes_needed)
 {
   GPU_Batch* batch = &g_vulkan_state->active_batch;
   MemoryZeroStruct(batch);
@@ -1341,7 +1346,7 @@ gpu_batch_begin(U64 upload_bytes_needed, U64 download_bytes_needed)
 }
 
 internal void
-gpu_batch_buffer_write(GPU_Batch* batch, GPU_Buffer* buffer, void* data, U64 size)
+gpu_vulkan_batch_buffer_write(GPU_Batch* batch, GPU_Buffer* buffer, void* data, U64 size)
 {
   if (size == 0 || !data) return;
 
@@ -1353,7 +1358,7 @@ gpu_batch_buffer_write(GPU_Batch* batch, GPU_Buffer* buffer, void* data, U64 siz
 
   if (batch->upload_cursor + size > g_vulkan_state->upload_staging_capacity)
   {
-    log_error("gpu_batch_buffer_write: exceeded reserved upload staging capacity, dropping write");
+    log_error("gpu_vulkan_batch_buffer_write: exceeded reserved upload staging capacity, dropping write");
     return;
   }
 
@@ -1368,7 +1373,7 @@ gpu_batch_buffer_write(GPU_Batch* batch, GPU_Buffer* buffer, void* data, U64 siz
 }
 
 internal void
-gpu_batch_buffer_fill(GPU_Batch* batch, GPU_Buffer* buffer, U64 size, U32 value)
+gpu_vulkan_batch_buffer_fill(GPU_Batch* batch, GPU_Buffer* buffer, U64 size, U32 value)
 {
   if (size == 0) return;
 
@@ -1379,13 +1384,13 @@ gpu_batch_buffer_fill(GPU_Batch* batch, GPU_Buffer* buffer, U64 size, U32 value)
 }
 
 internal void
-gpu_batch_buffer_zero(GPU_Batch* batch, GPU_Buffer* buffer, U64 size)
+gpu_vulkan_batch_buffer_zero(GPU_Batch* batch, GPU_Buffer* buffer, U64 size)
 {
-  gpu_batch_buffer_fill(batch, buffer, size, 0);
+  gpu_vulkan_batch_buffer_fill(batch, buffer, size, 0);
 }
 
 internal void
-gpu_batch_kernel_execute(GPU_Batch* batch, GPU_Kernel* kernel, U32 global_work_size, U32 local_work_size)
+gpu_vulkan_batch_kernel_execute(GPU_Batch* batch, GPU_Kernel* kernel, U32 global_work_size, U32 local_work_size)
 {
   if (batch->wrote_since_barrier || batch->dispatched_since_barrier)
   {
@@ -1429,12 +1434,12 @@ gpu_batch_kernel_execute(GPU_Batch* batch, GPU_Kernel* kernel, U32 global_work_s
 }
 
 internal void
-gpu_batch_buffer_read(GPU_Batch* batch, GPU_Buffer* buffer, void* out_data, U64 size)
+gpu_vulkan_batch_buffer_read(GPU_Batch* batch, GPU_Buffer* buffer, void* out_data, U64 size)
 {
   if (size == 0) return;
   if (batch->pending_read_count >= GPU_BATCH_MAX_PENDING_READS)
   {
-    log_error("gpu_batch_buffer_read: too many pending reads in one batch (max %u), dropping read", (U32)GPU_BATCH_MAX_PENDING_READS);
+    log_error("gpu_vulkan_batch_buffer_read: too many pending reads in one batch (max %u), dropping read", (U32)GPU_BATCH_MAX_PENDING_READS);
     return;
   }
 
@@ -1464,7 +1469,7 @@ gpu_batch_buffer_read(GPU_Batch* batch, GPU_Buffer* buffer, void* out_data, U64 
 
   if (batch->download_cursor + size > g_vulkan_state->download_staging_capacity)
   {
-    log_error("gpu_batch_buffer_read: exceeded reserved download staging capacity, dropping read");
+    log_error("gpu_vulkan_batch_buffer_read: exceeded reserved download staging capacity, dropping read");
     return;
   }
 
@@ -1482,7 +1487,7 @@ gpu_batch_buffer_read(GPU_Batch* batch, GPU_Buffer* buffer, void* out_data, U64 
 }
 
 internal B32
-gpu_batch_end(GPU_Batch* batch)
+gpu_vulkan_batch_end(GPU_Batch* batch)
 {
   B32 ok = 1;
 
@@ -1519,4 +1524,59 @@ gpu_batch_end(GPU_Batch* batch)
   }
 
   return ok;
+}
+
+internal Arena*
+gpu_vulkan_scratch_arena(void)
+{
+  return g_vulkan_state->arena;
+}
+
+internal String8
+gpu_vulkan_name(void)
+{
+  return str8_lit("vulkan");
+}
+
+internal GPU_Backend*
+gpu_vulkan_get_backend(void)
+{
+  local_persist GPU_Backend backend = {0};
+  backend.struct_size = sizeof(GPU_Backend);
+
+  backend.init = gpu_vulkan_init;
+  backend.release = gpu_vulkan_release;
+  backend.wait = gpu_vulkan_wait;
+  backend.get_executed_kernel_time_microseconds = gpu_vulkan_get_executed_kernel_time_microseconds;
+  backend.device_total_memory = gpu_vulkan_device_total_memory;
+  backend.device_free_memory = gpu_vulkan_device_free_memory;
+  backend.device_max_storage_buffer_range = gpu_vulkan_device_max_storage_buffer_range;
+  backend.device_lost = gpu_vulkan_device_lost;
+
+  backend.buffer_alloc = gpu_vulkan_buffer_alloc;
+  backend.buffer_alloc_pooled = gpu_vulkan_buffer_alloc_pooled;
+  backend.buffer_import_host_readonly = gpu_vulkan_buffer_import_host_readonly;
+  backend.buffer_import_host_readonly_pooled = gpu_vulkan_buffer_import_host_readonly_pooled;
+  backend.buffer_release = gpu_vulkan_buffer_release;
+  backend.buffer_write = gpu_vulkan_buffer_write;
+  backend.buffer_read = gpu_vulkan_buffer_read;
+
+  backend.kernel_alloc = gpu_vulkan_kernel_alloc;
+  backend.kernel_release = gpu_vulkan_kernel_release;
+  backend.kernel_execute = gpu_vulkan_kernel_execute;
+  backend.kernel_set_arg_buffer = gpu_vulkan_kernel_set_arg_buffer;
+  backend.kernel_set_arg_u64 = gpu_vulkan_kernel_set_arg_u64;
+
+  backend.batch_begin = gpu_vulkan_batch_begin;
+  backend.batch_buffer_write = gpu_vulkan_batch_buffer_write;
+  backend.batch_buffer_zero = gpu_vulkan_batch_buffer_zero;
+  backend.batch_buffer_fill = gpu_vulkan_batch_buffer_fill;
+  backend.batch_kernel_execute = gpu_vulkan_batch_kernel_execute;
+  backend.batch_buffer_read = gpu_vulkan_batch_buffer_read;
+  backend.batch_end = gpu_vulkan_batch_end;
+
+  backend.scratch_arena = gpu_vulkan_scratch_arena;
+  backend.name = gpu_vulkan_name;
+
+  return &backend;
 }

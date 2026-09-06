@@ -102,6 +102,12 @@ entry_point(CmdLine* cmdline)
     }
 
     gdb_init();
+
+    String8 gpu_backend_str = cmd_line_string(cmdline, str8_lit("gpu"));
+    if (gpu_backend_str.size != 0)
+    {
+      gpu_request_backend(gpu_backend_str);
+    }
     gpu_init();
 
     log_info("total gpu memory: %llu (MB)", gpu_device_total_memory() >> 20);

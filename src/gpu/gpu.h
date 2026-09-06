@@ -32,6 +32,7 @@ internal void gpu_init(void);
 internal void gpu_release(void);
 internal void gpu_wait(void);
 internal U64 gpu_get_executed_kernel_time_microseconds(void);
+internal Arena* gpu_scratch_arena(void);
 
 // tec: returns total device memory in bytes
 internal U64 gpu_device_total_memory(void);
@@ -64,5 +65,6 @@ internal void gpu_batch_buffer_fill(GPU_Batch* batch, GPU_Buffer* buffer, U64 si
 internal void gpu_batch_kernel_execute(GPU_Batch* batch, GPU_Kernel* kernel, U32 global_work_size, U32 local_work_size);
 internal void gpu_batch_buffer_read(GPU_Batch* batch, GPU_Buffer* buffer, void* out_data, U64 size);
 internal B32 gpu_batch_end(GPU_Batch* batch);
+
 
 #endif //GPU_H
