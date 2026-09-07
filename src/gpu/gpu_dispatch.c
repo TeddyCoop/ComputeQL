@@ -1,13 +1,3 @@
-#define GPU_BACKEND_NAME_BUF_SIZE 64
-
-global GPU_BackendRegistration g_gpu_backend_registrations[GPU_BackendKind_COUNT];
-global U32 g_gpu_backend_registration_count = 0;
-
-global GPU_BackendRegistration* g_active_gpu_backend_reg = 0;
-
-global char g_gpu_requested_backend_name_buf[GPU_BACKEND_NAME_BUF_SIZE];
-global String8 g_gpu_requested_backend_name = {0};
-
 internal void
 gpu_backend_register_all(void)
 {
@@ -27,10 +17,10 @@ gpu_backend_register(GPU_BackendKind kind, String8 name, GPU_Backend* backend)
   if (backend->struct_size != sizeof(GPU_Backend))
   {
     log_error("gpu_backend_register: '%.*s' backend struct_size mismatch (got %u, expected %u) - refusing to register",
-               str8_varg(name), backend->struct_size, (U32)sizeof(GPU_Backend));
+              str8_varg(name), backend->struct_size, (U32)sizeof(GPU_Backend));
     return;
   }
-
+  
   GPU_BackendRegistration* reg = &g_gpu_backend_registrations[g_gpu_backend_registration_count++];
   reg->kind = kind;
   reg->name = name;
@@ -81,7 +71,7 @@ internal GPU_BackendRegistration*
 gpu_choose_backend_registration(void)
 {
   GPU_BackendRegistration* chosen = 0;
-
+  
   if (g_gpu_requested_backend_name.size != 0)
   {
     chosen = gpu_find_backend_registration(g_gpu_requested_backend_name);
@@ -91,7 +81,7 @@ gpu_choose_backend_registration(void)
     }
     return chosen;
   }
-
+  
   if (g_gpu_backend_registration_count == 1)
   {
     chosen = &g_gpu_backend_registrations[0];
@@ -104,7 +94,7 @@ gpu_choose_backend_registration(void)
     log_error("gpu: multiple GPU backends are compiled in (%.*s) - pass --gpu=<name> to pick one", str8_varg(joined));
     scratch_end(scratch);
   }
-
+  
   return chosen;
 }
 
@@ -112,28 +102,28 @@ internal void
 gpu_init(void)
 {
   gpu_backend_register_all();
-
+  
   if (g_gpu_backend_registration_count == 0)
   {
     log_error("gpu_init: no GPU backend compiled in");
     os_abort(1);
   }
-
+  
   g_active_gpu_backend_reg = gpu_choose_backend_registration();
   if (!g_active_gpu_backend_reg)
   {
     os_abort(1);
   }
-
+  
   {
     Temp scratch = scratch_begin(0, 0);
     String8List available = gpu_available_backend_names(scratch.arena);
     String8 joined = str8_list_join(scratch.arena, &available, &(StringJoin){.sep = str8_lit(", ")});
     log_info("gpu: using backend '%.*s' (available: %.*s)",
-              str8_varg(g_active_gpu_backend_reg->name), str8_varg(joined));
+             str8_varg(g_active_gpu_backend_reg->name), str8_varg(joined));
     scratch_end(scratch);
   }
-
+  
   g_active_gpu_backend_reg->backend->init();
 }
 
@@ -146,16 +136,16 @@ gpu_backend_switch(String8 name)
     log_error("gpu_backend_switch: backend '%.*s' is not compiled in", str8_varg(name));
     return 0;
   }
-
+  
   if (g_active_gpu_backend_reg)
   {
     g_active_gpu_backend_reg->backend->wait();
     g_active_gpu_backend_reg->backend->release();
   }
-
+  
   g_active_gpu_backend_reg = next;
   g_active_gpu_backend_reg->backend->init();
-
+  
   log_info("gpu: switched to backend '%.*s'", str8_varg(g_active_gpu_backend_reg->name));
   return 1;
 }

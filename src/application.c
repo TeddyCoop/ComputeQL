@@ -161,12 +161,14 @@ gdb_check_eval(GDB_Table* table, void** row_data, B32* row_null, IR_Node* condit
   F64 lv = gdb_check_load_value(table, row_data, row_null, left, &lstr, &ls, &lnull);
   F64 rv = gdb_check_load_value(table, row_data, row_null, right, &rstr, &rs, &rnull);
   
-  // tec: three-valued logic - a NULL operand makes CHECK neither true nor false, so the row is rejected just like a direct comparison would be
+  // tec: three-valued logic. a NULL operand makes CHECK neither true nor false, so the row is rejected
   if (lnull || rnull) return 0; 
   
   if (lstr || rstr)
   {
-    if (str8_match(op, str8_lit("contains"), StringMatchFlag_CaseInsensitive)) return qe_str8_contains(ls, rs);
+    if (str8_match(op, str8_lit("contains"), StringMatchFlag_CaseInsensitive)) 
+      return qe_str8_contains(ls, rs)
+      ;
     B32 eq = qe_str8_compare(ls, rs) == 0;
     if (str8_match(op, str8_lit("!="), 0)) return !eq;
     return eq;
@@ -300,7 +302,7 @@ internal APP_QueryResult
 app_execute_query_capture(Arena* arena, String8 sql_query, GDB_Database** io_database, APP_ResultSet* out_result_set)
 {
   ProfBeginFunction();
-
+  
   if (out_result_set) { MemoryZeroStruct(out_result_set); }
   
   APP_QueryResult result = {0};
@@ -960,16 +962,16 @@ app_execute_query_capture(Arena* arena, String8 sql_query, GDB_Database** io_dat
         log_info("result count %llu", result_count);
         
         B32 capture_structured = (out_result_set != 0) && (ir_execution_node->next == NULL);
-
+        
         if (result.supported && select_output_columns)
         {
           Temp scratch = scratch_begin(0, 0);
-
+          
           U64 out_column_count = 0;
           if (capture_structured)
           {
             for (IR_Node* c = select_output_columns->first; c != NULL; c = c->next) out_column_count++;
-
+            
             out_result_set->valid = 1;
             out_result_set->column_count = out_column_count;
             out_result_set->row_count = result_count;
@@ -977,14 +979,14 @@ app_execute_query_capture(Arena* arena, String8 sql_query, GDB_Database** io_dat
             out_result_set->cell_text = push_array(arena, String8, Max(out_column_count * Max(result_count, 1), 1));
             out_result_set->cell_is_null = push_array(arena, B32, Max(out_column_count * Max(result_count, 1), 1));
             out_result_set->cell_numeric = push_array(arena, F64, Max(out_column_count * Max(result_count, 1), 1));
-
+            
             U64 name_i = 0;
             for (IR_Node* column_node = select_output_columns->first; column_node != NULL; column_node = column_node->next, name_i++)
             {
               out_result_set->columns[name_i].name = push_str8_copy(arena, qe_column_list_item_display_name(arena, column_node));
             }
           }
-
+          
           if (result.is_materialized)
           {
             if (capture_structured)
@@ -1001,7 +1003,7 @@ app_execute_query_capture(Arena* arena, String8 sql_query, GDB_Database** io_dat
                 out_result_set->columns[col_i].type = col_type;
               }
             }
-
+            
             for (U64 i = 0; i < result_count; i++)
             {
               U64 col_i = 0;
@@ -1017,9 +1019,9 @@ app_execute_query_capture(Arena* arena, String8 sql_query, GDB_Database** io_dat
                     break;
                   }
                 }
-
+                
                 U64 cell_i = i * out_column_count + col_i;
-
+                
                 if (!col)
                 {
                   APP_EMIT("? ");
@@ -1099,7 +1101,7 @@ app_execute_query_capture(Arena* arena, String8 sql_query, GDB_Database** io_dat
                 gathered[ci].numeric_values = qe_gather_numeric_column(scratch.arena, &result.rows, table_slot, column);
               }
             }
-
+            
             if (capture_structured)
             {
               for (U64 c = 0; c < column_count; c++)
@@ -1107,21 +1109,21 @@ app_execute_query_capture(Arena* arena, String8 sql_query, GDB_Database** io_dat
                 out_result_set->columns[c].type = gathered[c].resolved ? gathered[c].type : GDB_ColumnType_String8;
               }
             }
-
+            
             for (U64 i = 0; i < result_count; i++)
             {
               ci = 0;
               for (IR_Node* column_node = select_output_columns->first; column_node != NULL; column_node = column_node->next, ci++)
               {
                 U64 cell_i = i * column_count + ci;
-
+                
                 if (!gathered[ci].resolved)
                 {
                   APP_EMIT("? ");
                   if (capture_structured) { out_result_set->cell_is_null[cell_i] = 1; }
                   continue;
                 }
-
+                
                 U64 row_index = result.rows.row_indices[gathered[ci].table_slot][i];
                 if (row_index == PLAN_NULL_ROW || gdb_column_is_null(gathered[ci].column, row_index))
                 {
@@ -1129,7 +1131,7 @@ app_execute_query_capture(Arena* arena, String8 sql_query, GDB_Database** io_dat
                   if (capture_structured) { out_result_set->cell_is_null[cell_i] = 1; }
                   continue;
                 }
-
+                
                 switch (gathered[ci].type)
                 {
                   case GDB_ColumnType_U32:
@@ -1198,13 +1200,6 @@ app_execute_query_capture(Arena* arena, String8 sql_query, GDB_Database** io_dat
     String8 database_filepath = push_str8f(arena, "gdb_data/%.*s", (U32)database->name.size, database->name.str);
     gdb_database_save(database, database_filepath);
   }
-  
-  //String8 table_filepath = push_str8f(arena, "gdb_data/benchmark/%.*s/", str8_varg(database->tables[0]->name));
-  //gdb_table_save(database->tables[0], table_filepath);
-  
-  //gdb_table_export_csv(database->tables[0], str8_lit("data/output.csv"));
-  
-  //test_print_database(database);
   
   result.output_text = str8_list_join(arena, &out, &(StringJoin){0});
   

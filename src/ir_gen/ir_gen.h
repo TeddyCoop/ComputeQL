@@ -1,5 +1,3 @@
-/* date = February 4th 2025 11:03 pm */
-
 #ifndef IR_GEN_H
 #define IR_GEN_H
 

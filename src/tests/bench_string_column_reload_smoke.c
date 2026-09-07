@@ -1,17 +1,9 @@
-// string8 column persistence regression test:
-//
-// once a string8 column's saved .dat file grows past GDB_DISK_BACKED_THRESHOLD_SIZE (its reserved
-// data-blob capacity pads the file well beyond the handful of bytes actually used), reloading the
-// table marks that column disk-backed. appending a new row after such a reload used to write the
-// new string past the real end of the existing data and record a garbage end-offset for it,
-// producing a huge run of zero bytes ahead of the new (or a later) row's content. see
-// gdb_table_load's disk-backed String8 branch in gdb.c.
-
 #define BUILD_ENTRY_DEFINING_UNIT 1
 #define BUILD_CONSOLE_INTERFACE 1
 #define PROFILE_CUSTOM 1
 #define ARENA_FREE_LIST 1
 #define GPU_MAX_BUFFER_SIZE GB(2)
+#define GDB_DISK_BACKED_THRESHOLD_SIZE KB(4)
 
 #include "base/base_inc.h"
 #include "os/os_inc.h"

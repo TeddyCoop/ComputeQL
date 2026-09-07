@@ -1,5 +1,3 @@
-/* date = February 5th 2025 4:20 pm */
-
 #ifndef SQL_PARSER_H
 #define SQL_PARSER_H
 

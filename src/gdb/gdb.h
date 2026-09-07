@@ -47,7 +47,7 @@
 #endif
 
 #ifndef GDB_DISK_BACKED_THRESHOLD_SIZE
-#define GDB_DISK_BACKED_THRESHOLD_SIZE KB(4)
+#define GDB_DISK_BACKED_THRESHOLD_SIZE MB(64)
 #endif
 
 // tec: reserved name for the column catalog table
