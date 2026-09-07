@@ -1,5 +1,3 @@
-/* date = January 25th 2025 11:47 am */
-
 #ifndef GDB_H
 #define GDB_H
 
@@ -49,6 +47,12 @@
 #ifndef GDB_DISK_BACKED_THRESHOLD_SIZE
 #define GDB_DISK_BACKED_THRESHOLD_SIZE MB(64)
 #endif
+
+global U64 g_gdb_disk_backed_threshold_size = GDB_DISK_BACKED_THRESHOLD_SIZE;
+global U64 g_gdb_column_expand_count = GDB_COLUMN_EXPAND_COUNT;
+global U64 g_gdb_column_variable_capacity_alloc_size = GDB_COLUMN_VARIABLE_CAPACITY_ALLOC_SIZE;
+global U64 g_gdb_column_max_grow_by_size = GDB_COLUMN_MAX_GROW_BY_SIZE;
+global F64 g_gdb_table_expand_factor = GDB_TABLE_EXPAND_FACTOR;
 
 // tec: reserved name for the column catalog table
 #define GDB_COLUMN_CATALOG_TABLE_NAME str8_lit("column_catalog")
@@ -114,25 +118,25 @@ struct GDB_Column
   // tec: data storage
   U8 *data;
   U64 *offsets;
-
+  
   // tec: NULL tracking
   U8* null_flags;
   U64 null_flags_capacity;
-
+  
   //- tec: constraints, single-column only
   B32 not_null;        // tec: NOT NULL or PRIMARY KEY
   B32 is_unique;       // tec: UNIQUE or PRIMARY KEY
   B32 is_primary_key;  // tec: implies not_null && is_unique
-
+  
   B32 has_foreign_key;
   String8 fk_ref_table_name;
   String8 fk_ref_column_name;
-
+  
   // tec: CHECK(...), check_text is saved and reparsed into check_expr on table load
   B32 has_check;
   String8 check_text;
   IR_Node* check_expr;
-
+  
   //- tec: io
   B32 is_disk_backed;
   B32 disk_backed_offset_initialized;
@@ -146,7 +150,7 @@ struct GDB_Column
   Rng1U64 current_mapped_range;
   U64 write_generation;
   U64 mapped_generation;
-
+  
   GDB_Table* parent_table;
 };
 
@@ -156,7 +160,7 @@ struct GDB_Index
   String8 name;
   String8 column_name;
   GDB_Column* column;
-
+  
   U64* order;
   U64 order_count;
   U64 order_capacity;
@@ -165,17 +169,17 @@ struct GDB_Index
 struct GDB_Table
 {
   Arena* arena;
-
+  
   String8 name;
   U64 column_count;
   U64 column_capacity;
   U64 row_count;
   GDB_Column** columns;
-
+  
   U64 index_count;
   U64 index_capacity;
   GDB_Index** indexes;
-
+  
   GDB_Database* parent_database;
 };
 

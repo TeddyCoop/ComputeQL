@@ -18,10 +18,14 @@ gpu_vulkan_debug_callback(VkDebugUtilsMessageSeverityFlagBitsEXT severity, VkDeb
   return VK_FALSE;
 }
 
+#ifndef GDB_VULKAN_VALIDATION
+#define GDB_VULKAN_VALIDATION 0
+#endif
+
 internal B32
 gpu_vulkan_validation_requested(void)
 {
-  return 1;
+  return settings_bool(str8_lit("GDB_VULKAN_VALIDATION"), GDB_VULKAN_VALIDATION);
 }
 
 internal U32

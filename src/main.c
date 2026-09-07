@@ -8,6 +8,7 @@
 
 #include "base/base_inc.h"
 #include "os/os_inc.h"
+#include "settings/settings.h"
 #include "gdb/gdb_inc.h"
 #include "ir_gen/ir_gen_inc.h"
 #include "gpu/gpu_inc.h"
@@ -22,6 +23,7 @@
 
 #include "base/base_inc.c"
 #include "os/os_inc.c"
+#include "settings/settings.c"
 #include "gpu/gpu_inc.c"
 #include "ir_gen/ir_gen_inc.c"
 #include "gdb/gdb_inc.c"
@@ -50,13 +52,13 @@ entry_point(CmdLine* cmdline)
   
   log_alloc();
   g_query_exec_mutex = os_mutex_alloc();
-
+  
   String8 query_str = cmd_line_string(cmdline, str8_lit("query"));
   B32 valid_query = query_str.size != 0;
   B32 should_serve = cmd_line_has_flag(cmdline, str8_lit("serve"));
   B32 should_serve_pg = cmd_line_has_flag(cmdline, str8_lit("serve-pg"));
   String8 connect_str = cmd_line_string(cmdline, str8_lit("connect"));
-
+  
   if (connect_str.size != 0)
   {
     // tec: pure network client so no local database/GPU state needed
@@ -68,26 +70,26 @@ entry_point(CmdLine* cmdline)
     {
       Temp scratch = scratch_begin(0, 0);
       String8List connect_parts = str8_split_by_string_chars(scratch.arena, connect_str, str8_lit(":"), 0);
-
+      
       if (connect_parts.first && connect_parts.first->next)
       {
         String8 host = connect_parts.first->string;
         U16 port = (U16)u64_from_str8(connect_parts.first->next->string, 10);
-
+        
         if (valid_query) 
-		{ 
-	      client_run_one_shot(host, port, query_str); 
-		}
+        { 
+          client_run_one_shot(host, port, query_str); 
+        }
         else
-		{ 
-	      client_run_interactive(host, port);
-		}
+        { 
+          client_run_interactive(host, port);
+        }
       }
       else
       {
         log_error("--connect expects host:port");
       }
-
+      
       scratch_end(scratch);
     }
   }
@@ -100,18 +102,26 @@ entry_point(CmdLine* cmdline)
         os_make_directory(str8_lit("gdb_data/"));
       }
     }
-
+    
+    String8 settings_path = cmd_line_string(cmdline, str8_lit("settings"));
+    if (settings_path.size == 0)
+    { 
+      settings_path = str8_lit("settings.cfg"); 
+    }
+    settings_init();
+    settings_load_from_file(settings_path);
+    
     gdb_init();
-
+    
     String8 gpu_backend_str = cmd_line_string(cmdline, str8_lit("gpu"));
     if (gpu_backend_str.size != 0)
     {
       gpu_request_backend(gpu_backend_str);
     }
     gpu_init();
-
+    
     log_info("total gpu memory: %llu (MB)", gpu_device_total_memory() >> 20);
-
+    
     if (should_serve || should_serve_pg)
     {
       if (!os_net_init())
@@ -122,13 +132,13 @@ entry_point(CmdLine* cmdline)
       {
         String8 port_str = cmd_line_string(cmdline, str8_lit("serve"));
         U16 port = port_str.size ? (U16)u64_from_str8(port_str, 10) : 5432;
-
+        
         OS_Handle custom_thread = os_thread_launch(main_custom_server_thread_proc, &port, 0);
         os_thread_detach(custom_thread);
-
+        
         String8 pg_port_str = cmd_line_string(cmdline, str8_lit("serve-pg"));
         U16 pg_port = pg_port_str.size ? (U16)u64_from_str8(pg_port_str, 10) : 5432;
-
+        
         // tec: blocking accept loop, does not return for now
         server_run_pg(pg_port);
       }
@@ -136,7 +146,7 @@ entry_point(CmdLine* cmdline)
       {
         String8 port_str = cmd_line_string(cmdline, str8_lit("serve"));
         U16 port = port_str.size ? (U16)u64_from_str8(port_str, 10) : 5432;
-
+        
         // tec: blocking accept loop, does not return for now
         server_run(port);
       }
@@ -144,7 +154,7 @@ entry_point(CmdLine* cmdline)
       {
         String8 pg_port_str = cmd_line_string(cmdline, str8_lit("serve-pg"));
         U16 pg_port = pg_port_str.size ? (U16)u64_from_str8(pg_port_str, 10) : 5432;
-
+        
         // tec: blocking accept loop, does not return for now
         server_run_pg(pg_port);
       }
@@ -158,7 +168,7 @@ entry_point(CmdLine* cmdline)
       log_info("invalid query %.*s", str8_varg(query_str));
     }
   }
-
+  
   ProfEnd();
   ProfEndCapture();
   log_release();

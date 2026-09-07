@@ -6,6 +6,7 @@
 
 #include "base/base_inc.h"
 #include "os/os_inc.h"
+#include "settings/settings.h"
 #include "gdb/gdb_inc.h"
 #include "ir_gen/ir_gen_inc.h"
 #include "gpu/gpu_inc.h"
@@ -16,6 +17,7 @@
 
 #include "base/base_inc.c"
 #include "os/os_inc.c"
+#include "settings/settings.c"
 #include "gpu/gpu_inc.c"
 #include "ir_gen/ir_gen_inc.c"
 #include "gdb/gdb_inc.c"

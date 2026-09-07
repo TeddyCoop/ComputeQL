@@ -44,6 +44,9 @@ if %RELEASE%==1   set compile=%compile_release%
 if not exist build mkdir build
 if not exist build\shaders mkdir build\shaders
 
+:: copy settings to build
+copy /y settings.cfg build\settings.cfg > NUL
+
 :: build
 pushd build
 %compile% ..\src\main.c %compile_link% %out%gdb.exe|| exit /b 1
