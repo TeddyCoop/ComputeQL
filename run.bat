@@ -1,4 +1,4 @@
 @echo off
 pushd build
-call gdb.exe --query=""
+call gdb.exe --gpu="vulkan" --query=""
 popd
