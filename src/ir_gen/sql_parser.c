@@ -2051,6 +2051,38 @@ sql_parse_alter_clause(SQL_ParseCtx *ctx)
       type_node->parent = operation_node;
       operation_node->first->next = type_node;
       
+      // tec: optional (precision[, scale]) type arguments
+      if (sql_check(ctx, SQL_TokenType_Symbol, str8_lit("(")))
+      {
+        sql_advance(ctx, 1); // tec: move past '('
+        
+        if (!sql_check(ctx, SQL_TokenType_Number, (String8){0}))
+        {
+          sql_parse_error_at(sql_ctx_error_range(ctx),
+                             "expected precision after '(' in column type, found '%.*s'",
+                             str8_varg(sql_ctx_text_or_eof(ctx)));
+          return NULL;
+        }
+        SQL_Node* precision_node = push_array(ctx->arena, SQL_Node, 1);
+        precision_node->type = SQL_NodeType_Numeric;
+        precision_node->value = sql_take(ctx).value;
+        precision_node->parent = type_node;
+        type_node->first = type_node->last = precision_node;
+        
+        if (sql_match(ctx, SQL_TokenType_Symbol, str8_lit(",")))
+        {
+          if (!sql_check(ctx, SQL_TokenType_Number, (String8){0}))
+          {
+            sql_parse_error_at(sql_ctx_error_range(ctx),
+                               "expected scale after ',' in column type, found '%.*s'",
+                               str8_varg(sql_ctx_text_or_eof(ctx)));
+            return NULL;
+          }
+          SQL_Node* scale_node = push_array(ctx->arena, SQL_Node, 1);
+          scale_node->type = SQL_NodeType_Numeric;
+          scale_node->value = sql_take(ctx).value;
+          scale_node->parent = type_node;
+          DLLPushBack(type_node->first, type_node->last, scale_node);
         }
         
         if (!sql_match(ctx, SQL_TokenType_Symbol, str8_lit(")")))
