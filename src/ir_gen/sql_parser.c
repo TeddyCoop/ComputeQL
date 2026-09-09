@@ -116,9 +116,15 @@ sql_tokenize_from_text(Arena* arena, String8 text)
       
       pos++;
     }
-    else if (char_is_digit(text.str[pos], 10))
+    else if (char_is_digit(text.str[pos], 10) ||
+             (text.str[pos] == '-' && pos + 1 < text.size && char_is_digit(text.str[pos + 1], 10)))
     {
       B32 has_dot = 0;
+      
+      if (text.str[pos] == '-')
+      {
+        pos++;
+      }
       
       while (pos < text.size && (char_is_digit(text.str[pos], 10) || (!has_dot && text.str[pos] == '.')))
       {
@@ -1508,7 +1514,7 @@ sql_parse_create_clause(SQL_ParseCtx *ctx)
       column_node->value = sql_take(ctx).value;
       
       // tec: expect column type
-      if (!sql_check(ctx, SQL_TokenType_Keyword, (String8){0}))
+      if (!sql_check(ctx, SQL_TokenType_Keyword, (String8){0}) && !sql_check(ctx, SQL_TokenType_Identifier, (String8){0}))
       {
         sql_parse_error_at(sql_ctx_error_range(ctx),
                            "expected column type in 'create table' statement, found '%.*s'",
@@ -1519,6 +1525,49 @@ sql_parse_create_clause(SQL_ParseCtx *ctx)
       SQL_Node* type_node = push_array(ctx->arena, SQL_Node, 1);
       type_node->type = SQL_NodeType_Type;
       type_node->value = sql_take(ctx).value;
+      
+      // tec: optional (precision[, scale]) type arguments
+      if (sql_check(ctx, SQL_TokenType_Symbol, str8_lit("(")))
+      {
+        sql_advance(ctx, 1); // tec: move past '('
+        
+        if (!sql_check(ctx, SQL_TokenType_Number, (String8){0}))
+        {
+          sql_parse_error_at(sql_ctx_error_range(ctx),
+                             "expected precision after '(' in column type, found '%.*s'",
+                             str8_varg(sql_ctx_text_or_eof(ctx)));
+          return NULL;
+        }
+        SQL_Node* precision_node = push_array(ctx->arena, SQL_Node, 1);
+        precision_node->type = SQL_NodeType_Numeric;
+        precision_node->value = sql_take(ctx).value;
+        precision_node->parent = type_node;
+        type_node->first = type_node->last = precision_node;
+        
+        if (sql_match(ctx, SQL_TokenType_Symbol, str8_lit(",")))
+        {
+          if (!sql_check(ctx, SQL_TokenType_Number, (String8){0}))
+          {
+            sql_parse_error_at(sql_ctx_error_range(ctx),
+                               "expected scale after ',' in column type, found '%.*s'",
+                               str8_varg(sql_ctx_text_or_eof(ctx)));
+            return NULL;
+          }
+          SQL_Node* scale_node = push_array(ctx->arena, SQL_Node, 1);
+          scale_node->type = SQL_NodeType_Numeric;
+          scale_node->value = sql_take(ctx).value;
+          scale_node->parent = type_node;
+          DLLPushBack(type_node->first, type_node->last, scale_node);
+        }
+        
+        if (!sql_match(ctx, SQL_TokenType_Symbol, str8_lit(")")))
+        {
+          sql_parse_error_at(sql_ctx_error_range(ctx),
+                             "expected closing ')' after column type arguments, found '%.*s'",
+                             str8_varg(sql_ctx_text_or_eof(ctx)));
+          return NULL;
+        }
+      }
       
       column_node->first = type_node;
       column_node->last = type_node;
@@ -1767,10 +1816,94 @@ sql_parse_create_clause(SQL_ParseCtx *ctx)
       return NULL;
     }
   }
+  else if (str8_match(keyword, str8_lit("type"), StringMatchFlag_CaseInsensitive))
+  {
+    // tec: CREATE TYPE name AS ENUM
+    if (!sql_check(ctx, SQL_TokenType_Identifier, (String8){0}))
+    {
+      sql_parse_error_at(sql_ctx_error_range(ctx),
+                         "expected type name in 'create type' statement, found '%.*s'",
+                         str8_varg(sql_ctx_text_or_eof(ctx)));
+      return NULL;
+    }
+    
+    SQL_Node* enum_def_node = push_array(ctx->arena, SQL_Node, 1);
+    enum_def_node->type = SQL_NodeType_EnumDef;
+    enum_def_node->value = sql_take(ctx).value;
+    
+    create_node->first = enum_def_node;
+    create_node->last = enum_def_node;
+    enum_def_node->parent = create_node;
+    
+    if (!sql_match(ctx, SQL_TokenType_Keyword, str8_lit("as")))
+    {
+      sql_parse_error_at(sql_ctx_error_range(ctx),
+                         "expected 'as' in 'create type' statement, found '%.*s'",
+                         str8_varg(sql_ctx_text_or_eof(ctx)));
+      return NULL;
+    }
+    if (!sql_match(ctx, SQL_TokenType_Keyword, str8_lit("enum")))
+    {
+      sql_parse_error_at(sql_ctx_error_range(ctx),
+                         "expected 'enum' after 'as' in 'create type' statement, found '%.*s'",
+                         str8_varg(sql_ctx_text_or_eof(ctx)));
+      return NULL;
+    }
+    if (!sql_match(ctx, SQL_TokenType_Symbol, str8_lit("(")))
+    {
+      sql_parse_error_at(sql_ctx_error_range(ctx),
+                         "expected '(' after 'enum' in 'create type' statement, found '%.*s'",
+                         str8_varg(sql_ctx_text_or_eof(ctx)));
+      return NULL;
+    }
+    
+    SQL_Node* prev_value = NULL;
+    for (;;)
+    {
+      if (!sql_check(ctx, SQL_TokenType_String, (String8){0}))
+      {
+        sql_parse_error_at(sql_ctx_error_range(ctx),
+                           "expected a string label in 'create type ... as enum' statement, found '%.*s'",
+                           str8_varg(sql_ctx_text_or_eof(ctx)));
+        return NULL;
+      }
+      
+      SQL_Node* value_node = push_array(ctx->arena, SQL_Node, 1);
+      value_node->type = SQL_NodeType_EnumValue;
+      value_node->value = sql_take(ctx).value;
+      value_node->parent = enum_def_node;
+      
+      if (!enum_def_node->first)
+      { 
+        enum_def_node->first = value_node;
+      }
+      if (prev_value) 
+      {
+        prev_value->next = value_node;
+        value_node->prev = prev_value; 
+      }
+      prev_value = value_node;
+      
+      if (sql_match(ctx, SQL_TokenType_Symbol, str8_lit(",")))
+      {
+        continue;
+      }
+      break;
+    }
+    enum_def_node->last = prev_value;
+    
+    if (!sql_match(ctx, SQL_TokenType_Symbol, str8_lit(")")))
+    {
+      sql_parse_error_at(sql_ctx_error_range(ctx),
+                         "expected closing ')' in 'create type' statement, found '%.*s'",
+                         str8_varg(sql_ctx_text_or_eof(ctx)));
+      return NULL;
+    }
+  }
   else
   {
     sql_parse_error_at(keyword_tok.range,
-                       "unexpected keyword '%.*s' in 'create' statement, expected 'table', 'database', or 'index'",
+                       "unexpected keyword '%.*s' in 'create' statement, expected 'table', 'database', 'index', or 'type'",
                        str8_varg(keyword));
     return NULL;
   }
@@ -1909,13 +2042,25 @@ sql_parse_alter_clause(SQL_ParseCtx *ctx)
     operation_node->first = column_node;
     
     // tec: optional column type
-    if (sql_check(ctx, SQL_TokenType_Keyword, (String8){0}))
+    if (sql_check(ctx, SQL_TokenType_Keyword, (String8){0}) || sql_check(ctx, SQL_TokenType_Identifier, (String8){0}))
     {
       SQL_Node* type_node = push_array(ctx->arena, SQL_Node, 1);
       type_node->type = SQL_NodeType_Type;
-      type_node->value = sql_take(ctx).value; // tec: move past column type
+      // tec: move past column type
+      type_node->value = sql_take(ctx).value; 
       type_node->parent = operation_node;
       operation_node->first->next = type_node;
+      
+        }
+        
+        if (!sql_match(ctx, SQL_TokenType_Symbol, str8_lit(")")))
+        {
+          sql_parse_error_at(sql_ctx_error_range(ctx),
+                             "expected closing ')' after column type arguments, found '%.*s'",
+                             str8_varg(sql_ctx_text_or_eof(ctx)));
+          return NULL;
+        }
+      }
     }
   }
   else if (sql_check(ctx, SQL_TokenType_Keyword, str8_lit("drop")))
@@ -1937,7 +2082,8 @@ sql_parse_alter_clause(SQL_ParseCtx *ctx)
       return NULL;
     }
     operation_node->type = SQL_NodeType_Alter_DropColumn;
-    operation_node->value = sql_take(ctx).value; // tec: move past column name
+    // tec: move past column name
+    operation_node->value = sql_take(ctx).value; 
   }
   else if (sql_check(ctx, SQL_TokenType_Keyword, str8_lit("rename")))
   {
@@ -1958,7 +2104,8 @@ sql_parse_alter_clause(SQL_ParseCtx *ctx)
       return NULL;
     }
     operation_node->type = SQL_NodeType_Alter_Rename;
-    operation_node->value = sql_take(ctx).value; // tec: move past new table name
+    // tec: move past new table name
+    operation_node->value = sql_take(ctx).value; 
   }
   else
   {
@@ -2003,8 +2150,13 @@ sql_parse_values_clause(SQL_ParseCtx *ctx)
       SQL_Token tok = sql_peek(ctx, 0);
       B32 is_null_token = tok.type == SQL_TokenType_Keyword &&
         str8_match(tok.value, str8_lit("null"), StringMatchFlag_CaseInsensitive);
+      B32 is_true_token = tok.type == SQL_TokenType_Keyword &&
+        str8_match(tok.value, str8_lit("true"), StringMatchFlag_CaseInsensitive);
+      B32 is_false_token = tok.type == SQL_TokenType_Keyword &&
+        str8_match(tok.value, str8_lit("false"), StringMatchFlag_CaseInsensitive);
       
-      if (tok.type != SQL_TokenType_Number && tok.type != SQL_TokenType_String && !is_null_token)
+      if (tok.type != SQL_TokenType_Number && tok.type != SQL_TokenType_String &&
+          !is_null_token && !is_true_token && !is_false_token)
       {
         sql_parse_error_at(tok.range,
                            "expected a literal value in 'values' clause, found '%.*s'",
@@ -2013,9 +2165,10 @@ sql_parse_values_clause(SQL_ParseCtx *ctx)
       }
       
       SQL_Node* value_node = push_array(ctx->arena, SQL_Node, 1);
+      // tec: convert TRUE/FALSE to 1/0
       value_node->type = is_null_token ? SQL_NodeType_Null :
-      (tok.type == SQL_TokenType_Number ? SQL_NodeType_Numeric : SQL_NodeType_Literal);
-      value_node->value = tok.value;
+      ((is_true_token || is_false_token || tok.type == SQL_TokenType_Number) ? SQL_NodeType_Numeric : SQL_NodeType_Literal);
+      value_node->value = is_true_token ? str8_lit("1") : is_false_token ? str8_lit("0") : tok.value;
       sql_advance(ctx, 1);
       
       if (!value_group->first)
@@ -2257,6 +2410,18 @@ sql_parse_expression(SQL_ParseCtx *ctx)
     return node;
   }
   
+  if (token.type == SQL_TokenType_Keyword &&
+      (str8_match(token.value, str8_lit("true"), StringMatchFlag_CaseInsensitive) ||
+       str8_match(token.value, str8_lit("false"), StringMatchFlag_CaseInsensitive)))
+  {
+    B32 is_true = str8_match(token.value, str8_lit("true"), StringMatchFlag_CaseInsensitive);
+    SQL_Node *node = push_array(ctx->arena, SQL_Node, 1);
+    node->type = SQL_NodeType_Numeric;
+    node->value = is_true ? str8_lit("1") : str8_lit("0");
+    sql_advance(ctx, 1);
+    return node;
+  }
+  
   sql_parse_error_at(token.range, "unexpected token '%.*s' in expression", str8_varg(token.value));
   return NULL;
 }
@@ -2274,6 +2439,8 @@ sql_node_type_to_string(SQL_NodeType type)
     case SQL_NodeType_Use: result = str8_lit("SQL_NodeType_Use"); break;
     case SQL_NodeType_Describe: result = str8_lit("SQL_NodeType_Describe"); break;
     case SQL_NodeType_Explain: result = str8_lit("SQL_NodeType_Explain"); break;
+    case SQL_NodeType_EnumDef: result = str8_lit("SQL_NodeType_EnumDef"); break;
+    case SQL_NodeType_EnumValue: result = str8_lit("SQL_NodeType_EnumValue"); break;
     case SQL_NodeType_Select: result = str8_lit("SQL_NodeType_Select"); break;
     case SQL_NodeType_Column: result = str8_lit("SQL_NodeType_Column"); break;
     case SQL_NodeType_ColumnList: result = str8_lit("SQL_NodeType_ColumnList"); break;

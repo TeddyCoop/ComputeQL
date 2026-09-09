@@ -11,6 +11,7 @@ patterns = {
 "*.mdesk",
 "*.hlsl",
 "*.gdb",
+"*.comp"
 };
 blacklist_patterns = {
 ".*",

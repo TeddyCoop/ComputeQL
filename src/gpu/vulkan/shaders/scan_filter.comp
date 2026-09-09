@@ -27,6 +27,13 @@ layout(local_size_x = 256) in;
 #define COLTYPE_U64      2
 #define COLTYPE_F32      3
 #define COLTYPE_F64      4
+#define COLTYPE_BOOL      6
+#define COLTYPE_I32       7
+#define COLTYPE_I64       8
+#define COLTYPE_DATE      9
+#define COLTYPE_TIMESTAMP 10
+#define COLTYPE_DECIMAL   11
+#define COLTYPE_ENUM      12
 
 #define MAX_STACK 16
 
@@ -98,7 +105,7 @@ read_str_offset(uint offsets_slot, uint row)
 double
 read_num_column_value(uint slot, uint coltype, uint row)
 {
-  if (coltype == COLTYPE_U32)
+  if (coltype == COLTYPE_U32 || coltype == COLTYPE_ENUM)
   {
     return double(read_col_word(slot, row));
   }
@@ -112,11 +119,27 @@ read_num_column_value(uint slot, uint coltype, uint row)
   {
     return double(uintBitsToFloat(read_col_word(slot, row)));
   }
-  else // COLTYPE_F64
+  else if (coltype == COLTYPE_F64)
   {
     uint lo = read_col_word(slot, row * 2u + 0u);
     uint hi = read_col_word(slot, row * 2u + 1u);
     return packDouble2x32(uvec2(lo, hi));
+  }
+  else if (coltype == COLTYPE_BOOL)
+  {
+    return double(read_col_byte(slot, row));
+  }
+  else if (coltype == COLTYPE_I32 || coltype == COLTYPE_DATE)
+  {
+    return double(int(read_col_word(slot, row)));
+  }
+  else // COLTYPE_I64, COLTYPE_TIMESTAMP, or COLTYPE_DECIMAL
+  {
+    uint lo = read_col_word(slot, row * 2u + 0u);
+    uint hi = read_col_word(slot, row * 2u + 1u);
+    double unsigned_value = double(hi) * 4294967296.0LF + double(lo);
+    bool is_negative = (hi & 0x80000000u) != 0u;
+    return is_negative ? unsigned_value - 18446744073709551616.0LF : unsigned_value;
   }
 }
 
@@ -139,9 +162,7 @@ str_eq(uint slot, uint row, uint const_word_offset, uint const_len)
   return true;
 }
 
-// tec: defensive cap on string length considered by the byte-scan loops below - protects against
-// a corrupt/underflowed offset pair turning a single row's scan into a multi-billion iteration
-// loop
+// tec: defensive cap on string length considered by the byte-scan loops below
 #define MAX_SANE_STRING_LEN 1048576u
 
 bool
@@ -184,9 +205,7 @@ main()
   uint ip = 0u;
   bool running = true;
 
-  // tec: defensive bound on both the instruction pointer and total steps taken - guards against
-  // a corrupt/malformed bytecode stream (or a bug in a comparator) turning into a driver-hanging
-  // infinite loop instead of a clean early exit.
+  // tec: defensive bound on both the instruction pointer and total steps taken
   uint bytecode_word_count = bytecode.length();
   uint steps = 0u;
 
@@ -223,15 +242,61 @@ main()
         stack[sp++] = packDouble2x32(uvec2(lo, hi));
       } break;
 
-      case OP_CMP_EQ: { double b = stack[--sp]; double a = stack[--sp]; stack[sp++] = (a == b) ? 1.0LF : 0.0LF; } break;
-      case OP_CMP_NE: { double b = stack[--sp]; double a = stack[--sp]; stack[sp++] = (a != b) ? 1.0LF : 0.0LF; } break;
-      case OP_CMP_LT: { double b = stack[--sp]; double a = stack[--sp]; stack[sp++] = (a <  b) ? 1.0LF : 0.0LF; } break;
-      case OP_CMP_GT: { double b = stack[--sp]; double a = stack[--sp]; stack[sp++] = (a >  b) ? 1.0LF : 0.0LF; } break;
-      case OP_CMP_LE: { double b = stack[--sp]; double a = stack[--sp]; stack[sp++] = (a <= b) ? 1.0LF : 0.0LF; } break;
-      case OP_CMP_GE: { double b = stack[--sp]; double a = stack[--sp]; stack[sp++] = (a >= b) ? 1.0LF : 0.0LF; } break;
+      case OP_CMP_EQ:
+			{ 
+				double b = stack[--sp]; 
+				double a = stack[--sp]; 
+				stack[sp++] = (a == b) ? 1.0LF : 0.0LF; 
+			} break;
 
-      case OP_AND: { double b = stack[--sp]; double a = stack[--sp]; stack[sp++] = (a != 0.0LF && b != 0.0LF) ? 1.0LF : 0.0LF; } break;
-      case OP_OR:  { double b = stack[--sp]; double a = stack[--sp]; stack[sp++] = (a != 0.0LF || b != 0.0LF) ? 1.0LF : 0.0LF; } break;
+      case OP_CMP_NE: 
+			{ 
+				double b = stack[--sp]; 
+				double a = stack[--sp]; 
+				stack[sp++] = (a != b) ? 1.0LF : 0.0LF; 
+			} break;
+
+      case OP_CMP_LT: 
+			{ 
+				double b = stack[--sp]; 
+				double a = stack[--sp]; 
+				stack[sp++] = (a <  b) ? 1.0LF : 0.0LF; 
+			} break;
+
+      case OP_CMP_GT:
+			{ 
+				double b = stack[--sp]; 
+				double a = stack[--sp]; 
+				stack[sp++] = (a >  b) ? 1.0LF : 0.0LF; 
+			} break;
+
+      case OP_CMP_LE: 
+			{ 
+				double b = stack[--sp];
+				double a = stack[--sp]; 
+				stack[sp++] = (a <= b) ? 1.0LF : 0.0LF; 
+			} break;
+
+      case OP_CMP_GE:
+		  {
+				double b = stack[--sp]; 
+				double a = stack[--sp]; 
+				stack[sp++] = (a >= b) ? 1.0LF : 0.0LF;
+			} break;
+
+      case OP_AND: 
+			{ 
+				double b = stack[--sp]; 
+				double a = stack[--sp]; 
+				stack[sp++] = (a != 0.0LF && b != 0.0LF) ? 1.0LF : 0.0LF; 
+			} break;
+
+      case OP_OR:  
+			{ 
+				double b = stack[--sp]; 
+				double a = stack[--sp]; 
+				stack[sp++] = (a != 0.0LF || b != 0.0LF) ? 1.0LF : 0.0LF; 
+			} break;
 
       case OP_STR_EQ:
       {

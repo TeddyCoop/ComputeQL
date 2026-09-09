@@ -141,6 +141,61 @@ gdb_database_replace_table(GDB_Database* database, GDB_Table* new_table)
   gdb_database_add_table(database, new_table);
 }
 
+internal void
+gdb_database_add_enum_type(GDB_Database* database, GDB_EnumType* enum_type)
+{
+  if (database->enum_type_count == 0)
+  {
+    database->enum_types = push_array(database->arena, GDB_EnumType*, 2);
+    database->enum_type_capacity = 2;
+  }
+  else if (database->enum_type_count >= database->enum_type_capacity)
+  {
+    U64 new_capacity = database->enum_type_capacity * 2;
+    GDB_EnumType** new_enum_types = push_array(database->arena, GDB_EnumType*, new_capacity);
+    MemoryCopy(new_enum_types, database->enum_types, sizeof(GDB_EnumType*) * database->enum_type_count);
+    database->enum_types = new_enum_types;
+    database->enum_type_capacity = new_capacity;
+  }
+  
+  database->enum_types[database->enum_type_count++] = enum_type;
+}
+
+internal GDB_EnumType*
+gdb_database_find_enum_type(GDB_Database* database, String8 name)
+{
+  if (!database) return NULL;
+  for (U64 i = 0; i < database->enum_type_count; i++)
+  {
+    if (str8_match(database->enum_types[i]->name, name, StringMatchFlag_CaseInsensitive))
+    {
+      return database->enum_types[i];
+    }
+  }
+  return NULL;
+}
+
+internal B32
+gdb_enum_type_code_from_label(GDB_EnumType* enum_type, String8 label, U32* out_code)
+{
+  for (U32 i = 0; i < enum_type->value_count; i++)
+  {
+    if (str8_match(enum_type->value_labels[i], label, 0))
+    {
+      *out_code = i;
+      return 1;
+    }
+  }
+  return 0;
+}
+
+internal String8
+gdb_enum_type_label_from_code(GDB_EnumType* enum_type, U32 code)
+{
+  if (code >= enum_type->value_count) return str8_lit("?");
+  return enum_type->value_labels[code];
+}
+
 global String8 g_gdb_database_save_path = str8_lit_comp("gdb_data/");
 
 internal B32
@@ -154,6 +209,53 @@ gdb_database_save(GDB_Database* database, String8 directory)
   {
     log_error("failed to create/open database directory: %s", directory.str);
     return 0;
+  }
+  
+  // tec: enums.meta
+  {
+    U64 meta_size = sizeof(U64);
+    for (U64 i = 0; i < database->enum_type_count; i++)
+    {
+      GDB_EnumType* enum_type = database->enum_types[i];
+      meta_size += sizeof(U64) + enum_type->name.size + sizeof(U32);
+      for (U32 v = 0; v < enum_type->value_count; v++)
+      {
+        meta_size += sizeof(U64) + enum_type->value_labels[v].size;
+      }
+    }
+    
+    U8* meta_buffer = push_array(scratch.arena, U8, meta_size);
+    U8* meta_ptr = meta_buffer;
+    
+    *(U64*)meta_ptr = database->enum_type_count; meta_ptr += sizeof(U64);
+    for (U64 i = 0; i < database->enum_type_count; i++)
+    {
+      GDB_EnumType* enum_type = database->enum_types[i];
+      
+      *(U64*)meta_ptr = enum_type->name.size; meta_ptr += sizeof(U64);
+      MemoryCopy(meta_ptr, enum_type->name.str, enum_type->name.size);
+      meta_ptr += enum_type->name.size;
+      
+      *(U32*)meta_ptr = enum_type->value_count; meta_ptr += sizeof(U32);
+      for (U32 v = 0; v < enum_type->value_count; v++)
+      {
+        String8 label = enum_type->value_labels[v];
+        *(U64*)meta_ptr = label.size; meta_ptr += sizeof(U64);
+        MemoryCopy(meta_ptr, label.str, label.size);
+        meta_ptr += label.size;
+      }
+    }
+    
+    String8 enums_meta_path = push_str8f(scratch.arena, "%.*s/enums.meta", str8_varg(directory));
+    OS_Handle enums_meta_file = os_file_open(OS_AccessFlag_Write, enums_meta_path);
+    if (os_handle_match(os_handle_zero(), enums_meta_file))
+    {
+      log_error("failed to open enums.meta for saving: %.*s", str8_varg(enums_meta_path));
+      ProfEnd();
+      return 0;
+    }
+    os_file_write(enums_meta_file, r1u64(0, meta_size), meta_buffer);
+    os_file_close(enums_meta_file);
   }
   
   for (U64 i = 0; i < database->table_count; i++)
@@ -202,13 +304,75 @@ gdb_database_load(String8 directory_path)
   
   database->name = push_str8_copy(database->arena, str8_skip_last_slash(str8_chop_last_slash(directory_path)));
   
+  // tec: load enums.meta
+  {
+    String8 enums_meta_path = push_str8f(scratch.arena, "%.*senums.meta", str8_varg(directory_path));
+    if (os_file_path_exists(enums_meta_path))
+    {
+      String8 meta_data = os_data_from_file_path(scratch.arena, enums_meta_path);
+      U8* read_ptr = meta_data.str;
+      U8* end_ptr = meta_data.str + meta_data.size;
+      
+      if (read_ptr + sizeof(U64) <= end_ptr)
+      {
+        U64 enum_type_count = *(U64*)read_ptr; read_ptr += sizeof(U64);
+        
+        for (U64 i = 0; i < enum_type_count; i++)
+        {
+          if (read_ptr + sizeof(U64) > end_ptr) break;
+          String8 name = {0};
+          name.size = *(U64*)read_ptr; read_ptr += sizeof(U64);
+          if (read_ptr + name.size > end_ptr) break;
+          name.str = push_array(database->arena, U8, name.size);
+          MemoryCopy(name.str, read_ptr, name.size);
+          read_ptr += name.size;
+          
+          if (read_ptr + sizeof(U32) > end_ptr) 
+          {
+            break;
+          }
+          U32 value_count = *(U32*)read_ptr; read_ptr += sizeof(U32);
+          
+          GDB_EnumType* enum_type = push_array(database->arena, GDB_EnumType, 1);
+          enum_type->name = name;
+          enum_type->value_count = value_count;
+          enum_type->value_labels = push_array(database->arena, String8, Max(value_count, 1));
+          
+          B32 truncated = 0;
+          for (U32 v = 0; v < value_count; v++)
+          {
+            if (read_ptr + sizeof(U64) > end_ptr) 
+            { 
+              truncated = 1; 
+              break; 
+            }
+            String8 label = {0};
+            label.size = *(U64*)read_ptr; read_ptr += sizeof(U64);
+            if (read_ptr + label.size > end_ptr) 
+            { 
+              truncated = 1; 
+              break; 
+            }
+            label.str = push_array(database->arena, U8, label.size);
+            MemoryCopy(label.str, read_ptr, label.size);
+            read_ptr += label.size;
+            enum_type->value_labels[v] = label;
+          }
+          
+          gdb_database_add_enum_type(database, enum_type);
+          if (truncated) break;
+        }
+      }
+    }
+  }
+  
   OS_FileIter* it = os_file_iter_begin(scratch.arena, directory_path, OS_FileIterFlag_SkipFiles);
   U64 idx = 0;
   for(OS_FileInfo info = {0}; idx < 16384 && os_file_iter_next(scratch.arena, it, &info); idx += 1)
   {
     String8 table_dir = push_str8_cat(scratch.arena, directory_path, info.name);
     String8 meta_path = push_str8f(scratch.arena, "%.*s/%.*s.meta", str8_varg(table_dir), str8_varg(info.name));
-    GDB_Table* table = gdb_table_load(table_dir, meta_path);
+    GDB_Table* table = gdb_table_load(database, table_dir, meta_path);
     if (table)
     {
       gdb_database_add_table(database, table);
@@ -445,8 +609,7 @@ gdb_table_save(GDB_Table* table, String8 table_dir)
       meta_size += sizeof(U64) + index->name.size + sizeof(U64) + index->column_name.size;
     }
     
-    // tec: trailing, optional list of columns that have a <column>.null sidecar file
-    // sparse (only lists columns that have ever had a NULL written), so a table with no NULLs at all costs one extra U64(0) here
+    // tec: trailing, optional list of columns that have a <column>.null
     meta_size += sizeof(U64);
     for (U64 i = 0; i < table->column_count; i++)
     {
@@ -455,7 +618,6 @@ gdb_table_save(GDB_Table* table, String8 table_dir)
     }
     
     // tec: trailing, optional per column constraint section
-    //sparse (only columns with at least one constraint)
     meta_size += sizeof(U64);
     for (U64 i = 0; i < table->column_count; i++)
     {
@@ -472,6 +634,24 @@ gdb_table_save(GDB_Table* table, String8 table_dir)
       {
         meta_size += sizeof(U64) + column->check_text.size;
       }
+    }
+    
+    // tec: trailing, optional decimal precision/scale section
+    meta_size += sizeof(U64);
+    for (U64 i = 0; i < table->column_count; i++)
+    {
+      GDB_Column* column = table->columns[i];
+      if (column->type != GDB_ColumnType_Decimal) continue;
+      meta_size += sizeof(U64) + column->name.size + sizeof(U32) + sizeof(U32);
+    }
+    
+    // tec: trailing, optional enum col reference section
+    meta_size += sizeof(U64);
+    for (U64 i = 0; i < table->column_count; i++)
+    {
+      GDB_Column* column = table->columns[i];
+      if (column->type != GDB_ColumnType_Enum || !column->enum_type) continue;
+      meta_size += sizeof(U64) + column->name.size + sizeof(U64) + column->enum_type->name.size;
     }
     
     U8* meta_buffer = push_array(scratch.arena, U8, meta_size);
@@ -509,7 +689,10 @@ gdb_table_save(GDB_Table* table, String8 table_dir)
     U64 null_column_count = 0;
     for (U64 i = 0; i < table->column_count; i++)
     {
-      if (table->columns[i]->null_flags) null_column_count++;
+      if (table->columns[i]->null_flags)
+      {
+        null_column_count++;
+      }
     }
     
     *(U64*)meta_ptr = null_column_count; meta_ptr += sizeof(U64);
@@ -564,6 +747,48 @@ gdb_table_save(GDB_Table* table, String8 table_dir)
         MemoryCopy(meta_ptr, column->check_text.str, column->check_text.size);
         meta_ptr += column->check_text.size;
       }
+    }
+    
+    U64 decimal_column_count = 0;
+    for (U64 i = 0; i < table->column_count; i++)
+    {
+      if (table->columns[i]->type == GDB_ColumnType_Decimal) decimal_column_count++;
+    }
+    
+    *(U64*)meta_ptr = decimal_column_count; meta_ptr += sizeof(U64);
+    for (U64 i = 0; i < table->column_count; i++)
+    {
+      GDB_Column* column = table->columns[i];
+      if (column->type != GDB_ColumnType_Decimal) continue;
+      
+      *(U64*)meta_ptr = column->name.size; meta_ptr += sizeof(U64);
+      MemoryCopy(meta_ptr, column->name.str, column->name.size);
+      meta_ptr += column->name.size;
+      
+      *(U32*)meta_ptr = column->decimal_precision; meta_ptr += sizeof(U32);
+      *(U32*)meta_ptr = column->decimal_scale; meta_ptr += sizeof(U32);
+    }
+    
+    U64 enum_column_count = 0;
+    for (U64 i = 0; i < table->column_count; i++)
+    {
+      GDB_Column* column = table->columns[i];
+      if (column->type == GDB_ColumnType_Enum && column->enum_type) enum_column_count++;
+    }
+    
+    *(U64*)meta_ptr = enum_column_count; meta_ptr += sizeof(U64);
+    for (U64 i = 0; i < table->column_count; i++)
+    {
+      GDB_Column* column = table->columns[i];
+      if (column->type != GDB_ColumnType_Enum || !column->enum_type) continue;
+      
+      *(U64*)meta_ptr = column->name.size; meta_ptr += sizeof(U64);
+      MemoryCopy(meta_ptr, column->name.str, column->name.size);
+      meta_ptr += column->name.size;
+      
+      *(U64*)meta_ptr = column->enum_type->name.size; meta_ptr += sizeof(U64);
+      MemoryCopy(meta_ptr, column->enum_type->name.str, column->enum_type->name.size);
+      meta_ptr += column->enum_type->name.size;
     }
     
     os_file_write(meta_file, r1u64(0, meta_size), meta_buffer);
@@ -719,6 +944,41 @@ chunk.size += __s.size; \
       {
         output = gdb_column_get_string(scratch.arena, column, row);
       }
+      else if (column->type == GDB_ColumnType_I64)
+      {
+        S64* data = (S64*)gdb_column_get_data(column, row);
+        output = str8_from_s64(scratch.arena, *data, 10, 0, 0);
+      }
+      else if (column->type == GDB_ColumnType_I32)
+      {
+        S32* data = (S32*)gdb_column_get_data(column, row);
+        output = str8_from_s64(scratch.arena, *data, 10, 0, 0);
+      }
+      else if (column->type == GDB_ColumnType_Bool)
+      {
+        U8* data = (U8*)gdb_column_get_data(column, row);
+        output = *data ? str8_lit("true") : str8_lit("false");
+      }
+      else if (column->type == GDB_ColumnType_Date)
+      {
+        S32* data = (S32*)gdb_column_get_data(column, row);
+        output = push_iso_date_string(scratch.arena, *data);
+      }
+      else if (column->type == GDB_ColumnType_Timestamp)
+      {
+        S64* data = (S64*)gdb_column_get_data(column, row);
+        output = push_iso_timestamp_string(scratch.arena, *data);
+      }
+      else if (column->type == GDB_ColumnType_Decimal)
+      {
+        S64* data = (S64*)gdb_column_get_data(column, row);
+        output = decimal_to_str8(scratch.arena, *data, column->decimal_scale);
+      }
+      else if (column->type == GDB_ColumnType_Enum && column->enum_type)
+      {
+        U32* data = (U32*)gdb_column_get_data(column, row);
+        output = gdb_enum_type_label_from_code(column->enum_type, *data);
+      }
       
       if (output.size && output.str)
       {
@@ -762,7 +1022,7 @@ gdb_parse_check_expression(Arena* arena, String8 check_text)
 }
 
 internal GDB_Table*
-gdb_table_load(String8 table_dir, String8 meta_path)
+gdb_table_load(GDB_Database* database, String8 table_dir, String8 meta_path)
 {
   ProfBeginFunction();
   
@@ -1021,6 +1281,76 @@ gdb_table_load(String8 table_dir, String8 meta_path)
         column->check_text = push_str8_copy(table->arena, check_text);
         column->check_expr = gdb_parse_check_expression(table->arena, column->check_text);
       }
+    }
+  }
+  
+  //- tec: optional trailing decimal precision/scale section
+  if (read_ptr + sizeof(U64) <= meta_data.str + meta_data.size)
+  {
+    U64 decimal_column_count = *(U64*)read_ptr; read_ptr += sizeof(U64);
+    
+    for (U64 i = 0; i < decimal_column_count; i++)
+    {
+      if (read_ptr + sizeof(U64) > meta_data.str + meta_data.size) break;
+      String8 column_name = {0};
+      column_name.size = *(U64*)read_ptr; read_ptr += sizeof(U64);
+      if (read_ptr + column_name.size > meta_data.str + meta_data.size) break;
+      column_name.str = read_ptr;
+      read_ptr += column_name.size;
+      
+      if (read_ptr + sizeof(U32) + sizeof(U32) > meta_data.str + meta_data.size) break;
+      U32 precision = *(U32*)read_ptr; read_ptr += sizeof(U32);
+      U32 scale = *(U32*)read_ptr; read_ptr += sizeof(U32);
+      
+      GDB_Column* column = gdb_table_find_column(table, column_name);
+      if (!column)
+      {
+        log_error("gdb_table_load: decimal section refers to missing column '%.*s' - ignoring it", str8_varg(column_name));
+        continue;
+      }
+      
+      column->decimal_precision = precision;
+      column->decimal_scale = scale;
+    }
+  }
+  
+  //- tec: optional trailing enum column reference section
+  if (read_ptr + sizeof(U64) <= meta_data.str + meta_data.size)
+  {
+    U64 enum_column_count = *(U64*)read_ptr; read_ptr += sizeof(U64);
+    
+    for (U64 i = 0; i < enum_column_count; i++)
+    {
+      if (read_ptr + sizeof(U64) > meta_data.str + meta_data.size) break;
+      String8 column_name = {0};
+      column_name.size = *(U64*)read_ptr; read_ptr += sizeof(U64);
+      if (read_ptr + column_name.size > meta_data.str + meta_data.size) break;
+      column_name.str = read_ptr;
+      read_ptr += column_name.size;
+      
+      if (read_ptr + sizeof(U64) > meta_data.str + meta_data.size) break;
+      String8 enum_type_name = {0};
+      enum_type_name.size = *(U64*)read_ptr; read_ptr += sizeof(U64);
+      if (read_ptr + enum_type_name.size > meta_data.str + meta_data.size) break;
+      enum_type_name.str = read_ptr;
+      read_ptr += enum_type_name.size;
+      
+      GDB_Column* column = gdb_table_find_column(table, column_name);
+      if (!column)
+      {
+        log_error("gdb_table_load: enum section refers to missing column '%.*s' - ignoring it", str8_varg(column_name));
+        continue;
+      }
+      
+      GDB_EnumType* enum_type = gdb_database_find_enum_type(database, enum_type_name);
+      if (!enum_type)
+      {
+        log_error("gdb_table_load: column '%.*s' references unknown enum type '%.*s'",
+                  str8_varg(column_name), str8_varg(enum_type_name));
+        continue;
+      }
+      
+      column->enum_type = enum_type;
     }
   }
   
@@ -1466,6 +1796,13 @@ gdb_index_numeric_value(GDB_Column* column, U64 row_index)
     case GDB_ColumnType_U64: return (F64)(*(U64*)data);
     case GDB_ColumnType_F32: return (F64)(*(F32*)data);
     case GDB_ColumnType_F64: return *(F64*)data;
+    case GDB_ColumnType_Bool: return (F64)(*(U8*)data);
+    case GDB_ColumnType_I32: return (F64)(*(S32*)data);
+    case GDB_ColumnType_I64: return (F64)(*(S64*)data);
+    case GDB_ColumnType_Date: return (F64)(*(S32*)data);
+    case GDB_ColumnType_Timestamp: return (F64)(*(S64*)data);
+    case GDB_ColumnType_Decimal: return (F64)(*(S64*)data);
+    case GDB_ColumnType_Enum: return (F64)(*(U32*)data);
     default: return 0.0;
   }
 }
@@ -1536,6 +1873,13 @@ gdb_index_build_order(GDB_Index* index)
         case GDB_ColumnType_U64: numeric_keys[i] = (F64)(*(U64*)data); break;
         case GDB_ColumnType_F32: numeric_keys[i] = (F64)(*(F32*)data); break;
         case GDB_ColumnType_F64: numeric_keys[i] = *(F64*)data; break;
+        case GDB_ColumnType_Bool: numeric_keys[i] = (F64)(*(U8*)data); break;
+        case GDB_ColumnType_I32: numeric_keys[i] = (F64)(*(S32*)data); break;
+        case GDB_ColumnType_I64: numeric_keys[i] = (F64)(*(S64*)data); break;
+        case GDB_ColumnType_Date: numeric_keys[i] = (F64)(*(S32*)data); break;
+        case GDB_ColumnType_Timestamp: numeric_keys[i] = (F64)(*(S64*)data); break;
+        case GDB_ColumnType_Decimal: numeric_keys[i] = (F64)(*(S64*)data); break;
+        case GDB_ColumnType_Enum: numeric_keys[i] = (F64)(*(U32*)data); break;
         default: numeric_keys[i] = 0.0; break;
       }
     }
@@ -2613,7 +2957,7 @@ gdb_column_materialize_to_memory(GDB_Column* column)
 
 //~ tec: utils
 internal GDB_ColumnType
-gdb_column_type_from_string(String8 str)
+gdb_column_type_from_string(GDB_Database* database, String8 str)
 {
   if (str8_match(str, str8_lit("u32"), StringMatchFlag_CaseInsensitive))
   {
@@ -2635,9 +2979,38 @@ gdb_column_type_from_string(String8 str)
   {
     return GDB_ColumnType_String8;
   }
+  else if (str8_match(str, str8_lit("bool"), StringMatchFlag_CaseInsensitive))
+  {
+    return GDB_ColumnType_Bool;
+  }
+  else if (str8_match(str, str8_lit("i32"), StringMatchFlag_CaseInsensitive))
+  {
+    return GDB_ColumnType_I32;
+  }
+  else if (str8_match(str, str8_lit("i64"), StringMatchFlag_CaseInsensitive))
+  {
+    return GDB_ColumnType_I64;
+  }
+  else if (str8_match(str, str8_lit("date"), StringMatchFlag_CaseInsensitive))
+  {
+    return GDB_ColumnType_Date;
+  }
+  else if (str8_match(str, str8_lit("timestamp"), StringMatchFlag_CaseInsensitive))
+  {
+    return GDB_ColumnType_Timestamp;
+  }
+  else if (str8_match(str, str8_lit("decimal"), StringMatchFlag_CaseInsensitive) ||
+           str8_match(str, str8_lit("numeric"), StringMatchFlag_CaseInsensitive))
+  {
+    return GDB_ColumnType_Decimal;
+  }
+  else if (gdb_database_find_enum_type(database, str))
+  {
+    return GDB_ColumnType_Enum;
+  }
   
   log_error("failed to find matching GDB_ColumnType for '%.*s'", str8_varg(str));
-  return GDB_ColumnType_U64;
+  return GDB_ColumnType_Invalid;
 }
 
 internal String8
@@ -2651,6 +3024,13 @@ string_from_gdb_column_type(GDB_ColumnType type)
     case GDB_ColumnType_F32: { result = str8_lit("GDB_ColumnType_F32"); } break;
     case GDB_ColumnType_F64: { result = str8_lit("GDB_ColumnType_F64"); } break;
     case GDB_ColumnType_String8: { result = str8_lit("GDB_ColumnType_String8"); } break;
+    case GDB_ColumnType_Bool: { result = str8_lit("GDB_ColumnType_Bool"); } break;
+    case GDB_ColumnType_I32: { result = str8_lit("GDB_ColumnType_I32"); } break;
+    case GDB_ColumnType_I64: { result = str8_lit("GDB_ColumnType_I64"); } break;
+    case GDB_ColumnType_Date: { result = str8_lit("GDB_ColumnType_Date"); } break;
+    case GDB_ColumnType_Timestamp: { result = str8_lit("GDB_ColumnType_Timestamp"); } break;
+    case GDB_ColumnType_Decimal: { result = str8_lit("GDB_ColumnType_Decimal"); } break;
+    case GDB_ColumnType_Enum: { result = str8_lit("GDB_ColumnType_Enum"); } break;
   }
   return result;
 }
@@ -2662,21 +3042,92 @@ gdb_column_schema_create(String8 name, GDB_ColumnType type)
   return schema;
 }
 
-// tec: user-facing type name
 internal String8
-gdb_column_type_display_name(GDB_ColumnType type)
+gdb_column_type_display_name(Arena* arena, GDB_Column* column)
 {
   String8 result = str8_lit("");
-  switch (type)
+  switch (column->type)
   {
     case GDB_ColumnType_U32:     result = str8_lit("u32");     break;
     case GDB_ColumnType_U64:     result = str8_lit("u64");     break;
     case GDB_ColumnType_F32:     result = str8_lit("f32");     break;
     case GDB_ColumnType_F64:     result = str8_lit("f64");     break;
     case GDB_ColumnType_String8: result = str8_lit("string8"); break;
-    default: break;
+    case GDB_ColumnType_Bool:    result = str8_lit("bool");    break;
+    case GDB_ColumnType_I32:     result = str8_lit("i32");     break;
+    case GDB_ColumnType_I64:     result = str8_lit("i64");     break;
+    case GDB_ColumnType_Date:      result = str8_lit("date");      break;
+    case GDB_ColumnType_Timestamp: result = str8_lit("timestamp"); break;
+    case GDB_ColumnType_Decimal:
+    result = push_str8f(arena, "decimal(%u,%u)", column->decimal_precision, column->decimal_scale);
+    break;
+    case GDB_ColumnType_Enum:
+    result = column->enum_type ? push_str8_copy(arena, column->enum_type->name) : str8_lit("enum");
+    break;
+    default: log_error("gdb_column_type_display_name: unhandled GDB_ColumnType %u", column->type); break;
   }
   return result;
+}
+
+// tec: this and decimal to str8 should probably go into the base layer
+internal B32
+decimal_from_str8(String8 str, U32 scale, S64* out_raw)
+{
+  S64 sign = 1;
+  String8 rest = str;
+  if (rest.size > 0 && (rest.str[0] == '-' || rest.str[0] == '+'))
+  {
+    if (rest.str[0] == '-') sign = -1;
+    rest = str8_skip(rest, 1);
+  }
+  
+  U64 dot = str8_find_needle(rest, 0, str8_lit("."), 0);
+  String8 int_part = (dot < rest.size) ? str8_prefix(rest, dot) : rest;
+  String8 frac_part = (dot < rest.size) ? str8_skip(rest, dot + 1) : str8_zero();
+  
+  if (int_part.size == 0 && frac_part.size == 0) return 0;
+  if (int_part.size > 0 && !str8_is_integer(int_part, 10)) return 0;
+  if (frac_part.size > 0 && !str8_is_integer(frac_part, 10)) return 0;
+  
+  U64 int_value = int_part.size ? u64_from_str8(int_part, 10) : 0;
+  
+  U64 frac_len = Min(frac_part.size, (U64)scale);
+  String8 frac_kept = str8_prefix(frac_part, frac_len);
+  U64 frac_value = frac_kept.size ? u64_from_str8(frac_kept, 10) : 0;
+  for (U64 k = frac_len; k < scale; k++) frac_value *= 10;
+  
+  B32 round_up = 0;
+  if (frac_part.size > scale)
+  {
+    U8 round_digit = frac_part.str[scale];
+    round_up = (round_digit >= '5' && round_digit <= '9');
+  }
+  
+  U64 pow10_scale = 1;
+  for (U32 i = 0; i < scale; i++) pow10_scale *= 10;
+  
+  U64 magnitude = int_value * pow10_scale + frac_value;
+  if (round_up) magnitude += 1;
+  
+  *out_raw = sign * (S64)magnitude;
+  return 1;
+}
+
+internal String8
+decimal_to_str8(Arena* arena, S64 raw, U32 scale)
+{
+  if (scale == 0) return str8_from_s64(arena, raw, 10, 0, 0);
+  
+  B32 negative = raw < 0;
+  U64 magnitude = negative ? (U64)(-raw) : (U64)raw;
+  
+  U64 pow10_scale = 1;
+  for (U32 i = 0; i < scale; i++) pow10_scale *= 10;
+  
+  U64 int_part = magnitude / pow10_scale;
+  U64 frac_part = magnitude % pow10_scale;
+  
+  return push_str8f(arena, "%s%llu.%0*llu", negative ? "-" : "", int_part, (int)scale, frac_part);
 }
 
 //~ tec: column catalog
@@ -2713,7 +3164,7 @@ gdb_database_build_column_catalog(GDB_Database* database)
       GDB_Column* column = table->columns[c];
       GDB_Index* index_on_column = gdb_table_find_index_on_column(table, column);
       
-      String8 type_name = gdb_column_type_display_name(column->type);
+      String8 type_name = gdb_column_type_display_name(catalog->arena, column);
       U32 ordinal = (U32)c;
       U32 nullable = column->not_null ? 0 : 1;
       U32 is_unique = column->is_unique ? 1 : 0;

@@ -85,7 +85,7 @@ entry_point(CmdLine *cmdline)
   //- tec: reload from disk, exactly like a second process 'USE'-ing the database would
   Temp scratch = scratch_begin(0, 0);
   String8 meta_path = push_str8f(scratch.arena, "%.*s/t.meta", str8_varg(table_dir));
-  GDB_Table *loaded = gdb_table_load(table_dir, meta_path);
+  GDB_Table *loaded = gdb_table_load(NULL, table_dir, meta_path);
 
   if (!loaded || loaded->column_count != 2)
   {

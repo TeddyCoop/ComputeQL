@@ -76,6 +76,17 @@ global String8 g_sql_keywords[] =
   str8_lit_comp("f32"),
   str8_lit_comp("f64"),
   str8_lit_comp("string8"),
+  str8_lit_comp("bool"),
+  str8_lit_comp("i32"),
+  str8_lit_comp("i64"),
+  str8_lit_comp("true"),
+  str8_lit_comp("false"),
+  str8_lit_comp("date"),
+  str8_lit_comp("timestamp"),
+  str8_lit_comp("decimal"),
+  str8_lit_comp("numeric"),
+  str8_lit_comp("type"),
+  str8_lit_comp("enum"),
 };
 
 global String8 g_sql_operators[] =
@@ -203,6 +214,8 @@ typedef enum SQL_NodeType
   SQL_NodeType_AggregateCall,
   SQL_NodeType_Describe,
   SQL_NodeType_Explain,
+  SQL_NodeType_EnumDef,
+  SQL_NodeType_EnumValue,
 } SQL_NodeType;
 
 typedef struct SQL_Node SQL_Node;

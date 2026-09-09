@@ -21,6 +21,13 @@ gdb_zero_value_for_type(Arena* arena, GDB_ColumnType type)
     case GDB_ColumnType_F32: return push_array(arena, F32, 1);
     case GDB_ColumnType_F64: return push_array(arena, F64, 1);
     case GDB_ColumnType_String8: return push_array(arena, String8, 1);
+    case GDB_ColumnType_Bool: return push_array(arena, U8, 1);
+    case GDB_ColumnType_I32: return push_array(arena, S32, 1);
+    case GDB_ColumnType_I64: return push_array(arena, S64, 1);
+    case GDB_ColumnType_Date: return push_array(arena, S32, 1);
+    case GDB_ColumnType_Timestamp: return push_array(arena, S64, 1);
+    case GDB_ColumnType_Decimal: return push_array(arena, S64, 1);
+    case GDB_ColumnType_Enum: return push_array(arena, U32, 1);
     default: return NULL;
   }
 }
@@ -45,6 +52,13 @@ gdb_candidate_value_equals_row(Arena* arena, GDB_Column* column, void* candidate
     case GDB_ColumnType_U64: return *(U64*)candidate == *(U64*)existing_data;
     case GDB_ColumnType_F32: return *(F32*)candidate == *(F32*)existing_data;
     case GDB_ColumnType_F64: return *(F64*)candidate == *(F64*)existing_data;
+    case GDB_ColumnType_Bool: return *(U8*)candidate == *(U8*)existing_data;
+    case GDB_ColumnType_I32: return *(S32*)candidate == *(S32*)existing_data;
+    case GDB_ColumnType_I64: return *(S64*)candidate == *(S64*)existing_data;
+    case GDB_ColumnType_Date: return *(S32*)candidate == *(S32*)existing_data;
+    case GDB_ColumnType_Timestamp: return *(S64*)candidate == *(S64*)existing_data;
+    case GDB_ColumnType_Decimal: return *(S64*)candidate == *(S64*)existing_data;
+    case GDB_ColumnType_Enum: return *(U32*)candidate == *(U32*)existing_data;
     default: return 0;
   }
 }
@@ -100,6 +114,13 @@ gdb_check_load_value(GDB_Table* table, void** row_data, B32* row_null, IR_Node* 
       case GDB_ColumnType_U64: return (F64)(*(U64*)row_data[slot]);
       case GDB_ColumnType_F32: return (F64)(*(F32*)row_data[slot]);
       case GDB_ColumnType_F64: return *(F64*)row_data[slot];
+      case GDB_ColumnType_Bool: return (F64)(*(U8*)row_data[slot]);
+      case GDB_ColumnType_I32: return (F64)(*(S32*)row_data[slot]);
+      case GDB_ColumnType_I64: return (F64)(*(S64*)row_data[slot]);
+      case GDB_ColumnType_Date: return (F64)(*(S32*)row_data[slot]);
+      case GDB_ColumnType_Timestamp: return (F64)(*(S64*)row_data[slot]);
+      case GDB_ColumnType_Decimal: return (F64)(*(S64*)row_data[slot]);
+      case GDB_ColumnType_Enum: return (F64)(*(U32*)row_data[slot]);
       default: return 0.0;
     }
   }
@@ -159,10 +180,36 @@ gdb_check_eval(GDB_Table* table, void** row_data, B32* row_null, IR_Node* condit
   B32 lstr = 0, rstr = 0, lnull = 0, rnull = 0;
   String8 ls = {0}, rs = {0};
   F64 lv = gdb_check_load_value(table, row_data, row_null, left, &lstr, &ls, &lnull);
-  F64 rv = gdb_check_load_value(table, row_data, row_null, right, &rstr, &rs, &rnull);
+  
+  F64 rv = 0.0;
+  B32 right_resolved = 0;
+  if (left->type == IR_NodeType_Column && (right->type == IR_NodeType_Literal || right->type == IR_NodeType_Numeric))
+  {
+    GDB_Column* column = gdb_table_find_column(table, left->value);
+    if (column && right->type == IR_NodeType_Literal &&
+        (column->type == GDB_ColumnType_Date || column->type == GDB_ColumnType_Timestamp))
+    {
+      right_resolved = 1;
+      if (!qe_resolve_date_literal_value(column->type, right, &rv)) return 0; // unparsable literal never matches
+    }
+    else if (column && right->type == IR_NodeType_Literal && column->type == GDB_ColumnType_Enum)
+    {
+      right_resolved = 1;
+      if (!qe_resolve_enum_literal_value(column, right, &rv)) return 0; // unparsable literal never matches
+    }
+    else if (column && right->type == IR_NodeType_Numeric && column->type == GDB_ColumnType_Decimal)
+    {
+      right_resolved = 1;
+      if (!qe_resolve_decimal_literal_value(column, right, &rv)) return 0; // unparsable literal never matches
+    }
+  }
+  if (!right_resolved)
+  {
+    rv = gdb_check_load_value(table, row_data, row_null, right, &rstr, &rs, &rnull);
+  }
   
   // tec: three-valued logic. a NULL operand makes CHECK neither true nor false, so the row is rejected
-  if (lnull || rnull) return 0; 
+  if (lnull || rnull) return 0;
   
   if (lstr || rstr)
   {
@@ -285,7 +332,7 @@ gdb_row_has_referencing_children(Arena* arena, GDB_Database* database, GDB_Table
 #define APP_EMIT(...) str8_list_push(arena, &out, push_str8f(arena, __VA_ARGS__))
 
 internal String8
-app_format_cell_text(Arena* arena, GDB_ColumnType type, F64 numeric_value, String8 string_value)
+app_format_cell_text(Arena* arena, GDB_ColumnType type, F64 numeric_value, String8 string_value, U32 decimal_scale, GDB_EnumType* enum_type)
 {
   switch (type)
   {
@@ -294,6 +341,14 @@ app_format_cell_text(Arena* arena, GDB_ColumnType type, F64 numeric_value, Strin
     case GDB_ColumnType_F32: return push_str8f(arena, "%f", (F32)numeric_value);
     case GDB_ColumnType_F64: return push_str8f(arena, "%lf", numeric_value);
     case GDB_ColumnType_String8: return push_str8_copy(arena, string_value);
+    case GDB_ColumnType_Bool: return (numeric_value != 0.0) ? str8_lit("true") : str8_lit("false");
+    case GDB_ColumnType_I32: return push_str8f(arena, "%d", (S32)numeric_value);
+    case GDB_ColumnType_I64: return push_str8f(arena, "%lld", (S64)numeric_value);
+    case GDB_ColumnType_Date: return push_iso_date_string(arena, (S32)numeric_value);
+    case GDB_ColumnType_Timestamp: return push_iso_timestamp_string(arena, (S64)numeric_value);
+    case GDB_ColumnType_Decimal: return decimal_to_str8(arena, (S64)numeric_value, decimal_scale);
+    case GDB_ColumnType_Enum:
+    return enum_type ? push_str8_copy(arena, gdb_enum_type_label_from_code(enum_type, (U32)numeric_value)) : str8_lit("?");
     default: return str8_lit("UNKNOWN");
   }
 }
@@ -380,7 +435,7 @@ app_execute_query_capture(Arena* arena, String8 sql_query, GDB_Database** io_dat
             {
               GDB_Column* column = table->columns[i];
               
-              String8 type_name = gdb_column_type_display_name(column->type);
+              String8 type_name = gdb_column_type_display_name(arena, column);
               
               String8 key = str8_lit("");
               if (column->is_primary_key) key = str8_lit("PRI");
@@ -480,15 +535,47 @@ app_execute_query_capture(Arena* arena, String8 sql_query, GDB_Database** io_dat
             
             for (IR_Node* column_node = create_ir_node->first; column_node != 0; column_node = column_node->next)
             {
-              GDB_ColumnType column_type = gdb_column_type_from_string(column_node->first->value);
+              GDB_ColumnType column_type = gdb_column_type_from_string(database, column_node->first->value);
+              if (column_type == GDB_ColumnType_Invalid)
+              {
+                log_error("create table: unknown column type '%.*s' for column '%.*s'",
+                          str8_varg(column_node->first->value), str8_varg(column_node->value));
+                goto done;
+              }
               GDB_ColumnSchema column_schema = gdb_column_schema_create(column_node->value, column_type);
               gdb_table_add_column(table, column_schema);
               
               GDB_Column* new_column = table->columns[table->column_count - 1];
               
+              if (column_type == GDB_ColumnType_Enum)
+              {
+                new_column->enum_type = gdb_database_find_enum_type(database, column_node->first->value);
+              }
+              
+              if (column_type == GDB_ColumnType_Decimal)
+              {
+                IR_Node* precision_node = column_node->first->first;
+                IR_Node* scale_node = precision_node ? precision_node->next : NULL;
+                if (!precision_node || !scale_node)
+                {
+                  log_error("create table: decimal column '%.*s' requires both precision and scale, e.g. decimal(10,2)",
+                            str8_varg(column_node->value));
+                  goto done;
+                }
+                U64 precision = u64_from_str8(precision_node->value, 10);
+                U64 scale = u64_from_str8(scale_node->value, 10);
+                if (precision == 0 || precision > 18 || scale > precision)
+                {
+                  log_error("create table: decimal column '%.*s' has invalid precision/scale (%llu,%llu) - precision must be 1-18 and scale <= precision",
+                            str8_varg(column_node->value), precision, scale);
+                  goto done;
+                }
+                new_column->decimal_precision = (U32)precision;
+                new_column->decimal_scale = (U32)scale;
+              }
+              
               // tec: column_node->first is the Type node
-              // any constraint clauses (NOT NULL, UNIQUE, PRIMARY KEY, REFERENCES, CHECK) 
-              // were appended as its siblings by the parser, in whatever order they appeared
+              // any constraint clauses were appended as its siblings by the parser, in whatever order they appeared
               for (IR_Node* c = column_node->first->next; c != 0; c = c->next)
               {
                 switch (c->type)
@@ -504,7 +591,7 @@ app_execute_query_capture(Arena* arena, String8 sql_query, GDB_Database** io_dat
                   case IR_NodeType_PrimaryKey:
                   {
                     // tec: single column PRIMARY KEY only
-                    // ted: TODO support composite keys
+                    // tec: TODO support composite keys
                     new_column->is_primary_key = 1;
                     new_column->not_null = 1;
                     new_column->is_unique = 1;
@@ -563,6 +650,31 @@ app_execute_query_capture(Arena* arena, String8 sql_query, GDB_Database** io_dat
             }
           }
         }
+        else if (create_ir_node->type == IR_NodeType_EnumDef)
+        {
+          if (gdb_database_find_enum_type(database, create_ir_node->value))
+          {
+            log_error("create type: '%.*s' already exists", str8_varg(create_ir_node->value));
+          }
+          else
+          {
+            U32 value_count = 0;
+            for (IR_Node* v = create_ir_node->first; v != 0; v = v->next) value_count++;
+            
+            GDB_EnumType* enum_type = push_array(database->arena, GDB_EnumType, 1);
+            enum_type->name = push_str8_copy(database->arena, create_ir_node->value);
+            enum_type->value_count = value_count;
+            enum_type->value_labels = push_array(database->arena, String8, Max(value_count, 1));
+            
+            U32 vi = 0;
+            for (IR_Node* v = create_ir_node->first; v != 0; v = v->next, vi++)
+            {
+              enum_type->value_labels[vi] = push_str8_copy(database->arena, v->value);
+            }
+            
+            gdb_database_add_enum_type(database, enum_type);
+          }
+        }
         
       } break;
       case IR_NodeType_DropIndex:
@@ -601,7 +713,7 @@ app_execute_query_capture(Arena* arena, String8 sql_query, GDB_Database** io_dat
         if (!values_object)
         {
           log_error("missing 'values' clause in 'insert' statement");
-          return result;
+          goto done;
         }
         
         //- tec: value group
@@ -620,7 +732,7 @@ app_execute_query_capture(Arena* arena, String8 sql_query, GDB_Database** io_dat
           if (listed_count > table->column_count)
           {
             log_error("insert column list names more columns than table '%.*s' has", str8_varg(table->name));
-            return result;
+            goto done;
           }
           
           U64 ci = 0;
@@ -630,7 +742,7 @@ app_execute_query_capture(Arena* arena, String8 sql_query, GDB_Database** io_dat
             if (!column)
             {
               log_error("unknown column '%.*s' in 'insert' statement", str8_varg(c->value));
-              return result;
+              goto done;
             }
             
             U64 slot = 0;
@@ -662,7 +774,7 @@ app_execute_query_capture(Arena* arena, String8 sql_query, GDB_Database** io_dat
             if (column_index >= listed_count)
             {
               log_error("too many values in 'insert' statement");
-              return result;
+              goto done;
             }
             
             U64 slot = column_slots[column_index];
@@ -708,9 +820,82 @@ app_execute_query_capture(Arena* arena, String8 sql_query, GDB_Database** io_dat
                 *value = value_str;
                 value_ptr = value;
               } break;
+              case GDB_ColumnType_Bool:
+              {
+                U8* value = push_array(scratch.arena, U8, 1);
+                *value = (U8)u64_from_str8(value_str, 10);
+                value_ptr = value;
+              } break;
+              case GDB_ColumnType_I32:
+              {
+                S32* value = push_array(scratch.arena, S32, 1);
+                *value = (S32)s64_from_str8(value_str, 10);
+                value_ptr = value;
+              } break;
+              case GDB_ColumnType_I64:
+              {
+                S64* value = push_array(scratch.arena, S64, 1);
+                *value = s64_from_str8(value_str, 10);
+                value_ptr = value;
+              } break;
+              case GDB_ColumnType_Date:
+              {
+                S32* value = push_array(scratch.arena, S32, 1);
+                if (!parse_iso_date(value_str, value))
+                {
+                  log_error("invalid date literal '%.*s' for column '%.*s'", str8_varg(value_str), str8_varg(column->name));
+                  goto done;
+                }
+                value_ptr = value;
+              } break;
+              case GDB_ColumnType_Timestamp:
+              {
+                S64* value = push_array(scratch.arena, S64, 1);
+                if (!parse_iso_timestamp(value_str, value))
+                {
+                  log_error("invalid timestamp literal '%.*s' for column '%.*s'", str8_varg(value_str), str8_varg(column->name));
+                  goto done;
+                }
+                value_ptr = value;
+              } break;
+              case GDB_ColumnType_Decimal:
+              {
+                S64* value = push_array(scratch.arena, S64, 1);
+                if (!decimal_from_str8(value_str, column->decimal_scale, value))
+                {
+                  log_error("invalid decimal literal '%.*s' for column '%.*s'", str8_varg(value_str), str8_varg(column->name));
+                  goto done;
+                }
+                
+                U64 pow10_precision = 1;
+                for (U32 p = 0; p < column->decimal_precision; p++) pow10_precision *= 10;
+                S64 magnitude = (*value < 0) ? -(*value) : *value;
+                if ((U64)magnitude >= pow10_precision)
+                {
+                  log_error("decimal literal '%.*s' overflows %.*s's precision(%u) for column '%.*s'",
+                            str8_varg(value_str), str8_varg(gdb_column_type_display_name(scratch.arena, column)),
+                            column->decimal_precision, str8_varg(column->name));
+                  goto done;
+                }
+                
+                value_ptr = value;
+              } break;
+              case GDB_ColumnType_Enum:
+              {
+                U32* value = push_array(scratch.arena, U32, 1);
+                if (!column->enum_type || !gdb_enum_type_code_from_label(column->enum_type, value_str, value))
+                {
+                  log_error("'%.*s' is not a valid label for enum type '%.*s' on column '%.*s'",
+                            str8_varg(value_str),
+                            str8_varg(column->enum_type ? column->enum_type->name : str8_lit("?")),
+                            str8_varg(column->name));
+                  goto done;
+                }
+                value_ptr = value;
+              } break;
               default:
               log_error("unknown column type");
-              return result;
+              goto done;
             }
             
             row_data[slot] = value_ptr;
@@ -722,7 +907,7 @@ app_execute_query_capture(Arena* arena, String8 sql_query, GDB_Database** io_dat
           if (column_index != listed_count)
           {
             log_error("mismatch in column count and value count in 'insert' statement");
-            return result;
+            goto done;
           }
           
           // tec: any table column not named by a partial column list defaults to NULL
@@ -736,7 +921,7 @@ app_execute_query_capture(Arena* arena, String8 sql_query, GDB_Database** io_dat
           if (!gdb_table_validate_row_constraints(scratch.arena, database, table, row_data, row_null))
           {
             scratch_end(scratch);
-            return result;
+            goto done;
           }
           
           gdb_table_add_row(table, row_data, row_null);
@@ -792,14 +977,46 @@ app_execute_query_capture(Arena* arena, String8 sql_query, GDB_Database** io_dat
             break;
           }
           
-          GDB_ColumnType column_type = gdb_column_type_from_string(type_node->value);
+          GDB_ColumnType column_type = gdb_column_type_from_string(database, type_node->value);
+          if (column_type == GDB_ColumnType_Invalid)
+          {
+            log_error("alter table: unknown column type '%.*s'", str8_varg(type_node->value));
+            break;
+          }
+          // tec: resolve/validate BEFORE adding the colum
+          GDB_EnumType* enum_type = (column_type == GDB_ColumnType_Enum) ? gdb_database_find_enum_type(database, type_node->value) : NULL;
+          U32 decimal_precision = 0, decimal_scale = 0;
+          if (column_type == GDB_ColumnType_Decimal)
+          {
+            IR_Node* precision_node = type_node->first;
+            IR_Node* scale_node = precision_node ? precision_node->next : NULL;
+            if (!precision_node || !scale_node)
+            {
+              log_error("alter table: decimal column '%.*s' requires both precision and scale, e.g. decimal(10,2)",
+                        str8_varg(column_name_node->value));
+              break;
+            }
+            U64 precision = u64_from_str8(precision_node->value, 10);
+            U64 scale = u64_from_str8(scale_node->value, 10);
+            if (precision == 0 || precision > 18 || scale > precision)
+            {
+              log_error("alter table: decimal column '%.*s' has invalid precision/scale (%llu,%llu) - precision must be 1-18 and scale <= precision",
+                        str8_varg(column_name_node->value), precision, scale);
+              break;
+            }
+            decimal_precision = (U32)precision;
+            decimal_scale = (U32)scale;
+          }
+          
           GDB_ColumnSchema schema = gdb_column_schema_create(column_name_node->value, column_type);
           gdb_table_add_column(table, schema);
           
           // tec: backfill existing rows as NULL so the new column's row count stays in sync
-          // with the table (matches standard SQL ALTER TABLE ADD COLUMN semantics)
           GDB_Column* new_column = table->columns[table->column_count - 1];
           U64 existing_row_count = table->row_count;
+          new_column->decimal_precision = decimal_precision;
+          new_column->decimal_scale = decimal_scale;
+          new_column->enum_type = enum_type;
           
           Temp backfill_scratch = scratch_begin(0, 0);
           for (U64 i = 0; i < existing_row_count; i++)
@@ -1030,14 +1247,42 @@ app_execute_query_capture(Arena* arena, String8 sql_query, GDB_Database** io_dat
                 else if (col->type == GDB_ColumnType_String8)
                 {
                   APP_EMIT("%.*s ", str8_varg(col->string_values[i]));
-                  if (capture_structured) { out_result_set->cell_text[cell_i] = app_format_cell_text(arena, col->type, 0, col->string_values[i]); }
+                  if (capture_structured) { out_result_set->cell_text[cell_i] = app_format_cell_text(arena, col->type, 0, col->string_values[i], col->decimal_scale, col->enum_type); }
                 }
                 else if (col->type == GDB_ColumnType_U32 || col->type == GDB_ColumnType_U64)
                 {
                   APP_EMIT("%llu ", (U64)col->numeric_values[i]);
                   if (capture_structured)
                   {
-                    out_result_set->cell_text[cell_i] = app_format_cell_text(arena, col->type, col->numeric_values[i], (String8){0});
+                    out_result_set->cell_text[cell_i] = app_format_cell_text(arena, col->type, col->numeric_values[i], (String8){0}, col->decimal_scale, col->enum_type);
+                    out_result_set->cell_numeric[cell_i] = col->numeric_values[i];
+                  }
+                }
+                else if (col->type == GDB_ColumnType_I32 || col->type == GDB_ColumnType_I64)
+                {
+                  APP_EMIT("%lld ", (S64)col->numeric_values[i]);
+                  if (capture_structured)
+                  {
+                    out_result_set->cell_text[cell_i] = app_format_cell_text(arena, col->type, col->numeric_values[i], (String8){0}, col->decimal_scale, col->enum_type);
+                    out_result_set->cell_numeric[cell_i] = col->numeric_values[i];
+                  }
+                }
+                else if (col->type == GDB_ColumnType_Bool)
+                {
+                  APP_EMIT("%s ", col->numeric_values[i] != 0.0 ? "true" : "false");
+                  if (capture_structured)
+                  {
+                    out_result_set->cell_text[cell_i] = app_format_cell_text(arena, col->type, col->numeric_values[i], (String8){0}, col->decimal_scale, col->enum_type);
+                    out_result_set->cell_numeric[cell_i] = col->numeric_values[i];
+                  }
+                }
+                else if (col->type == GDB_ColumnType_Date || col->type == GDB_ColumnType_Timestamp || col->type == GDB_ColumnType_Decimal || col->type == GDB_ColumnType_Enum)
+                {
+                  String8 formatted = app_format_cell_text(arena, col->type, col->numeric_values[i], (String8){0}, col->decimal_scale, col->enum_type);
+                  APP_EMIT("%.*s ", str8_varg(formatted));
+                  if (capture_structured)
+                  {
+                    out_result_set->cell_text[cell_i] = formatted;
                     out_result_set->cell_numeric[cell_i] = col->numeric_values[i];
                   }
                 }
@@ -1046,7 +1291,7 @@ app_execute_query_capture(Arena* arena, String8 sql_query, GDB_Database** io_dat
                   APP_EMIT("%lf ", col->numeric_values[i]);
                   if (capture_structured)
                   {
-                    out_result_set->cell_text[cell_i] = app_format_cell_text(arena, col->type, col->numeric_values[i], (String8){0});
+                    out_result_set->cell_text[cell_i] = app_format_cell_text(arena, col->type, col->numeric_values[i], (String8){0}, col->decimal_scale, col->enum_type);
                     out_result_set->cell_numeric[cell_i] = col->numeric_values[i];
                   }
                 }
@@ -1138,7 +1383,7 @@ app_execute_query_capture(Arena* arena, String8 sql_query, GDB_Database** io_dat
                   APP_EMIT("%u ", (U32)gathered[ci].numeric_values[i]);
                   if (capture_structured)
                   {
-                    out_result_set->cell_text[cell_i] = app_format_cell_text(arena, gathered[ci].type, gathered[ci].numeric_values[i], (String8){0});
+                    out_result_set->cell_text[cell_i] = app_format_cell_text(arena, gathered[ci].type, gathered[ci].numeric_values[i], (String8){0}, gathered[ci].column->decimal_scale, gathered[ci].column->enum_type);
                     out_result_set->cell_numeric[cell_i] = gathered[ci].numeric_values[i];
                   }
                   break;
@@ -1146,7 +1391,7 @@ app_execute_query_capture(Arena* arena, String8 sql_query, GDB_Database** io_dat
                   APP_EMIT("%llu ", (U64)gathered[ci].numeric_values[i]);
                   if (capture_structured)
                   {
-                    out_result_set->cell_text[cell_i] = app_format_cell_text(arena, gathered[ci].type, gathered[ci].numeric_values[i], (String8){0});
+                    out_result_set->cell_text[cell_i] = app_format_cell_text(arena, gathered[ci].type, gathered[ci].numeric_values[i], (String8){0}, gathered[ci].column->decimal_scale, gathered[ci].column->enum_type);
                     out_result_set->cell_numeric[cell_i] = gathered[ci].numeric_values[i];
                   }
                   break;
@@ -1154,7 +1399,7 @@ app_execute_query_capture(Arena* arena, String8 sql_query, GDB_Database** io_dat
                   APP_EMIT("%f ", (F32)gathered[ci].numeric_values[i]);
                   if (capture_structured)
                   {
-                    out_result_set->cell_text[cell_i] = app_format_cell_text(arena, gathered[ci].type, gathered[ci].numeric_values[i], (String8){0});
+                    out_result_set->cell_text[cell_i] = app_format_cell_text(arena, gathered[ci].type, gathered[ci].numeric_values[i], (String8){0}, gathered[ci].column->decimal_scale, gathered[ci].column->enum_type);
                     out_result_set->cell_numeric[cell_i] = gathered[ci].numeric_values[i];
                   }
                   break;
@@ -1162,10 +1407,47 @@ app_execute_query_capture(Arena* arena, String8 sql_query, GDB_Database** io_dat
                   APP_EMIT("%lf ", gathered[ci].numeric_values[i]);
                   if (capture_structured)
                   {
-                    out_result_set->cell_text[cell_i] = app_format_cell_text(arena, gathered[ci].type, gathered[ci].numeric_values[i], (String8){0});
+                    out_result_set->cell_text[cell_i] = app_format_cell_text(arena, gathered[ci].type, gathered[ci].numeric_values[i], (String8){0}, gathered[ci].column->decimal_scale, gathered[ci].column->enum_type);
                     out_result_set->cell_numeric[cell_i] = gathered[ci].numeric_values[i];
                   }
                   break;
+                  case GDB_ColumnType_Bool:
+                  APP_EMIT("%s ", gathered[ci].numeric_values[i] != 0.0 ? "true" : "false");
+                  if (capture_structured)
+                  {
+                    out_result_set->cell_text[cell_i] = app_format_cell_text(arena, gathered[ci].type, gathered[ci].numeric_values[i], (String8){0}, gathered[ci].column->decimal_scale, gathered[ci].column->enum_type);
+                    out_result_set->cell_numeric[cell_i] = gathered[ci].numeric_values[i];
+                  }
+                  break;
+                  case GDB_ColumnType_I32:
+                  APP_EMIT("%d ", (S32)gathered[ci].numeric_values[i]);
+                  if (capture_structured)
+                  {
+                    out_result_set->cell_text[cell_i] = app_format_cell_text(arena, gathered[ci].type, gathered[ci].numeric_values[i], (String8){0}, gathered[ci].column->decimal_scale, gathered[ci].column->enum_type);
+                    out_result_set->cell_numeric[cell_i] = gathered[ci].numeric_values[i];
+                  }
+                  break;
+                  case GDB_ColumnType_I64:
+                  APP_EMIT("%lld ", (S64)gathered[ci].numeric_values[i]);
+                  if (capture_structured)
+                  {
+                    out_result_set->cell_text[cell_i] = app_format_cell_text(arena, gathered[ci].type, gathered[ci].numeric_values[i], (String8){0}, gathered[ci].column->decimal_scale, gathered[ci].column->enum_type);
+                    out_result_set->cell_numeric[cell_i] = gathered[ci].numeric_values[i];
+                  }
+                  break;
+                  case GDB_ColumnType_Date:
+                  case GDB_ColumnType_Timestamp:
+                  case GDB_ColumnType_Decimal:
+                  case GDB_ColumnType_Enum:
+                  {
+                    String8 formatted = app_format_cell_text(arena, gathered[ci].type, gathered[ci].numeric_values[i], (String8){0}, gathered[ci].column->decimal_scale, gathered[ci].column->enum_type);
+                    APP_EMIT("%.*s ", str8_varg(formatted));
+                    if (capture_structured)
+                    {
+                      out_result_set->cell_text[cell_i] = formatted;
+                      out_result_set->cell_numeric[cell_i] = gathered[ci].numeric_values[i];
+                    }
+                  } break;
                   case GDB_ColumnType_String8:
                   {
                     GDB_StringDataChunk* chunk = &gathered[ci].strings;
@@ -1173,7 +1455,7 @@ app_execute_query_capture(Arena* arena, String8 sql_query, GDB_Database** io_dat
                     U64 end = chunk->offsets[i + 1];
                     String8 str = str8((U8*)chunk->data + start, end - start);
                     APP_EMIT("%.*s ", str8_varg(str));
-                    if (capture_structured) { out_result_set->cell_text[cell_i] = app_format_cell_text(arena, gathered[ci].type, 0, str); }
+                    if (capture_structured) { out_result_set->cell_text[cell_i] = app_format_cell_text(arena, gathered[ci].type, 0, str, gathered[ci].column->decimal_scale, gathered[ci].column->enum_type); }
                   } break;
                   default:
                   APP_EMIT("UNKNOWN ");
@@ -1195,6 +1477,7 @@ app_execute_query_capture(Arena* arena, String8 sql_query, GDB_Database** io_dat
     }
   }
   
+  done:;
   if (database)
   {
     String8 database_filepath = push_str8f(arena, "gdb_data/%.*s", (U32)database->name.size, database->name.str);

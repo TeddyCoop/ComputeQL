@@ -67,17 +67,31 @@ enum
   GDB_ColumnType_F32,
   GDB_ColumnType_F64,
   GDB_ColumnType_String8,
+  GDB_ColumnType_Bool,
+  GDB_ColumnType_I32,
+  GDB_ColumnType_I64,
+  GDB_ColumnType_Date,
+  GDB_ColumnType_Timestamp,
+  GDB_ColumnType_Decimal,
+  GDB_ColumnType_Enum,
   GDB_ColumnType_COUNT
 };
 
-global U64 g_gdb_column_type_size[GDB_ColumnType_COUNT] = 
-{ 
+global U64 g_gdb_column_type_size[GDB_ColumnType_COUNT] =
+{
   0,
   sizeof(U32),
   sizeof(U64),
   sizeof(F32),
   sizeof(F64),
   sizeof(String8),
+  sizeof(U8),
+  sizeof(S32),
+  sizeof(S64),
+  sizeof(S32),
+  sizeof(S64),
+  sizeof(S64),
+  sizeof(U32),
 };
 
 typedef struct GDB_ColumnSchema GDB_ColumnSchema;
@@ -97,6 +111,14 @@ struct GDB_StringDataChunk
   U64 row_count;
 };
 
+typedef struct GDB_EnumType GDB_EnumType;
+struct GDB_EnumType
+{
+  String8 name;
+  String8* value_labels;
+  U32 value_count;
+};
+
 //~ tec: declare db structs
 typedef struct GDB_Column GDB_Column;
 typedef struct GDB_Table GDB_Table;
@@ -113,17 +135,24 @@ struct GDB_Column
   U64 size;
   U64 capacity;
   U64 variable_capacity;
-  U64 row_count; 
+  U64 row_count;
   
-  // tec: data storage
+  //- tec: for decimal columns
+  U32 decimal_precision;
+  U32 decimal_scale;
+  
+  //- tec: for enum cols
+  GDB_EnumType* enum_type;
+  
+  //- tec: data storage
   U8 *data;
   U64 *offsets;
   
-  // tec: NULL tracking
+  //- tec: NULL tracking
   U8* null_flags;
   U64 null_flags_capacity;
   
-  //- tec: constraints, single-column only
+  //- tec: constraints, single column only
   B32 not_null;        // tec: NOT NULL or PRIMARY KEY
   B32 is_unique;       // tec: UNIQUE or PRIMARY KEY
   B32 is_primary_key;  // tec: implies not_null && is_unique
@@ -191,6 +220,10 @@ struct GDB_Database
   U64 table_count;
   U64 table_capacity;
   GDB_Table** tables;
+  
+  U64 enum_type_count;
+  U64 enum_type_capacity;
+  GDB_EnumType** enum_types;
 };
 
 //~ tec: csv loading
@@ -248,6 +281,12 @@ internal GDB_Table* gdb_database_find_table(GDB_Database* database, String8 tabl
 internal GDB_Table* gdb_database_build_column_catalog(GDB_Database* database);
 internal GDB_Table* gdb_database_find_table_or_catalog(GDB_Database* database, String8 name);
 
+//~ tec: enum types
+internal void gdb_database_add_enum_type(GDB_Database* database, GDB_EnumType* enum_type);
+internal GDB_EnumType* gdb_database_find_enum_type(GDB_Database* database, String8 name);
+internal B32 gdb_enum_type_code_from_label(GDB_EnumType* enum_type, String8 label, U32* out_code);
+internal String8 gdb_enum_type_label_from_code(GDB_EnumType* enum_type, U32 code);
+
 //~ tec: tables
 internal GDB_Table* gdb_table_alloc(String8 name);
 internal void gdb_table_release(GDB_Table* table);
@@ -258,7 +297,7 @@ internal void gdb_table_remove_row(GDB_Table* table, U64 row_index);
 internal B32 gdb_table_may_have_nulls(GDB_Table* table);
 internal B32 gdb_table_save(GDB_Table* table, String8 table_dir);
 internal B32 gdb_table_export_csv(GDB_Table* table, String8 path);
-internal GDB_Table* gdb_table_load(String8 table_dir, String8 meta_path);
+internal GDB_Table* gdb_table_load(GDB_Database* database, String8 table_dir, String8 meta_path);
 internal GDB_Table* gdb_table_import_csv(GDB_Database* database, String8 path);
 internal GDB_Table* gdb_table_import_csv_streaming(GDB_Database *db, String8 table_name, String8 path);
 internal GDB_Column* gdb_table_find_column(GDB_Table* table, String8 column_name);
@@ -302,11 +341,14 @@ internal String8 gdb_generate_disk_path_for_column(Arena* arena, GDB_Column* col
 internal void gdb_column_convert_to_disk_backed(GDB_Column* column);
 
 //~ tec: utils
-internal GDB_ColumnType gdb_column_type_from_string(String8 str);
+internal GDB_ColumnType gdb_column_type_from_string(GDB_Database* database, String8 str);
 internal String8 string_from_gdb_column_type(GDB_ColumnType type);
 internal GDB_ColumnSchema gdb_column_schema_create(String8 name, GDB_ColumnType type);
 internal GDB_ColumnType gdb_infer_column_type(String8 value);
 internal GDB_ColumnType gdb_promote_type(GDB_ColumnType existing, GDB_ColumnType new_type);
-internal String8 gdb_column_type_display_name(GDB_ColumnType type);
+internal String8 gdb_column_type_display_name(Arena* arena, GDB_Column* column);
+
+internal B32 decimal_from_str8(String8 str, U32 scale, S64* out_raw);
+internal String8 decimal_to_str8(Arena* arena, S64 raw, U32 scale);
 
 #endif //GDB_H
