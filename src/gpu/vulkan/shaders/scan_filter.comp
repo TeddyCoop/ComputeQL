@@ -325,7 +325,10 @@ main()
   if (matched)
   {
     uint pos = atomicAdd(out_count[0], 1u);
-    out_indices[pos * 2u + 0u] = row;
-    out_indices[pos * 2u + 1u] = 0u;
+    if (pos < out_indices.length() / 2u)
+    {
+      out_indices[pos * 2u + 0u] = row;
+      out_indices[pos * 2u + 1u] = 0u;
+    }
   }
 }

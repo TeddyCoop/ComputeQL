@@ -30,9 +30,9 @@
 
 #define QE_PUSH_CONSTANT_ROW_COUNT 0
 
-// tec: must match GDB_ColumnType's enum ordinals (gdb.h) and scan_filter.comp's
-// COLTYPE_* defines exactly - qe_compile_load_value packs the raw GDB_ColumnType
-// value into the bytecode operand with no translation layer
+#define QE_SCAN_OUTPUT_DEFAULT_CAP_ROWS 65536
+
+// tec: must match GDB_ColumnType's enum and scan_filter.comp's COLTYPE_* defines exactly
 #define COLTYPE_BOOL      6
 #define COLTYPE_I32       7
 #define COLTYPE_I64       8
@@ -108,8 +108,8 @@ internal QE_ScanResult qe_cpu_scan_filter(Arena* arena, GDB_Table* table, IR_Nod
 typedef struct PLAN_RowSet PLAN_RowSet;
 struct PLAN_RowSet
 {
-  GDB_Table** tables;)
-    String8* aliases;
+  GDB_Table** tables;
+  String8* aliases;
   U64 table_count;
   U64** row_indices;
   U64 count;

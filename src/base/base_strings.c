@@ -2237,3 +2237,23 @@ str8_deserial_read_block(String8 string, U64 off, U64 size, String8 *block_out)
   *block_out = str8_substr(string, range);
   return block_out->size;
 }
+
+////////////////////////////////
+//~ tec: Basic String Hashes
+
+internal U64
+u64_hash_from_seed_str8(U64 seed, String8 string)
+{
+  U64 result = seed;
+  for (U64 i = 0; i < string.size; i += 1)
+  {
+    result = ((result << 5) + result) + string.str[i];
+  }
+  return result;
+}
+
+internal U64
+u64_hash_from_str8(String8 string)
+{
+  return u64_hash_from_seed_str8(5381, string);
+}

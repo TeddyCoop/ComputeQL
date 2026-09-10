@@ -650,7 +650,9 @@ qe_scan_filter(Arena* arena, GDB_Database* database, GDB_Table* table, IR_Node* 
       }
     }
     
-    GPU_Buffer* output_buffer = gpu_buffer_alloc_pooled(str8_lit("scan_filter_output"), Max(chunk_rows, 1) * 2 * sizeof(U32), GPU_BufferFlag_Read, 0);
+    // tec: sized to a default cap rather than chunk_rows
+    U64 output_cap_rows = Max(Min(chunk_rows, (U64)QE_SCAN_OUTPUT_DEFAULT_CAP_ROWS), 1);
+    GPU_Buffer* output_buffer = gpu_buffer_alloc_pooled(str8_lit("scan_filter_output"), output_cap_rows * 2 * sizeof(U32), GPU_BufferFlag_Read, 0);
     GPU_Buffer* result_counter_buffer = gpu_buffer_alloc_pooled(str8_lit("scan_filter_result_counter"), 2 * sizeof(U32), GPU_BufferFlag_ReadWrite | GPU_BufferFlag_HostCached, 0);
     buffer_alloc_time += os_now_microseconds() - buffer_alloc_start;
     ProfEnd();
@@ -669,17 +671,32 @@ qe_scan_filter(Arena* arena, GDB_Database* database, GDB_Table* table, IR_Node* 
       qe_prefetch_request(prefetch, (U32)((chunk_index + 1) % 2), next_range, next_rows);
     }
     
+    // tec: at most 2 attempts
     U32 result_count32[2] = {0, 0};
-    U64 submit_wait_start = os_now_microseconds();
-    GPU_Batch* dispatch_batch = gpu_batch_begin(0, sizeof(result_count32));
-    gpu_batch_buffer_zero(dispatch_batch, result_counter_buffer, 2 * sizeof(U32));
-    gpu_batch_kernel_execute(dispatch_batch, kernel, (U32)chunk_rows, QE_GPU_WORKGROUP_SIZE);
-    gpu_batch_buffer_read(dispatch_batch, result_counter_buffer, result_count32, sizeof(result_count32));
-    gpu_batch_end(dispatch_batch);
-    gpu_kernel_execution_time += gpu_get_executed_kernel_time_microseconds();
-    submit_wait_time += os_now_microseconds() - submit_wait_start;
-    
-    U64 result_count = result_count32[0];
+    U64 result_count = 0;
+    for (U32 attempt = 0; attempt < 2; attempt++)
+    {
+      U64 submit_wait_start = os_now_microseconds();
+      GPU_Batch* dispatch_batch = gpu_batch_begin(0, sizeof(result_count32));
+      gpu_batch_buffer_zero(dispatch_batch, result_counter_buffer, 2 * sizeof(U32));
+      gpu_batch_kernel_execute(dispatch_batch, kernel, (U32)chunk_rows, QE_GPU_WORKGROUP_SIZE);
+      gpu_batch_buffer_read(dispatch_batch, result_counter_buffer, result_count32, sizeof(result_count32));
+      gpu_batch_end(dispatch_batch);
+      gpu_kernel_execution_time += gpu_get_executed_kernel_time_microseconds();
+      submit_wait_time += os_now_microseconds() - submit_wait_start;
+      
+      result_count = result_count32[0];
+      if (result_count <= output_cap_rows)
+      {
+        break;
+      }
+      
+      U64 grow_start = os_now_microseconds();
+      output_cap_rows = result_count;
+      output_buffer = gpu_buffer_alloc_pooled(str8_lit("scan_filter_output"), output_cap_rows * 2 * sizeof(U32), GPU_BufferFlag_Read, 0);
+      gpu_kernel_set_arg_buffer(kernel, QE_BINDING_OUT_INDICES, output_buffer);
+      buffer_alloc_time += os_now_microseconds() - grow_start;
+    }
     
     if (!using_prefetch)
     {
