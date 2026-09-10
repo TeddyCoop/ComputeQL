@@ -32,6 +32,9 @@
 
 #define QE_SCAN_OUTPUT_DEFAULT_CAP_ROWS 65536
 
+// tec: must match scan_filter.comp's MAX_STACK exactly
+#define QE_SCAN_MAX_STACK 8
+
 // tec: must match GDB_ColumnType's enum and scan_filter.comp's COLTYPE_* defines exactly
 #define COLTYPE_BOOL      6
 #define COLTYPE_I32       7

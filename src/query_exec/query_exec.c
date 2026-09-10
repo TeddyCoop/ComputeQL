@@ -316,6 +316,70 @@ qe_bytecode_program_build(QE_BytecodeProgram* prog, GDB_Database* database, GDB_
   qe_bytecode_emit(prog, QE_Opcode_Halt);
 }
 
+internal U32
+qe_bytecode_program_max_stack_depth(QE_BytecodeProgram* prog)
+{
+  U32 depth = 0;
+  U32 max_depth = 0;
+  U64 ip = 0;
+  
+  while (ip < prog->word_count)
+  {
+    U32 opcode = prog->words[ip++];
+    switch (opcode)
+    {
+      case QE_Opcode_PushTrue:   
+      { 
+        depth += 1; 
+      } break;
+      
+      case QE_Opcode_LoadNumCol:
+      { 
+        ip += 1; 
+        depth += 1; } 
+      break;
+      
+      case QE_Opcode_PushConst:
+      { 
+        ip += 1;
+        depth += 1;
+      } break;
+      
+      case QE_Opcode_CmpEq:
+      case QE_Opcode_CmpNe:
+      case QE_Opcode_CmpLt:
+      case QE_Opcode_CmpGt:
+      case QE_Opcode_CmpLe: 
+      case QE_Opcode_CmpGe:
+      case QE_Opcode_And: 
+      case QE_Opcode_Or:
+      { 
+        depth -= 1; 
+      } break;
+      
+      case QE_Opcode_StrEq:
+      case QE_Opcode_StrContains: 
+      { 
+        ip += 3;
+        depth += 1; 
+      } break;
+      
+      case QE_Opcode_Halt: 
+      {
+        ip = prog->word_count; 
+      } break;
+      
+      default:
+      {
+        ip = prog->word_count; 
+      } break;
+    }
+    max_depth = Max(max_depth, depth);
+  }
+  
+  return max_depth;
+}
+
 //~ tec: double-buffered chunk prefetch for qe_scan_filter
 /*
   abackground thread loads the next chunk from disk while the main thread uploads, dispatches, and reads back the current chunk, overlapping disk IO with GPU work
@@ -461,6 +525,17 @@ qe_scan_filter(Arena* arena, GDB_Database* database, GDB_Table* table, IR_Node* 
   
   QE_BytecodeProgram* prog = push_array(arena, QE_BytecodeProgram, 1);
   qe_bytecode_program_build(prog, database, table, NULL, where_clause);
+  
+  U32 stack_depth = qe_bytecode_program_max_stack_depth(prog);
+  log_info("scan_filter bytecode peak operand-stack depth: %u (of MAX_STACK=%u)", stack_depth, (U32)QE_SCAN_MAX_STACK);
+  
+  if (stack_depth > QE_SCAN_MAX_STACK)
+  {
+    log_error("qe_scan_filter: WHERE clause needs operand-stack depth %u, exceeding scan_filter.comp's MAX_STACK (%u) - falling back to CPU scan to avoid a GPU stack overflow",
+              stack_depth, (U32)QE_SCAN_MAX_STACK);
+    ProfEnd();
+    return qe_cpu_scan_filter(arena, table, where_clause);
+  }
   
   GPU_Kernel* kernel = gpu_kernel_alloc(str8_lit("scan_filter"));
   if (!kernel)
