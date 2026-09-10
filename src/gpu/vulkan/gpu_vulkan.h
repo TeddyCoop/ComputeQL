@@ -12,7 +12,8 @@
 #define GPU_VULKAN_MEM_BLOCK_SIZE MB(1)
 #define GPU_VULKAN_MAX_MEM_BLOCKS 64
 
-struct GPU_Buffer
+typedef struct GPU_VulkanBuffer GPU_VulkanBuffer;
+struct GPU_VulkanBuffer
 {
   VkBuffer buffer;
   VkDeviceMemory memory;
@@ -32,18 +33,19 @@ struct GPU_VulkanMemBlock
   U32 memory_type_index;
 };
 
-struct GPU_Kernel
+typedef struct GPU_VulkanKernel GPU_VulkanKernel;
+struct GPU_VulkanKernel
 {
   String8 name;
-  
+
   VkShaderModule shader;
   VkPipeline pipeline;
-  
+
   VkDescriptorSet descriptor_set;
-  
-  GPU_Buffer* bound_buffers[GPU_VULKAN_MAX_BOUND_BUFFERS];
+
+  GPU_VulkanBuffer* bound_buffers[GPU_VULKAN_MAX_BOUND_BUFFERS];
   U32 bound_buffer_count;
-  
+
   U64 push_constants[GPU_VULKAN_PUSH_CONSTANT_COUNT];
 };
 
@@ -51,7 +53,7 @@ typedef struct GPU_PooledBuffer GPU_PooledBuffer;
 struct GPU_PooledBuffer
 {
   String8 name;
-  GPU_Buffer* buffer;
+  GPU_VulkanBuffer* buffer;
   U64 capacity;
   void* imported_host_ptr;
 };
@@ -66,7 +68,8 @@ struct GPU_PendingRead
   U64 size;
 };
 
-struct GPU_Batch
+typedef struct GPU_VulkanBatch GPU_VulkanBatch;
+struct GPU_VulkanBatch
 {
   VkCommandBuffer cmd;
   U64 upload_cursor;
@@ -81,7 +84,8 @@ struct GPU_Batch
   U32 pending_read_count;
 };
 
-struct GPU_State
+typedef struct GPU_VulkanState GPU_VulkanState;
+struct GPU_VulkanState
 {
   Arena* arena;
   
@@ -102,7 +106,7 @@ struct GPU_State
   VkDescriptorSetLayout shared_descriptor_set_layout;
   VkPipelineLayout shared_pipeline_layout;
   
-  GPU_Kernel* kernel_cache[GPU_VULKAN_MAX_CACHED_KERNELS];
+  GPU_VulkanKernel* kernel_cache[GPU_VULKAN_MAX_CACHED_KERNELS];
   U32 kernel_cache_count;
   
   GPU_PooledBuffer pooled_buffers[GPU_VULKAN_MAX_POOLED_BUFFERS];
@@ -144,10 +148,10 @@ struct GPU_State
   void* download_staging_mapped;
   U64 download_staging_capacity;
   
-  GPU_Batch active_batch;
+  GPU_VulkanBatch active_batch;
 };
 
-global GPU_State* g_vulkan_state = 0;
+global GPU_VulkanState* g_vulkan_state = 0;
 
 
 internal void gpu_vulkan_init(void);
@@ -171,13 +175,13 @@ internal VkCommandBuffer gpu_vulkan_begin_one_time_cmd(void);
 internal B32 gpu_vulkan_end_and_submit_cmd_tagged(VkCommandBuffer cmd, const char* tag);
 
 internal B32 gpu_vulkan_alloc_raw_buffer(U64 size, VkBufferUsageFlags usage, VkMemoryPropertyFlags mem_props, VkBuffer* out_buffer, VkDeviceMemory* out_memory);
-internal B32 gpu_vulkan_alloc_dedicated_memory(GPU_Buffer* result, VkMemoryRequirements* mem_req, U32 mem_type, B32 wants_mapped)
+internal B32 gpu_vulkan_alloc_dedicated_memory(GPU_VulkanBuffer* result, VkMemoryRequirements* mem_req, U32 mem_type, B32 wants_mapped);
 internal GPU_VulkanMemBlock* gpu_vulkan_find_or_create_mem_block(U32 memory_type_index, B32 wants_mapped, U64 needed_size, U64 alignment);
-internal B32 gpu_vulkan_buffer_alloc_backing(GPU_Buffer* result, U64 size, VkBufferUsageFlags usage, VkMemoryPropertyFlags mem_props);
+internal B32 gpu_vulkan_buffer_alloc_backing(GPU_VulkanBuffer* result, U64 size, VkBufferUsageFlags usage, VkMemoryPropertyFlags mem_props);
 internal void gpu_vulkan_ensure_staging_capacity(VkBufferUsageFlags usage, VkMemoryPropertyFlags mem_props,
                                                  VkBuffer* buffer, VkDeviceMemory* memory, void** mapped, U64* capacity,
                                                  U64 needed_size);
-internal void gpu_vulkan_staged_upload(GPU_Buffer* dst, void* data, U64 size);
+internal void gpu_vulkan_staged_upload(GPU_VulkanBuffer* dst, void* data, U64 size);
 internal GPU_Buffer* gpu_vulkan_buffer_alloc(U64 size, GPU_BufferFlags flags, void* data);
 internal void gpu_vulkan_buffer_release(GPU_Buffer* buffer);
 internal void gpu_vulkan_buffer_read(GPU_Buffer* buffer, void* data, U64 size);
@@ -198,7 +202,7 @@ internal void gpu_vulkan_kernel_execute(GPU_Kernel* kernel, U32 global_work_size
 
 internal GPU_Batch* gpu_vulkan_batch_begin(U64 upload_bytes_needed, U64 download_bytes_needed);
 internal void gpu_vulkan_batch_buffer_write(GPU_Batch* batch, GPU_Buffer* buffer, void* data, U64 size);
-internal voi gpu_vulkan_batch_buffer_fill(GPU_Batch* batch, GPU_Buffer* buffer, U64 size, U32 value);
+internal void gpu_vulkan_batch_buffer_fill(GPU_Batch* batch, GPU_Buffer* buffer, U64 size, U32 value);
 internal void gpu_vulkan_batch_buffer_zero(GPU_Batch* batch, GPU_Buffer* buffer, U64 size);
 internal void gpu_vulkan_batch_kernel_execute(GPU_Batch* batch, GPU_Kernel* kernel, U32 global_work_size, U32 local_work_size);
 internal void gpu_vulkan_batch_buffer_read(GPU_Batch* batch, GPU_Buffer* buffer, void* out_data, U64 size);

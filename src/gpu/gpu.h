@@ -23,7 +23,6 @@ typedef enum GPU_BufferFlags
   GPU_BufferFlag_COUNT,
 } GPU_BufferFlags;
 
-typedef struct GPU_State GPU_State;
 typedef struct GPU_Buffer GPU_Buffer;
 typedef struct GPU_Kernel GPU_Kernel;
 typedef struct GPU_Batch GPU_Batch;
