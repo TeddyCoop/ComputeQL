@@ -30,13 +30,6 @@ qe_add_numeric_const(QE_BytecodeProgram* prog, F64 value)
   return index;
 }
 
-typedef struct QE_StringConstRef QE_StringConstRef;
-struct QE_StringConstRef
-{
-  U32 word_offset;
-  U32 byte_len;
-};
-
 internal QE_StringConstRef
 qe_add_string_const(QE_BytecodeProgram* prog, String8 str)
 {
@@ -2543,12 +2536,12 @@ qe_index_upper_bound(Arena* arena, GDB_Column* column, B32 is_string, U64* order
 }
 
 internal B32
-qe_try_index_scan(Arena* arena, GDB_Table* table, IR_Node* where_clause, QE_ScanResult* out_result)
+qe_index_range_for_leaf(Arena* arena, GDB_Table* table, IR_Node* condition, QE_ScanResult* out_result)
 {
-  if (!where_clause || !where_clause->first) return 0;
-  
-  IR_Node* condition = where_clause->first;
-  if (condition->type != IR_NodeType_Operator) return 0;
+  if (!condition || condition->type != IR_NodeType_Operator)
+  {
+    return 0;
+  }
   
   String8 op = condition->value;
   B32 is_eq = str8_match(op, str8_lit("="), 0) || str8_match(op, str8_lit("=="), 0);
@@ -2560,8 +2553,14 @@ qe_try_index_scan(Arena* arena, GDB_Table* table, IR_Node* where_clause, QE_Scan
   
   IR_Node* left = condition->first;
   IR_Node* right = left ? left->next : NULL;
-  if (!left || !right || left->type != IR_NodeType_Column) return 0;
-  if (right->type != IR_NodeType_Numeric && right->type != IR_NodeType_Literal) return 0;
+  if (!left || !right || left->type != IR_NodeType_Column)
+  {
+    return 0;
+  }
+  if (right->type != IR_NodeType_Numeric && right->type != IR_NodeType_Literal)
+  {
+    return 0;
+  }
   
   GDB_Column* column = gdb_table_find_column(table, qe_bare_column_name(left->value));
   if (!column) return 0;
@@ -2579,11 +2578,16 @@ qe_try_index_scan(Arena* arena, GDB_Table* table, IR_Node* where_clause, QE_Scan
   
   if (is_date_key || is_enum_key)
   {
-    if (!literal_given) return 0; // tec: date/timestamp/enum comparisons always use a quoted literal
+    if (!literal_given)
+    {
+      // tec: date/timestamp/enum comparisons always use a quoted literal
+      return 0; 
+    }
   }
   else if (is_string_key != literal_given)
   {
-    return 0; // tec: type mismatch, dont guess
+    // tec: type mismatch, dont guess
+    return 0; 
   }
   
   U64 row_count = table->row_count;
@@ -2605,19 +2609,27 @@ qe_try_index_scan(Arena* arena, GDB_Table* table, IR_Node* where_clause, QE_Scan
   F64 target_numeric = 0.0;
   if (is_date_key)
   {
-    if (!qe_resolve_date_literal_value(column->type, right, &target_numeric)) return 0; // unparsable literal, cant use index
+    // unparsable literal, cant use index
+    if (!qe_resolve_date_literal_value(column->type, right, &target_numeric))
+    {
+      return 0; 
+    }
   }
   else if (is_enum_key)
   {
-    if (!qe_resolve_enum_literal_value(column, right, &target_numeric)) return 0; // unparsable literal, cant use index
+    // unparsable literal, cant use index
+    if (!qe_resolve_enum_literal_value(column, right, &target_numeric)) 
+    {
+      return 0; 
+    }
   }
   else if (column->type == GDB_ColumnType_Decimal)
   {
-    // tec: a decimal literal tokenizes as plain Numeric, same as any other
-    // numeric column's literal - but it must resolve through the column's own
-    // scale into raw-integer space, not f64_from_str8, for the same exactness
-    // reason documented on qe_compile_condition's DECIMAL branch
-    if (!qe_resolve_decimal_literal_value(column, right, &target_numeric)) return 0; // unparsable literal, cant use index
+    // unparsable literal, cant use index
+    if (!qe_resolve_decimal_literal_value(column, right, &target_numeric)) 
+    {
+      return 0; 
+    }
   }
   else if (!is_string_key)
   {
@@ -2662,6 +2674,70 @@ qe_try_index_scan(Arena* arena, GDB_Table* table, IR_Node* where_clause, QE_Scan
   
   scratch_end(scratch);
   return 1;
+}
+
+#define QE_INDEX_SCAN_MAX_AND_LEAVES 16
+
+internal U32
+qe_collect_and_leaves(IR_Node* condition, IR_Node** out_leaves, U32 count, U32 max_leaves)
+{
+  if (!condition || count >= max_leaves) return count;
+  
+  if (condition->type == IR_NodeType_Operator &&
+      str8_match(condition->value, str8_lit("and"), StringMatchFlag_CaseInsensitive))
+  {
+    count = qe_collect_and_leaves(condition->first, out_leaves, count, max_leaves);
+    count = qe_collect_and_leaves(condition->first ? condition->first->next : NULL, out_leaves, count, max_leaves);
+    return count;
+  }
+  
+  out_leaves[count++] = condition;
+  return count;
+}
+
+internal B32
+qe_try_index_scan(Arena* arena, GDB_Table* table, IR_Node* where_clause, QE_ScanResult* out_result)
+{
+  if (!where_clause || !where_clause->first) return 0;
+  IR_Node* root = where_clause->first;
+  
+  if (qe_index_range_for_leaf(arena, table, root, out_result))
+  {
+    return 1;
+  }
+  
+  if (root->type != IR_NodeType_Operator || !str8_match(root->value, str8_lit("and"), StringMatchFlag_CaseInsensitive))
+  {
+    return 0;
+  }
+  
+  IR_Node* leaves[QE_INDEX_SCAN_MAX_AND_LEAVES];
+  U32 leaf_count = qe_collect_and_leaves(root, leaves, 0, QE_INDEX_SCAN_MAX_AND_LEAVES);
+  
+  for (U32 i = 0; i < leaf_count; i++)
+  {
+    QE_ScanResult narrowed = {0};
+    if (!qe_index_range_for_leaf(arena, table, leaves[i], &narrowed))
+    {
+      continue;
+    }
+    
+    String8 empty_alias = {0};
+    U64* row_indices_for_table = narrowed.indices;
+    PLAN_RowSet single_table_rows = {0};
+    single_table_rows.tables = &table;
+    single_table_rows.aliases = &empty_alias;
+    single_table_rows.table_count = 1;
+    single_table_rows.row_indices = &row_indices_for_table;
+    single_table_rows.count = narrowed.count;
+    
+    PLAN_RowSet filtered = qe_filter_joined_rows(arena, &single_table_rows, root);
+    out_result->indices = filtered.row_indices[0];
+    out_result->count = filtered.count;
+    return 1;
+  }
+  
+  return 0;
 }
 
 internal B32

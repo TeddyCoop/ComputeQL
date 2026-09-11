@@ -2,8 +2,9 @@
 
 set MSVC=1
 set CLANG=0
-set DEBUG=0
-set RELEASE=1
+set DEBUG=1
+set RELEASE=0
+set COMPILE_SHADERS=0
 
 :: compile defintions
 set cl_common=     /I..\src\ /I..\src\third_party\vulkan\ /nologo /FC /Z7
@@ -53,8 +54,10 @@ pushd build
 popd
 
 :: compile compute shaders (GLSL -> SPIR-V), precompiled and never built at runtime
-for %%f in (src\gpu\vulkan\shaders\*.comp) do (
-  "%VULKAN_SDK%\Bin\glslc.exe" %%f -o build\shaders\%%~nf.spv || exit /b 1
+if %COMPILE_SHADERS% == 1 do (
+	for %%f in (src\gpu\vulkan\shaders\*.comp) do (
+ 	"%VULKAN_SDK%\Bin\glslc.exe" %%f -o build\shaders\%%~nf.spv || exit /b 1
+	)
 )
 
 :: unset

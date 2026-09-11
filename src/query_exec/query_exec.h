@@ -93,6 +93,22 @@ struct QE_BytecodeProgram
   U32 next_slot;
 };
 
+typedef struct QE_StringConstRef QE_StringConstRef;
+struct QE_StringConstRef
+{
+  U32 word_offset;
+  U32 byte_len;
+};
+
+internal void qe_bytecode_emit(QE_BytecodeProgram* prog, U32 word);
+internal U32 qe_add_numeric_const(QE_BytecodeProgram* prog, F64 value);
+internal QE_StringConstRef qe_add_string_const(QE_BytecodeProgram* prog, String8 str);
+internal QE_ColumnBinding* qe_find_binding(QE_BytecodeProgram* prog, String8 column_name);
+internal QE_ColumnBinding* qe_bind_column(QE_BytecodeProgram* prog, GDB_Table* table, String8 column_name);
+internal QE_Opcode qe_opcode_from_comparison_operator(String8 op);
+internal void qe_compile_load_value(QE_BytecodeProgram* prog, GDB_Table* table, IR_Node* node);
+internal void qe_compile_condition(QE_BytecodeProgram* prog, GDB_Table* table, IR_Node* condition);
+
 typedef struct QE_ScanResult QE_ScanResult;
 struct QE_ScanResult
 {
@@ -101,6 +117,7 @@ struct QE_ScanResult
 };
 
 internal void qe_bytecode_program_build(QE_BytecodeProgram* prog, GDB_Database* database, GDB_Table* table, IR_Node* root_node, IR_Node* where_clause);
+internal U32 qe_bytecode_program_max_stack_depth(QE_BytecodeProgram* prog);
 internal QE_ScanResult qe_scan_filter(Arena* arena, GDB_Database* database, GDB_Table* table, IR_Node* where_clause);
 internal B32 qe_try_index_scan(Arena* arena, GDB_Table* table, IR_Node* where_clause, QE_ScanResult* out_result);
 internal QE_ScanResult qe_cpu_scan_filter(Arena* arena, GDB_Table* table, IR_Node* where_clause);
