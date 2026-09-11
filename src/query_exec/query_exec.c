@@ -1247,7 +1247,7 @@ qe_sort_rows(Arena* arena, PLAN_RowSet* rows, IR_Node* order_by_ir)
   B32 key_is_string[QE_SORT_MAX_KEYS];
   U32 num_keys = 0;
   B32 any_string_key = 0;
-  
+
   for (IR_Node* col_node = order_by_ir->first; col_node != NULL; col_node = col_node->next)
   {
     if (num_keys >= QE_SORT_MAX_KEYS)
@@ -1255,19 +1255,19 @@ qe_sort_rows(Arena* arena, PLAN_RowSet* rows, IR_Node* order_by_ir)
       log_error("qe_sort_rows: more than %u ORDER BY columns is not supported, ignoring the rest", (U32)QE_SORT_MAX_KEYS);
       break;
     }
-    
+
     String8 bare_name = {0};
     U64 slot = max_U64;
     GDB_Table* table = qe_resolve_column_table(rows, col_node->value, &bare_name, &slot);
     if (!table) continue; // tec: already logged by qe_resolve_column_table
-    
+
     GDB_Column* column = gdb_table_find_column(table, bare_name);
     if (!column) continue;
-    
+
     B32 desc = (col_node->first && col_node->first->type == IR_NodeType_Descending);
     B32 is_string = (column->type == GDB_ColumnType_String8);
     any_string_key |= is_string;
-    
+
     key_slots[num_keys] = slot;
     key_columns[num_keys] = column;
     key_desc[num_keys] = desc;
@@ -1343,18 +1343,30 @@ qe_sort_rows(Arena* arena, PLAN_RowSet* rows, IR_Node* order_by_ir)
     gathered[k] = qe_gather_numeric_column(scratch.arena, rows, key_slots[k], key_columns[k]);
   }
   
-  F64* keys = push_array(scratch.arena, F64, padded_count * QE_SORT_MAX_KEYS);
+  B32 use_narrow_keys = 1;
+  for (U32 k = 0; k < num_keys && use_narrow_keys; k++)
+  {
+    for (U64 i = 0; i < real_count; i++)
+    {
+      F64 v = gathered[k][i];
+      if ((F64)(F32)v != v) { use_narrow_keys = 0; break; }
+    }
+  }
+  U64 keys_elem_size = use_narrow_keys ? sizeof(F32) : sizeof(F64);
+  void* keys = push_array(scratch.arena, U8, padded_count * QE_SORT_MAX_KEYS * keys_elem_size);
   U32* payload = push_array(scratch.arena, U32, padded_count * 9);
-  
+
   for (U64 i = 0; i < padded_count; i++)
   {
     B32 is_real = i < real_count;
-    
+
     for (U32 k = 0; k < QE_SORT_MAX_KEYS; k++)
     {
-      keys[i * QE_SORT_MAX_KEYS + k] = (is_real && k < num_keys) ? gathered[k][i] : 0.0;
+      F64 v = (is_real && k < num_keys) ? gathered[k][i] : 0.0;
+      if (use_narrow_keys) ((F32*)keys)[i * QE_SORT_MAX_KEYS + k] = (F32)v;
+      else                 ((F64*)keys)[i * QE_SORT_MAX_KEYS + k] = v;
     }
-    
+
     for (U32 t = 0; t < QE_SORT_MAX_TABLES; t++)
     {
       U64 row = (is_real && t < rows->table_count) ? rows->row_indices[t][i] : 0;
@@ -1363,17 +1375,17 @@ qe_sort_rows(Arena* arena, PLAN_RowSet* rows, IR_Node* order_by_ir)
     }
     payload[i * 9 + 8] = is_real ? 1u : 0u;
   }
-  
-  GPU_Kernel* kernel = gpu_kernel_alloc(str8_lit("bitonic_sort"));
+
+  GPU_Kernel* kernel = gpu_kernel_alloc(use_narrow_keys ? str8_lit("bitonic_sort_f32") : str8_lit("bitonic_sort"));
   if (!kernel)
   {
-    log_error("qe_sort_rows: failed to alloc 'bitonic_sort' kernel, returning unsorted");
+    log_error("qe_sort_rows: failed to alloc 'bitonic_sort%s' kernel, returning unsorted", use_narrow_keys ? "_f32" : "");
     scratch_end(scratch);
     ProfEnd();
     return result;
   }
-  
-  U64 keys_size = padded_count * QE_SORT_MAX_KEYS * sizeof(F64);
+
+  U64 keys_size = padded_count * QE_SORT_MAX_KEYS * keys_elem_size;
   U64 payload_size = padded_count * 9 * sizeof(U32);
   
   GPU_Buffer* keys_buf = gpu_buffer_alloc(keys_size, GPU_BufferFlag_ReadWrite, 0);
@@ -1408,7 +1420,9 @@ qe_sort_rows(Arena* arena, PLAN_RowSet* rows, IR_Node* order_by_ir)
   U32* sorted_payload = push_array(scratch.arena, U32, padded_count * 9);
   gpu_batch_buffer_read(sort_batch, payload_buf, sorted_payload, payload_size);
   gpu_batch_end(sort_batch);
-  
+  log_info("qe_sort_rows: bitonic sort (real_count=%llu, padded_count=%llu, num_stages=%u, keys=%s) GPU kernel time: %llu microseconds",
+           real_count, padded_count, num_stages, use_narrow_keys ? "f32" : "f64", gpu_get_executed_kernel_time_microseconds());
+
   gpu_buffer_release(keys_buf);
   gpu_buffer_release(payload_buf);
   gpu_kernel_release(kernel);
