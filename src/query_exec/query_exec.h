@@ -122,6 +122,11 @@ internal QE_ScanResult qe_scan_filter(Arena* arena, GDB_Database* database, GDB_
 internal B32 qe_try_index_scan(Arena* arena, GDB_Table* table, IR_Node* where_clause, QE_ScanResult* out_result);
 internal QE_ScanResult qe_cpu_scan_filter(Arena* arena, GDB_Table* table, IR_Node* where_clause);
 
+//~ tec: thread pool
+global TP_Context* g_qe_thread_pool = 0;
+global TP_Arena*   g_qe_thread_pool_arena = 0;
+internal void qe_thread_pool_init(void);
+
 //~ tec: shared query-result representation
 #define PLAN_NULL_ROW max_U64 // tec: unmatched side of a LEFT JOIN - treat a column read against this as NULL
 

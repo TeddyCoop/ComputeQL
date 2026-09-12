@@ -1,3 +1,16 @@
+internal void
+qe_thread_pool_init(void)
+{
+  if (g_qe_thread_pool)
+  {
+    return;
+  }
+  
+  Arena* arena = arena_alloc();
+  U32 worker_count = Max(1, os_get_system_info()->logical_processor_count);
+  g_qe_thread_pool = tp_alloc(arena, worker_count, 0, str8_zero());
+  g_qe_thread_pool_arena = tp_arena_alloc(g_qe_thread_pool);
+}
 
 internal void
 qe_bytecode_emit(QE_BytecodeProgram* prog, U32 word)
@@ -190,6 +203,24 @@ qe_compile_condition(QE_BytecodeProgram* prog, GDB_Table* table, IR_Node* condit
     qe_compile_condition(prog, table, left);
     qe_compile_condition(prog, table, right);
     qe_bytecode_emit(prog, QE_Opcode_Or);
+    return;
+  }
+  
+  // tec: because null checking is weird, theres no right side operand.
+  // so this needs to be checked now
+  if (str8_match(op, str8_lit("is null"), StringMatchFlag_CaseInsensitive) ||
+      str8_match(op, str8_lit("is not null"), StringMatchFlag_CaseInsensitive))
+  {
+    B32 is_not = str8_match(op, str8_lit("is not null"), StringMatchFlag_CaseInsensitive);
+    if (is_not)
+    {
+      qe_bytecode_emit(prog, QE_Opcode_PushTrue);
+    }
+    else
+    {
+      qe_bytecode_emit(prog, QE_Opcode_PushConst);
+      qe_bytecode_emit(prog, qe_add_numeric_const(prog, 0.0));
+    }
     return;
   }
   
@@ -1247,7 +1278,7 @@ qe_sort_rows(Arena* arena, PLAN_RowSet* rows, IR_Node* order_by_ir)
   B32 key_is_string[QE_SORT_MAX_KEYS];
   U32 num_keys = 0;
   B32 any_string_key = 0;
-
+  
   for (IR_Node* col_node = order_by_ir->first; col_node != NULL; col_node = col_node->next)
   {
     if (num_keys >= QE_SORT_MAX_KEYS)
@@ -1255,19 +1286,19 @@ qe_sort_rows(Arena* arena, PLAN_RowSet* rows, IR_Node* order_by_ir)
       log_error("qe_sort_rows: more than %u ORDER BY columns is not supported, ignoring the rest", (U32)QE_SORT_MAX_KEYS);
       break;
     }
-
+    
     String8 bare_name = {0};
     U64 slot = max_U64;
     GDB_Table* table = qe_resolve_column_table(rows, col_node->value, &bare_name, &slot);
     if (!table) continue; // tec: already logged by qe_resolve_column_table
-
+    
     GDB_Column* column = gdb_table_find_column(table, bare_name);
     if (!column) continue;
-
+    
     B32 desc = (col_node->first && col_node->first->type == IR_NodeType_Descending);
     B32 is_string = (column->type == GDB_ColumnType_String8);
     any_string_key |= is_string;
-
+    
     key_slots[num_keys] = slot;
     key_columns[num_keys] = column;
     key_desc[num_keys] = desc;
@@ -1355,18 +1386,18 @@ qe_sort_rows(Arena* arena, PLAN_RowSet* rows, IR_Node* order_by_ir)
   U64 keys_elem_size = use_narrow_keys ? sizeof(F32) : sizeof(F64);
   void* keys = push_array(scratch.arena, U8, padded_count * QE_SORT_MAX_KEYS * keys_elem_size);
   U32* payload = push_array(scratch.arena, U32, padded_count * 9);
-
+  
   for (U64 i = 0; i < padded_count; i++)
   {
     B32 is_real = i < real_count;
-
+    
     for (U32 k = 0; k < QE_SORT_MAX_KEYS; k++)
     {
       F64 v = (is_real && k < num_keys) ? gathered[k][i] : 0.0;
       if (use_narrow_keys) ((F32*)keys)[i * QE_SORT_MAX_KEYS + k] = (F32)v;
       else                 ((F64*)keys)[i * QE_SORT_MAX_KEYS + k] = v;
     }
-
+    
     for (U32 t = 0; t < QE_SORT_MAX_TABLES; t++)
     {
       U64 row = (is_real && t < rows->table_count) ? rows->row_indices[t][i] : 0;
@@ -1375,7 +1406,7 @@ qe_sort_rows(Arena* arena, PLAN_RowSet* rows, IR_Node* order_by_ir)
     }
     payload[i * 9 + 8] = is_real ? 1u : 0u;
   }
-
+  
   GPU_Kernel* kernel = gpu_kernel_alloc(use_narrow_keys ? str8_lit("bitonic_sort_f32") : str8_lit("bitonic_sort"));
   if (!kernel)
   {
@@ -1384,7 +1415,7 @@ qe_sort_rows(Arena* arena, PLAN_RowSet* rows, IR_Node* order_by_ir)
     ProfEnd();
     return result;
   }
-
+  
   U64 keys_size = padded_count * QE_SORT_MAX_KEYS * keys_elem_size;
   U64 payload_size = padded_count * 9 * sizeof(U32);
   
@@ -1422,7 +1453,7 @@ qe_sort_rows(Arena* arena, PLAN_RowSet* rows, IR_Node* order_by_ir)
   gpu_batch_end(sort_batch);
   log_info("qe_sort_rows: bitonic sort (real_count=%llu, padded_count=%llu, num_stages=%u, keys=%s) GPU kernel time: %llu microseconds",
            real_count, padded_count, num_stages, use_narrow_keys ? "f32" : "f64", gpu_get_executed_kernel_time_microseconds());
-
+  
   gpu_buffer_release(keys_buf);
   gpu_buffer_release(payload_buf);
   gpu_kernel_release(kernel);
@@ -2979,9 +3010,39 @@ qe_row_condition_eval(Arena* arena, PLAN_RowSet* rows, IR_Node* condition, U64 o
   return 1;
 }
 
+typedef struct QE_CpuScanTask QE_CpuScanTask;
+struct QE_CpuScanTask
+{
+  Rng1U64* ranges;
+  PLAN_RowSet* rows;
+  IR_Node* condition_root;
+  U64* task_matched_counts;
+  U64** task_matched_indices;
+};
+
+internal THREAD_POOL_TASK_FUNC(qe_cpu_scan_filter_task)
+{
+  QE_CpuScanTask* task = (QE_CpuScanTask*)raw_task;
+  Rng1U64 range = task->ranges[task_id];
+  U64* local_matched = task->task_matched_indices[task_id];
+  U64 local_count = 0;
+  
+  for (U64 i = range.min; i < range.max; i++)
+  {
+    if (qe_row_condition_eval(arena, task->rows, task->condition_root, i))
+    {
+      local_matched[local_count++] = i;
+    }
+  }
+  
+  task->task_matched_counts[task_id] = local_count;
+}
+
 internal QE_ScanResult
 qe_cpu_scan_filter(Arena* arena, GDB_Table* table, IR_Node* where_clause)
 {
+  qe_thread_pool_init();
+  
   QE_ScanResult result = {0};
   U64 row_count = table->row_count;
   
@@ -3000,15 +3061,39 @@ qe_cpu_scan_filter(Arena* arena, GDB_Table* table, IR_Node* where_clause)
   
   IR_Node* condition_root = where_clause ? where_clause->first : NULL;
   
-  U64* matched = push_array(arena, U64, Max(row_count, 1));
-  U64 matched_count = 0;
-  for (U64 i = 0; i < row_count; i++)
+  U64 cpu_scan_start = os_now_microseconds();
+  
+  TP_Context* pool = g_qe_thread_pool;
+  U64 task_count = (row_count > 1) ? Min((U64)pool->worker_count, row_count) : 1;
+  
+  QE_CpuScanTask task = {0};
+  task.ranges = tp_divide_work(scratch.arena, row_count, (U32)task_count);
+  task.rows = &rows;
+  task.condition_root = condition_root;
+  task.task_matched_counts = push_array(scratch.arena, U64, task_count);
+  task.task_matched_indices = push_array(scratch.arena, U64*, task_count);
+  for (U64 t = 0; t < task_count; t++)
   {
-    if (qe_row_condition_eval(arena, &rows, condition_root, i))
-    {
-      matched[matched_count++] = i;
-    }
+    U64 width = task.ranges[t].max - task.ranges[t].min;
+    task.task_matched_indices[t] = push_array(scratch.arena, U64, Max(width, 1));
   }
+  
+  TP_Temp temp = tp_temp_begin(g_qe_thread_pool_arena);
+  tp_for_parallel(pool, g_qe_thread_pool_arena, task_count, qe_cpu_scan_filter_task, &task);
+  tp_temp_end(temp);
+  
+  U64 matched_count = 0;
+  for (U64 t = 0; t < task_count; t++) matched_count += task.task_matched_counts[t];
+  
+  U64* matched = push_array(arena, U64, Max(matched_count, 1));
+  U64 out_i = 0;
+  for (U64 t = 0; t < task_count; t++)
+  {
+    MemoryCopy(matched + out_i, task.task_matched_indices[t], task.task_matched_counts[t] * sizeof(U64));
+    out_i += task.task_matched_counts[t];
+  }
+  
+  log_info("qe_cpu_scan_filter: CPU scan (row_count=%llu) total time: %llu microseconds", row_count, os_now_microseconds() - cpu_scan_start);
   
   result.indices = matched;
   result.count = matched_count;

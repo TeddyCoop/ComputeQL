@@ -31,8 +31,6 @@ struct APP_ResultSet
   F64* cell_numeric;    
 };
 
-internal void app_thread_pool_init(void);
-
 // tec: out_result_set may be NULL
 internal APP_QueryResult app_execute_query_capture(Arena* arena, String8 sql_query, GDB_Database** io_database, APP_ResultSet* out_result_set);
 internal void app_execute_query(String8 sql_query);

@@ -1578,7 +1578,8 @@ gdb_table_import_csv_streaming(GDB_Database *db, String8 table_name, String8 pat
           
           if (val.size == 0)
           {
-            gdb_column_add_data(column, NULL);
+            // tec: an empty CSV field is a NULL
+            gdb_column_add_data_maybe_null(column, NULL, 1);
           }
           else
           {
@@ -1587,31 +1588,31 @@ gdb_table_import_csv_streaming(GDB_Database *db, String8 table_name, String8 pat
               case GDB_ColumnType_U32:
               {
                 U32 value = (U32)u64_from_str8(val, 10);
-                gdb_column_add_data(column, &value);
+                gdb_column_add_data_maybe_null(column, &value, 0);
               } break;
               
               case GDB_ColumnType_U64:
               {
                 U64 value = u64_from_str8(val, 10);
-                gdb_column_add_data(column, &value);
+                gdb_column_add_data_maybe_null(column, &value, 0);
               } break;
               
               case GDB_ColumnType_F32:
               {
                 F32 value = (F32)f64_from_str8(val);
-                gdb_column_add_data(column, &value);
+                gdb_column_add_data_maybe_null(column, &value, 0);
               } break;
               
               case GDB_ColumnType_F64:
               {
                 F64 value = f64_from_str8(val);
-                gdb_column_add_data(column, &value);
+                gdb_column_add_data_maybe_null(column, &value, 0);
               } break;
               
               case GDB_ColumnType_String8:
               default:
               {
-                gdb_column_add_data(column, &val);
+                gdb_column_add_data_maybe_null(column, &val, 0);
               } break;
             }
           }
@@ -1639,18 +1640,19 @@ gdb_table_import_csv_streaming(GDB_Database *db, String8 table_name, String8 pat
           
           if (val.size == 0)
           {
-            gdb_column_add_data(column, NULL);
+            // tec: an empty CSV field is a NULL
+            gdb_column_add_data_maybe_null(column, NULL, 1);
           }
           else
           {
             switch (column->type)
             {
-              case GDB_ColumnType_U32: { U32 v = (U32)u64_from_str8(val, 10); gdb_column_add_data(column, &v); } break;
-              case GDB_ColumnType_U64: { U64 v = u64_from_str8(val, 10); gdb_column_add_data(column, &v); } break;
-              case GDB_ColumnType_F32: { F32 v = (F32)f64_from_str8(val); gdb_column_add_data(column, &v); } break;
-              case GDB_ColumnType_F64: { F64 v = f64_from_str8(val); gdb_column_add_data(column, &v); } break;
+              case GDB_ColumnType_U32: { U32 v = (U32)u64_from_str8(val, 10); gdb_column_add_data_maybe_null(column, &v, 0); } break;
+              case GDB_ColumnType_U64: { U64 v = u64_from_str8(val, 10); gdb_column_add_data_maybe_null(column, &v, 0); } break;
+              case GDB_ColumnType_F32: { F32 v = (F32)f64_from_str8(val); gdb_column_add_data_maybe_null(column, &v, 0); } break;
+              case GDB_ColumnType_F64: { F64 v = f64_from_str8(val); gdb_column_add_data_maybe_null(column, &v, 0); } break;
               case GDB_ColumnType_String8:
-              default: { gdb_column_add_data(column, &val); } break;
+              default: { gdb_column_add_data_maybe_null(column, &val, 0); } break;
             }
           }
         }
@@ -2204,7 +2206,19 @@ gdb_column_add_data_disk_backed(GDB_Column* column, void* data)
       column->file = file;
     }
     U64 offset = column->row_count * column->size;
-    os_file_write(file, r1u64(offset, offset + column->size), data);
+    if (data)
+    {
+      os_file_write(file, r1u64(offset, offset + column->size), data);
+    }
+    else
+    {
+      // tec: NULL data. write a zeroed placeholder
+      Temp scratch = temp_begin(g_gdb_state->arena);
+      void* zero_buf = push_array(scratch.arena, U8, column->size);
+      MemoryZero(zero_buf, column->size);
+      os_file_write(file, r1u64(offset, offset + column->size), zero_buf);
+      temp_end(scratch);
+    }
     
     if (os_handle_match(os_handle_zero(), column->file))
     {
@@ -2227,7 +2241,7 @@ gdb_column_add_data(GDB_Column* column, void* data)
     
     if (column->is_disk_backed)
     {
-      gdb_column_add_data_disk_backed(column, data);
+      gdb_column_add_data_disk_backed(column, str);
     }
     else
     {
@@ -2326,8 +2340,15 @@ gdb_column_add_data(GDB_Column* column, void* data)
         column->capacity = new_capacity;
       }
       
-      // tec: add data
-      MemoryCopy(column->data + column->row_count * column->size, data, column->size);
+      // tec: add data. which may or may not be null
+      if (data)
+      {
+        MemoryCopy(column->data + column->row_count * column->size, data, column->size);
+      }
+      else
+      {
+        MemoryZero(column->data + column->row_count * column->size, column->size);
+      }
       
       if ((column->row_count + 1) * column->size > g_gdb_disk_backed_threshold_size)
       {

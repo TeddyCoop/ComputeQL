@@ -8,6 +8,7 @@
 
 #include "base/base_inc.h"
 #include "os/os_inc.h"
+#include "thread_pool/thread_pool.h"
 #include "settings/settings.h"
 #include "gdb/gdb_inc.h"
 #include "ir_gen/ir_gen_inc.h"
@@ -15,7 +16,6 @@
 #include "query_exec/query_exec.h"
 #include "planner/planner.h"
 #include "application.h"
-#include "thread_pool/thread_pool.h"
 #include "server/server.h"
 #include "server/pg_protocol.h"
 #include "server/pg_server.h"
@@ -23,6 +23,7 @@
 
 #include "base/base_inc.c"
 #include "os/os_inc.c"
+#include "thread_pool/thread_pool.c"
 #include "settings/settings.c"
 #include "gpu/gpu_inc.c"
 #include "ir_gen/ir_gen_inc.c"
@@ -30,7 +31,6 @@
 #include "query_exec/query_exec.c"
 #include "planner/planner.c"
 #include "application.c"
-#include "thread_pool/thread_pool.c"
 #include "server/server.c"
 #include "server/pg_protocol.c"
 #include "server/pg_server.c"
@@ -112,7 +112,7 @@ entry_point(CmdLine* cmdline)
     settings_load_from_file(settings_path);
     
     gdb_init();
-    app_thread_pool_init();
+    qe_thread_pool_init();
 
     String8 gpu_backend_str = cmd_line_string(cmdline, str8_lit("gpu"));
     if (gpu_backend_str.size != 0)
