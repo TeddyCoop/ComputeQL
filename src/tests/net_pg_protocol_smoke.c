@@ -15,6 +15,7 @@
 #include "query_exec/query_exec.h"
 #include "planner/planner.h"
 #include "application.h"
+#include "thread_pool/thread_pool.h"
 #include "server/pg_protocol.h"
 #include "server/pg_server.h"
 
@@ -27,6 +28,7 @@
 #include "query_exec/query_exec.c"
 #include "planner/planner.c"
 #include "application.c"
+#include "thread_pool/thread_pool.c"
 #include "server/pg_protocol.c"
 #include "server/pg_server.c"
 

@@ -14,6 +14,7 @@
 #include "query_exec/query_exec.h"
 #include "planner/planner.h"
 #include "application.h"
+#include "thread_pool/thread_pool.h"
 #include "server/server.h"
 
 #include "base/base_inc.c"
@@ -25,6 +26,7 @@
 #include "query_exec/query_exec.c"
 #include "planner/planner.c"
 #include "application.c"
+#include "thread_pool/thread_pool.c"
 #include "server/server.c"
 
 #define NCS_TEST_PORT 47322

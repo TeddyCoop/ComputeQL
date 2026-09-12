@@ -112,7 +112,8 @@ entry_point(CmdLine* cmdline)
     settings_load_from_file(settings_path);
     
     gdb_init();
-    
+    app_thread_pool_init();
+
     String8 gpu_backend_str = cmd_line_string(cmdline, str8_lit("gpu"));
     if (gpu_backend_str.size != 0)
     {

@@ -1,6 +1,19 @@
 
 global OS_Handle g_query_exec_mutex = {0};
 
+global TP_Context* g_app_thread_pool = 0;
+global TP_Arena*   g_app_thread_pool_arena = 0;
+
+internal void
+app_thread_pool_init(void)
+{
+  if (g_app_thread_pool) return;
+  Arena* arena = arena_alloc();
+  U32 worker_count = Max(1, os_get_system_info()->logical_processor_count);
+  g_app_thread_pool = tp_alloc(arena, worker_count, 0, str8_zero());
+  g_app_thread_pool_arena = tp_arena_alloc(g_app_thread_pool);
+}
+
 internal int
 delete_row_index_compare_descending(const void* a, const void* b)
 {
@@ -353,13 +366,206 @@ app_format_cell_text(Arena* arena, GDB_ColumnType type, F64 numeric_value, Strin
   }
 }
 
+typedef struct SelectColGather SelectColGather;
+struct SelectColGather
+{
+  B32 resolved;
+  GDB_Table* col_table;
+  GDB_Column* column;
+  U64 table_slot;
+  GDB_ColumnType type;
+  F64* numeric_values;
+  GDB_StringDataChunk strings;
+};
+
+typedef struct APP_SelectFormatTask APP_SelectFormatTask;
+struct APP_SelectFormatTask
+{
+  Rng1U64* ranges;
+  IR_Node* select_output_columns;
+  SelectColGather* gathered;
+  U64 column_count;
+  PLAN_RowSet* rows;
+  B32 capture_structured;
+  APP_ResultSet* out_result_set;
+  String8List* worker_lists;
+};
+
+internal THREAD_POOL_TASK_FUNC(app_select_format_task)
+{
+  APP_SelectFormatTask* task = (APP_SelectFormatTask*)raw_task;
+  Rng1U64 range = task->ranges[task_id];
+  B32 capture_structured = task->capture_structured;
+  APP_ResultSet* out_result_set = task->out_result_set;
+  String8List local_out = {0};
+
+  for (U64 i = range.min; i < range.max; i++)
+  {
+    U64 ci = 0;
+    for (IR_Node* column_node = task->select_output_columns->first; column_node != NULL; column_node = column_node->next, ci++)
+    {
+      U64 cell_i = i * task->column_count + ci;
+
+      if (!task->gathered[ci].resolved)
+      {
+        if (!capture_structured) { str8_list_push(arena, &local_out, str8_lit("? ")); }
+        if (capture_structured) { out_result_set->cell_is_null[cell_i] = 1; }
+        continue;
+      }
+
+      U64 row_index = task->rows->row_indices[task->gathered[ci].table_slot][i];
+      if (row_index == PLAN_NULL_ROW || gdb_column_is_null(task->gathered[ci].column, row_index))
+      {
+        if (!capture_structured) { str8_list_push(arena, &local_out, str8_lit("NULL ")); }
+        if (capture_structured) { out_result_set->cell_is_null[cell_i] = 1; }
+        continue;
+      }
+
+      switch (task->gathered[ci].type)
+      {
+        case GDB_ColumnType_U32:
+        if (!capture_structured) { str8_list_push(arena, &local_out, push_str8f(arena, "%u ", (U32)task->gathered[ci].numeric_values[i])); }
+        if (capture_structured)
+        {
+          out_result_set->cell_text[cell_i] = app_format_cell_text(arena, task->gathered[ci].type, task->gathered[ci].numeric_values[i], (String8){0}, task->gathered[ci].column->decimal_scale, task->gathered[ci].column->enum_type);
+          out_result_set->cell_numeric[cell_i] = task->gathered[ci].numeric_values[i];
+        }
+        break;
+        case GDB_ColumnType_U64:
+        if (!capture_structured) { str8_list_push(arena, &local_out, push_str8f(arena, "%llu ", (U64)task->gathered[ci].numeric_values[i])); }
+        if (capture_structured)
+        {
+          out_result_set->cell_text[cell_i] = app_format_cell_text(arena, task->gathered[ci].type, task->gathered[ci].numeric_values[i], (String8){0}, task->gathered[ci].column->decimal_scale, task->gathered[ci].column->enum_type);
+          out_result_set->cell_numeric[cell_i] = task->gathered[ci].numeric_values[i];
+        }
+        break;
+        case GDB_ColumnType_F32:
+        if (!capture_structured) { str8_list_push(arena, &local_out, push_str8f(arena, "%f ", (F32)task->gathered[ci].numeric_values[i])); }
+        if (capture_structured)
+        {
+          out_result_set->cell_text[cell_i] = app_format_cell_text(arena, task->gathered[ci].type, task->gathered[ci].numeric_values[i], (String8){0}, task->gathered[ci].column->decimal_scale, task->gathered[ci].column->enum_type);
+          out_result_set->cell_numeric[cell_i] = task->gathered[ci].numeric_values[i];
+        }
+        break;
+        case GDB_ColumnType_F64:
+        if (!capture_structured) { str8_list_push(arena, &local_out, push_str8f(arena, "%lf ", task->gathered[ci].numeric_values[i])); }
+        if (capture_structured)
+        {
+          out_result_set->cell_text[cell_i] = app_format_cell_text(arena, task->gathered[ci].type, task->gathered[ci].numeric_values[i], (String8){0}, task->gathered[ci].column->decimal_scale, task->gathered[ci].column->enum_type);
+          out_result_set->cell_numeric[cell_i] = task->gathered[ci].numeric_values[i];
+        }
+        break;
+        case GDB_ColumnType_Bool:
+        if (!capture_structured) { str8_list_push(arena, &local_out, push_str8f(arena, "%s ", task->gathered[ci].numeric_values[i] != 0.0 ? "true" : "false")); }
+        if (capture_structured)
+        {
+          out_result_set->cell_text[cell_i] = app_format_cell_text(arena, task->gathered[ci].type, task->gathered[ci].numeric_values[i], (String8){0}, task->gathered[ci].column->decimal_scale, task->gathered[ci].column->enum_type);
+          out_result_set->cell_numeric[cell_i] = task->gathered[ci].numeric_values[i];
+        }
+        break;
+        case GDB_ColumnType_I32:
+        if (!capture_structured) { str8_list_push(arena, &local_out, push_str8f(arena, "%d ", (S32)task->gathered[ci].numeric_values[i])); }
+        if (capture_structured)
+        {
+          out_result_set->cell_text[cell_i] = app_format_cell_text(arena, task->gathered[ci].type, task->gathered[ci].numeric_values[i], (String8){0}, task->gathered[ci].column->decimal_scale, task->gathered[ci].column->enum_type);
+          out_result_set->cell_numeric[cell_i] = task->gathered[ci].numeric_values[i];
+        }
+        break;
+        case GDB_ColumnType_I64:
+        if (!capture_structured) { str8_list_push(arena, &local_out, push_str8f(arena, "%lld ", (S64)task->gathered[ci].numeric_values[i])); }
+        if (capture_structured)
+        {
+          out_result_set->cell_text[cell_i] = app_format_cell_text(arena, task->gathered[ci].type, task->gathered[ci].numeric_values[i], (String8){0}, task->gathered[ci].column->decimal_scale, task->gathered[ci].column->enum_type);
+          out_result_set->cell_numeric[cell_i] = task->gathered[ci].numeric_values[i];
+        }
+        break;
+        case GDB_ColumnType_Date:
+        case GDB_ColumnType_Timestamp:
+        case GDB_ColumnType_Decimal:
+        case GDB_ColumnType_Enum:
+        {
+          String8 formatted = app_format_cell_text(arena, task->gathered[ci].type, task->gathered[ci].numeric_values[i], (String8){0}, task->gathered[ci].column->decimal_scale, task->gathered[ci].column->enum_type);
+          if (!capture_structured) { str8_list_push(arena, &local_out, push_str8f(arena, "%.*s ", str8_varg(formatted))); }
+          if (capture_structured)
+          {
+            out_result_set->cell_text[cell_i] = formatted;
+            out_result_set->cell_numeric[cell_i] = task->gathered[ci].numeric_values[i];
+          }
+        } break;
+        case GDB_ColumnType_String8:
+        {
+          GDB_StringDataChunk* chunk = &task->gathered[ci].strings;
+          U64 start = chunk->offsets[i];
+          U64 end = chunk->offsets[i + 1];
+          String8 str = str8((U8*)chunk->data + start, end - start);
+          if (!capture_structured) { str8_list_push(arena, &local_out, push_str8f(arena, "%.*s ", str8_varg(str))); }
+          if (capture_structured) { out_result_set->cell_text[cell_i] = app_format_cell_text(arena, task->gathered[ci].type, 0, str, task->gathered[ci].column->decimal_scale, task->gathered[ci].column->enum_type); }
+        } break;
+        default:
+        if (!capture_structured) { str8_list_push(arena, &local_out, str8_lit("UNKNOWN ")); }
+        break;
+      }
+    }
+    if (!capture_structured) { str8_list_push(arena, &local_out, str8_lit("\n")); }
+  }
+
+  if (!capture_structured) { task->worker_lists[task_id] = local_out; }
+}
+
+internal void
+app_select_format_dispatch(Arena* arena, String8List* out, IR_Node* select_output_columns, SelectColGather* gathered,
+                            U64 column_count, PLAN_RowSet* rows, U64 result_count, B32 capture_structured, APP_ResultSet* out_result_set)
+{
+  Temp scratch = scratch_begin(&arena, 1);
+  TP_Context* pool = g_app_thread_pool;
+  U64 task_count = (result_count > 1) ? Min((U64)pool->worker_count, result_count) : 1;
+
+  APP_SelectFormatTask task = {0};
+  task.ranges = tp_divide_work(scratch.arena, result_count, (U32)task_count);
+  task.select_output_columns = select_output_columns;
+  task.gathered = gathered;
+  task.column_count = column_count;
+  task.rows = rows;
+  task.capture_structured = capture_structured;
+  task.out_result_set = out_result_set;
+  task.worker_lists = push_array(scratch.arena, String8List, task_count);
+
+  TP_Temp temp = tp_temp_begin(g_app_thread_pool_arena);
+  tp_for_parallel(pool, g_app_thread_pool_arena, task_count, app_select_format_task, &task);
+
+  if (capture_structured)
+  {
+    // tec: copy cell_text into caller's arena
+    for (U64 idx = 0; idx < column_count * Max(result_count, 1); idx++)
+    {
+      if (out_result_set->cell_text[idx].size)
+      {
+        out_result_set->cell_text[idx] = push_str8_copy(arena, out_result_set->cell_text[idx]);
+      }
+    }
+  }
+  else
+  {
+    for (U64 w = 0; w < task_count; w++)
+    {
+      String8 joined = str8_list_join(arena, &task.worker_lists[w], &(StringJoin){0});
+      str8_list_push(arena, out, joined);
+    }
+  }
+  tp_temp_end(temp);
+
+  scratch_end(scratch);
+}
+
 internal APP_QueryResult
 app_execute_query_capture(Arena* arena, String8 sql_query, GDB_Database** io_database, APP_ResultSet* out_result_set)
 {
   ProfBeginFunction();
-  
+
+  app_thread_pool_init();
+
   if (out_result_set) { MemoryZeroStruct(out_result_set); }
-  
+
   APP_QueryResult result = {0};
   String8List out = {0};
   
@@ -1307,19 +1513,7 @@ app_execute_query_capture(Arena* arena, String8 sql_query, GDB_Database** io_dat
           {
             U64 column_count = 0;
             for (IR_Node* c = select_output_columns->first; c != NULL; c = c->next) column_count++;
-            
-            typedef struct SelectColGather SelectColGather;
-            struct SelectColGather
-            {
-              B32 resolved;
-              GDB_Table* col_table;
-              GDB_Column* column;
-              U64 table_slot;
-              GDB_ColumnType type;
-              F64* numeric_values;
-              GDB_StringDataChunk strings;
-            };
-            
+
             SelectColGather* gathered = push_array(scratch.arena, SelectColGather, Max(column_count, 1));
             
             U64 gather_start = os_now_microseconds();
@@ -1364,115 +1558,8 @@ app_execute_query_capture(Arena* arena, String8 sql_query, GDB_Database** io_dat
             log_info("select column gather total time: %llu microseconds", os_now_microseconds() - gather_start);
             U64 format_start = os_now_microseconds();
             
-            for (U64 i = 0; i < result_count; i++)
-            {
-              ci = 0;
-              for (IR_Node* column_node = select_output_columns->first; column_node != NULL; column_node = column_node->next, ci++)
-              {
-                U64 cell_i = i * column_count + ci;
-                
-                if (!gathered[ci].resolved)
-                {
-                  if (!capture_structured) { APP_EMIT("? "); }
-                  if (capture_structured) { out_result_set->cell_is_null[cell_i] = 1; }
-                  continue;
-                }
-                
-                U64 row_index = result.rows.row_indices[gathered[ci].table_slot][i];
-                if (row_index == PLAN_NULL_ROW || gdb_column_is_null(gathered[ci].column, row_index))
-                {
-                  if (!capture_structured) { APP_EMIT("NULL "); }
-                  if (capture_structured) { out_result_set->cell_is_null[cell_i] = 1; }
-                  continue;
-                }
-                
-                switch (gathered[ci].type)
-                {
-                  case GDB_ColumnType_U32:
-                  if (!capture_structured) { APP_EMIT("%u ", (U32)gathered[ci].numeric_values[i]); }
-                  if (capture_structured)
-                  {
-                    out_result_set->cell_text[cell_i] = app_format_cell_text(arena, gathered[ci].type, gathered[ci].numeric_values[i], (String8){0}, gathered[ci].column->decimal_scale, gathered[ci].column->enum_type);
-                    out_result_set->cell_numeric[cell_i] = gathered[ci].numeric_values[i];
-                  }
-                  break;
-                  case GDB_ColumnType_U64:
-                  if (!capture_structured) { APP_EMIT("%llu ", (U64)gathered[ci].numeric_values[i]); }
-                  if (capture_structured)
-                  {
-                    out_result_set->cell_text[cell_i] = app_format_cell_text(arena, gathered[ci].type, gathered[ci].numeric_values[i], (String8){0}, gathered[ci].column->decimal_scale, gathered[ci].column->enum_type);
-                    out_result_set->cell_numeric[cell_i] = gathered[ci].numeric_values[i];
-                  }
-                  break;
-                  case GDB_ColumnType_F32:
-                  if (!capture_structured) { APP_EMIT("%f ", (F32)gathered[ci].numeric_values[i]); }
-                  if (capture_structured)
-                  {
-                    out_result_set->cell_text[cell_i] = app_format_cell_text(arena, gathered[ci].type, gathered[ci].numeric_values[i], (String8){0}, gathered[ci].column->decimal_scale, gathered[ci].column->enum_type);
-                    out_result_set->cell_numeric[cell_i] = gathered[ci].numeric_values[i];
-                  }
-                  break;
-                  case GDB_ColumnType_F64:
-                  if (!capture_structured) { APP_EMIT("%lf ", gathered[ci].numeric_values[i]); }
-                  if (capture_structured)
-                  {
-                    out_result_set->cell_text[cell_i] = app_format_cell_text(arena, gathered[ci].type, gathered[ci].numeric_values[i], (String8){0}, gathered[ci].column->decimal_scale, gathered[ci].column->enum_type);
-                    out_result_set->cell_numeric[cell_i] = gathered[ci].numeric_values[i];
-                  }
-                  break;
-                  case GDB_ColumnType_Bool:
-                  if (!capture_structured) { APP_EMIT("%s ", gathered[ci].numeric_values[i] != 0.0 ? "true" : "false"); }
-                  if (capture_structured)
-                  {
-                    out_result_set->cell_text[cell_i] = app_format_cell_text(arena, gathered[ci].type, gathered[ci].numeric_values[i], (String8){0}, gathered[ci].column->decimal_scale, gathered[ci].column->enum_type);
-                    out_result_set->cell_numeric[cell_i] = gathered[ci].numeric_values[i];
-                  }
-                  break;
-                  case GDB_ColumnType_I32:
-                  if (!capture_structured) { APP_EMIT("%d ", (S32)gathered[ci].numeric_values[i]); }
-                  if (capture_structured)
-                  {
-                    out_result_set->cell_text[cell_i] = app_format_cell_text(arena, gathered[ci].type, gathered[ci].numeric_values[i], (String8){0}, gathered[ci].column->decimal_scale, gathered[ci].column->enum_type);
-                    out_result_set->cell_numeric[cell_i] = gathered[ci].numeric_values[i];
-                  }
-                  break;
-                  case GDB_ColumnType_I64:
-                  if (!capture_structured) { APP_EMIT("%lld ", (S64)gathered[ci].numeric_values[i]); }
-                  if (capture_structured)
-                  {
-                    out_result_set->cell_text[cell_i] = app_format_cell_text(arena, gathered[ci].type, gathered[ci].numeric_values[i], (String8){0}, gathered[ci].column->decimal_scale, gathered[ci].column->enum_type);
-                    out_result_set->cell_numeric[cell_i] = gathered[ci].numeric_values[i];
-                  }
-                  break;
-                  case GDB_ColumnType_Date:
-                  case GDB_ColumnType_Timestamp:
-                  case GDB_ColumnType_Decimal:
-                  case GDB_ColumnType_Enum:
-                  {
-                    String8 formatted = app_format_cell_text(arena, gathered[ci].type, gathered[ci].numeric_values[i], (String8){0}, gathered[ci].column->decimal_scale, gathered[ci].column->enum_type);
-                    if (!capture_structured) { APP_EMIT("%.*s ", str8_varg(formatted)); }
-                    if (capture_structured)
-                    {
-                      out_result_set->cell_text[cell_i] = formatted;
-                      out_result_set->cell_numeric[cell_i] = gathered[ci].numeric_values[i];
-                    }
-                  } break;
-                  case GDB_ColumnType_String8:
-                  {
-                    GDB_StringDataChunk* chunk = &gathered[ci].strings;
-                    U64 start = chunk->offsets[i];
-                    U64 end = chunk->offsets[i + 1];
-                    String8 str = str8((U8*)chunk->data + start, end - start);
-                    if (!capture_structured) { APP_EMIT("%.*s ", str8_varg(str)); }
-                    if (capture_structured) { out_result_set->cell_text[cell_i] = app_format_cell_text(arena, gathered[ci].type, 0, str, gathered[ci].column->decimal_scale, gathered[ci].column->enum_type); }
-                  } break;
-                  default:
-                  if (!capture_structured) { APP_EMIT("UNKNOWN "); }
-                  break;
-                }
-              }
-              if (!capture_structured) { APP_EMIT("\n"); }
-            }
+            app_select_format_dispatch(arena, &out, select_output_columns, gathered, column_count,
+                                        &result.rows, result_count, capture_structured, out_result_set);
             log_info("select cell format/emit total time: %llu microseconds", os_now_microseconds() - format_start);
           }
           

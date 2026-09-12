@@ -2,8 +2,8 @@
 
 set MSVC=1
 set CLANG=0
-set DEBUG=1
-set RELEASE=0
+set DEBUG=0
+set RELEASE=1
 set COMPILE_SHADERS=0
 
 :: compile defintions
