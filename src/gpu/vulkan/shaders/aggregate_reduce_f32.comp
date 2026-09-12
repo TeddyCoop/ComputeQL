@@ -1,0 +1,139 @@
+#version 450
+#extension GL_ARB_gpu_shader_fp64 : enable
+
+// tec: narrow- rg twin of aggregate_reduce.comp
+//
+// NOTE: binding layout/push-constant slot order/func codes MUST stay in sync with qe_aggregate and
+// aggregate_reduce.comp - this must be a drop-in swap for that kernel, narrow arg buffers aside.
+
+layout(local_size_x = 256) in;
+
+#define FUNC_COUNT 0u
+#define FUNC_SUM   1u
+#define FUNC_AVG   2u
+#define FUNC_MIN   3u
+#define FUNC_MAX   4u
+
+layout(std430, binding = 0) readonly buffer MembersBuf    { uint group_member_rows[]; };
+layout(std430, binding = 1) readonly buffer ChunkRangeBuf { uint chunk_range[]; };
+layout(std430, binding = 2) readonly buffer ChunkGroupBuf { uint chunk_group[]; };
+layout(std430, binding = 3) buffer ReprBuf                { uint representative_row_out[]; };
+layout(std430, binding = 4) buffer PartialsBuf            { double partials_out[]; };
+
+layout(std430, binding = 5)  readonly buffer Arg0Buf { float arg0[]; };
+layout(std430, binding = 6)  readonly buffer Arg1Buf { float arg1[]; };
+layout(std430, binding = 7)  readonly buffer Arg2Buf { float arg2[]; };
+layout(std430, binding = 8)  readonly buffer Arg3Buf { float arg3[]; };
+layout(std430, binding = 9)  readonly buffer Arg4Buf { float arg4[]; };
+layout(std430, binding = 10) readonly buffer Arg5Buf { float arg5[]; };
+layout(std430, binding = 11) readonly buffer Arg6Buf { float arg6[]; };
+layout(std430, binding = 12) readonly buffer Arg7Buf { float arg7[]; };
+
+layout(push_constant) uniform PushConstants
+{
+  uint words[16];
+} pc;
+
+double
+read_arg(uint e, uint row)
+{
+  switch (e)
+  {
+    case 0u: return double(arg0[row]);
+    case 1u: return double(arg1[row]);
+    case 2u: return double(arg2[row]);
+    case 3u: return double(arg3[row]);
+    case 4u: return double(arg4[row]);
+    case 5u: return double(arg5[row]);
+    case 6u: return double(arg6[row]);
+    case 7u: return double(arg7[row]);
+  }
+  return 0.0LF;
+}
+
+shared double sh_acc[256];
+shared double sh_mn[256];
+shared double sh_mx[256];
+shared uint   sh_count[256];
+
+void
+main()
+{
+  uint total_chunks  = pc.words[0];
+  uint num_exprs     = pc.words[2];
+  uint func_codes    = pc.words[4];
+  bool identity_mode = pc.words[6] != 0u;
+
+  uint chunk_id = gl_WorkGroupID.x;
+  if (chunk_id >= total_chunks) return;
+
+  uint tid = gl_LocalInvocationID.x;
+
+  uint start = chunk_range[chunk_id * 2u + 0u];
+  uint end   = chunk_range[chunk_id * 2u + 1u];
+  uint g = chunk_group[chunk_id];
+
+  if (tid == 0u)
+  {
+    representative_row_out[g] = identity_mode ? start : group_member_rows[start];
+  }
+
+  for (uint e = 0u; e < num_exprs; e++)
+  {
+    uint func = (func_codes >> (e * 4u)) & 0xfu;
+
+    double acc = 0.0LF;
+    double mn = 1.0e300LF;
+    double mx = -1.0e300LF;
+    uint count = 0u;
+
+    for (uint m = start + tid; m < end; m += 256u)
+    {
+      uint row = identity_mode ? m : group_member_rows[m];
+      count++;
+
+      if (func == FUNC_SUM || func == FUNC_AVG)
+      {
+        acc += read_arg(e, row);
+      }
+      else if (func == FUNC_MIN)
+      {
+        double v = read_arg(e, row);
+        if (v < mn) mn = v;
+      }
+      else if (func == FUNC_MAX)
+      {
+        double v = read_arg(e, row);
+        if (v > mx) mx = v;
+      }
+    }
+
+    sh_acc[tid] = acc;
+    sh_mn[tid] = mn;
+    sh_mx[tid] = mx;
+    sh_count[tid] = count;
+    barrier();
+
+    for (uint stride = 128u; stride > 0u; stride >>= 1u)
+    {
+      if (tid < stride)
+      {
+        sh_acc[tid] += sh_acc[tid + stride];
+        if (sh_mn[tid + stride] < sh_mn[tid]) sh_mn[tid] = sh_mn[tid + stride];
+        if (sh_mx[tid + stride] > sh_mx[tid]) sh_mx[tid] = sh_mx[tid + stride];
+        sh_count[tid] += sh_count[tid + stride];
+      }
+      barrier();
+    }
+
+    if (tid == 0u)
+    {
+      uint base = (chunk_id * num_exprs + e) * 4u;
+      partials_out[base + 0u] = sh_acc[0];
+      partials_out[base + 1u] = double(sh_count[0]);
+      partials_out[base + 2u] = sh_mn[0];
+      partials_out[base + 3u] = sh_mx[0];
+    }
+    barrier();
+  }
+}

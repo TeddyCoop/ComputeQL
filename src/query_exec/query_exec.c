@@ -1116,6 +1116,92 @@ qe_gather_numeric_column(Arena* arena, PLAN_RowSet* rows, U64 table_slot, GDB_Co
   return values;
 }
 
+typedef struct QE_NarrowCheckTask QE_NarrowCheckTask;
+struct QE_NarrowCheckTask
+{
+  Rng1U64* ranges;
+  F64* values;
+  B32* task_narrow;
+};
+
+internal THREAD_POOL_TASK_FUNC(qe_narrow_check_task)
+{
+  QE_NarrowCheckTask* task = (QE_NarrowCheckTask*)raw_task;
+  Rng1U64 range = task->ranges[task_id];
+  B32 narrow = 1;
+  for (U64 i = range.min; i < range.max; i++)
+  {
+    F64 v = task->values[i];
+    if ((F64)(F32)v != v) { narrow = 0; break; }
+  }
+  task->task_narrow[task_id] = narrow;
+}
+
+internal B32
+qe_values_round_trip_f32(F64* values, U64 count)
+{
+  if (count == 0) return 1;
+  qe_thread_pool_init();
+  
+  Temp scratch = scratch_begin(0, 0);
+  TP_Context* pool = g_qe_thread_pool;
+  U64 task_count = Max((U64)1, Min((U64)pool->worker_count, count));
+  
+  QE_NarrowCheckTask task = {0};
+  task.ranges = tp_divide_work(scratch.arena, count, (U32)task_count);
+  task.values = values;
+  task.task_narrow = push_array(scratch.arena, B32, task_count);
+  
+  TP_Temp temp = tp_temp_begin(g_qe_thread_pool_arena);
+  tp_for_parallel(pool, g_qe_thread_pool_arena, task_count, qe_narrow_check_task, &task);
+  tp_temp_end(temp);
+  
+  B32 all_narrow = 1;
+  for (U64 t = 0; t < task_count; t++) if (!task.task_narrow[t]) { all_narrow = 0; break; }
+  
+  scratch_end(scratch);
+  return all_narrow;
+}
+
+typedef struct QE_NarrowConvertTask QE_NarrowConvertTask;
+struct QE_NarrowConvertTask
+{
+  Rng1U64* ranges;
+  F64* src;
+  F32* dst;
+};
+
+internal THREAD_POOL_TASK_FUNC(qe_narrow_convert_task)
+{
+  QE_NarrowConvertTask* task = (QE_NarrowConvertTask*)raw_task;
+  Rng1U64 range = task->ranges[task_id];
+  for (U64 i = range.min; i < range.max; i++) task->dst[i] = (F32)task->src[i];
+}
+
+internal F32*
+qe_values_to_f32(Arena* arena, F64* values, U64 count)
+{
+  F32* out = push_array(arena, F32, Max(count, 1));
+  if (count == 0) return out;
+  qe_thread_pool_init();
+  
+  Temp scratch = scratch_begin(0, 0);
+  TP_Context* pool = g_qe_thread_pool;
+  U64 task_count = Max((U64)1, Min((U64)pool->worker_count, count));
+  
+  QE_NarrowConvertTask task = {0};
+  task.ranges = tp_divide_work(scratch.arena, count, (U32)task_count);
+  task.src = values;
+  task.dst = out;
+  
+  TP_Temp temp = tp_temp_begin(g_qe_thread_pool_arena);
+  tp_for_parallel(pool, g_qe_thread_pool_arena, task_count, qe_narrow_convert_task, &task);
+  tp_temp_end(temp);
+  
+  scratch_end(scratch);
+  return out;
+}
+
 internal GDB_StringDataChunk
 qe_gather_string_column(Arena* arena, PLAN_RowSet* rows, U64 table_slot, GDB_Column* column)
 {
@@ -1901,10 +1987,67 @@ qe_aggregate(Arena* arena, GDB_Database* database, PLAN_RowSet* input, IR_Node* 
     U32 same_as = e;
     for (U32 e2 = 0; e2 < e; e2++)
     {
-      if (exprs[e2].arg_column == exprs[e].arg_column && exprs[e2].arg_slot == exprs[e].arg_slot) { same_as = e2; break; }
+      if (exprs[e2].arg_column == exprs[e].arg_column && exprs[e2].arg_slot == exprs[e].arg_slot) 
+      { 
+        same_as = e2; 
+        break; 
+      }
     }
     
     expr_args[e] = (same_as != e) ? expr_args[same_as] : qe_gather_numeric_column(arena, input, exprs[e].arg_slot, exprs[e].arg_column);
+  }
+  
+  // tec: narrow numeric aggregate args
+  B32 arg_narrow = 1;
+  for (U32 e = 0; e < num_exprs && arg_narrow; e++)
+  {
+    if (!expr_args[e])
+    {
+      continue;
+    }
+    B32 already_checked = 0;
+    for (U32 e2 = 0; e2 < e; e2++) 
+    {
+      if (expr_args[e2] == expr_args[e]) 
+      { 
+        already_checked = 1; 
+        break; 
+      }
+    }
+    if (already_checked) 
+    {
+      continue;
+    }
+    if (!qe_values_round_trip_f32(expr_args[e], row_count)) 
+    {
+      arg_narrow = 0;
+    }
+  }
+  F32* expr_args_f32[QE_AGG_MAX_EXPRS] = {0};
+  if (arg_narrow)
+  {
+    for (U32 e = 0; e < num_exprs; e++)
+    {
+      if (!expr_args[e]) 
+      {
+        continue;
+      }
+      U32 same_as = e;
+      for (U32 e2 = 0; e2 < e; e2++) 
+      {
+        if (expr_args[e2] == expr_args[e]) 
+        { 
+          same_as = e2; 
+          break; 
+        }
+      }
+      if (same_as != e) 
+      { 
+        expr_args_f32[e] = expr_args_f32[same_as]; 
+        continue;
+      }
+      expr_args_f32[e] = qe_values_to_f32(arena, expr_args[e], row_count);
+    }
   }
   
   // tec: max_num_buckets is the worst-case
@@ -2079,9 +2222,13 @@ qe_aggregate(Arena* arena, GDB_Database* database, PLAN_RowSet* input, IR_Node* 
     }
     
     // tec: prefer growing num_buckets
+    // step size scales with how badly this size missed,
+    // so a very wrong initial guess converges in one or two retries instead of creeping up by 2x each time
     if (num_buckets < max_num_buckets)
     {
-      U64 next_num_buckets = Min(num_buckets * 2, max_num_buckets);
+      F64 overflow_frac = (F64)overflow_readback / (F64)row_count;
+      U64 growth = (overflow_frac >= 0.20) ? 8 : (overflow_frac >= 0.05) ? 4 : 2;
+      U64 next_num_buckets = Min(num_buckets * growth, max_num_buckets);
       log_info("qe_aggregate: %u row(s) overflowed the group-by hash table with num_buckets=%llu - retrying with num_buckets=%llu",
                overflow_readback, num_buckets, next_num_buckets);
       num_buckets = next_num_buckets;
@@ -2129,7 +2276,7 @@ qe_aggregate(Arena* arena, GDB_Database* database, PLAN_RowSet* input, IR_Node* 
   // scatter rows into per slot CSR member lists
   // and pass 3/3 - one thread per group, serial reduction over its own member rows
   GPU_Kernel* scatter_kernel = gpu_kernel_alloc(str8_lit("csr_scatter"));
-  GPU_Kernel* reduce_kernel = gpu_kernel_alloc(str8_lit("aggregate_reduce"));
+  GPU_Kernel* reduce_kernel = gpu_kernel_alloc(arg_narrow ? str8_lit("aggregate_reduce_f32") : str8_lit("aggregate_reduce"));
   if (!scatter_kernel || !reduce_kernel)
   {
     log_error("qe_aggregate: failed to alloc '%s' kernel", scatter_kernel ? "aggregate_reduce" : "csr_scatter");
@@ -2172,8 +2319,13 @@ qe_aggregate(Arena* arena, GDB_Database* database, PLAN_RowSet* input, IR_Node* 
     }
   }
   
+  // tec: no GROUP BY. chunk_range already is a partition of raw row indices [0,row_count),
+  // so the reduce kernel can read rows directly instead of indirecting through group_member_rows,
+  // and members_buf (a full row_count-sized scatter target) is never touched
+  B32 identity_mode = (num_group_cols == 0);
+  
   U64 cursor_size = num_slots * sizeof(U32);
-  U64 members_size = Max(row_count, 1) * sizeof(U32);
+  U64 members_size = identity_mode ? sizeof(U32) : Max(row_count, 1) * sizeof(U32);
   U64 chunk_range_size = Max(total_chunks, 1) * 2 * sizeof(U32);
   U64 chunk_group_size = Max(total_chunks, 1) * sizeof(U32);
   U64 repr_size = Max(num_groups, 1) * sizeof(U32);
@@ -2193,9 +2345,6 @@ qe_aggregate(Arena* arena, GDB_Database* database, PLAN_RowSet* input, IR_Node* 
   GPU_Buffer* repr_buf = gpu_buffer_alloc_pooled(str8_lit("agg_repr_buf"), repr_size, GPU_BufferFlag_ReadWrite, 0);
   GPU_Buffer* partials_buf = gpu_buffer_alloc_pooled(str8_lit("agg_partials_buf"), partials_size, GPU_BufferFlag_ReadWrite, 0);
   
-  // tec: no GROUP BY. chunk_range already is a partition of raw row indices [0,row_count),
-  // so the reduce kernel can read rows directly instead of indirecting through group_member_rows
-  B32 identity_mode = (num_group_cols == 0);
   gpu_kernel_set_arg_buffer(reduce_kernel, 0, identity_mode ? chunk_range_buf : members_buf);
   gpu_kernel_set_arg_buffer(reduce_kernel, 1, chunk_range_buf);
   gpu_kernel_set_arg_buffer(reduce_kernel, 2, chunk_group_buf);
@@ -2215,7 +2364,7 @@ qe_aggregate(Arena* arena, GDB_Database* database, PLAN_RowSet* input, IR_Node* 
     }
     
     arg_bufs[e] = (same_as != e) ? arg_bufs[same_as]
-      : gpu_buffer_alloc_pooled(push_str8f(gpu_scratch_arena(), "agg_arg_buf:%u", e), row_count * sizeof(F64), GPU_BufferFlag_Write, 0);
+      : gpu_buffer_alloc_pooled(push_str8f(gpu_scratch_arena(), "agg_arg_buf:%u", e), row_count * (arg_narrow ? sizeof(F32) : sizeof(F64)), GPU_BufferFlag_Write, 0);
   }
   
   for (U32 e = 0; e < QE_AGG_MAX_EXPRS; e++)
@@ -2231,8 +2380,15 @@ qe_aggregate(Arena* arena, GDB_Database* database, PLAN_RowSet* input, IR_Node* 
   gpu_kernel_set_arg_u64(reduce_kernel, 2, func_codes_packed);
   gpu_kernel_set_arg_u64(reduce_kernel, 3, identity_mode ? 1 : 0);
   
+  U64 arg_elem_size = arg_narrow ? sizeof(F32) : sizeof(F64);
   U64 reduce_upload_bytes = cursor_size + chunk_range_size + chunk_group_size;
-  for (U32 e = 0; e < num_exprs; e++) if (arg_bufs[e]) reduce_upload_bytes += row_count * sizeof(F64);
+  for (U32 e = 0; e < num_exprs; e++) 
+  {
+    if (arg_bufs[e]) 
+    {
+      reduce_upload_bytes += row_count * arg_elem_size;
+    }
+  }
   U64 reduce_download_bytes = repr_size + partials_size;
   
   U32* repr32 = push_array(scratch.arena, U32, Max(num_groups, 1));
@@ -2244,10 +2400,24 @@ qe_aggregate(Arena* arena, GDB_Database* database, PLAN_RowSet* input, IR_Node* 
   gpu_batch_buffer_write(scatter_batch, chunk_group_buf, chunk_group, chunk_group_size);
   for (U32 e = 0; e < num_exprs; e++)
   {
-    if (!arg_bufs[e]) continue;
+    if (!arg_bufs[e])
+    {
+      continue;
+    }
     B32 already_uploaded = 0;
-    for (U32 e2 = 0; e2 < e; e2++) if (arg_bufs[e2] == arg_bufs[e]) { already_uploaded = 1; break; }
-    if (!already_uploaded) gpu_batch_buffer_write(scatter_batch, arg_bufs[e], expr_args[e], row_count * sizeof(F64));
+    for (U32 e2 = 0; e2 < e; e2++) 
+    {
+      if (arg_bufs[e2] == arg_bufs[e]) 
+      { 
+        already_uploaded = 1; 
+        break; 
+      }
+    }
+    if (!already_uploaded)
+    {
+      void* arg_data = arg_narrow ? (void*)expr_args_f32[e] : (void*)expr_args[e];
+      gpu_batch_buffer_write(scatter_batch, arg_bufs[e], arg_data, row_count * arg_elem_size);
+    }
   }
   if (!identity_mode)
   {
