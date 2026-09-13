@@ -8,6 +8,9 @@ gdb_init(void)
   g_gdb_column_variable_capacity_alloc_size = settings_u64(str8_lit("GDB_COLUMN_VARIABLE_CAPACITY_ALLOC_SIZE"), GDB_COLUMN_VARIABLE_CAPACITY_ALLOC_SIZE);
   g_gdb_column_max_grow_by_size = settings_u64(str8_lit("GDB_COLUMN_MAX_GROW_BY_SIZE"), GDB_COLUMN_MAX_GROW_BY_SIZE);
   g_gdb_table_expand_factor = settings_f64(str8_lit("GDB_TABLE_EXPAND_FACTOR"), GDB_TABLE_EXPAND_FACTOR);
+  g_gdb_dict_encode_min_rows = settings_u64(str8_lit("GDB_DICT_ENCODE_MIN_ROWS"), GDB_DICT_ENCODE_MIN_ROWS);
+  g_gdb_dict_encode_max_distinct = settings_u64(str8_lit("GDB_DICT_ENCODE_MAX_DISTINCT"), GDB_DICT_ENCODE_MAX_DISTINCT);
+  g_gdb_dict_encode_max_cardinality_ratio = settings_f64(str8_lit("GDB_DICT_ENCODE_MAX_CARDINALITY_RATIO"), GDB_DICT_ENCODE_MAX_CARDINALITY_RATIO);
   
   U64 state_arena_reserve_size = settings_u64(str8_lit("GDB_STATE_ARENA_RESERVE_SIZE"), GDB_STATE_ARENA_RESERVE_SIZE);
   U64 state_arena_commit_size = settings_u64(str8_lit("GDB_STATE_ARENA_COMMIT_SIZE"), GDB_STATE_ARENA_COMMIT_SIZE);
@@ -17,7 +20,7 @@ gdb_init(void)
   
   g_gdb_state->databases = NULL;
   g_gdb_state->rw_mutex = os_rw_mutex_alloc();
-
+  
   ProfEnd();
 }
 
@@ -1642,7 +1645,7 @@ gdb_table_import_csv_streaming(GDB_Database *db, String8 table_name, String8 pat
     
     String8 leftover = {0};
     B32 skipped_header = 0;
-
+    
     while (file_pos < file_size)
     {
       U64 p0 = os_now_microseconds();
@@ -1711,7 +1714,7 @@ gdb_table_import_csv_streaming(GDB_Database *db, String8 table_name, String8 pat
         TP_Context* pool = app_thread_pool();
         U64 task_count = Max((U64)1, Min((U64)pool->worker_count, chunk_row_count));
         task.ranges = tp_divide_work(row_arena, chunk_row_count, (U32)task_count);
-
+        
         TP_Arena* pool_arena = app_thread_pool_arena();
         TP_Temp temp = tp_temp_begin(pool_arena);
         tp_for_parallel(pool, pool_arena, task_count, gdb_csv_parse_task, &task);
@@ -2223,6 +2226,10 @@ gdb_column_alloc(String8 name, GDB_ColumnType type, U64 size)
 internal void
 gdb_column_release(GDB_Column* column)
 {
+  if (column->dict) 
+  {
+    arena_release(column->dict->arena);
+  }
   arena_release(column->arena);
 }
 
@@ -2965,6 +2972,261 @@ gdb_column_close_string_chunk(GDB_Column* column)
 {
   OS_Handle file_map = column->file_map;
   os_file_map_view_close(file_map, column->mapped_ptr, column->current_mapped_range);
+}
+
+internal U64
+gdb_string_hash(String8 s)
+{
+  U64 h = 2166136261u;
+  for (U64 i = 0; i < s.size; i++)
+  {
+    h = (h ^ s.str[i]) * 16777619u;
+  }
+  return h;
+}
+
+internal B32
+gdb_string_dict_code_from_value(GDB_StringDict* dict, String8 value, U32* out_code)
+{
+  U64 mask = dict->index_capacity - 1;
+  U64 slot = gdb_string_hash(value) & mask;
+  for (U32 probe = 0; probe < GDB_DICT_MAX_PROBE; probe++)
+  {
+    U32 code = dict->index_codes[slot];
+    if (code == GDB_DICT_EMPTY_SLOT) 
+    {
+      return 0;
+    }
+    if (str8_match(dict->values[code], value, 0)) 
+    { 
+      *out_code = code; 
+      return 1; 
+    }
+    slot = (slot + 1) & mask;
+  }
+  return 0;
+}
+
+internal U32
+gdb_string_dict_code_or_sentinel(GDB_StringDict* dict, String8 value)
+{
+  U32 code = 0;
+  return gdb_string_dict_code_from_value(dict, value, &code) ? code : GDB_DICT_NOT_FOUND;
+}
+
+read_only global String8 g_gdb_dict_empty_str8 = {0};
+
+internal String8
+gdb_dict_row_string(GDB_StringDataChunk* chunk, U64 row)
+{
+  if (!chunk->data)
+  {
+    return g_gdb_dict_empty_str8;
+  }
+  U64 start = chunk->offsets[row];
+  U64 len = chunk->offsets[row + 1] - start;
+  return str8((U8*)chunk->data + start, len);
+}
+
+typedef struct GDB_DictBuildCtx GDB_DictBuildCtx;
+struct GDB_DictBuildCtx
+{
+  GDB_StringDataChunk chunk;
+  Rng1U64* ranges;
+  U32* owner_row;
+  U64 capacity;
+  U32 overflow_flag;
+};
+
+internal THREAD_POOL_TASK_FUNC(gdb_dict_claim_task)
+{
+  GDB_DictBuildCtx* ctx = (GDB_DictBuildCtx*)raw_task;
+  Rng1U64 range = ctx->ranges[task_id];
+  U64 mask = ctx->capacity - 1;
+  
+  for (U64 row = range.min; row < range.max; row++)
+  {
+    if (ctx->overflow_flag) break;
+    
+    String8 s = gdb_dict_row_string(&ctx->chunk, row);
+    U64 slot = gdb_string_hash(s) & mask;
+    B32 placed = 0;
+    
+    for (U32 probe = 0; probe < GDB_DICT_MAX_PROBE; probe++)
+    {
+      U32 existing = ins_atomic_u32_eval_cond_assign(&ctx->owner_row[slot], (U32)row, GDB_DICT_EMPTY_SLOT);
+      if (existing == GDB_DICT_EMPTY_SLOT)
+      {
+        placed = 1;
+        break;
+      }
+      
+      String8 existing_str = gdb_dict_row_string(&ctx->chunk, existing);
+      if (MemoryMatch(existing_str.str, s.str, s.size) && existing_str.size == s.size)
+      {
+        placed = 1;
+        break;
+      }
+      
+      slot = (slot + 1) & mask;
+    }
+    
+    if (!placed)
+    {
+      ins_atomic_u32_eval_assign(&ctx->overflow_flag, 1);
+      break;
+    }
+  }
+}
+
+typedef struct GDB_DictFillCtx GDB_DictFillCtx;
+struct GDB_DictFillCtx
+{
+  GDB_StringDataChunk chunk;
+  Rng1U64* ranges;
+  GDB_StringDict* dict;
+  U32* dict_codes;
+};
+
+internal THREAD_POOL_TASK_FUNC(gdb_dict_fill_codes_task)
+{
+  GDB_DictFillCtx* ctx = (GDB_DictFillCtx*)raw_task;
+  Rng1U64 range = ctx->ranges[task_id];
+  
+  for (U64 row = range.min; row < range.max; row++)
+  {
+    String8 s = gdb_dict_row_string(&ctx->chunk, row);
+    U32 code = 0;
+    B32 found = gdb_string_dict_code_from_value(ctx->dict, s, &code);
+    ctx->dict_codes[row] = found ? code : 0; 
+  }
+}
+
+internal void
+gdb_column_ensure_string_dict(GDB_Column* column)
+{
+  ProfBeginFunction();
+  
+  if (column->type != GDB_ColumnType_String8)
+  {
+    ProfEnd();
+    return;
+  }
+  
+  if (column->dict_checked_generation == column->write_generation)
+  {
+    ProfEnd();
+    return;
+  }
+  
+  if (column->dict) 
+  {
+    arena_release(column->dict->arena);
+  }
+  column->has_dict = 0;
+  column->dict = 0;
+  column->dict_codes = 0;
+  
+  if (column->row_count < g_gdb_dict_encode_min_rows)
+  {
+    column->dict_checked_generation = column->write_generation;
+    ProfEnd();
+    return;
+  }
+  
+  Temp scratch = scratch_begin(0, 0);
+  
+  GDB_DictBuildCtx build_ctx = {0};
+  build_ctx.chunk = gdb_column_get_string_chunk(scratch.arena, column, r1u64(0, column->row_count));
+  build_ctx.capacity = u64_up_to_pow2(g_gdb_dict_encode_max_distinct * GDB_DICT_TABLE_CAPACITY_FACTOR);
+  build_ctx.owner_row = push_array(scratch.arena, U32, build_ctx.capacity);
+  for (U64 i = 0; i < build_ctx.capacity; i++) build_ctx.owner_row[i] = GDB_DICT_EMPTY_SLOT;
+  
+  TP_Context* pool = app_thread_pool();
+  U64 task_count = Max((U64)1, Min((U64)pool->worker_count, column->row_count));
+  build_ctx.ranges = tp_divide_work(scratch.arena, column->row_count, (U32)task_count);
+  
+  TP_Arena* pool_arena = app_thread_pool_arena();
+  TP_Temp temp = tp_temp_begin(pool_arena);
+  tp_for_parallel(pool, pool_arena, task_count, gdb_dict_claim_task, &build_ctx);
+  tp_temp_end(temp);
+  
+  B32 eligible = !build_ctx.overflow_flag;
+  U32 distinct_count = 0;
+  
+  if (eligible)
+  {
+    for (U64 slot = 0; slot < build_ctx.capacity; slot++)
+    {
+      if (build_ctx.owner_row[slot] != GDB_DICT_EMPTY_SLOT)
+      {
+        if (distinct_count >= g_gdb_dict_encode_max_distinct) 
+        { 
+          eligible = 0; 
+          break; 
+        }
+        distinct_count++;
+      }
+    }
+  }
+  
+  if (eligible && (F64)distinct_count / (F64)column->row_count > g_gdb_dict_encode_max_cardinality_ratio)
+  {
+    eligible = 0;
+  }
+  
+  if (eligible)
+  {
+    Arena* dict_arena = arena_alloc();
+    GDB_StringDict* dict = push_array(dict_arena, GDB_StringDict, 1);
+    dict->arena = dict_arena;
+    dict->value_count = distinct_count;
+    dict->values = push_array(dict_arena, String8, Max(distinct_count, 1));
+    dict->index_capacity = build_ctx.capacity;
+    dict->index_codes = push_array(dict_arena, U32, build_ctx.capacity);
+    
+    U32 next_code = 0;
+    for (U64 slot = 0; slot < build_ctx.capacity; slot++)
+    {
+      U32 owner = build_ctx.owner_row[slot];
+      if (owner == GDB_DICT_EMPTY_SLOT)
+      {
+        dict->index_codes[slot] = GDB_DICT_EMPTY_SLOT;
+      }
+      else
+      {
+        U32 code = next_code++;
+        dict->values[code] = push_str8_copy(dict_arena, gdb_dict_row_string(&build_ctx.chunk, owner));
+        dict->index_codes[slot] = code;
+      }
+    }
+    
+    U32* dict_codes = push_array(column->arena, U32, Max(column->row_count, 1));
+    
+    GDB_DictFillCtx fill_ctx = {0};
+    fill_ctx.chunk = build_ctx.chunk;
+    fill_ctx.ranges = build_ctx.ranges;
+    fill_ctx.dict = dict;
+    fill_ctx.dict_codes = dict_codes;
+    
+    temp = tp_temp_begin(pool_arena);
+    tp_for_parallel(pool, pool_arena, task_count, gdb_dict_fill_codes_task, &fill_ctx);
+    tp_temp_end(temp);
+    
+    column->dict = dict;
+    column->dict_codes = dict_codes;
+    column->has_dict = 1;
+  }
+  
+  if (build_ctx.chunk.data)
+  {
+    gdb_column_close_string_chunk(column);
+  }
+  
+  column->dict_checked_generation = column->write_generation;
+  
+  scratch_end(scratch);
+  ProfEnd();
 }
 
 internal String8

@@ -101,6 +101,45 @@ qe_bind_column(QE_BytecodeProgram* prog, GDB_Table* table, String8 column_name)
   return binding;
 }
 
+internal QE_ColumnBinding*
+qe_bind_column_dict_codes(QE_BytecodeProgram* prog, GDB_Table* table, String8 column_name)
+{
+  String8 synthetic_name = push_str8f(prog->arena, "%.*s$dict", str8_varg(column_name));
+  
+  QE_ColumnBinding* existing = qe_find_binding(prog, synthetic_name);
+  if (existing) return existing;
+  
+  if (prog->binding_count >= QE_MAX_COLUMN_BINDINGS)
+  {
+    log_error("qe_bind_column_dict_codes: exceeded max column bindings (%u)", (U32)QE_MAX_COLUMN_BINDINGS);
+    return 0;
+  }
+  
+  GDB_Column* column = gdb_table_find_column(table, column_name);
+  if (!column || !column->has_dict)
+  {
+    log_error("qe_bind_column_dict_codes: '%.*s' has no dictionary", str8_varg(column_name));
+    return 0;
+  }
+  
+  if (prog->next_slot + 1 > QE_MAX_COLUMN_BINDINGS)
+  {
+    log_error("qe_bind_column_dict_codes: exceeded available descriptor column slots for '%.*s'", str8_varg(column_name));
+    return 0;
+  }
+  
+  QE_ColumnBinding* binding = &prog->bindings[prog->binding_count++];
+  binding->name = synthetic_name;
+  binding->column = column;
+  binding->type = GDB_ColumnType_U32;
+  binding->first_slot = prog->next_slot;
+  binding->slot_count = 1;
+  binding->use_dict_codes = 1;
+  prog->next_slot += 1;
+  
+  return binding;
+}
+
 internal QE_Opcode
 qe_opcode_from_comparison_operator(String8 op)
 {
@@ -232,6 +271,33 @@ qe_compile_condition(QE_BytecodeProgram* prog, GDB_Table* table, IR_Node* condit
         is_eq = 1;
       }
       
+      // tec: dictionary encoded equality
+      if (is_eq)
+      {
+        gdb_column_ensure_string_dict(binding->column);
+        if (binding->column->has_dict)
+        {
+          U32 code = 0;
+          if (!gdb_string_dict_code_from_value(binding->column->dict, right->value, &code))
+          {
+            qe_bytecode_emit(prog, QE_Opcode_PushFalse);
+            return;
+          }
+          
+          QE_ColumnBinding* dict_binding = qe_bind_column_dict_codes(prog, table, left->value);
+          if (dict_binding)
+          {
+            U32 operand = ((U32)dict_binding->type << 8) | (dict_binding->first_slot & 0xff);
+            qe_bytecode_emit(prog, QE_Opcode_LoadNumCol);
+            qe_bytecode_emit(prog, operand);
+            qe_bytecode_emit(prog, QE_Opcode_PushConst);
+            qe_bytecode_emit(prog, qe_add_numeric_const(prog, (F64)code));
+            qe_bytecode_emit(prog, QE_Opcode_CmpEq);
+            return;
+          }
+        }
+      }
+      
       QE_StringConstRef ref = qe_add_string_const(prog, right->value);
       
       qe_bytecode_emit(prog, is_contains ? QE_Opcode_StrContains : QE_Opcode_StrEq);
@@ -313,6 +379,7 @@ internal void
 qe_bytecode_program_build(Arena* arena, QE_BytecodeProgram* prog, GDB_Database* database, GDB_Table* table, IR_Node* root_node, IR_Node* where_clause)
 {
   MemoryZeroStruct(prog);
+  prog->arena = arena;
   prog->words_cap = settings_u64(str8_lit("QE_BYTECODE_MAX_WORDS"), 4096);
   prog->consts_cap = settings_u64(str8_lit("QE_MAX_NUMERIC_CONSTS"), 256);
   prog->str_const_pool_cap = settings_u64(str8_lit("QE_STRING_CONST_POOL_SIZE"), KB(64));
@@ -344,9 +411,10 @@ qe_bytecode_program_max_stack_depth(QE_BytecodeProgram* prog)
     U32 opcode = prog->words[ip++];
     switch (opcode)
     {
-      case QE_Opcode_PushTrue:   
-      { 
-        depth += 1; 
+      case QE_Opcode_PushTrue:
+      case QE_Opcode_PushFalse:
+      {
+        depth += 1;
       } break;
       
       case QE_Opcode_LoadNumCol:
@@ -436,7 +504,13 @@ qe_prefetch_read_slot(QE_PrefetchSlot* slot, QE_BytecodeProgram* prog, Rng1U64 r
     QE_PrefetchBindingResult* out = &slot->bindings[i];
     MemoryZeroStruct(out);
     
-    if (binding->type == GDB_ColumnType_String8)
+    if (binding->use_dict_codes)
+    {
+      out->data_ptr = binding->column->dict_codes + range.min;
+      out->size = (range.max - range.min) * sizeof(U32);
+      out->valid = (binding->column->dict_codes != 0);
+    }
+    else if (binding->type == GDB_ColumnType_String8)
     {
       out->is_string = 1;
       out->str_chunk = gdb_column_get_string_chunk(slot->arena, binding->column, range);
@@ -690,7 +764,20 @@ qe_scan_filter(Arena* arena, GDB_Database* database, GDB_Table* table, IR_Node* 
       
       String8 col_pool_key = push_str8f(gpu_scratch_arena(), "scan_col:%.*s.%.*s", str8_varg(table->name), str8_varg(binding->name));
       
-      if (binding->type == GDB_ColumnType_String8)
+      if (binding->use_dict_codes)
+      {
+        if (in->valid)
+        {
+          GPU_Buffer* data_buf = gpu_buffer_alloc_pooled(col_pool_key, in->size, GPU_BufferFlag_Write, in->data_ptr);
+          gpu_kernel_set_arg_buffer(kernel, descriptor_binding, data_buf);
+          column_slot_used[binding->first_slot] = 1;
+        }
+        else
+        {
+          log_error("qe_scan_filter: failed to load dictionary codes for column '%.*s'", str8_varg(binding->name));
+        }
+      }
+      else if (binding->type == GDB_ColumnType_String8)
       {
         if (in->valid)
         {
@@ -1147,6 +1234,153 @@ qe_gather_numeric_column(Arena* arena, PLAN_RowSet* rows, U64 table_slot, GDB_Co
   return values;
 }
 
+typedef struct QE_GatherDictCodesTask QE_GatherDictCodesTask;
+struct QE_GatherDictCodesTask
+{
+  Rng1U64* ranges;
+  U64* table_rows;
+  U32* dict_codes;
+  F64* values;
+};
+
+internal THREAD_POOL_TASK_FUNC(qe_gather_dict_codes_task)
+{
+  QE_GatherDictCodesTask* task = (QE_GatherDictCodesTask*)raw_task;
+  Rng1U64 range = task->ranges[task_id];
+  
+  for (U64 i = range.min; i < range.max; i++)
+  {
+    U64 row = task->table_rows[i];
+    task->values[i] = (row == PLAN_NULL_ROW) ? 0.0 : (F64)task->dict_codes[row];
+  }
+}
+
+internal F64*
+qe_gather_string_dict_codes(Arena* arena, PLAN_RowSet* rows, U64 table_slot, GDB_Column* column)
+{
+  ProfBeginFunction();
+  
+  F64* values = push_array(arena, F64, Max(rows->count, 1));
+  
+  if (table_slot >= rows->table_count)
+  {
+    log_error("qe_gather_string_dict_codes: slot %llu is not part of this row set", table_slot);
+    ProfEnd();
+    return values;
+  }
+  
+  Temp scratch = scratch_begin(&arena, 1);
+  TP_Context* pool = app_thread_pool();
+  U64 task_count = Max((U64)1, Min((U64)pool->worker_count, rows->count));
+  
+  QE_GatherDictCodesTask task = {0};
+  task.ranges = tp_divide_work(scratch.arena, rows->count, (U32)task_count);
+  task.table_rows = rows->row_indices[table_slot];
+  task.dict_codes = column->dict_codes;
+  task.values = values;
+  
+  TP_Arena* pool_arena = app_thread_pool_arena();
+  TP_Temp temp = tp_temp_begin(pool_arena);
+  tp_for_parallel(pool, pool_arena, task_count, qe_gather_dict_codes_task, &task);
+  tp_temp_end(temp);
+  
+  scratch_end(scratch);
+  
+  ProfEnd();
+  return values;
+}
+
+typedef struct QE_DictLookupTask QE_DictLookupTask;
+struct QE_DictLookupTask
+{
+  Rng1U64* ranges;
+  GDB_StringDataChunk chunk;
+  GDB_StringDict* dict;
+  F64* values;
+};
+
+internal THREAD_POOL_TASK_FUNC(qe_dict_lookup_task)
+{
+  QE_DictLookupTask* task = (QE_DictLookupTask*)raw_task;
+  Rng1U64 range = task->ranges[task_id];
+  
+  for (U64 i = range.min; i < range.max; i++)
+  {
+    U64 start = task->chunk.offsets[i];
+    U64 len = task->chunk.offsets[i + 1] - start;
+    String8 s = str8((U8*)task->chunk.data + start, len);
+    task->values[i] = (F64)gdb_string_dict_code_or_sentinel(task->dict, s);
+  }
+}
+
+typedef struct QE_DenseDictCodesTask QE_DenseDictCodesTask;
+struct QE_DenseDictCodesTask
+{
+  Rng1U64* ranges;
+  U32* codes;
+  F64* values;
+};
+
+internal THREAD_POOL_TASK_FUNC(qe_dense_dict_codes_task)
+{
+  QE_DenseDictCodesTask* task = (QE_DenseDictCodesTask*)raw_task;
+  Rng1U64 range = task->ranges[task_id];
+  for (U64 i = range.min; i < range.max; i++) task->values[i] = (F64)task->codes[i];
+}
+
+internal F64*
+qe_dict_codes_to_f64_dense(Arena* arena, U32* codes, U64 count)
+{
+  F64* values = push_array(arena, F64, Max(count, 1));
+  if (count == 0) return values;
+  
+  Temp scratch = scratch_begin(&arena, 1);
+  TP_Context* pool = app_thread_pool();
+  U64 task_count = Max((U64)1, Min((U64)pool->worker_count, count));
+  
+  QE_DenseDictCodesTask task = {0};
+  task.ranges = tp_divide_work(scratch.arena, count, (U32)task_count);
+  task.codes = codes;
+  task.values = values;
+  
+  TP_Arena* pool_arena = app_thread_pool_arena();
+  TP_Temp temp = tp_temp_begin(pool_arena);
+  tp_for_parallel(pool, pool_arena, task_count, qe_dense_dict_codes_task, &task);
+  tp_temp_end(temp);
+  
+  scratch_end(scratch);
+  return values;
+}
+
+// tec: cross-column lookup
+internal F64*
+qe_dict_codes_from_string_chunk(Arena* arena, GDB_StringDataChunk* chunk, GDB_StringDict* dict)
+{
+  ProfBeginFunction();
+  
+  F64* values = push_array(arena, F64, Max(chunk->row_count, 1));
+  
+  Temp scratch = scratch_begin(&arena, 1);
+  TP_Context* pool = app_thread_pool();
+  U64 task_count = Max((U64)1, Min((U64)pool->worker_count, chunk->row_count));
+  
+  QE_DictLookupTask task = {0};
+  task.ranges = tp_divide_work(scratch.arena, chunk->row_count, (U32)task_count);
+  task.chunk = *chunk;
+  task.dict = dict;
+  task.values = values;
+  
+  TP_Arena* pool_arena = app_thread_pool_arena();
+  TP_Temp temp = tp_temp_begin(pool_arena);
+  tp_for_parallel(pool, pool_arena, task_count, qe_dict_lookup_task, &task);
+  tp_temp_end(temp);
+  
+  scratch_end(scratch);
+  
+  ProfEnd();
+  return values;
+}
+
 typedef struct QE_NarrowCheckTask QE_NarrowCheckTask;
 struct QE_NarrowCheckTask
 {
@@ -1172,7 +1406,7 @@ internal B32
 qe_values_round_trip_f32(F64* values, U64 count)
 {
   if (count == 0) return 1;
-
+  
   Temp scratch = scratch_begin(0, 0);
   TP_Context* pool = app_thread_pool();
   U64 task_count = Max((U64)1, Min((U64)pool->worker_count, count));
@@ -1214,7 +1448,7 @@ qe_values_to_f32(Arena* arena, F64* values, U64 count)
 {
   F32* out = push_array(arena, F32, Max(count, 1));
   if (count == 0) return out;
-
+  
   Temp scratch = scratch_begin(0, 0);
   TP_Context* pool = app_thread_pool();
   U64 task_count = Max((U64)1, Min((U64)pool->worker_count, count));
@@ -2001,8 +2235,16 @@ qe_aggregate(Arena* arena, GDB_Database* database, PLAN_RowSet* input, IR_Node* 
   {
     if (group_columns[c]->type == GDB_ColumnType_String8)
     {
-      group_string[c] = qe_gather_string_column(arena, input, group_slots[c], group_columns[c]);
-      group_string_mask |= (1u << c);
+      gdb_column_ensure_string_dict(group_columns[c]);
+      if (group_columns[c]->has_dict)
+      {
+        group_numeric[c] = qe_gather_string_dict_codes(arena, input, group_slots[c], group_columns[c]);
+      }
+      else
+      {
+        group_string[c] = qe_gather_string_column(arena, input, group_slots[c], group_columns[c]);
+        group_string_mask |= (1u << c);
+      }
     }
     else
     {
@@ -3391,6 +3633,20 @@ qe_hash_join(Arena* arena, PLAN_RowSet* left, GDB_Table* right_table, String8 ri
     return result;
   }
   
+  // tec: dictionary codes are only comparable within the column that produced them
+  B32 dict_key = 0;
+  GDB_StringDict* join_dict = 0;
+  if (is_string_key)
+  {
+    gdb_column_ensure_string_dict(right_key_column);
+    if (right_key_column->has_dict)
+    {
+      dict_key = 1;
+      join_dict = right_key_column->dict;
+      is_string_key = 0;
+    }
+  }
+  
   U64 build_row_count = right_table->row_count;
   U64 probe_row_count = left->count;
   B32 is_left_join = str8_match(join_type, str8_lit("left"), StringMatchFlag_CaseInsensitive);
@@ -3419,7 +3675,12 @@ qe_hash_join(Arena* arena, PLAN_RowSet* left, GDB_Table* right_table, String8 ri
   U64* build_offsets = NULL;
   U64 build_data_size = 4;
   
-  if (is_string_key)
+  if (dict_key)
+  {
+    build_data = qe_dict_codes_to_f64_dense(scratch.arena, right_key_column->dict_codes, build_row_count);
+    build_data_size = Max(build_row_count, 1) * sizeof(F64);
+  }
+  else if (is_string_key)
   {
     GDB_StringDataChunk chunk = gdb_column_get_string_chunk(scratch.arena, right_key_column, r1u64(0, build_row_count));
     build_data = chunk.data;
@@ -3460,7 +3721,13 @@ qe_hash_join(Arena* arena, PLAN_RowSet* left, GDB_Table* right_table, String8 ri
   U64* probe_offsets = NULL;
   U64 probe_data_size = 4;
   
-  if (is_string_key)
+  if (dict_key)
+  {
+    GDB_StringDataChunk chunk = qe_gather_string_column(scratch.arena, left, left_key_slot, left_key_column);
+    probe_data = qe_dict_codes_from_string_chunk(scratch.arena, &chunk, join_dict);
+    probe_data_size = Max(probe_row_count, 1) * sizeof(F64);
+  }
+  else if (is_string_key)
   {
     GDB_StringDataChunk chunk = qe_gather_string_column(scratch.arena, left, left_key_slot, left_key_column);
     probe_data = chunk.data;

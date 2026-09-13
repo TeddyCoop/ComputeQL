@@ -1,9 +1,4 @@
 
-global OS_Handle g_query_exec_mutex = {0};
-
-global TP_Context* g_app_thread_pool = 0;
-global TP_Arena* g_app_thread_pool_arena = 0;
-
 internal TP_Context*
 app_thread_pool(void)
 {

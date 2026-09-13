@@ -48,11 +48,24 @@
 #define GDB_DISK_BACKED_THRESHOLD_SIZE MB(64)
 #endif
 
+#ifndef GDB_DICT_ENCODE_MIN_ROWS
+#define GDB_DICT_ENCODE_MIN_ROWS 4096
+#endif
+#ifndef GDB_DICT_ENCODE_MAX_DISTINCT
+#define GDB_DICT_ENCODE_MAX_DISTINCT 65536
+#endif
+#ifndef GDB_DICT_ENCODE_MAX_CARDINALITY_RATIO
+#define GDB_DICT_ENCODE_MAX_CARDINALITY_RATIO 0.5
+#endif
+
 global U64 g_gdb_disk_backed_threshold_size = GDB_DISK_BACKED_THRESHOLD_SIZE;
 global U64 g_gdb_column_expand_count = GDB_COLUMN_EXPAND_COUNT;
 global U64 g_gdb_column_variable_capacity_alloc_size = GDB_COLUMN_VARIABLE_CAPACITY_ALLOC_SIZE;
 global U64 g_gdb_column_max_grow_by_size = GDB_COLUMN_MAX_GROW_BY_SIZE;
 global F64 g_gdb_table_expand_factor = GDB_TABLE_EXPAND_FACTOR;
+global U64 g_gdb_dict_encode_min_rows = GDB_DICT_ENCODE_MIN_ROWS;
+global U64 g_gdb_dict_encode_max_distinct = GDB_DICT_ENCODE_MAX_DISTINCT;
+global F64 g_gdb_dict_encode_max_cardinality_ratio = GDB_DICT_ENCODE_MAX_CARDINALITY_RATIO;
 
 // tec: reserved name for the column catalog table
 #define GDB_COLUMN_CATALOG_TABLE_NAME str8_lit("column_catalog")
@@ -119,6 +132,22 @@ struct GDB_EnumType
   U32 value_count;
 };
 
+// tec: automatic dictionary encoding for low cardinality String8 columns
+#define GDB_DICT_EMPTY_SLOT ((U32)0xFFFFFFFF)
+#define GDB_DICT_NOT_FOUND  ((U32)0xFFFFFFFF)
+#define GDB_DICT_MAX_PROBE  256
+#define GDB_DICT_TABLE_CAPACITY_FACTOR 4
+
+typedef struct GDB_StringDict GDB_StringDict;
+struct GDB_StringDict
+{
+  Arena* arena;
+  String8* values;
+  U32 value_count;
+  U32* index_codes;    
+  U64 index_capacity;
+};
+
 //~ tec: declare db structs
 typedef struct GDB_Column GDB_Column;
 typedef struct GDB_Table GDB_Table;
@@ -143,6 +172,12 @@ struct GDB_Column
   
   //- tec: for enum cols
   GDB_EnumType* enum_type;
+  
+  //- tec: dictionary encoding
+  B32 has_dict;
+  U64 dict_checked_generation;
+  GDB_StringDict* dict;
+  U32* dict_codes;
   
   //- tec: data storage
   U8 *data;
@@ -333,6 +368,10 @@ internal void gdb_column_remove_data(GDB_Column* column, U64 row_index);
 internal B32 gdb_column_is_null(GDB_Column* column, U64 row_index);
 internal void* gdb_column_get_data_range(Arena* arena, GDB_Column* column, Rng1U64 row_range, U64* out_size);
 internal GDB_StringDataChunk gdb_column_get_string_chunk(Arena* arena, GDB_Column* column, Rng1U64 row_range);
+
+internal void gdb_column_ensure_string_dict(GDB_Column* column);
+internal B32 gdb_string_dict_code_from_value(GDB_StringDict* dict, String8 value, U32* out_code);
+internal U32 gdb_string_dict_code_or_sentinel(GDB_StringDict* dict, String8 value);
 
 internal String8 gdb_generate_disk_path_for_column(Arena* arena, GDB_Column* column);
 internal void gdb_column_convert_to_disk_backed(GDB_Column* column);

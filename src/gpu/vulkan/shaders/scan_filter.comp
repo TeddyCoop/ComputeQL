@@ -22,6 +22,7 @@ layout(local_size_x = 256) in;
 #define OP_STR_EQ        11
 #define OP_STR_CONTAINS  12
 #define OP_HALT          13
+#define OP_PUSH_FALSE    14
 
 #define COLTYPE_U32      1
 #define COLTYPE_U64      2
@@ -224,6 +225,11 @@ main()
       case OP_PUSH_TRUE:
       {
         stack[sp++] = 1.0LF;
+      } break;
+
+      case OP_PUSH_FALSE:
+      {
+        stack[sp++] = 0.0LF;
       } break;
 
       case OP_LOAD_NUM_COL:

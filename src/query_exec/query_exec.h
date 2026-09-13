@@ -59,6 +59,7 @@ typedef enum QE_Opcode
   QE_Opcode_StrEq       = 11,
   QE_Opcode_StrContains = 12,
   QE_Opcode_Halt        = 13,
+  QE_Opcode_PushFalse   = 14,
 } QE_Opcode;
 
 typedef struct QE_ColumnBinding QE_ColumnBinding;
@@ -69,11 +70,14 @@ struct QE_ColumnBinding
   GDB_ColumnType type;
   U32 first_slot; // tec: relative slot (0..QE_MAX_COLUMN_BINDINGS-1), maps to descriptor binding QE_BINDING_COLUMN_BASE+first_slot
   U32 slot_count; // tec: 1 for numeric columns, 2 (data+offsets) for string columns
+  B32 use_dict_codes;
 };
 
 typedef struct QE_BytecodeProgram QE_BytecodeProgram;
 struct QE_BytecodeProgram
 {
+  Arena* arena;
+  
   U32* words;
   U64 word_count;
   U64 words_cap;
