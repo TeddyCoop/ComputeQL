@@ -19,7 +19,7 @@ settings_init(void)
   settings_set(str8_lit("QE_SCAN_OUTPUT_DEFAULT_CAP_ROWS"), str8_lit("65536"));
   settings_set(str8_lit("QE_AGG_ROWS_PER_CHUNK"), str8_lit("4096"));
   settings_set(str8_lit("QE_INDEX_SCAN_MAX_AND_LEAVES"), str8_lit("16"));
-  settings_set(str8_lit("QE_THREAD_POOL_WORKER_COUNT"), str8_lit("0"));
+  settings_set(str8_lit("APP_THREAD_POOL_WORKER_COUNT"), str8_lit("0"));
 }
 
 internal U64

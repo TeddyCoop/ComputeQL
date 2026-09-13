@@ -1,6 +1,34 @@
 
 global OS_Handle g_query_exec_mutex = {0};
 
+global TP_Context* g_app_thread_pool = 0;
+global TP_Arena* g_app_thread_pool_arena = 0;
+
+internal TP_Context*
+app_thread_pool(void)
+{
+  if (!g_app_thread_pool)
+  {
+    Arena* arena = arena_alloc();
+    // tec: 0 (default) means auto-detect from the logical processor count
+    U32 worker_count = (U32)settings_u64(str8_lit("APP_THREAD_POOL_WORKER_COUNT"), 0);
+    if (worker_count == 0)
+    {
+      worker_count = Max(1, os_get_system_info()->logical_processor_count);
+    }
+    g_app_thread_pool = tp_alloc(arena, worker_count, 0, str8_zero());
+    g_app_thread_pool_arena = tp_arena_alloc(g_app_thread_pool);
+  }
+  return g_app_thread_pool;
+}
+
+internal TP_Arena*
+app_thread_pool_arena(void)
+{
+  app_thread_pool();
+  return g_app_thread_pool_arena;
+}
+
 internal int
 delete_row_index_compare_descending(const void* a, const void* b)
 {
@@ -504,7 +532,7 @@ app_select_format_dispatch(Arena* arena, String8List* out, IR_Node* select_outpu
                             U64 column_count, PLAN_RowSet* rows, U64 result_count, B32 capture_structured, APP_ResultSet* out_result_set)
 {
   Temp scratch = scratch_begin(&arena, 1);
-  TP_Context* pool = g_qe_thread_pool;
+  TP_Context* pool = app_thread_pool();
   U64 task_count = (result_count > 1) ? Min((U64)pool->worker_count, result_count) : 1;
 
   APP_SelectFormatTask task = {0};
@@ -517,8 +545,9 @@ app_select_format_dispatch(Arena* arena, String8List* out, IR_Node* select_outpu
   task.out_result_set = out_result_set;
   task.worker_lists = push_array(scratch.arena, String8List, task_count);
 
-  TP_Temp temp = tp_temp_begin(g_qe_thread_pool_arena);
-  tp_for_parallel(pool, g_qe_thread_pool_arena, task_count, app_select_format_task, &task);
+  TP_Arena* pool_arena = app_thread_pool_arena();
+  TP_Temp temp = tp_temp_begin(pool_arena);
+  tp_for_parallel(pool, pool_arena, task_count, app_select_format_task, &task);
 
   if (capture_structured)
   {
@@ -548,8 +577,6 @@ internal APP_QueryResult
 app_execute_query_capture(Arena* arena, String8 sql_query, GDB_Database** io_database, APP_ResultSet* out_result_set)
 {
   ProfBeginFunction();
-
-  qe_thread_pool_init();
 
   if (out_result_set) { MemoryZeroStruct(out_result_set); }
 

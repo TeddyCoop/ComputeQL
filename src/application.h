@@ -31,9 +31,17 @@ struct APP_ResultSet
   F64* cell_numeric;    
 };
 
+global OS_Handle g_query_exec_mutex = {0};
+
+global TP_Context* g_app_thread_pool = 0;
+global TP_Arena* g_app_thread_pool_arena = 0;
+
 // tec: out_result_set may be NULL
 internal APP_QueryResult app_execute_query_capture(Arena* arena, String8 sql_query, GDB_Database** io_database, APP_ResultSet* out_result_set);
 internal void app_execute_query(String8 sql_query);
 internal PLAN_ExecResult app_perform_kernel(Arena* arena, GDB_Database* database, IR_Node* root_node);
+
+internal TP_Context* app_thread_pool(void);
+internal TP_Arena* app_thread_pool_arena(void);
 
 #endif //APPLICATION_H

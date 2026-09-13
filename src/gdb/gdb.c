@@ -17,9 +17,7 @@ gdb_init(void)
   
   g_gdb_state->databases = NULL;
   g_gdb_state->rw_mutex = os_rw_mutex_alloc();
-  
-  gdb_thread_pool_init();
-  
+
   ProfEnd();
 }
 
@@ -1403,25 +1401,6 @@ parse_csv_line(U8 *input, U64 len, String8 *fields, U64 max_fields)
   return count;
 }
 
-internal void
-gdb_thread_pool_init(void)
-{
-  if (g_gdb_thread_pool)
-  {
-    return;
-  }
-  
-  Arena* arena = arena_alloc();
-  // tec: 0 (default) means auto-detect from the logical processor count
-  U32 worker_count = (U32)settings_u64(str8_lit("GDB_THREAD_POOL_WORKER_COUNT"), 0);
-  if (worker_count == 0)
-  {
-    worker_count = Max(1, os_get_system_info()->logical_processor_count);
-  }
-  g_gdb_thread_pool = tp_alloc(arena, worker_count, 0, str8_zero());
-  g_gdb_thread_pool_arena = tp_arena_alloc(g_gdb_thread_pool);
-}
-
 internal THREAD_POOL_TASK_FUNC(gdb_csv_parse_task)
 {
   GDB_CSV_ParseTask* task = (GDB_CSV_ParseTask*)raw_task;
@@ -1663,9 +1642,7 @@ gdb_table_import_csv_streaming(GDB_Database *db, String8 table_name, String8 pat
     
     String8 leftover = {0};
     B32 skipped_header = 0;
-    
-    gdb_thread_pool_init();
-    
+
     while (file_pos < file_size)
     {
       U64 p0 = os_now_microseconds();
@@ -1731,11 +1708,13 @@ gdb_table_import_csv_streaming(GDB_Database *db, String8 table_name, String8 pat
         task.table = table;
         task.column_count = column_count;
         
-        U64 task_count = Max((U64)1, Min((U64)g_gdb_thread_pool->worker_count, chunk_row_count));
+        TP_Context* pool = app_thread_pool();
+        U64 task_count = Max((U64)1, Min((U64)pool->worker_count, chunk_row_count));
         task.ranges = tp_divide_work(row_arena, chunk_row_count, (U32)task_count);
-        
-        TP_Temp temp = tp_temp_begin(g_gdb_thread_pool_arena);
-        tp_for_parallel(g_gdb_thread_pool, g_gdb_thread_pool_arena, task_count, gdb_csv_parse_task, &task);
+
+        TP_Arena* pool_arena = app_thread_pool_arena();
+        TP_Temp temp = tp_temp_begin(pool_arena);
+        tp_for_parallel(pool, pool_arena, task_count, gdb_csv_parse_task, &task);
         tp_temp_end(temp);
         t_parse += os_now_microseconds() - p2;
         

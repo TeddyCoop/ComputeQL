@@ -15,6 +15,7 @@
 #include "gpu/gpu_inc.h"
 #include "query_exec/query_exec.h"
 #include "planner/planner.h"
+#include "application.h"
 #include "third_party/sqlite/sqlite3.h"
 #include "third_party/duckdb/duckdb.h"
 
@@ -27,6 +28,7 @@
 #include "gdb/gdb_inc.c"
 #include "query_exec/query_exec.c"
 #include "planner/planner.c"
+#include "application.c"
 
 #include "tests/bench_common.h"
 

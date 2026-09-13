@@ -1,22 +1,4 @@
 internal void
-qe_thread_pool_init(void)
-{
-  if (g_qe_thread_pool)
-  {
-    return;
-  }
-  
-  Arena* arena = arena_alloc();
-  U32 worker_count = (U32)settings_u64(str8_lit("QE_THREAD_POOL_WORKER_COUNT"), 0);
-  if (worker_count == 0)
-  {
-    worker_count = Max(1, os_get_system_info()->logical_processor_count);
-  }
-  g_qe_thread_pool = tp_alloc(arena, worker_count, 0, str8_zero());
-  g_qe_thread_pool_arena = tp_arena_alloc(g_qe_thread_pool);
-}
-
-internal void
 qe_bytecode_emit(QE_BytecodeProgram* prog, U32 word)
 {
   if (prog->word_count >= prog->words_cap)
@@ -1141,9 +1123,8 @@ qe_gather_numeric_column(Arena* arena, PLAN_RowSet* rows, U64 table_slot, GDB_Co
     base_ptr = gdb_column_get_data_range(arena, column, r1u64(min_row, max_row + 1), &range_size);
   }
   
-  qe_thread_pool_init();
   Temp scratch = scratch_begin(&arena, 1);
-  TP_Context* pool = g_qe_thread_pool;
+  TP_Context* pool = app_thread_pool();
   U64 task_count = Max((U64)1, Min((U64)pool->worker_count, rows->count));
   
   QE_GatherNumericTask task = {0};
@@ -1155,8 +1136,9 @@ qe_gather_numeric_column(Arena* arena, PLAN_RowSet* rows, U64 table_slot, GDB_Co
   task.column_size = column->size;
   task.values = values;
   
-  TP_Temp temp = tp_temp_begin(g_qe_thread_pool_arena);
-  tp_for_parallel(pool, g_qe_thread_pool_arena, task_count, qe_gather_numeric_task, &task);
+  TP_Arena* pool_arena = app_thread_pool_arena();
+  TP_Temp temp = tp_temp_begin(pool_arena);
+  tp_for_parallel(pool, pool_arena, task_count, qe_gather_numeric_task, &task);
   tp_temp_end(temp);
   
   scratch_end(scratch);
@@ -1190,10 +1172,9 @@ internal B32
 qe_values_round_trip_f32(F64* values, U64 count)
 {
   if (count == 0) return 1;
-  qe_thread_pool_init();
-  
+
   Temp scratch = scratch_begin(0, 0);
-  TP_Context* pool = g_qe_thread_pool;
+  TP_Context* pool = app_thread_pool();
   U64 task_count = Max((U64)1, Min((U64)pool->worker_count, count));
   
   QE_NarrowCheckTask task = {0};
@@ -1201,8 +1182,9 @@ qe_values_round_trip_f32(F64* values, U64 count)
   task.values = values;
   task.task_narrow = push_array(scratch.arena, B32, task_count);
   
-  TP_Temp temp = tp_temp_begin(g_qe_thread_pool_arena);
-  tp_for_parallel(pool, g_qe_thread_pool_arena, task_count, qe_narrow_check_task, &task);
+  TP_Arena* pool_arena = app_thread_pool_arena();
+  TP_Temp temp = tp_temp_begin(pool_arena);
+  tp_for_parallel(pool, pool_arena, task_count, qe_narrow_check_task, &task);
   tp_temp_end(temp);
   
   B32 all_narrow = 1;
@@ -1232,10 +1214,9 @@ qe_values_to_f32(Arena* arena, F64* values, U64 count)
 {
   F32* out = push_array(arena, F32, Max(count, 1));
   if (count == 0) return out;
-  qe_thread_pool_init();
-  
+
   Temp scratch = scratch_begin(0, 0);
-  TP_Context* pool = g_qe_thread_pool;
+  TP_Context* pool = app_thread_pool();
   U64 task_count = Max((U64)1, Min((U64)pool->worker_count, count));
   
   QE_NarrowConvertTask task = {0};
@@ -1243,8 +1224,9 @@ qe_values_to_f32(Arena* arena, F64* values, U64 count)
   task.src = values;
   task.dst = out;
   
-  TP_Temp temp = tp_temp_begin(g_qe_thread_pool_arena);
-  tp_for_parallel(pool, g_qe_thread_pool_arena, task_count, qe_narrow_convert_task, &task);
+  TP_Arena* pool_arena = app_thread_pool_arena();
+  TP_Temp temp = tp_temp_begin(pool_arena);
+  tp_for_parallel(pool, pool_arena, task_count, qe_narrow_convert_task, &task);
   tp_temp_end(temp);
   
   scratch_end(scratch);
@@ -3274,8 +3256,6 @@ internal THREAD_POOL_TASK_FUNC(qe_cpu_scan_filter_task)
 internal QE_ScanResult
 qe_cpu_scan_filter(Arena* arena, GDB_Table* table, IR_Node* where_clause)
 {
-  qe_thread_pool_init();
-  
   QE_ScanResult result = {0};
   U64 row_count = table->row_count;
   
@@ -3296,7 +3276,7 @@ qe_cpu_scan_filter(Arena* arena, GDB_Table* table, IR_Node* where_clause)
   
   U64 cpu_scan_start = os_now_microseconds();
   
-  TP_Context* pool = g_qe_thread_pool;
+  TP_Context* pool = app_thread_pool();
   U64 task_count = (row_count > 1) ? Min((U64)pool->worker_count, row_count) : 1;
   
   QE_CpuScanTask task = {0};
@@ -3311,8 +3291,9 @@ qe_cpu_scan_filter(Arena* arena, GDB_Table* table, IR_Node* where_clause)
     task.task_matched_indices[t] = push_array(scratch.arena, U64, Max(width, 1));
   }
   
-  TP_Temp temp = tp_temp_begin(g_qe_thread_pool_arena);
-  tp_for_parallel(pool, g_qe_thread_pool_arena, task_count, qe_cpu_scan_filter_task, &task);
+  TP_Arena* pool_arena = app_thread_pool_arena();
+  TP_Temp temp = tp_temp_begin(pool_arena);
+  tp_for_parallel(pool, pool_arena, task_count, qe_cpu_scan_filter_task, &task);
   tp_temp_end(temp);
   
   U64 matched_count = 0;

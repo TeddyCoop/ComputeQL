@@ -14,6 +14,7 @@
 #include "gpu/gpu_inc.h"
 #include "query_exec/query_exec.h"
 #include "planner/planner.h"
+#include "application.h"
 #include "third_party/sqlite/sqlite3.h"
 
 #include "base/base_inc.c"
@@ -25,6 +26,7 @@
 #include "gdb/gdb_inc.c"
 #include "query_exec/query_exec.c"
 #include "planner/planner.c"
+#include "application.c"
 
 internal B32
 scr_check_string(GDB_Column *column, U64 index, String8 expected, B32 *pass)

@@ -261,11 +261,6 @@ struct GDB_State
 
 global GDB_State* g_gdb_state = 0;
 
-//~ tec: thread pool
-global TP_Context* g_gdb_thread_pool = 0;
-global TP_Arena*   g_gdb_thread_pool_arena = 0;
-internal void gdb_thread_pool_init(void);
-
 internal void gdb_init(void);
 internal void gdb_add_database(GDB_Database* database);
 internal GDB_Database* gdb_state_find_database_by_name(String8 name);
