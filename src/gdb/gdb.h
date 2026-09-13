@@ -58,15 +58,6 @@
 #define GDB_DICT_ENCODE_MAX_CARDINALITY_RATIO 0.5
 #endif
 
-global U64 g_gdb_disk_backed_threshold_size = GDB_DISK_BACKED_THRESHOLD_SIZE;
-global U64 g_gdb_column_expand_count = GDB_COLUMN_EXPAND_COUNT;
-global U64 g_gdb_column_variable_capacity_alloc_size = GDB_COLUMN_VARIABLE_CAPACITY_ALLOC_SIZE;
-global U64 g_gdb_column_max_grow_by_size = GDB_COLUMN_MAX_GROW_BY_SIZE;
-global F64 g_gdb_table_expand_factor = GDB_TABLE_EXPAND_FACTOR;
-global U64 g_gdb_dict_encode_min_rows = GDB_DICT_ENCODE_MIN_ROWS;
-global U64 g_gdb_dict_encode_max_distinct = GDB_DICT_ENCODE_MAX_DISTINCT;
-global F64 g_gdb_dict_encode_max_cardinality_ratio = GDB_DICT_ENCODE_MAX_CARDINALITY_RATIO;
-
 // tec: reserved name for the column catalog table
 #define GDB_COLUMN_CATALOG_TABLE_NAME str8_lit("column_catalog")
 
@@ -286,12 +277,22 @@ typedef struct GDB_State GDB_State;
 struct GDB_State
 {
   Arena* arena;
-  
+
   GDB_Database** databases;
   U64 database_count;
   U64 database_capacity;
-  
+
   OS_Handle rw_mutex;
+
+  //- tec: settings derived tunables
+  U64 disk_backed_threshold_size;
+  U64 column_expand_count;
+  U64 column_variable_capacity_alloc_size;
+  U64 column_max_grow_by_size;
+  F64 table_expand_factor;
+  U64 dict_encode_min_rows;
+  U64 dict_encode_max_distinct;
+  F64 dict_encode_max_cardinality_ratio;
 };
 
 global GDB_State* g_gdb_state = 0;

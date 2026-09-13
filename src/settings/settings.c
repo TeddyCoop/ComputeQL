@@ -22,21 +22,10 @@ settings_init(void)
   settings_set(str8_lit("APP_THREAD_POOL_WORKER_COUNT"), str8_lit("0"));
 }
 
-internal U64
-settings_hash_from_str8(String8 string)
-{
-  U64 result = 5381;
-  for (U64 i = 0; i < string.size; i += 1)
-  {
-    result = ((result << 5) + result) + string.str[i];
-  }
-  return result;
-}
-
 internal Settings_Entry**
 settings_slot_from_key(String8 key_lower)
 {
-  U64 hash = settings_hash_from_str8(key_lower);
+  U64 hash = u64_hash_from_str8(key_lower);
   return &g_settings_state->slots[hash % g_settings_state->slot_count];
 }
 

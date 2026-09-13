@@ -2,25 +2,25 @@ internal void
 gdb_init(void)
 {
   ProfBeginFunction();
-  
-  g_gdb_disk_backed_threshold_size = settings_u64(str8_lit("GDB_DISK_BACKED_THRESHOLD_SIZE"), GDB_DISK_BACKED_THRESHOLD_SIZE);
-  g_gdb_column_expand_count = settings_u64(str8_lit("GDB_COLUMN_EXPAND_COUNT"), GDB_COLUMN_EXPAND_COUNT);
-  g_gdb_column_variable_capacity_alloc_size = settings_u64(str8_lit("GDB_COLUMN_VARIABLE_CAPACITY_ALLOC_SIZE"), GDB_COLUMN_VARIABLE_CAPACITY_ALLOC_SIZE);
-  g_gdb_column_max_grow_by_size = settings_u64(str8_lit("GDB_COLUMN_MAX_GROW_BY_SIZE"), GDB_COLUMN_MAX_GROW_BY_SIZE);
-  g_gdb_table_expand_factor = settings_f64(str8_lit("GDB_TABLE_EXPAND_FACTOR"), GDB_TABLE_EXPAND_FACTOR);
-  g_gdb_dict_encode_min_rows = settings_u64(str8_lit("GDB_DICT_ENCODE_MIN_ROWS"), GDB_DICT_ENCODE_MIN_ROWS);
-  g_gdb_dict_encode_max_distinct = settings_u64(str8_lit("GDB_DICT_ENCODE_MAX_DISTINCT"), GDB_DICT_ENCODE_MAX_DISTINCT);
-  g_gdb_dict_encode_max_cardinality_ratio = settings_f64(str8_lit("GDB_DICT_ENCODE_MAX_CARDINALITY_RATIO"), GDB_DICT_ENCODE_MAX_CARDINALITY_RATIO);
-  
+
   U64 state_arena_reserve_size = settings_u64(str8_lit("GDB_STATE_ARENA_RESERVE_SIZE"), GDB_STATE_ARENA_RESERVE_SIZE);
   U64 state_arena_commit_size = settings_u64(str8_lit("GDB_STATE_ARENA_COMMIT_SIZE"), GDB_STATE_ARENA_COMMIT_SIZE);
   Arena* arena = arena_alloc(.reserve_size=state_arena_reserve_size, .commit_size=state_arena_commit_size);
   g_gdb_state = push_array(arena, GDB_State, 1);
   g_gdb_state->arena = arena;
-  
+
   g_gdb_state->databases = NULL;
   g_gdb_state->rw_mutex = os_rw_mutex_alloc();
-  
+
+  g_gdb_state->disk_backed_threshold_size = settings_u64(str8_lit("GDB_DISK_BACKED_THRESHOLD_SIZE"), GDB_DISK_BACKED_THRESHOLD_SIZE);
+  g_gdb_state->column_expand_count = settings_u64(str8_lit("GDB_COLUMN_EXPAND_COUNT"), GDB_COLUMN_EXPAND_COUNT);
+  g_gdb_state->column_variable_capacity_alloc_size = settings_u64(str8_lit("GDB_COLUMN_VARIABLE_CAPACITY_ALLOC_SIZE"), GDB_COLUMN_VARIABLE_CAPACITY_ALLOC_SIZE);
+  g_gdb_state->column_max_grow_by_size = settings_u64(str8_lit("GDB_COLUMN_MAX_GROW_BY_SIZE"), GDB_COLUMN_MAX_GROW_BY_SIZE);
+  g_gdb_state->table_expand_factor = settings_f64(str8_lit("GDB_TABLE_EXPAND_FACTOR"), GDB_TABLE_EXPAND_FACTOR);
+  g_gdb_state->dict_encode_min_rows = settings_u64(str8_lit("GDB_DICT_ENCODE_MIN_ROWS"), GDB_DICT_ENCODE_MIN_ROWS);
+  g_gdb_state->dict_encode_max_distinct = settings_u64(str8_lit("GDB_DICT_ENCODE_MAX_DISTINCT"), GDB_DICT_ENCODE_MAX_DISTINCT);
+  g_gdb_state->dict_encode_max_cardinality_ratio = settings_f64(str8_lit("GDB_DICT_ENCODE_MAX_CARDINALITY_RATIO"), GDB_DICT_ENCODE_MAX_CARDINALITY_RATIO);
+
   ProfEnd();
 }
 
@@ -466,7 +466,7 @@ gdb_table_add_column(GDB_Table* table, GDB_ColumnSchema schema)
   }
   else if (table->column_count >= table->column_capacity)
   {
-    U64 new_capacity = (U64)ceil_f64(table->column_capacity * g_gdb_table_expand_factor);
+    U64 new_capacity = (U64)ceil_f64(table->column_capacity * g_gdb_state->table_expand_factor);
     GDB_Column** new_columns = push_array(table->arena, GDB_Column*, new_capacity);
     MemoryCopy(new_columns, table->columns, sizeof(GDB_Column*) * table->column_count);
     table->columns = new_columns;
@@ -1084,7 +1084,7 @@ gdb_table_load(GDB_Database* database, String8 table_dir, String8 meta_path)
       continue;
     }
     
-    if (props.size > g_gdb_disk_backed_threshold_size)
+    if (props.size > g_gdb_state->disk_backed_threshold_size)
     {
       column->is_disk_backed = 1;
       column->disk_path = push_str8_copy(column->arena, column_path);
@@ -2039,7 +2039,7 @@ gdb_index_ensure_order_capacity(GDB_Index* index, GDB_Table* table)
 {
   if (index->order_count < index->order_capacity) return;
   
-  U64 new_capacity = (index->order_capacity > 0) ? index->order_capacity * 2 : g_gdb_column_expand_count;
+  U64 new_capacity = (index->order_capacity > 0) ? index->order_capacity * 2 : g_gdb_state->column_expand_count;
   U64* new_order = push_array(table->arena, U64, new_capacity);
   if (index->order)
   {
@@ -2289,7 +2289,7 @@ gdb_column_add_data_disk_backed(GDB_Column* column, void* data)
       U64 new_reserved = var_reserved * 2;
       if (new_reserved < column->variable_capacity + str->size)
       {
-        new_reserved = AlignUp(column->variable_capacity + str->size + g_gdb_column_variable_capacity_alloc_size, 8);
+        new_reserved = AlignUp(column->variable_capacity + str->size + g_gdb_state->column_variable_capacity_alloc_size, 8);
       }
       
       U64 old_offset_pos = sizeof(U64) + var_reserved;
@@ -2388,7 +2388,7 @@ gdb_column_add_data(GDB_Column* column, void* data)
       //- tec: grow offsets array if needed
       if (column->row_count == column->capacity)
       {
-        U64 new_capacity = (column->capacity > 0) ? column->capacity * 2 : g_gdb_column_expand_count;
+        U64 new_capacity = (column->capacity > 0) ? column->capacity * 2 : g_gdb_state->column_expand_count;
         U64* new_offsets = push_array(column->arena, U64, new_capacity);
         if (column->offsets) 
         {
@@ -2403,13 +2403,13 @@ gdb_column_add_data(GDB_Column* column, void* data)
       U64 required_size = previous_offset + str->size;
       if (required_size > column->variable_capacity)
       {
-        U64 new_variable_capacity = (column->variable_capacity > 0) ? column->variable_capacity * 2 : g_gdb_column_variable_capacity_alloc_size;
+        U64 new_variable_capacity = (column->variable_capacity > 0) ? column->variable_capacity * 2 : g_gdb_state->column_variable_capacity_alloc_size;
         while (new_variable_capacity < required_size)
         {
           new_variable_capacity *= 2;
         }
         
-        if (new_variable_capacity > g_gdb_disk_backed_threshold_size)
+        if (new_variable_capacity > g_gdb_state->disk_backed_threshold_size)
         {
           if (!column->is_disk_backed)
           {
@@ -2458,10 +2458,10 @@ gdb_column_add_data(GDB_Column* column, void* data)
         }
         
         // tec: cap capacity
-        U64 new_capacity = (column->capacity > 0) ? column->capacity * 2 : g_gdb_column_expand_count;
-        if (new_capacity > column->capacity + g_gdb_column_max_grow_by_size)
+        U64 new_capacity = (column->capacity > 0) ? column->capacity * 2 : g_gdb_state->column_expand_count;
+        if (new_capacity > column->capacity + g_gdb_state->column_max_grow_by_size)
         {
-          new_capacity = column->capacity + g_gdb_column_max_grow_by_size;
+          new_capacity = column->capacity + g_gdb_state->column_max_grow_by_size;
         }
         //log_debug("growing column: old_capacity=%llu, new_capacity=%llu, size=%llu", column->capacity, new_capacity, column->size);
         
@@ -2490,7 +2490,7 @@ gdb_column_add_data(GDB_Column* column, void* data)
         MemoryZero(column->data + column->row_count * column->size, column->size);
       }
       
-      if ((column->row_count + 1) * column->size > g_gdb_disk_backed_threshold_size)
+      if ((column->row_count + 1) * column->size > g_gdb_state->disk_backed_threshold_size)
       {
         gdb_column_convert_to_disk_backed(column);
       }
@@ -2526,7 +2526,7 @@ gdb_column_ensure_null_flags_capacity(GDB_Column* column, U64 needed_count)
 {
   if (needed_count <= column->null_flags_capacity) return;
   
-  U64 new_capacity = (column->null_flags_capacity > 0) ? column->null_flags_capacity * 2 : g_gdb_column_expand_count;
+  U64 new_capacity = (column->null_flags_capacity > 0) ? column->null_flags_capacity * 2 : g_gdb_state->column_expand_count;
   while (new_capacity < needed_count) new_capacity *= 2;
   
   U8* new_flags = push_array(column->arena, U8, new_capacity); // tec: push_array auto-zeroes
@@ -2974,22 +2974,11 @@ gdb_column_close_string_chunk(GDB_Column* column)
   os_file_map_view_close(file_map, column->mapped_ptr, column->current_mapped_range);
 }
 
-internal U64
-gdb_string_hash(String8 s)
-{
-  U64 h = 2166136261u;
-  for (U64 i = 0; i < s.size; i++)
-  {
-    h = (h ^ s.str[i]) * 16777619u;
-  }
-  return h;
-}
-
 internal B32
 gdb_string_dict_code_from_value(GDB_StringDict* dict, String8 value, U32* out_code)
 {
   U64 mask = dict->index_capacity - 1;
-  U64 slot = gdb_string_hash(value) & mask;
+  U64 slot = u64_hash_from_str8(value) & mask;
   for (U32 probe = 0; probe < GDB_DICT_MAX_PROBE; probe++)
   {
     U32 code = dict->index_codes[slot];
@@ -3049,7 +3038,7 @@ internal THREAD_POOL_TASK_FUNC(gdb_dict_claim_task)
     if (ctx->overflow_flag) break;
     
     String8 s = gdb_dict_row_string(&ctx->chunk, row);
-    U64 slot = gdb_string_hash(s) & mask;
+    U64 slot = u64_hash_from_str8(s) & mask;
     B32 placed = 0;
     
     for (U32 probe = 0; probe < GDB_DICT_MAX_PROBE; probe++)
@@ -3127,7 +3116,7 @@ gdb_column_ensure_string_dict(GDB_Column* column)
   column->dict = 0;
   column->dict_codes = 0;
   
-  if (column->row_count < g_gdb_dict_encode_min_rows)
+  if (column->row_count < g_gdb_state->dict_encode_min_rows)
   {
     column->dict_checked_generation = column->write_generation;
     ProfEnd();
@@ -3138,7 +3127,7 @@ gdb_column_ensure_string_dict(GDB_Column* column)
   
   GDB_DictBuildCtx build_ctx = {0};
   build_ctx.chunk = gdb_column_get_string_chunk(scratch.arena, column, r1u64(0, column->row_count));
-  build_ctx.capacity = u64_up_to_pow2(g_gdb_dict_encode_max_distinct * GDB_DICT_TABLE_CAPACITY_FACTOR);
+  build_ctx.capacity = u64_up_to_pow2(g_gdb_state->dict_encode_max_distinct * GDB_DICT_TABLE_CAPACITY_FACTOR);
   build_ctx.owner_row = push_array(scratch.arena, U32, build_ctx.capacity);
   for (U64 i = 0; i < build_ctx.capacity; i++) build_ctx.owner_row[i] = GDB_DICT_EMPTY_SLOT;
   
@@ -3160,7 +3149,7 @@ gdb_column_ensure_string_dict(GDB_Column* column)
     {
       if (build_ctx.owner_row[slot] != GDB_DICT_EMPTY_SLOT)
       {
-        if (distinct_count >= g_gdb_dict_encode_max_distinct) 
+        if (distinct_count >= g_gdb_state->dict_encode_max_distinct) 
         { 
           eligible = 0; 
           break; 
@@ -3170,7 +3159,7 @@ gdb_column_ensure_string_dict(GDB_Column* column)
     }
   }
   
-  if (eligible && (F64)distinct_count / (F64)column->row_count > g_gdb_dict_encode_max_cardinality_ratio)
+  if (eligible && (F64)distinct_count / (F64)column->row_count > g_gdb_state->dict_encode_max_cardinality_ratio)
   {
     eligible = 0;
   }

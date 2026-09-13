@@ -1,24 +1,13 @@
 ////////////////////////////////
 //~ NOTE(rjf): Command Line Option Parsing
 
-internal U64
-cmd_line_hash_from_string(String8 string)
-{
-  U64 result = 5381;
-  for(U64 i = 0; i < string.size; i += 1)
-  {
-    result = ((result << 5) + result) + string.str[i];
-  }
-  return result;
-}
-
 internal CmdLineOpt **
 cmd_line_slot_from_string(CmdLine *cmd_line, String8 string)
 {
   CmdLineOpt **slot = 0;
   if(cmd_line->option_table_size != 0)
   {
-    U64 hash = cmd_line_hash_from_string(string);
+    U64 hash = u64_hash_from_str8(string);
     U64 bucket = hash % cmd_line->option_table_size;
     slot = &cmd_line->option_table[bucket];
   }
@@ -61,7 +50,7 @@ cmd_line_insert_opt(Arena *arena, CmdLine *cmd_line, String8 string, String8List
   {
     var = push_array(arena, CmdLineOpt, 1);
     var->hash_next = *slot;
-    var->hash = cmd_line_hash_from_string(string);
+    var->hash = u64_hash_from_str8(string);
     var->string = push_str8_copy(arena, string);
     var->value_strings = values;
     StringJoin join = {0};

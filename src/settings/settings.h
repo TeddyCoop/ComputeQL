@@ -23,7 +23,6 @@ internal void settings_init(void);
 internal void settings_load_from_file(String8 path);
 internal void settings_load_from_string(String8 text);
 
-internal U64 settings_hash_from_str8(String8 string);
 internal Settings_Entry** settings_slot_from_key(String8 key_lower);
 internal void settings_set(String8 key, String8 value);
 
