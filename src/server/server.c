@@ -29,7 +29,7 @@ server_connection_thread_proc(void *ptr)
       break;
     }
     
-    Arena *arena = arena_alloc(.reserve_size=Max(GB(1), GPU_MAX_BUFFER_SIZE), .commit_size=MB(64));
+    Arena *arena = arena_alloc(.reserve_size=Max(GB(1), settings_u64(str8_lit("GPU_MAX_BUFFER_SIZE"), GPU_MAX_BUFFER_SIZE)), .commit_size=MB(64));
     
     APP_QueryResult result = {0};
     B32 ok = 0;

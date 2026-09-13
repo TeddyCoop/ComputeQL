@@ -1,5 +1,3 @@
-/* date = January 23rd 2025 10:18 pm */
-
 #ifndef GPU_H
 #define GPU_H
 

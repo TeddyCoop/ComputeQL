@@ -7,7 +7,11 @@ qe_thread_pool_init(void)
   }
   
   Arena* arena = arena_alloc();
-  U32 worker_count = Max(1, os_get_system_info()->logical_processor_count);
+  U32 worker_count = (U32)settings_u64(str8_lit("QE_THREAD_POOL_WORKER_COUNT"), 0);
+  if (worker_count == 0)
+  {
+    worker_count = Max(1, os_get_system_info()->logical_processor_count);
+  }
   g_qe_thread_pool = tp_alloc(arena, worker_count, 0, str8_zero());
   g_qe_thread_pool_arena = tp_arena_alloc(g_qe_thread_pool);
 }
@@ -15,9 +19,9 @@ qe_thread_pool_init(void)
 internal void
 qe_bytecode_emit(QE_BytecodeProgram* prog, U32 word)
 {
-  if (prog->word_count >= QE_BYTECODE_MAX_WORDS)
+  if (prog->word_count >= prog->words_cap)
   {
-    log_error("qe_bytecode_emit: bytecode program exceeded max word count (%u)", (U32)QE_BYTECODE_MAX_WORDS);
+    log_error("qe_bytecode_emit: bytecode program exceeded max word count (%llu)", prog->words_cap);
     return;
   }
   prog->words[prog->word_count++] = word;
@@ -26,9 +30,9 @@ qe_bytecode_emit(QE_BytecodeProgram* prog, U32 word)
 internal U32
 qe_add_numeric_const(QE_BytecodeProgram* prog, F64 value)
 {
-  if (prog->const_count >= QE_MAX_NUMERIC_CONSTS)
+  if (prog->const_count >= prog->consts_cap)
   {
-    log_error("qe_add_numeric_const: exceeded max numeric const count (%u)", (U32)QE_MAX_NUMERIC_CONSTS);
+    log_error("qe_add_numeric_const: exceeded max numeric const count (%llu)", prog->consts_cap);
     return 0;
   }
   
@@ -51,7 +55,7 @@ qe_add_string_const(QE_BytecodeProgram* prog, String8 str)
   // tec: keep every string constant on a 4-byte boundary so word_offset*4 == byte offset
   U64 aligned_offset = AlignPow2(prog->str_const_pool_size, 4);
   
-  if (aligned_offset + str.size > QE_STRING_CONST_POOL_SIZE)
+  if (aligned_offset + str.size > prog->str_const_pool_cap)
   {
     log_error("qe_add_string_const: string constant pool exhausted");
     return ref;
@@ -324,9 +328,15 @@ qe_compile_condition(QE_BytecodeProgram* prog, GDB_Table* table, IR_Node* condit
 }
 
 internal void
-qe_bytecode_program_build(QE_BytecodeProgram* prog, GDB_Database* database, GDB_Table* table, IR_Node* root_node, IR_Node* where_clause)
+qe_bytecode_program_build(Arena* arena, QE_BytecodeProgram* prog, GDB_Database* database, GDB_Table* table, IR_Node* root_node, IR_Node* where_clause)
 {
   MemoryZeroStruct(prog);
+  prog->words_cap = settings_u64(str8_lit("QE_BYTECODE_MAX_WORDS"), 4096);
+  prog->consts_cap = settings_u64(str8_lit("QE_MAX_NUMERIC_CONSTS"), 256);
+  prog->str_const_pool_cap = settings_u64(str8_lit("QE_STRING_CONST_POOL_SIZE"), KB(64));
+  prog->words = push_array(arena, U32, prog->words_cap);
+  prog->consts = push_array(arena, U32, prog->consts_cap * 2);
+  prog->str_const_pool = push_array(arena, U8, prog->str_const_pool_cap);
   
   if (where_clause && where_clause->first)
   {
@@ -548,7 +558,7 @@ qe_scan_filter(Arena* arena, GDB_Database* database, GDB_Table* table, IR_Node* 
   QE_ScanResult result = {0};
   
   QE_BytecodeProgram* prog = push_array(arena, QE_BytecodeProgram, 1);
-  qe_bytecode_program_build(prog, database, table, NULL, where_clause);
+  qe_bytecode_program_build(arena, prog, database, table, NULL, where_clause);
   
   U32 stack_depth = qe_bytecode_program_max_stack_depth(prog);
   log_info("scan_filter bytecode peak operand-stack depth: %u (of MAX_STACK=%u)", stack_depth, (U32)QE_SCAN_MAX_STACK);
@@ -619,7 +629,8 @@ qe_scan_filter(Arena* arena, GDB_Database* database, GDB_Table* table, IR_Node* 
   U64 buffer_alloc_time = 0;
   U64 submit_wait_time = 0;
   
-  B32 needs_chunking = largest_column_size > GPU_MAX_BUFFER_SIZE;
+  U64 gpu_max_buffer_size = settings_u64(str8_lit("GPU_MAX_BUFFER_SIZE"), GPU_MAX_BUFFER_SIZE);
+  B32 needs_chunking = largest_column_size > gpu_max_buffer_size;
   
   U64 rows_per_chunk = table->row_count;
   U64 chunk_count = 1;
@@ -633,7 +644,7 @@ qe_scan_filter(Arena* arena, GDB_Database* database, GDB_Table* table, IR_Node* 
     }
     if (row_size == 0) row_size = 1;
     
-    rows_per_chunk = GPU_MAX_BUFFER_SIZE / row_size;
+    rows_per_chunk = gpu_max_buffer_size / row_size;
     if (rows_per_chunk == 0) rows_per_chunk = 1;
     
     chunk_count = (table->row_count + rows_per_chunk - 1) / rows_per_chunk;
@@ -750,7 +761,7 @@ qe_scan_filter(Arena* arena, GDB_Database* database, GDB_Table* table, IR_Node* 
     }
     
     // tec: sized to a default cap rather than chunk_rows
-    U64 output_cap_rows = Max(Min(chunk_rows, (U64)QE_SCAN_OUTPUT_DEFAULT_CAP_ROWS), 1);
+    U64 output_cap_rows = Max(Min(chunk_rows, settings_u64(str8_lit("QE_SCAN_OUTPUT_DEFAULT_CAP_ROWS"), 65536)), 1);
     GPU_Buffer* output_buffer = gpu_buffer_alloc_pooled(str8_lit("scan_filter_output"), output_cap_rows * 2 * sizeof(U32), GPU_BufferFlag_Read, 0);
     GPU_Buffer* result_counter_buffer = gpu_buffer_alloc_pooled(str8_lit("scan_filter_result_counter"), 2 * sizeof(U32), GPU_BufferFlag_ReadWrite | GPU_BufferFlag_HostCached, 0);
     buffer_alloc_time += os_now_microseconds() - buffer_alloc_start;
@@ -1051,6 +1062,51 @@ qe_rowset_table_slot(PLAN_RowSet* rows, GDB_Table* table)
   return max_U64;
 }
 
+typedef struct QE_GatherNumericTask QE_GatherNumericTask;
+struct QE_GatherNumericTask
+{
+  Rng1U64* ranges;
+  U64* table_rows;
+  void* base_ptr;
+  U64 min_row;
+  GDB_ColumnType column_type;
+  U64 column_size;
+  F64* values;
+};
+
+internal THREAD_POOL_TASK_FUNC(qe_gather_numeric_task)
+{
+  QE_GatherNumericTask* task = (QE_GatherNumericTask*)raw_task;
+  Rng1U64 range = task->ranges[task_id];
+  
+  for (U64 i = range.min; i < range.max; i++)
+  {
+    U64 row = task->table_rows[i];
+    if (row == PLAN_NULL_ROW || !task->base_ptr)
+    {
+      task->values[i] = 0.0;
+      continue;
+    }
+    
+    void* data = (U8*)task->base_ptr + (row - task->min_row) * task->column_size;
+    switch (task->column_type)
+    {
+      case GDB_ColumnType_U32: task->values[i] = (F64)(*(U32*)data); break;
+      case GDB_ColumnType_U64: task->values[i] = (F64)(*(U64*)data); break;
+      case GDB_ColumnType_F32: task->values[i] = (F64)(*(F32*)data); break;
+      case GDB_ColumnType_F64: task->values[i] = *(F64*)data; break;
+      case GDB_ColumnType_Bool: task->values[i] = (F64)(*(U8*)data); break;
+      case GDB_ColumnType_I32: task->values[i] = (F64)(*(S32*)data); break;
+      case GDB_ColumnType_I64: task->values[i] = (F64)(*(S64*)data); break;
+      case GDB_ColumnType_Date: task->values[i] = (F64)(*(S32*)data); break;
+      case GDB_ColumnType_Timestamp: task->values[i] = (F64)(*(S64*)data); break;
+      case GDB_ColumnType_Decimal: task->values[i] = (F64)(*(S64*)data); break;
+      case GDB_ColumnType_Enum: task->values[i] = (F64)(*(U32*)data); break;
+      default: task->values[i] = 0.0; break;
+    }
+  }
+}
+
 internal F64*
 qe_gather_numeric_column(Arena* arena, PLAN_RowSet* rows, U64 table_slot, GDB_Column* column)
 {
@@ -1085,32 +1141,25 @@ qe_gather_numeric_column(Arena* arena, PLAN_RowSet* rows, U64 table_slot, GDB_Co
     base_ptr = gdb_column_get_data_range(arena, column, r1u64(min_row, max_row + 1), &range_size);
   }
   
-  for (U64 i = 0; i < rows->count; i++)
-  {
-    U64 row = table_rows[i];
-    if (row == PLAN_NULL_ROW || !base_ptr)
-    {
-      values[i] = 0.0;
-      continue;
-    }
-    
-    void* data = (U8*)base_ptr + (row - min_row) * column->size;
-    switch (column->type)
-    {
-      case GDB_ColumnType_U32: values[i] = (F64)(*(U32*)data); break;
-      case GDB_ColumnType_U64: values[i] = (F64)(*(U64*)data); break;
-      case GDB_ColumnType_F32: values[i] = (F64)(*(F32*)data); break;
-      case GDB_ColumnType_F64: values[i] = *(F64*)data; break;
-      case GDB_ColumnType_Bool: values[i] = (F64)(*(U8*)data); break;
-      case GDB_ColumnType_I32: values[i] = (F64)(*(S32*)data); break;
-      case GDB_ColumnType_I64: values[i] = (F64)(*(S64*)data); break;
-      case GDB_ColumnType_Date: values[i] = (F64)(*(S32*)data); break;
-      case GDB_ColumnType_Timestamp: values[i] = (F64)(*(S64*)data); break;
-      case GDB_ColumnType_Decimal: values[i] = (F64)(*(S64*)data); break;
-      case GDB_ColumnType_Enum: values[i] = (F64)(*(U32*)data); break;
-      default: values[i] = 0.0; break;
-    }
-  }
+  qe_thread_pool_init();
+  Temp scratch = scratch_begin(&arena, 1);
+  TP_Context* pool = g_qe_thread_pool;
+  U64 task_count = Max((U64)1, Min((U64)pool->worker_count, rows->count));
+  
+  QE_GatherNumericTask task = {0};
+  task.ranges = tp_divide_work(scratch.arena, rows->count, (U32)task_count);
+  task.table_rows = table_rows;
+  task.base_ptr = base_ptr;
+  task.min_row = min_row;
+  task.column_type = column->type;
+  task.column_size = column->size;
+  task.values = values;
+  
+  TP_Temp temp = tp_temp_begin(g_qe_thread_pool_arena);
+  tp_for_parallel(pool, g_qe_thread_pool_arena, task_count, qe_gather_numeric_task, &task);
+  tp_temp_end(temp);
+  
+  scratch_end(scratch);
   
   ProfEnd();
   return values;
@@ -1882,6 +1931,7 @@ qe_aggregate(Arena* arena, GDB_Database* database, PLAN_RowSet* input, IR_Node* 
   
   PLAN_Materialized result = {0};
   U64 row_count = input->count;
+  U64 qe_agg_t_start = os_now_microseconds();
   
   if (gpu_device_lost())
   {
@@ -2050,6 +2100,8 @@ qe_aggregate(Arena* arena, GDB_Database* database, PLAN_RowSet* input, IR_Node* 
     }
   }
   
+  U64 qe_agg_t_gathered = os_now_microseconds();
+  
   // tec: max_num_buckets is the worst-case
   U64 max_num_buckets = 1;
   while (max_num_buckets < row_count) max_num_buckets <<= 1;
@@ -2135,7 +2187,7 @@ qe_aggregate(Arena* arena, GDB_Database* database, PLAN_RowSet* input, IR_Node* 
       ProfEnd();
       return result;
     }
-    if (num_slots * sizeof(U32) > GPU_MAX_BUFFER_SIZE)
+    if (num_slots * sizeof(U32) > settings_u64(str8_lit("GPU_MAX_BUFFER_SIZE"), GPU_MAX_BUFFER_SIZE))
     {
       log_info("qe_aggregate: group-by hash table (%llu bytes, row_count=%llu) exceeds GPU_MAX_BUFFER_SIZE - "
                "allocating it as a single large buffer rather than chunking", num_slots * sizeof(U32), row_count);
@@ -2243,6 +2295,7 @@ qe_aggregate(Arena* arena, GDB_Database* database, PLAN_RowSet* input, IR_Node* 
   }
   
   gpu_kernel_release(assign_kernel);
+  U64 qe_agg_t_assigned = os_now_microseconds();
   
   // tec: prefix-sum slot_row_count -> slot_offsets, and (for GROUP BY) compact occupied slots
   U32* slot_offsets = push_array(scratch.arena, U32, num_slots + 1);
@@ -2285,8 +2338,9 @@ qe_aggregate(Arena* arena, GDB_Database* database, PLAN_RowSet* input, IR_Node* 
     return result;
   }
   
-  // tec: split each group's CSR range into ceil(member_count / QE_AGG_ROWS_PER_CHUNK) chunks,
+  // tec: split each group's CSR range into ceil(member_count / agg_rows_per_chunk) chunks,
   // each getting its own reduce kernel workgroup
+  U64 agg_rows_per_chunk = settings_u64(str8_lit("QE_AGG_ROWS_PER_CHUNK"), 4096);
   U64* chunks_per_group = push_array(scratch.arena, U64, Max(num_groups, 1));
   U64* chunk_base_of_group = push_array(scratch.arena, U64, Max(num_groups, 1));
   U64 total_chunks = 0;
@@ -2294,7 +2348,7 @@ qe_aggregate(Arena* arena, GDB_Database* database, PLAN_RowSet* input, IR_Node* 
   {
     U32 slot = group_ids[g];
     U64 member_count = slot_offsets[slot + 1] - slot_offsets[slot];
-    U64 c = (member_count + QE_AGG_ROWS_PER_CHUNK - 1) / QE_AGG_ROWS_PER_CHUNK;
+    U64 c = (member_count + agg_rows_per_chunk - 1) / agg_rows_per_chunk;
     if (c < 1) c = 1;
     chunks_per_group[g] = c;
     chunk_base_of_group[g] = total_chunks;
@@ -2311,8 +2365,8 @@ qe_aggregate(Arena* arena, GDB_Database* database, PLAN_RowSet* input, IR_Node* 
     for (U64 k = 0; k < chunks_per_group[g]; k++)
     {
       U64 chunk_idx = chunk_base_of_group[g] + k;
-      U32 c_start = group_start + (U32)(k * QE_AGG_ROWS_PER_CHUNK);
-      U32 c_end = Min(c_start + (U32)QE_AGG_ROWS_PER_CHUNK, group_end);
+      U32 c_start = group_start + (U32)(k * agg_rows_per_chunk);
+      U32 c_end = Min(c_start + (U32)agg_rows_per_chunk, group_end);
       chunk_range[chunk_idx * 2 + 0] = c_start;
       chunk_range[chunk_idx * 2 + 1] = c_end;
       chunk_group[chunk_idx] = (U32)g;
@@ -2437,8 +2491,9 @@ qe_aggregate(Arena* arena, GDB_Database* database, PLAN_RowSet* input, IR_Node* 
            row_count, (group_string_mask != 0), total_chunks, gpu_get_executed_kernel_time_microseconds());
   
   gpu_kernel_release(scatter_kernel);
+  U64 qe_agg_t_reduced = os_now_microseconds();
   
-  // tec: combine each group's chunk partials into its final SUM/AVG/MIN/MAX/COUNT 
+  // tec: combine each group's chunk partials into its final SUM/AVG/MIN/MAX/COUNT
   // cheap even when total_chunks is large, since any one group's own chunk count stays small
   for (U64 g = 0; g < num_groups; g++)
   {
@@ -2471,8 +2526,17 @@ qe_aggregate(Arena* arena, GDB_Database* database, PLAN_RowSet* input, IR_Node* 
   for (U64 g = 0; g < num_groups; g++) representative_readback[g] = (repr32[g] == max_U32) ? max_U64 : repr32[g];
   
   gpu_kernel_release(reduce_kernel);
+  U64 qe_agg_t_combined = os_now_microseconds();
   
   result = qe_aggregate_build_output(arena, input, column_list_ir, exprs, num_exprs, num_groups, representative_readback, results_readback);
+  
+  log_info("qe_aggregate: row_count=%llu num_groups=%llu phases (us): gather=%llu assign=%llu reduce=%llu combine=%llu total=%llu",
+           row_count, num_groups,
+           qe_agg_t_gathered - qe_agg_t_start,
+           qe_agg_t_assigned - qe_agg_t_gathered,
+           qe_agg_t_reduced - qe_agg_t_assigned,
+           qe_agg_t_combined - qe_agg_t_reduced,
+           qe_agg_t_combined - qe_agg_t_start);
   
   scratch_end(scratch);
   ProfEnd();
@@ -2891,8 +2955,6 @@ qe_index_range_for_leaf(Arena* arena, GDB_Table* table, IR_Node* condition, QE_S
   return 1;
 }
 
-#define QE_INDEX_SCAN_MAX_AND_LEAVES 16
-
 internal U32
 qe_collect_and_leaves(IR_Node* condition, IR_Node** out_leaves, U32 count, U32 max_leaves)
 {
@@ -2926,8 +2988,9 @@ qe_try_index_scan(Arena* arena, GDB_Table* table, IR_Node* where_clause, QE_Scan
     return 0;
   }
   
-  IR_Node* leaves[QE_INDEX_SCAN_MAX_AND_LEAVES];
-  U32 leaf_count = qe_collect_and_leaves(root, leaves, 0, QE_INDEX_SCAN_MAX_AND_LEAVES);
+  U64 max_and_leaves = settings_u64(str8_lit("QE_INDEX_SCAN_MAX_AND_LEAVES"), 16);
+  IR_Node** leaves = push_array(arena, IR_Node*, max_and_leaves);
+  U32 leaf_count = qe_collect_and_leaves(root, leaves, 0, (U32)max_and_leaves);
   
   for (U32 i = 0; i < leaf_count; i++)
   {
@@ -3362,7 +3425,7 @@ qe_hash_join(Arena* arena, PLAN_RowSet* left, GDB_Table* right_table, String8 ri
     ProfEnd();
     return result;
   }
-  if (num_buckets * sizeof(U32) > GPU_MAX_BUFFER_SIZE)
+  if (num_buckets * sizeof(U32) > settings_u64(str8_lit("GPU_MAX_BUFFER_SIZE"), GPU_MAX_BUFFER_SIZE))
   {
     log_info("qe_hash_join: build-side hash table (%llu bytes, build_row_count=%llu) exceeds GPU_MAX_BUFFER_SIZE - "
              "allocating it as a single large buffer rather than chunking", num_buckets * sizeof(U32), build_row_count);
@@ -3519,7 +3582,7 @@ qe_hash_join(Arena* arena, PLAN_RowSet* left, GDB_Table* right_table, String8 ri
   U64 out_capacity = Max(probe_row_count, build_row_count) + probe_row_count;
   if (out_capacity > out_hard_max_capacity) out_capacity = out_hard_max_capacity;
   if (out_capacity < 1) out_capacity = 1;
-  if (out_capacity * 4 * sizeof(U32) > GPU_MAX_BUFFER_SIZE)
+  if (out_capacity * 4 * sizeof(U32) > settings_u64(str8_lit("GPU_MAX_BUFFER_SIZE"), GPU_MAX_BUFFER_SIZE))
   {
     log_info("qe_hash_join: probe output buffer (%llu bytes, %llu-pair capacity) exceeds GPU_MAX_BUFFER_SIZE - "
              "allocating it as a single large buffer rather than chunking", out_capacity * 4 * sizeof(U32), out_capacity);

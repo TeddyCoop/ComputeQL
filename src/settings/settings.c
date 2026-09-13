@@ -6,6 +6,20 @@ settings_init(void)
   g_settings_state->arena = arena;
   g_settings_state->slot_count = 256;
   g_settings_state->slots = push_array(arena, Settings_Entry*, g_settings_state->slot_count);
+  
+  settings_set(str8_lit("GPU_VULKAN_MAX_CACHED_KERNELS"), str8_lit("16"));
+  settings_set(str8_lit("GPU_VULKAN_MAX_POOLED_BUFFERS"), str8_lit("128"));
+  settings_set(str8_lit("GPU_VULKAN_POOLED_BUFFER_HASH_SLOTS"), str8_lit("256"));
+  settings_set(str8_lit("GPU_BATCH_MAX_PENDING_READS"), str8_lit("8"));
+  settings_set(str8_lit("GPU_VULKAN_MEM_BLOCK_SIZE"), str8_lit("1mb"));
+  settings_set(str8_lit("GPU_VULKAN_MAX_MEM_BLOCKS"), str8_lit("64"));
+  settings_set(str8_lit("QE_BYTECODE_MAX_WORDS"), str8_lit("4096"));
+  settings_set(str8_lit("QE_MAX_NUMERIC_CONSTS"), str8_lit("256"));
+  settings_set(str8_lit("QE_STRING_CONST_POOL_SIZE"), str8_lit("64kb"));
+  settings_set(str8_lit("QE_SCAN_OUTPUT_DEFAULT_CAP_ROWS"), str8_lit("65536"));
+  settings_set(str8_lit("QE_AGG_ROWS_PER_CHUNK"), str8_lit("4096"));
+  settings_set(str8_lit("QE_INDEX_SCAN_MAX_AND_LEAVES"), str8_lit("16"));
+  settings_set(str8_lit("QE_THREAD_POOL_WORKER_COUNT"), str8_lit("0"));
 }
 
 internal U64

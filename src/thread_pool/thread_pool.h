@@ -1,5 +1,3 @@
-/* date = March 29th 2025 10:42 pm */
-
 #ifndef THREAD_POOL_H
 #define THREAD_POOL_H
 

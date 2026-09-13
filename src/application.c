@@ -1578,7 +1578,7 @@ app_execute_query_capture(Arena* arena, String8 sql_query, GDB_Database** io_dat
 internal void
 app_execute_query(String8 sql_query)
 {
-  Arena* arena = arena_alloc(.reserve_size=Max(GB(1), GPU_MAX_BUFFER_SIZE), .commit_size=MB(64));
+  Arena* arena = arena_alloc(.reserve_size=Max(GB(1), settings_u64(str8_lit("GPU_MAX_BUFFER_SIZE"), GPU_MAX_BUFFER_SIZE)), .commit_size=MB(64));
   
   APP_QueryResult result = {0};
   GDB_Database* database = NULL;

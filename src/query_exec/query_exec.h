@@ -21,18 +21,13 @@
 #define QE_BINDING_COLUMN_BASE  6
 
 #define QE_MAX_COLUMN_BINDINGS  10
-#define QE_BYTECODE_MAX_WORDS   4096
-#define QE_MAX_NUMERIC_CONSTS   256
-#define QE_STRING_CONST_POOL_SIZE KB(64)
 
-// tec: must match every kernel .comp's `layout(local_size_x = ...)` - all of them use this same workgroup size
+// tec: must match every kernel .comp's `layout(local_size_x = ...)`
 #define QE_GPU_WORKGROUP_SIZE 256
 
 #define QE_PUSH_CONSTANT_ROW_COUNT 0
 
-#define QE_SCAN_OUTPUT_DEFAULT_CAP_ROWS 65536
-
-// tec: must match scan_filter.comp's MAX_STACK exactly
+// tec: must match scan_filter.comp's MAX_STACK exactly. settings configurable,
 #define QE_SCAN_MAX_STACK 8
 
 // tec: must match GDB_ColumnType's enum and scan_filter.comp's COLTYPE_* defines exactly
@@ -79,14 +74,17 @@ struct QE_ColumnBinding
 typedef struct QE_BytecodeProgram QE_BytecodeProgram;
 struct QE_BytecodeProgram
 {
-  U32 words[QE_BYTECODE_MAX_WORDS];
+  U32* words;
   U64 word_count;
+  U64 words_cap;
   
-  U32 consts[QE_MAX_NUMERIC_CONSTS * 2]; // tec: pairs of (lo, hi) per constant
+  U32* consts;
   U64 const_count;
+  U64 consts_cap;
   
-  U8 str_const_pool[QE_STRING_CONST_POOL_SIZE];
+  U8* str_const_pool;
   U64 str_const_pool_size;
+  U64 str_const_pool_cap;
   
   QE_ColumnBinding bindings[QE_MAX_COLUMN_BINDINGS];
   U32 binding_count;
@@ -116,7 +114,7 @@ struct QE_ScanResult
   U64 count;
 };
 
-internal void qe_bytecode_program_build(QE_BytecodeProgram* prog, GDB_Database* database, GDB_Table* table, IR_Node* root_node, IR_Node* where_clause);
+internal void qe_bytecode_program_build(Arena* arena, QE_BytecodeProgram* prog, GDB_Database* database, GDB_Table* table, IR_Node* root_node, IR_Node* where_clause);
 internal U32 qe_bytecode_program_max_stack_depth(QE_BytecodeProgram* prog);
 internal QE_ScanResult qe_scan_filter(Arena* arena, GDB_Database* database, GDB_Table* table, IR_Node* where_clause);
 internal B32 qe_try_index_scan(Arena* arena, GDB_Table* table, IR_Node* where_clause, QE_ScanResult* out_result);
@@ -179,6 +177,9 @@ internal F64* qe_gather_numeric_column(Arena* arena, PLAN_RowSet* rows, U64 tabl
 internal GDB_StringDataChunk qe_gather_string_column(Arena* arena, PLAN_RowSet* rows, U64 table_slot, GDB_Column* column);
 
 //~ tec: sort
+
+// tec: baked into bitonic_sort.comp/bitonic_sort_f32.comp's PAYLOAD_STRIDE and key indexing
+// so they cant be configured via settings
 #define QE_SORT_MAX_KEYS   4
 #define QE_SORT_MAX_TABLES 4
 internal PLAN_RowSet qe_sort_rows(Arena* arena, PLAN_RowSet* rows, IR_Node* order_by_ir);
@@ -186,9 +187,11 @@ internal PLAN_Materialized qe_sort_materialized(Arena* arena, PLAN_Materialized*
 
 //~ tec: aggregate
 
+// tec: baked into aggregate_assign.comp/aggregate_reduce.comp's fixed binding count
+// so they cant be configured via settings
 #define QE_AGG_MAX_GROUP_COLS 4
 #define QE_AGG_MAX_EXPRS      8
-#define QE_AGG_ROWS_PER_CHUNK 4096
+
 internal PLAN_Materialized qe_aggregate(Arena* arena, GDB_Database* database, PLAN_RowSet* input, IR_Node* group_by_ir, IR_Node* column_list_ir, IR_Node* having_ir);
 internal PLAN_Materialized qe_apply_having(Arena* arena, PLAN_Materialized* m, IR_Node* having_ir);
 

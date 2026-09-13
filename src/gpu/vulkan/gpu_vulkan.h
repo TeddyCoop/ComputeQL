@@ -3,14 +3,10 @@
 
 #include "third_party/vulkan/vulkan/vulkan.h"
 
+// tec: fixed descriptor set / push constant layout shared with every .comp kernel
+// they must stay insync
 #define GPU_VULKAN_MAX_BOUND_BUFFERS 16
 #define GPU_VULKAN_PUSH_CONSTANT_COUNT 8
-#define GPU_VULKAN_MAX_CACHED_KERNELS 16
-#define GPU_VULKAN_MAX_POOLED_BUFFERS 128
-#define GPU_VULKAN_POOLED_BUFFER_HASH_SLOTS 256
-#define GPU_BATCH_MAX_PENDING_READS 8
-#define GPU_VULKAN_MEM_BLOCK_SIZE MB(1)
-#define GPU_VULKAN_MAX_MEM_BLOCKS 64
 
 typedef struct GPU_VulkanBuffer GPU_VulkanBuffer;
 struct GPU_VulkanBuffer
@@ -37,15 +33,15 @@ typedef struct GPU_VulkanKernel GPU_VulkanKernel;
 struct GPU_VulkanKernel
 {
   String8 name;
-
+  
   VkShaderModule shader;
   VkPipeline pipeline;
-
+  
   VkDescriptorSet descriptor_set;
-
+  
   GPU_VulkanBuffer* bound_buffers[GPU_VULKAN_MAX_BOUND_BUFFERS];
   U32 bound_buffer_count;
-
+  
   U64 push_constants[GPU_VULKAN_PUSH_CONSTANT_COUNT];
 };
 
@@ -80,8 +76,9 @@ struct GPU_VulkanBatch
   B32 had_dispatch;
   B32 has_commands;
   
-  GPU_PendingRead pending_reads[GPU_BATCH_MAX_PENDING_READS];
+  GPU_PendingRead* pending_reads;
   U32 pending_read_count;
+  U32 pending_read_cap;
 };
 
 typedef struct GPU_VulkanState GPU_VulkanState;
@@ -106,15 +103,20 @@ struct GPU_VulkanState
   VkDescriptorSetLayout shared_descriptor_set_layout;
   VkPipelineLayout shared_pipeline_layout;
   
-  GPU_VulkanKernel* kernel_cache[GPU_VULKAN_MAX_CACHED_KERNELS];
+  GPU_VulkanKernel** kernel_cache;
   U32 kernel_cache_count;
+  U32 kernel_cache_cap;
   
-  GPU_PooledBuffer pooled_buffers[GPU_VULKAN_MAX_POOLED_BUFFERS];
+  GPU_PooledBuffer* pooled_buffers;
   U32 pooled_buffer_count;
-  U32 pooled_buffer_hash_slots[GPU_VULKAN_POOLED_BUFFER_HASH_SLOTS];
+  U32 pooled_buffer_cap;
+  U32* pooled_buffer_hash_slots;
+  U32 pooled_buffer_hash_slots_cap;
   
-  GPU_VulkanMemBlock mem_blocks[GPU_VULKAN_MAX_MEM_BLOCKS];
+  GPU_VulkanMemBlock* mem_blocks;
   U32 mem_block_count;
+  U32 mem_block_cap;
+  U64 mem_block_size;
   
   VkQueryPool timestamp_query_pool;
   F32 timestamp_period_ns;

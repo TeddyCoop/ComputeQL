@@ -725,7 +725,7 @@ pg_connection_thread_proc(void *ptr)
 
     for (;;)
     {
-      Arena *msg_arena = arena_alloc(.reserve_size=Max(GB(1), GPU_MAX_BUFFER_SIZE), .commit_size=MB(64));
+      Arena *msg_arena = arena_alloc(.reserve_size=Max(GB(1), settings_u64(str8_lit("GPU_MAX_BUFFER_SIZE"), GPU_MAX_BUFFER_SIZE)), .commit_size=MB(64));
 
       U8 msg_type = 0;
       String8 msg_body = {0};
