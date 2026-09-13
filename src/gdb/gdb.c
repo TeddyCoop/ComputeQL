@@ -18,6 +18,8 @@ gdb_init(void)
   g_gdb_state->databases = NULL;
   g_gdb_state->rw_mutex = os_rw_mutex_alloc();
   
+  gdb_thread_pool_init();
+  
   ProfEnd();
 }
 
@@ -1401,11 +1403,152 @@ parse_csv_line(U8 *input, U64 len, String8 *fields, U64 max_fields)
   return count;
 }
 
-// tec: TODO make this function faster with multithreading
+internal void
+gdb_thread_pool_init(void)
+{
+  if (g_gdb_thread_pool)
+  {
+    return;
+  }
+  
+  Arena* arena = arena_alloc();
+  // tec: 0 (default) means auto-detect from the logical processor count
+  U32 worker_count = (U32)settings_u64(str8_lit("GDB_THREAD_POOL_WORKER_COUNT"), 0);
+  if (worker_count == 0)
+  {
+    worker_count = Max(1, os_get_system_info()->logical_processor_count);
+  }
+  g_gdb_thread_pool = tp_alloc(arena, worker_count, 0, str8_zero());
+  g_gdb_thread_pool_arena = tp_arena_alloc(g_gdb_thread_pool);
+}
+
+internal THREAD_POOL_TASK_FUNC(gdb_csv_parse_task)
+{
+  GDB_CSV_ParseTask* task = (GDB_CSV_ParseTask*)raw_task;
+  Rng1U64 range = task->ranges[task_id];
+  String8* fields = push_array(arena, String8, task->column_count);
+  
+  for (U64 row = range.min; row < range.max; row++)
+  {
+    String8 line = task->lines[row];
+    U64 value_count = parse_csv_line(line.str, line.size, fields, task->column_count);
+    
+    GDB_CSV_ParsedField* row_out = task->parsed + row * task->column_count;
+    for (U64 col_i = 0; col_i < value_count; col_i++)
+    {
+      GDB_Column* column = task->table->columns[col_i];
+      String8 val = str8_skip_chop_whitespace(fields[col_i]);
+      GDB_CSV_ParsedField* pf = &row_out[col_i];
+      pf->present = 1;
+      
+      if (val.size == 0)
+      {
+        // tec: an empty CSV field is a NULL
+        pf->is_null = 1;
+      }
+      else
+      {
+        switch (column->type)
+        {
+          case GDB_ColumnType_U32:
+          {
+            U32 v = (U32)u64_from_str8(val, 10);
+            MemoryCopy(&pf->numeric_bits, &v, sizeof(v));
+          } break;
+          
+          case GDB_ColumnType_U64:
+          {
+            U64 v = u64_from_str8(val, 10);
+            MemoryCopy(&pf->numeric_bits, &v, sizeof(v));
+          } break;
+          
+          case GDB_ColumnType_F32:
+          {
+            F32 v = (F32)f64_from_str8(val);
+            MemoryCopy(&pf->numeric_bits, &v, sizeof(v));
+          } break;
+          
+          case GDB_ColumnType_F64:
+          {
+            F64 v = f64_from_str8(val);
+            MemoryCopy(&pf->numeric_bits, &v, sizeof(v));
+          } break;
+          
+          case GDB_ColumnType_String8:
+          default:
+          {
+            pf->str_value = val;
+          } break;
+        }
+      }
+    }
+  }
+}
+
+internal void
+gdb_csv_append_parsed_row(GDB_Table* table, GDB_CSV_ParsedField* row_fields, U64 column_count)
+{
+  table->row_count++;
+  if ((table->row_count % 1000000) == 0)
+  {
+    log_info("processing row %llu", table->row_count);
+  }
+  
+  for (U64 col_i = 0; col_i < column_count; col_i++)
+  {
+    GDB_CSV_ParsedField* pf = &row_fields[col_i];
+    if (!pf->present) continue;
+    
+    GDB_Column* column = table->columns[col_i];
+    if (pf->is_null)
+    {
+      gdb_column_add_data_maybe_null(column, NULL, 1);
+      continue;
+    }
+    
+    switch (column->type)
+    {
+      case GDB_ColumnType_U32: 
+      { 
+        U32 v; 
+        MemoryCopy(&v, &pf->numeric_bits, sizeof(v));
+        gdb_column_add_data_maybe_null(column, &v, 0); 
+      } break;
+      
+      case GDB_ColumnType_U64: 
+      {
+        U64 v;
+        MemoryCopy(&v, &pf->numeric_bits, sizeof(v));
+        gdb_column_add_data_maybe_null(column, &v, 0); 
+      } break;
+      
+      case GDB_ColumnType_F32: 
+      { 
+        F32 v;
+        MemoryCopy(&v, &pf->numeric_bits, sizeof(v));
+        gdb_column_add_data_maybe_null(column, &v, 0);
+      } break;
+      
+      case GDB_ColumnType_F64: 
+      { 
+        F64 v; MemoryCopy(&v, &pf->numeric_bits, sizeof(v));
+        gdb_column_add_data_maybe_null(column, &v, 0); 
+      } break;
+      
+      case GDB_ColumnType_String8:
+      default: 
+      { 
+        gdb_column_add_data_maybe_null(column, &pf->str_value, 0); 
+      } break;
+    }
+  }
+}
+
 internal GDB_Table*
 gdb_table_import_csv_streaming(GDB_Database *db, String8 table_name, String8 path)
 {
   ProfBeginFunction();
+  U64 t_fn_start = os_now_microseconds();
   
   Temp scratch = temp_begin(g_gdb_state->arena);
   
@@ -1429,6 +1572,7 @@ gdb_table_import_csv_streaming(GDB_Database *db, String8 table_name, String8 pat
   String8 *column_names = 0;
   U64 column_count = 0;
   
+  U64 t_typesample_start = os_now_microseconds();
   ProfBegin("column type parsing");
   {
     U64 file_pos = 0;
@@ -1451,7 +1595,7 @@ gdb_table_import_csv_streaming(GDB_Database *db, String8 table_name, String8 pat
       }
       
       U64 at = 0;
-      while (at < chunk.size)
+      while (at < chunk.size && sample_rows < 256)
       {
         U64 line_start = at;
         while (at < chunk.size && chunk.str[at] != '\n') at++;
@@ -1509,6 +1653,8 @@ gdb_table_import_csv_streaming(GDB_Database *db, String8 table_name, String8 pat
     }
   }
   ProfEnd();
+  U64 t_typesample = os_now_microseconds() - t_typesample_start;
+  U64 t_read = 0, t_scan = 0, t_parse = 0, t_append = 0;
   
   {
     Arena *row_arena = arena_alloc(.reserve_size = GB(1), .commit_size = MB(32));
@@ -1518,11 +1664,15 @@ gdb_table_import_csv_streaming(GDB_Database *db, String8 table_name, String8 pat
     String8 leftover = {0};
     B32 skipped_header = 0;
     
+    gdb_thread_pool_init();
+    
     while (file_pos < file_size)
     {
+      U64 p0 = os_now_microseconds();
       U64 read_size = Min(buffer_size, file_size - file_pos);
       os_file_read(file, r1u64(file_pos, file_pos + read_size), buffer);
       file_pos += read_size;
+      t_read += os_now_microseconds() - p0;
       
       String8 chunk = str8(buffer, read_size);
       if (leftover.size)
@@ -1531,6 +1681,9 @@ gdb_table_import_csv_streaming(GDB_Database *db, String8 table_name, String8 pat
         leftover = (String8){0};
       }
       
+      // tec: pass 1. find all lines
+      U64 p1 = os_now_microseconds();
+      String8List chunk_lines = {0};
       U64 at = 0;
       while (at < chunk.size)
       {
@@ -1554,72 +1707,48 @@ gdb_table_import_csv_streaming(GDB_Database *db, String8 table_name, String8 pat
           continue;
         }
         
-        table->row_count++;
-        if ((table->row_count % 1000000) == 0)
-        {
-          log_info("processing row %llu", table->row_count);
-        }
-        
-        String8* values = push_array(row_arena, String8, column_count);
-        U64 value_count = parse_csv_line(line.str, line.size, values, column_count);
-        
-        for (U64 col_i = 0; col_i < value_count; col_i++)
-        {
-          /*
-          String8List values = str8_split_by_string_chars(row_arena, line, str8_lit(","), StringSplitFlag_RespectQuotes | StringSplitFlag_KeepEmpties);
-          
-          U64 col_i = 0;
-          for (String8Node *node = values.first; node && col_i < column_count; node = node->next, col_i++)
-          {
-          String8 val = str8_skip_chop_whitespace(node->string);
-            */
-          String8 val = str8_skip_chop_whitespace(values[col_i]);
-          GDB_Column *column = table->columns[col_i];
-          
-          if (val.size == 0)
-          {
-            // tec: an empty CSV field is a NULL
-            gdb_column_add_data_maybe_null(column, NULL, 1);
-          }
-          else
-          {
-            switch (column->type)
-            {
-              case GDB_ColumnType_U32:
-              {
-                U32 value = (U32)u64_from_str8(val, 10);
-                gdb_column_add_data_maybe_null(column, &value, 0);
-              } break;
-              
-              case GDB_ColumnType_U64:
-              {
-                U64 value = u64_from_str8(val, 10);
-                gdb_column_add_data_maybe_null(column, &value, 0);
-              } break;
-              
-              case GDB_ColumnType_F32:
-              {
-                F32 value = (F32)f64_from_str8(val);
-                gdb_column_add_data_maybe_null(column, &value, 0);
-              } break;
-              
-              case GDB_ColumnType_F64:
-              {
-                F64 value = f64_from_str8(val);
-                gdb_column_add_data_maybe_null(column, &value, 0);
-              } break;
-              
-              case GDB_ColumnType_String8:
-              default:
-              {
-                gdb_column_add_data_maybe_null(column, &val, 0);
-              } break;
-            }
-          }
-        }
-        
-        arena_clear(row_arena);
+        str8_list_push(row_arena, &chunk_lines, line);
       }
+      t_scan += os_now_microseconds() - p1;
+      
+      U64 chunk_row_count = chunk_lines.node_count;
+      if (chunk_row_count > 0)
+      {
+        String8* lines_arr = push_array(row_arena, String8, chunk_row_count);
+        U64 line_i = 0;
+        for (String8Node *node = chunk_lines.first; node; node = node->next, line_i++)
+        {
+          lines_arr[line_i] = node->string;
+        }
+        
+        // tec: pass 2. parse each line
+        U64 p2 = os_now_microseconds();
+        GDB_CSV_ParsedField* parsed = push_array(row_arena, GDB_CSV_ParsedField, chunk_row_count * column_count);
+        
+        GDB_CSV_ParseTask task = {0};
+        task.lines = lines_arr;
+        task.parsed = parsed;
+        task.table = table;
+        task.column_count = column_count;
+        
+        U64 task_count = Max((U64)1, Min((U64)g_gdb_thread_pool->worker_count, chunk_row_count));
+        task.ranges = tp_divide_work(row_arena, chunk_row_count, (U32)task_count);
+        
+        TP_Temp temp = tp_temp_begin(g_gdb_thread_pool_arena);
+        tp_for_parallel(g_gdb_thread_pool, g_gdb_thread_pool_arena, task_count, gdb_csv_parse_task, &task);
+        tp_temp_end(temp);
+        t_parse += os_now_microseconds() - p2;
+        
+        // tec: pass 3. append each line
+        U64 p3 = os_now_microseconds();
+        for (U64 row = 0; row < chunk_row_count; row++)
+        {
+          gdb_csv_append_parsed_row(table, parsed + row * column_count, column_count);
+        }
+        t_append += os_now_microseconds() - p3;
+      }
+      
+      arena_clear(row_arena);
     }
     
     if (leftover.size > 0)
@@ -1647,12 +1776,35 @@ gdb_table_import_csv_streaming(GDB_Database *db, String8 table_name, String8 pat
           {
             switch (column->type)
             {
-              case GDB_ColumnType_U32: { U32 v = (U32)u64_from_str8(val, 10); gdb_column_add_data_maybe_null(column, &v, 0); } break;
-              case GDB_ColumnType_U64: { U64 v = u64_from_str8(val, 10); gdb_column_add_data_maybe_null(column, &v, 0); } break;
-              case GDB_ColumnType_F32: { F32 v = (F32)f64_from_str8(val); gdb_column_add_data_maybe_null(column, &v, 0); } break;
-              case GDB_ColumnType_F64: { F64 v = f64_from_str8(val); gdb_column_add_data_maybe_null(column, &v, 0); } break;
+              case GDB_ColumnType_U32: 
+              { 
+                U32 v = (U32)u64_from_str8(val, 10); 
+                gdb_column_add_data_maybe_null(column, &v, 0); 
+              } break;
+              
+              case GDB_ColumnType_U64: 
+              { 
+                U64 v = u64_from_str8(val, 10);
+                gdb_column_add_data_maybe_null(column, &v, 0); 
+              } break;
+              
+              case GDB_ColumnType_F32: 
+              {
+                F32 v = (F32)f64_from_str8(val);
+                gdb_column_add_data_maybe_null(column, &v, 0); 
+              } break;
+              
+              case GDB_ColumnType_F64: 
+              {
+                F64 v = f64_from_str8(val);
+                gdb_column_add_data_maybe_null(column, &v, 0); 
+              } break;
+              
               case GDB_ColumnType_String8:
-              default: { gdb_column_add_data_maybe_null(column, &val, 0); } break;
+              default: 
+              {
+                gdb_column_add_data_maybe_null(column, &val, 0); 
+              } break;
             }
           }
         }
@@ -1663,6 +1815,8 @@ gdb_table_import_csv_streaming(GDB_Database *db, String8 table_name, String8 pat
   os_file_close(file);
   temp_end(scratch);
   log_info("ending import csv file %.*s", str8_varg(path));
+  log_info("gdb_table_import_csv_streaming: %llu rows, phases (us): type_sample=%llu read=%llu scan=%llu parse=%llu append=%llu total=%llu",
+           table->row_count, t_typesample, t_read, t_scan, t_parse, t_append, os_now_microseconds() - t_fn_start);
   ProfEnd();
   return table;
 }

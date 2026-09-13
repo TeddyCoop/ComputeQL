@@ -227,26 +227,23 @@ struct GDB_Database
 };
 
 //~ tec: csv loading
-typedef struct GDB_CSV_ThreadColumnData GDB_CSV_ThreadColumnData;
-struct GDB_CSV_ThreadColumnData
+typedef struct GDB_CSV_ParsedField GDB_CSV_ParsedField;
+struct GDB_CSV_ParsedField
 {
-  void** values;
-  U64 count;
-  GDB_ColumnType type;
+  B32 present;
+  B32 is_null;
+  String8 str_value; 
+  U64 numeric_bits;
 };
 
-typedef struct GDB_CSV_ThreadContext GDB_CSV_ThreadContext;
-struct GDB_CSV_ThreadContext
+typedef struct GDB_CSV_ParseTask GDB_CSV_ParseTask;
+struct GDB_CSV_ParseTask
 {
+  Rng1U64* ranges;
+  String8* lines;
+  GDB_CSV_ParsedField* parsed;
   GDB_Table* table;
-  Rng1U64 range;
-  OS_Handle map;
-  OS_Handle mutex;
-  U64 offset_within_view;
-  GDB_CSV_ThreadColumnData* columns;
-  Arena* arena;
-  U64 starting_row_index;
-  U64 view_size;
+  U64 column_count;
 };
 
 //~ tec: state
@@ -263,6 +260,11 @@ struct GDB_State
 };
 
 global GDB_State* g_gdb_state = 0;
+
+//~ tec: thread pool
+global TP_Context* g_gdb_thread_pool = 0;
+global TP_Arena*   g_gdb_thread_pool_arena = 0;
+internal void gdb_thread_pool_init(void);
 
 internal void gdb_init(void);
 internal void gdb_add_database(GDB_Database* database);
