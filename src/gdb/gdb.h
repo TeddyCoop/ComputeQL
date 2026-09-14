@@ -191,6 +191,9 @@ struct GDB_Column
   U64 zone_map_chunk_count;
   U64 zone_map_capacity;
   
+  U64 gpu_upload_generation;
+  U64 gpu_upload_data_size;
+  
   //- tec: data storage
   U8 *data;
   U64 *offsets;

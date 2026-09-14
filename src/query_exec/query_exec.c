@@ -478,6 +478,7 @@ struct QE_PrefetchBindingResult
 {
   B32 valid;
   B32 is_string;
+  B32 cached;
   void* data_ptr;
   U64 size;
   GDB_StringDataChunk str_chunk;
@@ -504,7 +505,14 @@ qe_prefetch_read_slot(QE_PrefetchSlot* slot, QE_BytecodeProgram* prog, Rng1U64 r
     QE_PrefetchBindingResult* out = &slot->bindings[i];
     MemoryZeroStruct(out);
     
-    if (binding->use_dict_codes)
+    B32 is_whole_column = (range.min == 0 && range.max == binding->column->row_count);
+    if (binding->type != GDB_ColumnType_String8 && is_whole_column &&
+        binding->column->gpu_upload_generation == binding->column->write_generation)
+    {
+      out->valid = 1;
+      out->cached = 1;
+    }
+    else if (binding->use_dict_codes)
     {
       out->data_ptr = binding->column->dict_codes + range.min;
       out->size = (range.max - range.min) * sizeof(U32);
@@ -726,6 +734,7 @@ qe_scan_filter(Arena* arena, GDB_Database* database, GDB_Table* table, IR_Node* 
     Rng1U64 chunk_range = dispatch_ranges[chunk_index];
     U64 chunk_row_start = chunk_range.min;
     U64 chunk_rows = chunk_range.max - chunk_range.min;
+    B32 chunk_is_whole_column = (chunk_range.min == 0 && chunk_range.max == table->row_count);
     
     log_info("filtering rows %llu-%llu", chunk_range.min, chunk_range.max);
     
@@ -772,14 +781,34 @@ qe_scan_filter(Arena* arena, GDB_Database* database, GDB_Table* table, IR_Node* 
       U32 descriptor_binding = QE_BINDING_COLUMN_BASE + binding->first_slot;
       
       String8 col_pool_key = push_str8f(gpu_scratch_arena(), "scan_col:%.*s.%.*s", str8_varg(table->name), str8_varg(binding->name));
+      // tec: a distinct key from col_pool_key, used only for whole column dispatches
+      String8 col_pool_key_full = push_str8f(gpu_scratch_arena(), "%.*s.whole", str8_varg(col_pool_key));
+      
+      if (in->cached)
+      {
+        log_info("qe_scan_filter: reusing GPU-resident buffer for column '%.*s' (generation %llu, %llu bytes) - no read, no re-upload",
+                 str8_varg(binding->name), binding->column->gpu_upload_generation, binding->column->gpu_upload_data_size);
+      }
       
       if (binding->use_dict_codes)
       {
-        if (in->valid)
+        if (in->cached)
         {
-          GPU_Buffer* data_buf = gpu_buffer_alloc_pooled(col_pool_key, in->size, GPU_BufferFlag_Write, in->data_ptr);
+          GPU_Buffer* data_buf = gpu_buffer_alloc_pooled(col_pool_key_full, binding->column->gpu_upload_data_size, GPU_BufferFlag_Write, 0);
           gpu_kernel_set_arg_buffer(kernel, descriptor_binding, data_buf);
           column_slot_used[binding->first_slot] = 1;
+        }
+        else if (in->valid)
+        {
+          String8 key = chunk_is_whole_column ? col_pool_key_full : col_pool_key;
+          GPU_Buffer* data_buf = gpu_buffer_alloc_pooled(key, in->size, GPU_BufferFlag_Write, in->data_ptr);
+          gpu_kernel_set_arg_buffer(kernel, descriptor_binding, data_buf);
+          column_slot_used[binding->first_slot] = 1;
+          if (chunk_is_whole_column)
+          {
+            binding->column->gpu_upload_generation = binding->column->write_generation;
+            binding->column->gpu_upload_data_size = in->size;
+          }
         }
         else
         {
@@ -810,6 +839,21 @@ qe_scan_filter(Arena* arena, GDB_Database* database, GDB_Table* table, IR_Node* 
         
         // tec: safe to close now, the data's already been copyed into the GPU buffer above
         gdb_column_close_string_chunk(binding->column);
+      }
+      else if (in->cached)
+      {
+        GPU_Buffer* data_buf = gpu_buffer_alloc_pooled(col_pool_key_full, binding->column->gpu_upload_data_size, GPU_BufferFlag_Write, 0);
+        gpu_kernel_set_arg_buffer(kernel, descriptor_binding, data_buf);
+        column_slot_used[binding->first_slot] = 1;
+      }
+      else if (in->valid && chunk_is_whole_column)
+      {
+        GPU_Buffer* data_buf = gpu_buffer_alloc_pooled(col_pool_key_full, in->size, GPU_BufferFlag_Write, in->data_ptr);
+        gpu_kernel_set_arg_buffer(kernel, descriptor_binding, data_buf);
+        
+        column_slot_used[binding->first_slot] = 1;
+        binding->column->gpu_upload_generation = binding->column->write_generation;
+        binding->column->gpu_upload_data_size = in->size;
       }
       else if (in->valid)
       {
@@ -3030,7 +3074,7 @@ qe_index_upper_bound(Arena* arena, GDB_Column* column, B32 is_string, U64* order
   }
   return lo;
 }
-.
+
 internal B32
 qe_resolve_leaf_comparison(GDB_Table* table, IR_Node* condition,
                            GDB_Column** out_column,
