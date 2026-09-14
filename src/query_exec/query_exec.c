@@ -689,7 +689,6 @@ qe_scan_filter(Arena* arena, GDB_Database* database, GDB_Table* table, IR_Node* 
   B32 needs_chunking = largest_column_size > gpu_max_buffer_size;
   
   U64 rows_per_chunk = table->row_count;
-  U64 chunk_count = 1;
   
   if (needs_chunking)
   {
@@ -702,8 +701,18 @@ qe_scan_filter(Arena* arena, GDB_Database* database, GDB_Table* table, IR_Node* 
     
     rows_per_chunk = gpu_max_buffer_size / row_size;
     if (rows_per_chunk == 0) rows_per_chunk = 1;
-    
-    chunk_count = (table->row_count + rows_per_chunk - 1) / rows_per_chunk;
+  }
+  if (rows_per_chunk == 0) rows_per_chunk = 1; // tec: table->row_count == 0 case
+  
+  // tec: zone map pruning may skip some of these ranges' wroth of rows completely and merge the rest into
+  // fewer, differently sized dispatches. fall back to chunk_index*rows_per_chunk if no leaf of the where clause is prunable
+  U64 chunk_count = 0;
+  U64 pruned_rows = 0;
+  Rng1U64* dispatch_ranges = qe_scan_build_dispatch_ranges(arena, table, where_clause, rows_per_chunk, &chunk_count, &pruned_rows);
+  if (pruned_rows > 0)
+  {
+    log_info("qe_scan_filter: zone-map pruning skipped %llu of %llu rows, %llu dispatch range(s) remain",
+             pruned_rows, table->row_count, chunk_count);
   }
   
   // tec: only worth a background thread + two extra arenas when there's a next chunk to hide IO for the common single-chunk case
@@ -714,9 +723,9 @@ qe_scan_filter(Arena* arena, GDB_Database* database, GDB_Table* table, IR_Node* 
     Temp fallback_arena = {0};
     B32 using_prefetch = (prefetch != 0);
     
-    U64 chunk_row_start = chunk_index * rows_per_chunk;
-    U64 chunk_rows = needs_chunking ? Min(rows_per_chunk, table->row_count - chunk_row_start) : table->row_count;
-    Rng1U64 chunk_range = r1u64(chunk_row_start, chunk_row_start + chunk_rows);
+    Rng1U64 chunk_range = dispatch_ranges[chunk_index];
+    U64 chunk_row_start = chunk_range.min;
+    U64 chunk_rows = chunk_range.max - chunk_range.min;
     
     log_info("filtering rows %llu-%llu", chunk_range.min, chunk_range.max);
     
@@ -844,9 +853,8 @@ qe_scan_filter(Arena* arena, GDB_Database* database, GDB_Table* table, IR_Node* 
     // so its safe to kick off the next chunk's read in the background
     if (using_prefetch && chunk_index + 1 < chunk_count)
     {
-      U64 next_row_start = (chunk_index + 1) * rows_per_chunk;
-      U64 next_rows = Min(rows_per_chunk, table->row_count - next_row_start);
-      Rng1U64 next_range = r1u64(next_row_start, next_row_start + next_rows);
+      Rng1U64 next_range = dispatch_ranges[chunk_index + 1];
+      U64 next_rows = next_range.max - next_range.min;
       qe_prefetch_request(prefetch, (U32)((chunk_index + 1) % 2), next_range, next_rows);
     }
     
@@ -1038,22 +1046,7 @@ qe_read_numeric_as_f64(GDB_Column* column, U64 row_index)
 {
   void* data = gdb_column_get_data(column, row_index);
   if (!data) return 0.0;
-  
-  switch (column->type)
-  {
-    case GDB_ColumnType_U32: return (F64)(*(U32*)data);
-    case GDB_ColumnType_U64: return (F64)(*(U64*)data);
-    case GDB_ColumnType_F32: return (F64)(*(F32*)data);
-    case GDB_ColumnType_F64: return *(F64*)data;
-    case GDB_ColumnType_Bool: return (F64)(*(U8*)data);
-    case GDB_ColumnType_I32: return (F64)(*(S32*)data);
-    case GDB_ColumnType_I64: return (F64)(*(S64*)data);
-    case GDB_ColumnType_Date: return (F64)(*(S32*)data);
-    case GDB_ColumnType_Timestamp: return (F64)(*(S64*)data);
-    case GDB_ColumnType_Decimal: return (F64)(*(S64*)data);
-    case GDB_ColumnType_Enum: return (F64)(*(U32*)data);
-    default: return 0.0;
-  }
+  return gdb_numeric_value_as_f64(column->type, data);
 }
 
 internal B32
@@ -3037,9 +3030,12 @@ qe_index_upper_bound(Arena* arena, GDB_Column* column, B32 is_string, U64* order
   }
   return lo;
 }
-
+.
 internal B32
-qe_index_range_for_leaf(Arena* arena, GDB_Table* table, IR_Node* condition, QE_ScanResult* out_result)
+qe_resolve_leaf_comparison(GDB_Table* table, IR_Node* condition,
+                           GDB_Column** out_column,
+                           B32* out_is_eq, B32* out_is_lt, B32* out_is_le, B32* out_is_gt, B32* out_is_ge,
+                           B32* out_is_string, F64* out_target_numeric, String8* out_target_string)
 {
   if (!condition || condition->type != IR_NodeType_Operator)
   {
@@ -3068,12 +3064,6 @@ qe_index_range_for_leaf(Arena* arena, GDB_Table* table, IR_Node* condition, QE_S
   GDB_Column* column = gdb_table_find_column(table, qe_bare_column_name(left->value));
   if (!column) return 0;
   
-  // tec: the sorted (key,row) array has no room for NULLs to sort correctly against a real value, so fall back rather than risk treating a NULL as its placeholder value
-  if (column->null_flags) return 0;
-  
-  GDB_Index* index = gdb_table_find_index_on_column(table, column);
-  if (!index) return 0;
-  
   B32 is_string_key = (column->type == GDB_ColumnType_String8);
   B32 is_date_key = (column->type == GDB_ColumnType_Date || column->type == GDB_ColumnType_Timestamp);
   B32 is_enum_key = (column->type == GDB_ColumnType_Enum);
@@ -3084,14 +3074,76 @@ qe_index_range_for_leaf(Arena* arena, GDB_Table* table, IR_Node* condition, QE_S
     if (!literal_given)
     {
       // tec: date/timestamp/enum comparisons always use a quoted literal
-      return 0; 
+      return 0;
     }
   }
   else if (is_string_key != literal_given)
   {
     // tec: type mismatch, dont guess
-    return 0; 
+    return 0;
   }
+  
+  F64 target_numeric = 0.0;
+  if (is_date_key)
+  {
+    // unparsable literal, cant use
+    if (!qe_resolve_date_literal_value(column->type, right, &target_numeric))
+    {
+      return 0;
+    }
+  }
+  else if (is_enum_key)
+  {
+    // unparsable literal, cant use
+    if (!qe_resolve_enum_literal_value(column, right, &target_numeric))
+    {
+      return 0;
+    }
+  }
+  else if (column->type == GDB_ColumnType_Decimal)
+  {
+    // unparsable literal, cant use
+    if (!qe_resolve_decimal_literal_value(column, right, &target_numeric))
+    {
+      return 0;
+    }
+  }
+  else if (!is_string_key)
+  {
+    target_numeric = f64_from_str8(right->value);
+  }
+  
+  *out_column = column;
+  *out_is_eq = is_eq;
+  *out_is_lt = is_lt;
+  *out_is_le = is_le;
+  *out_is_gt = is_gt;
+  *out_is_ge = is_ge;
+  *out_is_string = is_string_key;
+  *out_target_numeric = target_numeric;
+  *out_target_string = is_string_key ? right->value : (String8){0};
+  return 1;
+}
+
+internal B32
+qe_index_range_for_leaf(Arena* arena, GDB_Table* table, IR_Node* condition, QE_ScanResult* out_result)
+{
+  GDB_Column* column = 0;
+  B32 is_eq = 0, is_lt = 0, is_le = 0, is_gt = 0, is_ge = 0, is_string_key = 0;
+  F64 target_numeric = 0.0;
+  String8 target_string = {0};
+  if (!qe_resolve_leaf_comparison(table, condition, &column, &is_eq, &is_lt, &is_le, &is_gt, &is_ge,
+                                  &is_string_key, &target_numeric, &target_string))
+  {
+    return 0;
+  }
+  
+  // tec: the sorted (key,row) array has no room for NULLs to sort correctly against a real value,
+  // so fall back rather than risk treating a NULL as its placeholder value
+  if (column->null_flags) return 0;
+  
+  GDB_Index* index = gdb_table_find_index_on_column(table, column);
+  if (!index) return 0;
   
   U64 row_count = table->row_count;
   if (row_count == 0)
@@ -3108,37 +3160,6 @@ qe_index_range_for_leaf(Arena* arena, GDB_Table* table, IR_Node* condition, QE_S
   }
   
   Temp scratch = scratch_begin(&arena, 1);
-  
-  F64 target_numeric = 0.0;
-  if (is_date_key)
-  {
-    // unparsable literal, cant use index
-    if (!qe_resolve_date_literal_value(column->type, right, &target_numeric))
-    {
-      return 0; 
-    }
-  }
-  else if (is_enum_key)
-  {
-    // unparsable literal, cant use index
-    if (!qe_resolve_enum_literal_value(column, right, &target_numeric)) 
-    {
-      return 0; 
-    }
-  }
-  else if (column->type == GDB_ColumnType_Decimal)
-  {
-    // unparsable literal, cant use index
-    if (!qe_resolve_decimal_literal_value(column, right, &target_numeric)) 
-    {
-      return 0; 
-    }
-  }
-  else if (!is_string_key)
-  {
-    target_numeric = f64_from_str8(right->value);
-  }
-  String8 target_string = is_string_key ? right->value : (String8){0};
   
   U64 range_lo = 0, range_hi = 0;
   if (is_eq)
@@ -3240,6 +3261,186 @@ qe_try_index_scan(Arena* arena, GDB_Table* table, IR_Node* where_clause, QE_Scan
   }
   
   return 0;
+}
+
+typedef struct QE_ZonemapLeaf QE_ZonemapLeaf;
+struct QE_ZonemapLeaf
+{
+  GDB_Column* column;
+  B32 is_eq, is_lt, is_le, is_gt, is_ge;
+  F64 target;
+};
+
+// tec: does column's [min,max] over a chunk provably rule out every row satisfying `leaf`?
+internal B32
+qe_zonemap_chunk_is_prunable(QE_ZonemapLeaf* leaf, GDB_ZoneMapChunk* chunk)
+{
+  if (!chunk->has_values) return 0; // tec: an all NULL (so far) chunk can never be proven empty
+  
+  if (leaf->is_eq) return leaf->target < chunk->min || leaf->target > chunk->max;
+  if (leaf->is_lt) return chunk->min >= leaf->target;
+  if (leaf->is_le) return chunk->min > leaf->target;
+  if (leaf->is_gt) return chunk->max <= leaf->target;
+  if (leaf->is_ge) return chunk->max < leaf->target;
+  return 0;
+}
+
+internal Rng1U64*
+qe_scan_build_dispatch_ranges(Arena* arena, GDB_Table* table, IR_Node* where_clause,
+                              U64 rows_per_chunk, U64* out_range_count, U64* out_pruned_rows)
+{
+  *out_pruned_rows = 0;
+  
+  U64 uniform_range_count = (table->row_count == 0) ? 0 : (table->row_count + rows_per_chunk - 1) / rows_per_chunk;
+  
+  if (g_gdb_state->zonemap_chunk_rows > rows_per_chunk)
+  {
+    Rng1U64* ranges = push_array(arena, Rng1U64, Max(uniform_range_count, 1));
+    for (U64 i = 0; i < uniform_range_count; i++)
+    {
+      U64 start = i * rows_per_chunk;
+      ranges[i] = r1u64(start, Min(start + rows_per_chunk, table->row_count));
+    }
+    *out_range_count = uniform_range_count;
+    return ranges;
+  }
+  
+  Temp scratch = scratch_begin(&arena, 1);
+  
+  //- tec: collect top level AND leaves (or just the root)
+  IR_Node* root = (where_clause && where_clause->first) ? where_clause->first : NULL;
+  U64 max_leaves = settings_u64(str8_lit("QE_INDEX_SCAN_MAX_AND_LEAVES"), 16);
+  IR_Node** condition_leaves = push_array(scratch.arena, IR_Node*, Max(max_leaves, 1));
+  U32 leaf_count = 0;
+  if (root)
+  {
+    if (root->type == IR_NodeType_Operator && str8_match(root->value, str8_lit("and"), StringMatchFlag_CaseInsensitive))
+    {
+      leaf_count = qe_collect_and_leaves(root, condition_leaves, 0, (U32)max_leaves);
+    }
+    else
+    {
+      condition_leaves[0] = root;
+      leaf_count = 1;
+    }
+  }
+  
+  //- tec: resolve each leaf into a zone map usable comparison
+  QE_ZonemapLeaf* zonemap_leaves = push_array(scratch.arena, QE_ZonemapLeaf, Max(leaf_count, 1));
+  U32 zonemap_leaf_count = 0;
+  U64 zone_map_chunk_count = 0;
+  
+  for (U32 i = 0; i < leaf_count; i++)
+  {
+    GDB_Column* column = 0;
+    B32 is_eq = 0, is_lt = 0, is_le = 0, is_gt = 0, is_ge = 0, is_string = 0;
+    F64 target_numeric = 0.0;
+    String8 target_string = {0};
+    if (!qe_resolve_leaf_comparison(table, condition_leaves[i], &column, &is_eq, &is_lt, &is_le, &is_gt, &is_ge,
+                                    &is_string, &target_numeric, &target_string))
+    {
+      continue;
+    }
+    if (is_string || !gdb_column_type_is_zone_map_eligible(column->type)) 
+    {
+      continue;
+    }
+    // tec: != can't be safely pruned via a min/max range
+    if (!(is_eq || is_lt || is_le || is_gt || is_ge)) 
+    {
+      continue;
+    }
+    
+    gdb_column_ensure_zone_map(column);
+    if (!column->has_zone_map) 
+    {
+      continue;
+    }
+    
+    QE_ZonemapLeaf* out = &zonemap_leaves[zonemap_leaf_count++];
+    out->column = column;
+    out->is_eq = is_eq;
+    out->is_lt = is_lt;
+    out->is_le = is_le; 
+    out->is_gt = is_gt;
+    out->is_ge = is_ge;
+    out->target = target_numeric;
+    
+    // tec: identical across all columns of this table
+    zone_map_chunk_count = column->zone_map_chunk_count; 
+  }
+  
+  if (zonemap_leaf_count == 0 || zone_map_chunk_count == 0)
+  {
+    // tec: nothing to prune
+    Rng1U64* ranges = push_array(arena, Rng1U64, Max(uniform_range_count, 1));
+    for (U64 i = 0; i < uniform_range_count; i++)
+    {
+      U64 start = i * rows_per_chunk;
+      ranges[i] = r1u64(start, Min(start + rows_per_chunk, table->row_count));
+    }
+    *out_range_count = uniform_range_count;
+    scratch_end(scratch);
+    return ranges;
+  }
+  
+  //- tec: mark each zone map chunk prunable if any kept leaf proves it empty
+  B32* chunk_prunable = push_array(scratch.arena, B32, zone_map_chunk_count);
+  for (U64 z = 0; z < zone_map_chunk_count; z++)
+  {
+    for (U32 i = 0; i < zonemap_leaf_count; i++)
+    {
+      GDB_ZoneMapChunk* chunk = &zonemap_leaves[i].column->zone_map[z];
+      if (qe_zonemap_chunk_is_prunable(&zonemap_leaves[i], chunk))
+      {
+        chunk_prunable[z] = 1;
+        break;
+      }
+    }
+  }
+  
+  //- tec: combine consecutive unprunable chunks into rows_per_chunk-capped dispatch ranges
+  U64 zonemap_chunk_rows = g_gdb_state->zonemap_chunk_rows;
+  U64 range_cap = rows_per_chunk;
+  
+  Rng1U64* ranges = push_array(arena, Rng1U64, zone_map_chunk_count + 1);
+  U64 range_count = 0;
+  U64 pruned_rows = 0;
+  
+  U64 z = 0;
+  while (z < zone_map_chunk_count)
+  {
+    U64 chunk_row_start = z * zonemap_chunk_rows;
+    if (chunk_prunable[z])
+    {
+      U64 chunk_row_end = Min(chunk_row_start + zonemap_chunk_rows, table->row_count);
+      pruned_rows += chunk_row_end - chunk_row_start;
+      z++;
+      continue;
+    }
+    
+    U64 run_start = chunk_row_start;
+    U64 run_end = Min(run_start + zonemap_chunk_rows, table->row_count);
+    z++;
+    while (z < zone_map_chunk_count && !chunk_prunable[z])
+    {
+      // tec: check the PROSPECTIVE size before committing to grow, so a run can never overshoot range_cap
+      U64 prospective_end = Min(run_end + zonemap_chunk_rows, table->row_count);
+      if (prospective_end - run_start > range_cap) 
+      {
+        break;
+      }
+      run_end = prospective_end;
+      z++;
+    }
+    
+    ranges[range_count++] = r1u64(run_start, run_end);
+  }
+  
+  *out_range_count = range_count;
+  *out_pruned_rows = pruned_rows;
+  scratch_end(scratch);
+  return ranges;
 }
 
 internal B32

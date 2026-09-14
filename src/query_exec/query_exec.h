@@ -124,6 +124,13 @@ internal QE_ScanResult qe_scan_filter(Arena* arena, GDB_Database* database, GDB_
 internal B32 qe_try_index_scan(Arena* arena, GDB_Table* table, IR_Node* where_clause, QE_ScanResult* out_result);
 internal QE_ScanResult qe_cpu_scan_filter(Arena* arena, GDB_Table* table, IR_Node* where_clause);
 
+internal B32 qe_resolve_leaf_comparison(GDB_Table* table, IR_Node* condition,
+                                         GDB_Column** out_column,
+                                         B32* out_is_eq, B32* out_is_lt, B32* out_is_le, B32* out_is_gt, B32* out_is_ge,
+                                         B32* out_is_string, F64* out_target_numeric, String8* out_target_string);
+internal Rng1U64* qe_scan_build_dispatch_ranges(Arena* arena, GDB_Table* table, IR_Node* where_clause,
+                                                 U64 rows_per_chunk, U64* out_range_count, U64* out_pruned_rows);
+
 //~ tec: shared query-result representation
 #define PLAN_NULL_ROW max_U64 // tec: unmatched side of a LEFT JOIN - treat a column read against this as NULL
 

@@ -58,6 +58,11 @@
 #define GDB_DICT_ENCODE_MAX_CARDINALITY_RATIO 0.5
 #endif
 
+// tec: must be a power of two
+#ifndef GDB_ZONEMAP_CHUNK_ROWS
+#define GDB_ZONEMAP_CHUNK_ROWS 8192
+#endif
+
 // tec: reserved name for the column catalog table
 #define GDB_COLUMN_CATALOG_TABLE_NAME str8_lit("column_catalog")
 
@@ -123,7 +128,7 @@ struct GDB_EnumType
   U32 value_count;
 };
 
-// tec: automatic dictionary encoding for low cardinality String8 columns
+//~ tec: automatic dictionary encoding for low cardinality String8 columns
 #define GDB_DICT_EMPTY_SLOT ((U32)0xFFFFFFFF)
 #define GDB_DICT_NOT_FOUND  ((U32)0xFFFFFFFF)
 #define GDB_DICT_MAX_PROBE  256
@@ -135,8 +140,17 @@ struct GDB_StringDict
   Arena* arena;
   String8* values;
   U32 value_count;
-  U32* index_codes;    
+  U32* index_codes;
   U64 index_capacity;
+};
+
+//~ tec: zone maps
+typedef struct GDB_ZoneMapChunk GDB_ZoneMapChunk;
+struct GDB_ZoneMapChunk
+{
+  F64 min;
+  F64 max;
+  B32 has_values;
 };
 
 //~ tec: declare db structs
@@ -169,6 +183,13 @@ struct GDB_Column
   U64 dict_checked_generation;
   GDB_StringDict* dict;
   U32* dict_codes;
+  
+  //- tec: zone maps
+  B32 has_zone_map;
+  U64 zonemap_checked_generation;
+  GDB_ZoneMapChunk* zone_map;
+  U64 zone_map_chunk_count;
+  U64 zone_map_capacity;
   
   //- tec: data storage
   U8 *data;
@@ -277,13 +298,13 @@ typedef struct GDB_State GDB_State;
 struct GDB_State
 {
   Arena* arena;
-
+  
   GDB_Database** databases;
   U64 database_count;
   U64 database_capacity;
-
+  
   OS_Handle rw_mutex;
-
+  
   //- tec: settings derived tunables
   U64 disk_backed_threshold_size;
   U64 column_expand_count;
@@ -293,6 +314,8 @@ struct GDB_State
   U64 dict_encode_min_rows;
   U64 dict_encode_max_distinct;
   F64 dict_encode_max_cardinality_ratio;
+  U64 zonemap_chunk_rows;
+  U64 zonemap_chunk_rows_log2; 
 };
 
 global GDB_State* g_gdb_state = 0;
@@ -373,6 +396,10 @@ internal GDB_StringDataChunk gdb_column_get_string_chunk(Arena* arena, GDB_Colum
 internal void gdb_column_ensure_string_dict(GDB_Column* column);
 internal B32 gdb_string_dict_code_from_value(GDB_StringDict* dict, String8 value, U32* out_code);
 internal U32 gdb_string_dict_code_or_sentinel(GDB_StringDict* dict, String8 value);
+
+internal F64 gdb_numeric_value_as_f64(GDB_ColumnType type, void* data);
+internal B32 gdb_column_type_is_zone_map_eligible(GDB_ColumnType type);
+internal void gdb_column_ensure_zone_map(GDB_Column* column);
 
 internal String8 gdb_generate_disk_path_for_column(Arena* arena, GDB_Column* column);
 internal void gdb_column_convert_to_disk_backed(GDB_Column* column);

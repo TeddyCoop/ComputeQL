@@ -2,16 +2,16 @@ internal void
 gdb_init(void)
 {
   ProfBeginFunction();
-
+  
   U64 state_arena_reserve_size = settings_u64(str8_lit("GDB_STATE_ARENA_RESERVE_SIZE"), GDB_STATE_ARENA_RESERVE_SIZE);
   U64 state_arena_commit_size = settings_u64(str8_lit("GDB_STATE_ARENA_COMMIT_SIZE"), GDB_STATE_ARENA_COMMIT_SIZE);
   Arena* arena = arena_alloc(.reserve_size=state_arena_reserve_size, .commit_size=state_arena_commit_size);
   g_gdb_state = push_array(arena, GDB_State, 1);
   g_gdb_state->arena = arena;
-
+  
   g_gdb_state->databases = NULL;
   g_gdb_state->rw_mutex = os_rw_mutex_alloc();
-
+  
   g_gdb_state->disk_backed_threshold_size = settings_u64(str8_lit("GDB_DISK_BACKED_THRESHOLD_SIZE"), GDB_DISK_BACKED_THRESHOLD_SIZE);
   g_gdb_state->column_expand_count = settings_u64(str8_lit("GDB_COLUMN_EXPAND_COUNT"), GDB_COLUMN_EXPAND_COUNT);
   g_gdb_state->column_variable_capacity_alloc_size = settings_u64(str8_lit("GDB_COLUMN_VARIABLE_CAPACITY_ALLOC_SIZE"), GDB_COLUMN_VARIABLE_CAPACITY_ALLOC_SIZE);
@@ -20,7 +20,20 @@ gdb_init(void)
   g_gdb_state->dict_encode_min_rows = settings_u64(str8_lit("GDB_DICT_ENCODE_MIN_ROWS"), GDB_DICT_ENCODE_MIN_ROWS);
   g_gdb_state->dict_encode_max_distinct = settings_u64(str8_lit("GDB_DICT_ENCODE_MAX_DISTINCT"), GDB_DICT_ENCODE_MAX_DISTINCT);
   g_gdb_state->dict_encode_max_cardinality_ratio = settings_f64(str8_lit("GDB_DICT_ENCODE_MAX_CARDINALITY_RATIO"), GDB_DICT_ENCODE_MAX_CARDINALITY_RATIO);
-
+  
+  U64 zonemap_chunk_rows = settings_u64(str8_lit("GDB_ZONEMAP_CHUNK_ROWS"), GDB_ZONEMAP_CHUNK_ROWS);
+  if (!IsPow2(zonemap_chunk_rows))
+  {
+    log_error("settings: GDB_ZONEMAP_CHUNK_ROWS (%llu) must be a power of two, using default (%d)", zonemap_chunk_rows, GDB_ZONEMAP_CHUNK_ROWS);
+    zonemap_chunk_rows = GDB_ZONEMAP_CHUNK_ROWS;
+  }
+  g_gdb_state->zonemap_chunk_rows = zonemap_chunk_rows;
+  g_gdb_state->zonemap_chunk_rows_log2 = 0;
+  while (((U64)1 << g_gdb_state->zonemap_chunk_rows_log2) < zonemap_chunk_rows)
+  {
+    g_gdb_state->zonemap_chunk_rows_log2++;
+  }
+  
   ProfEnd();
 }
 
@@ -657,6 +670,16 @@ gdb_table_save(GDB_Table* table, String8 table_dir)
       meta_size += sizeof(U64) + column->name.size + sizeof(U64) + column->enum_type->name.size;
     }
     
+    // tec: trailing, optional per column zone map section
+    meta_size += sizeof(U64);
+    for (U64 i = 0; i < table->column_count; i++)
+    {
+      GDB_Column* column = table->columns[i];
+      if (!column->has_zone_map) continue;
+      meta_size += sizeof(U64) + column->name.size + sizeof(U64) +
+        column->zone_map_chunk_count * (sizeof(F64) * 2 + sizeof(U32));
+    }
+    
     U8* meta_buffer = push_array(scratch.arena, U8, meta_size);
     U8* meta_ptr = meta_buffer;
     
@@ -792,6 +815,32 @@ gdb_table_save(GDB_Table* table, String8 table_dir)
       *(U64*)meta_ptr = column->enum_type->name.size; meta_ptr += sizeof(U64);
       MemoryCopy(meta_ptr, column->enum_type->name.str, column->enum_type->name.size);
       meta_ptr += column->enum_type->name.size;
+    }
+    
+    U64 zone_map_column_count = 0;
+    for (U64 i = 0; i < table->column_count; i++)
+    {
+      if (table->columns[i]->has_zone_map) zone_map_column_count++;
+    }
+    
+    *(U64*)meta_ptr = zone_map_column_count; meta_ptr += sizeof(U64);
+    for (U64 i = 0; i < table->column_count; i++)
+    {
+      GDB_Column* column = table->columns[i];
+      if (!column->has_zone_map) continue;
+      
+      *(U64*)meta_ptr = column->name.size; meta_ptr += sizeof(U64);
+      MemoryCopy(meta_ptr, column->name.str, column->name.size);
+      meta_ptr += column->name.size;
+      
+      *(U64*)meta_ptr = column->zone_map_chunk_count; meta_ptr += sizeof(U64);
+      for (U64 c = 0; c < column->zone_map_chunk_count; c++)
+      {
+        GDB_ZoneMapChunk* chunk = &column->zone_map[c];
+        *(F64*)meta_ptr = chunk->min; meta_ptr += sizeof(F64);
+        *(F64*)meta_ptr = chunk->max; meta_ptr += sizeof(F64);
+        *(U32*)meta_ptr = chunk->has_values; meta_ptr += sizeof(U32);
+      }
     }
     
     os_file_write(meta_file, r1u64(0, meta_size), meta_buffer);
@@ -1357,6 +1406,50 @@ gdb_table_load(GDB_Database* database, String8 table_dir, String8 meta_path)
     }
   }
   
+  //- tec: optional trailing zone map section
+  if (read_ptr + sizeof(U64) <= meta_data.str + meta_data.size)
+  {
+    U64 zone_map_column_count = *(U64*)read_ptr; read_ptr += sizeof(U64);
+    
+    for (U64 i = 0; i < zone_map_column_count; i++)
+    {
+      if (read_ptr + sizeof(U64) > meta_data.str + meta_data.size) break;
+      String8 column_name = {0};
+      column_name.size = *(U64*)read_ptr; read_ptr += sizeof(U64);
+      if (read_ptr + column_name.size > meta_data.str + meta_data.size) break;
+      column_name.str = read_ptr;
+      read_ptr += column_name.size;
+      
+      if (read_ptr + sizeof(U64) > meta_data.str + meta_data.size) break;
+      U64 chunk_count = *(U64*)read_ptr; read_ptr += sizeof(U64);
+      
+      U64 chunks_size = chunk_count * (sizeof(F64) * 2 + sizeof(U32));
+      if (read_ptr + chunks_size > meta_data.str + meta_data.size) break;
+      
+      GDB_Column* column = gdb_table_find_column(table, column_name);
+      // tec: a mismatched chunk count is not trusted
+      U64 expected_chunk_count = column ? (column->row_count + g_gdb_state->zonemap_chunk_rows - 1) / g_gdb_state->zonemap_chunk_rows : 0;
+      if (!column || chunk_count != expected_chunk_count)
+      {
+        if (column) log_info("gdb_table_load: zone map chunk count mismatch for column '%.*s' - will rebuild lazily", str8_varg(column_name));
+        read_ptr += chunks_size;
+        continue;
+      }
+      
+      column->zone_map = push_array(column->arena, GDB_ZoneMapChunk, Max(chunk_count, 1));
+      column->zone_map_capacity = chunk_count;
+      column->zone_map_chunk_count = chunk_count;
+      for (U64 c = 0; c < chunk_count; c++)
+      {
+        column->zone_map[c].min = *(F64*)read_ptr; read_ptr += sizeof(F64);
+        column->zone_map[c].max = *(F64*)read_ptr; read_ptr += sizeof(F64);
+        column->zone_map[c].has_values = *(U32*)read_ptr; read_ptr += sizeof(U32);
+      }
+      column->has_zone_map = 1;
+      column->zonemap_checked_generation = column->write_generation;
+    }
+  }
+  
   table->name = push_str8_copy(table->arena, str8_skip_last_slash(table_dir));
   temp_end(scratch);
   
@@ -1370,13 +1463,19 @@ parse_csv_line(U8 *input, U64 len, String8 *fields, U64 max_fields)
 {
   U64 count = 0;
   U64 i = 0;
-  while (i < len && count < max_fields)
+  B32 need_field = len > 0;
+  while (need_field && count < max_fields)
   {
+    need_field = 0;
     B32 in_quote = 0;
     U64 start = i;
-    if (input[i] == '"') { in_quote = 1; i++; start++; }
+    if (i < len && input[i] == '"') 
+    { 
+      in_quote = 1; 
+      i++; 
+      start++; 
+    }
     
-    U64 field_len = 0;
     for (; i < len; i++)
     {
       if (in_quote)
@@ -1386,19 +1485,29 @@ parse_csv_line(U8 *input, U64 len, String8 *fields, U64 max_fields)
           i++;
           break;
         }
-        else if (input[i] == '"' && input[i + 1] == '"')
+        else if (input[i] == '"' && i + 1 < len && input[i + 1] == '"')
         {
           i++; // skip escaped quote
         }
       }
-      else if (input[i] == ',') break;
+      else if (input[i] == ',') 
+      {
+        break;
+      }
     }
     
     U64 end = i;
-    if (in_quote && end > start && input[end - 1] == '"') end--;
+    if (in_quote && end > start && input[end - 1] == '"') 
+    {
+      end--;
+    }
     fields[count++] = str8(input + start, end - start);
     
-    if (i < len && input[i] == ',') i++;
+    if (i < len && input[i] == ',') 
+    { 
+      i++; 
+      need_field = 1; 
+    }
   }
   
   return count;
@@ -2219,6 +2328,7 @@ gdb_column_alloc(String8 name, GDB_ColumnType type, U64 size)
   column->type = type;
   column->size = size;
   column->arena = arena;
+  column->write_generation = 1;
   
   return column;
 }
@@ -2538,6 +2648,81 @@ gdb_column_ensure_null_flags_capacity(GDB_Column* column, U64 needed_count)
   column->null_flags_capacity = new_capacity;
 }
 
+internal F64
+gdb_numeric_value_as_f64(GDB_ColumnType type, void* data)
+{
+  switch (type)
+  {
+    case GDB_ColumnType_U32: return (F64)(*(U32*)data);
+    case GDB_ColumnType_U64: return (F64)(*(U64*)data);
+    case GDB_ColumnType_F32: return (F64)(*(F32*)data);
+    case GDB_ColumnType_F64: return *(F64*)data;
+    case GDB_ColumnType_Bool: return (F64)(*(U8*)data);
+    case GDB_ColumnType_I32: return (F64)(*(S32*)data);
+    case GDB_ColumnType_I64: return (F64)(*(S64*)data);
+    case GDB_ColumnType_Date: return (F64)(*(S32*)data);
+    case GDB_ColumnType_Timestamp: return (F64)(*(S64*)data);
+    case GDB_ColumnType_Decimal: return (F64)(*(S64*)data);
+    case GDB_ColumnType_Enum: return (F64)(*(U32*)data);
+    default: return 0.0;
+  }
+}
+
+internal B32
+gdb_column_type_is_zone_map_eligible(GDB_ColumnType type)
+{
+  return type != GDB_ColumnType_Invalid && type != GDB_ColumnType_String8;
+}
+
+internal void
+gdb_column_zone_map_grow(GDB_Column* column, U64 needed_count)
+{
+  if (needed_count <= column->zone_map_capacity) return;
+  
+  U64 new_capacity = (column->zone_map_capacity > 0) ? column->zone_map_capacity * 2 : g_gdb_state->column_expand_count;
+  while (new_capacity < needed_count) new_capacity *= 2;
+  
+  GDB_ZoneMapChunk* new_zone_map = push_array(column->arena, GDB_ZoneMapChunk, new_capacity); // tec: push_array auto-zeroes -> has_values=0
+  if (column->zone_map)
+  {
+    MemoryCopy(new_zone_map, column->zone_map, column->zone_map_chunk_count * sizeof(GDB_ZoneMapChunk));
+  }
+  column->zone_map = new_zone_map;
+  column->zone_map_capacity = new_capacity;
+}
+
+internal void
+gdb_column_zone_map_note_append(GDB_Column* column, void* data)
+{
+  if (!gdb_column_type_is_zone_map_eligible(column->type)) return;
+  
+  U64 new_row_index = column->row_count - 1; // tec: caller already incremented row_count
+  U64 chunk_index = new_row_index >> g_gdb_state->zonemap_chunk_rows_log2;
+  
+  if (chunk_index >= column->zone_map_chunk_count)
+  {
+    gdb_column_zone_map_grow(column, chunk_index + 1);
+    column->zone_map_chunk_count = chunk_index + 1;
+  }
+  
+  F64 value = data ? gdb_numeric_value_as_f64(column->type, data) : 0.0;
+  GDB_ZoneMapChunk* chunk = &column->zone_map[chunk_index];
+  if (!chunk->has_values)
+  {
+    chunk->min = value;
+    chunk->max = value;
+    chunk->has_values = 1;
+  }
+  else
+  {
+    if (value < chunk->min) chunk->min = value;
+    if (value > chunk->max) chunk->max = value;
+  }
+  
+  column->has_zone_map = 1;
+  column->zonemap_checked_generation = column->write_generation;
+}
+
 internal void
 gdb_column_add_data_maybe_null(GDB_Column* column, void* data, B32 is_null)
 {
@@ -2551,6 +2736,11 @@ gdb_column_add_data_maybe_null(GDB_Column* column, void* data, B32 is_null)
   {
     gdb_column_ensure_null_flags_capacity(column, column->row_count);
     column->null_flags[column->row_count - 1] = is_null ? 1 : 0;
+  }
+  
+  if (!is_null)
+  {
+    gdb_column_zone_map_note_append(column, data);
   }
 }
 
@@ -3215,6 +3405,116 @@ gdb_column_ensure_string_dict(GDB_Column* column)
   column->dict_checked_generation = column->write_generation;
   
   scratch_end(scratch);
+  ProfEnd();
+}
+
+typedef struct GDB_ZoneMapBuildCtx GDB_ZoneMapBuildCtx;
+struct GDB_ZoneMapBuildCtx
+{
+  GDB_Column* column;
+  GDB_ZoneMapChunk* zone_map;
+  
+  // tec: in CHUNK-index units, not row units
+  Rng1U64* chunk_ranges; 
+  
+  U64 chunk_rows;
+  void* base_ptr; 
+};
+
+internal THREAD_POOL_TASK_FUNC(gdb_zone_map_build_task)
+{
+  GDB_ZoneMapBuildCtx* ctx = (GDB_ZoneMapBuildCtx*)raw_task;
+  Rng1U64 chunk_range = ctx->chunk_ranges[task_id];
+  GDB_Column* column = ctx->column;
+  
+  for (U64 c = chunk_range.min; c < chunk_range.max; c++)
+  {
+    U64 row_start = c * ctx->chunk_rows;
+    U64 row_end = Min(row_start + ctx->chunk_rows, column->row_count);
+    if (row_start >= row_end) break;
+    
+    GDB_ZoneMapChunk* out = &ctx->zone_map[c];
+    for (U64 row = row_start; row < row_end; row++)
+    {
+      if (gdb_column_is_null(column, row)) continue;
+      if (!ctx->base_ptr) continue;
+      
+      void* data = (U8*)ctx->base_ptr + row * column->size;
+      F64 value = gdb_numeric_value_as_f64(column->type, data);
+      if (!out->has_values)
+      {
+        out->min = value;
+        out->max = value;
+        out->has_values = 1;
+      }
+      else
+      {
+        if (value < out->min) out->min = value;
+        if (value > out->max) out->max = value;
+      }
+    }
+  }
+}
+
+internal void
+gdb_column_ensure_zone_map(GDB_Column* column)
+{
+  ProfBeginFunction();
+  
+  if (!gdb_column_type_is_zone_map_eligible(column->type))
+  {
+    ProfEnd();
+    return;
+  }
+  
+  if (column->zonemap_checked_generation == column->write_generation)
+  {
+    ProfEnd();
+    return;
+  }
+  
+  column->zone_map = 0;
+  column->zone_map_capacity = 0;
+  column->zone_map_chunk_count = 0;
+  column->has_zone_map = 0;
+  
+  U64 chunk_rows = g_gdb_state->zonemap_chunk_rows;
+  U64 chunk_count = (column->row_count + chunk_rows - 1) / chunk_rows;
+  
+  if (chunk_count > 0)
+  {
+    GDB_ZoneMapChunk* zone_map = push_array(column->arena, GDB_ZoneMapChunk, chunk_count); 
+    
+    Temp scratch = scratch_begin(0, 0);
+    U64 range_size = 0;
+    void* base_ptr = gdb_column_get_data_range(scratch.arena, column, r1u64(0, column->row_count), &range_size);
+    
+    TP_Context* pool = app_thread_pool();
+    U64 task_count = Max((U64)1, Min((U64)pool->worker_count, chunk_count));
+    Rng1U64* chunk_ranges = tp_divide_work(scratch.arena, chunk_count, (U32)task_count);
+    
+    GDB_ZoneMapBuildCtx ctx = {0};
+    ctx.column = column;
+    ctx.zone_map = zone_map;
+    ctx.chunk_ranges = chunk_ranges;
+    ctx.chunk_rows = chunk_rows;
+    ctx.base_ptr = base_ptr;
+    
+    TP_Arena* pool_arena = app_thread_pool_arena();
+    TP_Temp temp = tp_temp_begin(pool_arena);
+    tp_for_parallel(pool, pool_arena, task_count, gdb_zone_map_build_task, &ctx);
+    tp_temp_end(temp);
+    
+    scratch_end(scratch);
+    
+    column->zone_map = zone_map;
+    column->zone_map_capacity = chunk_count;
+    column->zone_map_chunk_count = chunk_count;
+    column->has_zone_map = 1;
+  }
+  
+  column->zonemap_checked_generation = column->write_generation;
+  
   ProfEnd();
 }
 
