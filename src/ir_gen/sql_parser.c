@@ -733,6 +733,65 @@ sql_parse_table_ref(SQL_ParseCtx *ctx)
 }
 
 internal SQL_Node*
+sql_parse_aggregate_call(SQL_ParseCtx *ctx, String8 func_name)
+{
+  sql_advance(ctx, 2); // move past function name and '('
+  
+  SQL_Node *call_node = push_array(ctx->arena, SQL_Node, 1);
+  call_node->type = SQL_NodeType_AggregateCall;
+  call_node->value = func_name;
+  
+  for (;;)
+  {
+    SQL_Node *arg = NULL;
+    if (sql_check(ctx, SQL_TokenType_Symbol, str8_lit("*")))
+    {
+      arg = push_array(ctx->arena, SQL_Node, 1);
+      arg->type = SQL_NodeType_Column;
+      arg->value = str8_lit("*");
+      sql_advance(ctx, 1);
+    }
+    else if (sql_check(ctx, SQL_TokenType_Number, (String8){0}))
+    {
+      arg = push_array(ctx->arena, SQL_Node, 1);
+      arg->type = SQL_NodeType_Numeric;
+      arg->value = sql_take(ctx).value;
+    }
+    else
+    {
+      arg = sql_parse_column_ref(ctx);
+      if (!arg) return NULL;
+    }
+    
+    arg->parent = call_node;
+    if (call_node->last)
+    {
+      call_node->last->next = arg;
+      arg->prev = call_node->last;
+      call_node->last = arg;
+    }
+    else
+    {
+      call_node->first = call_node->last = arg;
+    }
+    
+    if (sql_match(ctx, SQL_TokenType_Symbol, str8_lit(","))) continue;
+    break;
+  }
+  
+  if (!sql_check(ctx, SQL_TokenType_Symbol, str8_lit(")")))
+  {
+    sql_parse_error_at(sql_ctx_error_range(ctx),
+                       "expected ')' after aggregate function argument, found '%.*s'",
+                       str8_varg(sql_ctx_text_or_eof(ctx)));
+    return NULL;
+  }
+  sql_advance(ctx, 1); // move past ')'
+  
+  return call_node;
+}
+
+internal SQL_Node*
 sql_parse_select_item(SQL_ParseCtx *ctx)
 {
   if (sql_at_end(ctx))
@@ -766,37 +825,8 @@ sql_parse_select_item(SQL_ParseCtx *ctx)
   // tec: identifier immediately followed by '(' -> aggregate/function call, e.g. COUNT(*), SUM(amount)
   if (sql_peek(ctx, 1).type == SQL_TokenType_Symbol && str8_match(sql_peek(ctx, 1).value, str8_lit("("), 0))
   {
-    String8 func_name = token.value;
-    sql_advance(ctx, 2); // move past function name and '('
-    
-    SQL_Node *operand = NULL;
-    if (sql_check(ctx, SQL_TokenType_Symbol, str8_lit("*")))
-    {
-      operand = push_array(ctx->arena, SQL_Node, 1);
-      operand->type = SQL_NodeType_Column;
-      operand->value = str8_lit("*");
-      sql_advance(ctx, 1);
-    }
-    else
-    {
-      operand = sql_parse_column_ref(ctx);
-      if (!operand) return NULL;
-    }
-    
-    if (!sql_check(ctx, SQL_TokenType_Symbol, str8_lit(")")))
-    {
-      sql_parse_error_at(sql_ctx_error_range(ctx),
-                         "expected ')' after aggregate function argument, found '%.*s'",
-                         str8_varg(sql_ctx_text_or_eof(ctx)));
-      return NULL;
-    }
-    sql_advance(ctx, 1); // move past ')'
-    
-    item = push_array(ctx->arena, SQL_Node, 1);
-    item->type = SQL_NodeType_AggregateCall;
-    item->value = func_name;
-    item->first = item->last = operand;
-    operand->parent = item;
+    item = sql_parse_aggregate_call(ctx, token.value);
+    if (!item) return NULL;
   }
   else
   {
@@ -2396,38 +2426,7 @@ sql_parse_expression(SQL_ParseCtx *ctx)
     // tec: identifier immediately followed by '(' -> aggregate/function call, e.g. HAVING COUNT(*) > 1
     if (sql_peek(ctx, 1).type == SQL_TokenType_Symbol && str8_match(sql_peek(ctx, 1).value, str8_lit("("), 0))
     {
-      String8 func_name = token.value;
-      sql_advance(ctx, 2); // move past function name and '('
-      
-      SQL_Node *operand = NULL;
-      if (sql_check(ctx, SQL_TokenType_Symbol, str8_lit("*")))
-      {
-        operand = push_array(ctx->arena, SQL_Node, 1);
-        operand->type = SQL_NodeType_Column;
-        operand->value = str8_lit("*");
-        sql_advance(ctx, 1);
-      }
-      else
-      {
-        operand = sql_parse_column_ref(ctx);
-        if (!operand) return NULL;
-      }
-      
-      if (!sql_check(ctx, SQL_TokenType_Symbol, str8_lit(")")))
-      {
-        sql_parse_error_at(sql_ctx_error_range(ctx),
-                           "expected ')' after aggregate function argument, found '%.*s'",
-                           str8_varg(sql_ctx_text_or_eof(ctx)));
-        return NULL;
-      }
-      sql_advance(ctx, 1); // move past ')'
-      
-      SQL_Node *call_node = push_array(ctx->arena, SQL_Node, 1);
-      call_node->type = SQL_NodeType_AggregateCall;
-      call_node->value = func_name;
-      call_node->first = call_node->last = operand;
-      operand->parent = call_node;
-      return call_node;
+      return sql_parse_aggregate_call(ctx, token.value);
     }
     
     return sql_parse_column_ref(ctx);

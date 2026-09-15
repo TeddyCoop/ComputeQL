@@ -125,11 +125,11 @@ internal B32 qe_try_index_scan(Arena* arena, GDB_Table* table, IR_Node* where_cl
 internal QE_ScanResult qe_cpu_scan_filter(Arena* arena, GDB_Table* table, IR_Node* where_clause);
 
 internal B32 qe_resolve_leaf_comparison(GDB_Table* table, IR_Node* condition,
-                                         GDB_Column** out_column,
-                                         B32* out_is_eq, B32* out_is_lt, B32* out_is_le, B32* out_is_gt, B32* out_is_ge,
-                                         B32* out_is_string, F64* out_target_numeric, String8* out_target_string);
+                                        GDB_Column** out_column,
+                                        B32* out_is_eq, B32* out_is_lt, B32* out_is_le, B32* out_is_gt, B32* out_is_ge,
+                                        B32* out_is_string, F64* out_target_numeric, String8* out_target_string);
 internal Rng1U64* qe_scan_build_dispatch_ranges(Arena* arena, GDB_Table* table, IR_Node* where_clause,
-                                                 U64 rows_per_chunk, U64* out_range_count, U64* out_pruned_rows);
+                                                U64 rows_per_chunk, U64* out_range_count, U64* out_pruned_rows);
 
 //~ tec: shared query-result representation
 #define PLAN_NULL_ROW max_U64 // tec: unmatched side of a LEFT JOIN - treat a column read against this as NULL
@@ -193,10 +193,37 @@ internal PLAN_Materialized qe_sort_materialized(Arena* arena, PLAN_Materialized*
 
 //~ tec: aggregate
 
-// tec: baked into aggregate_assign.comp/aggregate_reduce.comp's fixed binding count
-// so they cant be configured via settings
 #define QE_AGG_MAX_GROUP_COLS 4
 #define QE_AGG_MAX_EXPRS      8
+
+// tec: aggregate func_codes. must stay in sync with aggregate_reduce.comp/aggregate_reduce_f32.comp's FUNC_* defines
+#define QE_AGG_FUNC_COUNT                 0
+#define QE_AGG_FUNC_SUM                    1
+#define QE_AGG_FUNC_AVG                    2
+#define QE_AGG_FUNC_MIN                    3
+#define QE_AGG_FUNC_MAX                    4
+#define QE_AGG_FUNC_APPROX_COUNT_DISTINCT 5
+#define QE_AGG_FUNC_APPROX_PERCENTILE      6
+#define QE_AGG_FUNC_COUNT_CODES            7 // tec: one past the last valid func_code, for policy table sizing
+
+typedef struct QE_AggFuncPolicy QE_AggFuncPolicy;
+struct QE_AggFuncPolicy
+{
+  GDB_ColumnType output_type;
+};
+
+global QE_AggFuncPolicy qe_agg_func_policy[QE_AGG_FUNC_COUNT_CODES] =
+{
+  { GDB_ColumnType_U64 }, // QE_AGG_FUNC_COUNT
+  { GDB_ColumnType_F64 }, // QE_AGG_FUNC_SUM
+  { GDB_ColumnType_F64 }, // QE_AGG_FUNC_AVG
+  { GDB_ColumnType_F64 }, // QE_AGG_FUNC_MIN
+  { GDB_ColumnType_F64 }, // QE_AGG_FUNC_MAX
+  { GDB_ColumnType_U64 }, // QE_AGG_FUNC_APPROX_COUNT_DISTINCT
+  { GDB_ColumnType_F64 }, // QE_AGG_FUNC_APPROX_PERCENTILE
+};
+
+internal F64 qe_hll_estimate_cardinality(U32* registers, U64 num_registers);
 
 internal PLAN_Materialized qe_aggregate(Arena* arena, GDB_Database* database, PLAN_RowSet* input, IR_Node* group_by_ir, IR_Node* column_list_ir, IR_Node* having_ir);
 internal PLAN_Materialized qe_apply_having(Arena* arena, PLAN_Materialized* m, IR_Node* having_ir);

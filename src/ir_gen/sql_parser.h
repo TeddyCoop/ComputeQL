@@ -234,6 +234,7 @@ struct SQL_Node
 internal SQL_Node* sql_parse_use_clause(SQL_ParseCtx *ctx);
 internal SQL_Node* sql_parse_select_clause(SQL_ParseCtx *ctx);
 internal SQL_Node* sql_parse_select_item(SQL_ParseCtx *ctx);
+internal SQL_Node* sql_parse_aggregate_call(SQL_ParseCtx *ctx, String8 func_name);
 internal SQL_Node* sql_parse_column_ref(SQL_ParseCtx *ctx);
 internal SQL_Node* sql_parse_table_ref(SQL_ParseCtx *ctx);
 internal SQL_Node* sql_parse_from_clause(SQL_ParseCtx *ctx, SQL_Node *select_node);

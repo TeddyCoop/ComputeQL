@@ -1005,6 +1005,12 @@ qe_column_list_item_display_name(Arena* arena, IR_Node* item)
   {
     IR_Node* arg = item->first;
     String8 arg_text = arg ? arg->value : str8_lit("*");
+    // tec: a second, nonalias argument must be part of the display name too
+    IR_Node* arg2 = (arg && arg->next && arg->next->type != IR_NodeType_Alias) ? arg->next : NULL;
+    if (arg2)
+    {
+      return push_str8f(arena, "%.*s(%.*s, %.*s)", str8_varg(item->value), str8_varg(arg_text), str8_varg(arg2->value));
+    }
     return push_str8f(arena, "%.*s(%.*s)", str8_varg(item->value), str8_varg(arg_text));
   }
   
@@ -1961,26 +1967,149 @@ typedef struct QE_AggExprInfo QE_AggExprInfo;
 struct QE_AggExprInfo
 {
   String8 display_name;
-  U32 func_code;          // 0 COUNT, 1 SUM, 2 AVG, 3 MIN, 4 MAX
-  GDB_Table* arg_table;   // NULL for COUNT(*)/COUNT(col) - counting never needs the argument's value
-  U64 arg_slot;           // tec: input row-set slot arg_table was resolved to (see qe_resolve_column_table)
+  U32 func_code;
+  GDB_Table* arg_table;
+  U64 arg_slot;
   GDB_Column* arg_column;
+  // tec: APPROX_PERCENTILE's fraction argument
+  F64 f64_param;   
 };
 
-internal U32
-qe_agg_func_code_from_name(String8 name)
+internal B32
+qe_agg_func_code_from_name(String8 name, U32* out_func_code)
 {
-  if (str8_match(name, str8_lit("count"), StringMatchFlag_CaseInsensitive)) return 0;
-  if (str8_match(name, str8_lit("sum"),   StringMatchFlag_CaseInsensitive)) return 1;
-  if (str8_match(name, str8_lit("avg"),   StringMatchFlag_CaseInsensitive)) return 2;
-  if (str8_match(name, str8_lit("min"),   StringMatchFlag_CaseInsensitive)) return 3;
-  if (str8_match(name, str8_lit("max"),   StringMatchFlag_CaseInsensitive)) return 4;
+  if (str8_match(name, str8_lit("count"), StringMatchFlag_CaseInsensitive)) 
+  { 
+    *out_func_code = QE_AGG_FUNC_COUNT;
+    return 1; 
+  }
+  if (str8_match(name, str8_lit("sum"), StringMatchFlag_CaseInsensitive))
+  { 
+    *out_func_code = QE_AGG_FUNC_SUM; 
+    return 1; 
+  }
+  if (str8_match(name, str8_lit("avg"), StringMatchFlag_CaseInsensitive)) 
+  { 
+    *out_func_code = QE_AGG_FUNC_AVG; 
+    return 1; 
+  }
+  if (str8_match(name, str8_lit("min"), StringMatchFlag_CaseInsensitive)) 
+  {
+    *out_func_code = QE_AGG_FUNC_MIN;
+    return 1; 
+  }
+  if (str8_match(name, str8_lit("max"), StringMatchFlag_CaseInsensitive)) 
+  {
+    *out_func_code = QE_AGG_FUNC_MAX;
+    return 1;
+  }
+  if (str8_match(name, str8_lit("approx_count_distinct"), StringMatchFlag_CaseInsensitive)) 
+  { 
+    *out_func_code = QE_AGG_FUNC_APPROX_COUNT_DISTINCT; 
+    return 1; 
+  }
+  if (str8_match(name, str8_lit("approx_percentile"), StringMatchFlag_CaseInsensitive)) 
+  { 
+    *out_func_code = QE_AGG_FUNC_APPROX_PERCENTILE; 
+    return 1; 
+  }
   
-  log_error("qe_aggregate: unsupported aggregate function '%.*s', defaulting to COUNT", str8_varg(name));
+  log_error("qe_aggregate: unsupported aggregate function '%.*s'", str8_varg(name));
   return 0;
 }
 
-internal void
+// tec: standard HyperLogLog cardinality estimator
+internal F64
+qe_hll_estimate_cardinality(U32* registers, U64 num_registers)
+{
+  F64 m = (F64)num_registers;
+  F64 alpha = (num_registers == 16) ? 0.673
+    : (num_registers == 32) ? 0.697
+    : (num_registers == 64) ? 0.709
+    : 0.7213 / (1.0 + 1.079 / m);
+  
+  F64 sum = 0.0;
+  U64 zero_registers = 0;
+  for (U64 i = 0; i < num_registers; i++)
+  {
+    sum += 1.0 / (F64)((U64)1 << registers[i]);
+    if (registers[i] == 0) zero_registers++;
+  }
+  
+  F64 estimate = alpha * m * m / sum;
+  
+  // tec: small cardinality correction. raw HLL is biased low when most registers are still empty
+  if (estimate <= 2.5 * m && zero_registers > 0)
+  {
+    estimate = m * log(m / (F64)zero_registers);
+  }
+  
+  return estimate;
+}
+
+// tec: a t-digest centroid - a (mean, weight) pair.
+typedef struct QE_TDigestCentroid QE_TDigestCentroid;
+struct QE_TDigestCentroid
+{
+  F32 mean;
+  F32 weight;
+};
+
+internal int
+qe_tdigest_centroid_compare(const void* a, const void* b)
+{
+  F32 ma = ((QE_TDigestCentroid*)a)->mean;
+  F32 mb = ((QE_TDigestCentroid*)b)->mean;
+  return (ma > mb) - (ma < mb);
+}
+
+// tec: standard t-digest quantile query 
+// sort centroids by mean, then linearly interpolate between consecutive centroids' cumulative weight midpoints to find the target rank
+internal F64
+qe_tdigest_estimate_percentile(QE_TDigestCentroid* centroids, U64 count, F64 fraction)
+{
+  if (count == 0) return 0.0;
+  
+  qsort(centroids, count, sizeof(QE_TDigestCentroid), qe_tdigest_centroid_compare);
+  
+  F64 total_weight = 0.0;
+  for (U64 i = 0; i < count; i++) total_weight += centroids[i].weight;
+  {
+    if (total_weight <= 0.0)
+    {
+      return 0.0;
+    }
+  }
+  
+  F64 target = fraction * total_weight;
+  
+  F64 cumulative = 0.0;
+  F64 prev_pos = -1.0;
+  F64 prev_mean = (F64)centroids[0].mean;
+  for (U64 i = 0; i < count; i++)
+  {
+    F64 pos = cumulative + (F64)centroids[i].weight * 0.5;
+    if (target <= pos)
+    {
+      // tec: target falls before the first centroid's own cumulative-weight midpoint
+      // no lower centroid to interpolate from, so just report this one
+      if (prev_pos < 0.0) 
+      {
+        return (F64)centroids[i].mean;
+      }
+      F64 t = (target - prev_pos) / (pos - prev_pos);
+      return prev_mean + t * ((F64)centroids[i].mean - prev_mean);
+    }
+    cumulative += centroids[i].weight;
+    prev_pos = pos;
+    prev_mean = (F64)centroids[i].mean;
+  }
+  
+  // tec: target falls after the last centroid's midpoint
+  return (F64)centroids[count - 1].mean; 
+}
+
+internal B32
 qe_aggregate_collect_exprs(Arena* arena, PLAN_RowSet* input, IR_Node* node, QE_AggExprInfo* exprs, U32* num_exprs)
 {
   for (IR_Node* n = node; n != NULL; n = n->next)
@@ -2006,12 +2135,15 @@ qe_aggregate_collect_exprs(Arena* arena, PLAN_RowSet* input, IR_Node* node, QE_A
         {
           QE_AggExprInfo* info = &exprs[*num_exprs];
           info->display_name = name;
-          info->func_code = qe_agg_func_code_from_name(n->value);
+          if (!qe_agg_func_code_from_name(n->value, &info->func_code))
+          {
+            return 0;
+          }
           
           IR_Node* arg = n->first;
           B32 is_star = (!arg) || str8_match(arg->value, str8_lit("*"), 0);
           
-          if (is_star || info->func_code == 0)
+          if (is_star || info->func_code == QE_AGG_FUNC_COUNT)
           {
             info->arg_table = NULL;
             info->arg_slot = max_U64;
@@ -2027,13 +2159,35 @@ qe_aggregate_collect_exprs(Arena* arena, PLAN_RowSet* input, IR_Node* node, QE_A
             info->arg_column = table ? gdb_table_find_column(table, bare_name) : NULL;
           }
           
+          if (info->func_code == QE_AGG_FUNC_APPROX_PERCENTILE)
+          {
+            IR_Node* frac_node = arg ? arg->next : NULL;
+            if (!frac_node || frac_node->type != IR_NodeType_Numeric)
+            {
+              log_error("qe_aggregate: APPROX_PERCENTILE requires a second numeric argument (the fraction), "
+                        "e.g. APPROX_PERCENTILE(col, 0.95)");
+              return 0;
+            }
+            F64 fraction = f64_from_str8(frac_node->value);
+            if (fraction < 0.0 || fraction > 1.0)
+            {
+              log_error("qe_aggregate: APPROX_PERCENTILE fraction %.4f is out of range [0,1]", fraction);
+              return 0;
+            }
+            info->f64_param = fraction;
+          }
+          
           (*num_exprs)++;
         }
       }
     }
     
-    qe_aggregate_collect_exprs(arena, input, n->first, exprs, num_exprs);
+    if (!qe_aggregate_collect_exprs(arena, input, n->first, exprs, num_exprs))
+    {
+      return 0;
+    }
   }
+  return 1;
 }
 
 // tec: assembles the final materialized result in column_list order
@@ -2065,7 +2219,7 @@ qe_aggregate_build_output(Arena* arena, PLAN_RowSet* input, IR_Node* column_list
       }
       
       dst->name = name;
-      dst->type = (exprs[e].func_code == 0) ? GDB_ColumnType_U64 : GDB_ColumnType_F64;
+      dst->type = qe_agg_func_policy[exprs[e].func_code].output_type;
       dst->numeric_values = push_array(arena, F64, Max(num_groups, 1));
       for (U64 g = 0; g < num_groups; g++) dst->numeric_values[g] = results_readback[g * num_exprs + e];
       out_count++;
@@ -2165,7 +2319,7 @@ qe_aggregate_build_output(Arena* arena, PLAN_RowSet* input, IR_Node* column_list
     
     PLAN_AggColumn* dst = &out_columns[out_count];
     dst->name = exprs[e].display_name;
-    dst->type = (exprs[e].func_code == 0) ? GDB_ColumnType_U64 : GDB_ColumnType_F64;
+    dst->type = qe_agg_func_policy[exprs[e].func_code].output_type;
     dst->numeric_values = push_array(arena, F64, Max(num_groups, 1));
     for (U64 g = 0; g < num_groups; g++) dst->numeric_values[g] = results_readback[g * num_exprs + e];
     out_count++;
@@ -2221,8 +2375,12 @@ qe_aggregate(Arena* arena, GDB_Database* database, PLAN_RowSet* input, IR_Node* 
   //- tec: union of aggregate expressions referenced by the select list and HAVING
   QE_AggExprInfo exprs[QE_AGG_MAX_EXPRS];
   U32 num_exprs = 0;
-  qe_aggregate_collect_exprs(arena, input, column_list_ir ? column_list_ir->first : NULL, exprs, &num_exprs);
-  qe_aggregate_collect_exprs(arena, input, having_ir ? having_ir->first : NULL, exprs, &num_exprs);
+  if (!qe_aggregate_collect_exprs(arena, input, column_list_ir ? column_list_ir->first : NULL, exprs, &num_exprs) ||
+      !qe_aggregate_collect_exprs(arena, input, having_ir ? having_ir->first : NULL, exprs, &num_exprs))
+  {
+    ProfEnd();
+    return result;
+  }
   
   // tec: GROUP BY/aggregate kernels dont know about NULL yet, so a NULL cell is grouped/summed using its placeholder value instead of being excluded
   {
@@ -2660,6 +2818,111 @@ qe_aggregate(Arena* arena, GDB_Database* database, PLAN_RowSet* input, IR_Node* 
   GPU_Buffer* repr_buf = gpu_buffer_alloc_pooled(str8_lit("agg_repr_buf"), repr_size, GPU_BufferFlag_ReadWrite, 0);
   GPU_Buffer* partials_buf = gpu_buffer_alloc_pooled(str8_lit("agg_partials_buf"), partials_size, GPU_BufferFlag_ReadWrite, 0);
   
+  // tec: APPROX_COUNT_DISTINCT keeps one HyperLogLog sketch (an array of registers) per (group, expr) instead of a partials_buf-style scalar
+  U64 hll_precision = settings_u64(str8_lit("QE_HLL_PRECISION"), 10);
+  U64 hll_words = 1ull << hll_precision;
+  U32 hll_slot_of_expr[QE_AGG_MAX_EXPRS] = {0};
+  U32 num_hll_exprs = 0;
+  for (U32 e = 0; e < num_exprs; e++)
+  {
+    if (exprs[e].func_code == QE_AGG_FUNC_APPROX_COUNT_DISTINCT)
+    {
+      hll_slot_of_expr[e] = num_hll_exprs++;
+    }
+  }
+  
+  U64 sketch_size = Max(num_groups, 1) * Max(num_hll_exprs, 1) * hll_words * sizeof(U32);
+  GPU_Buffer* sketch_buf = repr_buf; // tec: unused filler binding when there's no APPROX_COUNT_DISTINCT expr
+  U32* sketch_readback = 0;
+  
+  if (num_hll_exprs > 0)
+  {
+    U64 sketch_max_bytes = settings_u64(str8_lit("QE_HLL_SKETCH_MAX_TOTAL_BYTES"), MB(64));
+    if (sketch_size > gpu_device_max_storage_buffer_range())
+    {
+      log_error("qe_aggregate: APPROX_COUNT_DISTINCT sketch buffer (%llu bytes) exceeds this GPU's maxStorageBufferRange "
+                "(%llu bytes) - num_groups=%llu at QE_HLL_PRECISION=%llu is too large for this device",
+                sketch_size, gpu_device_max_storage_buffer_range(), num_groups, hll_precision);
+      scratch_end(scratch);
+      ProfEnd();
+      return result;
+    }
+    if (sketch_size > sketch_max_bytes)
+    {
+      log_error("qe_aggregate: APPROX_COUNT_DISTINCT sketch buffer (%llu bytes, num_groups=%llu, QE_HLL_PRECISION=%llu) "
+                "exceeds QE_HLL_SKETCH_MAX_TOTAL_BYTES (%llu bytes) - reduce QE_HLL_PRECISION or GROUP BY cardinality",
+                sketch_size, num_groups, hll_precision, sketch_max_bytes);
+      scratch_end(scratch);
+      ProfEnd();
+      return result;
+    }
+    
+    sketch_buf = gpu_buffer_alloc_pooled(str8_lit("agg_sketch_buf"), sketch_size, GPU_BufferFlag_ReadWrite, 0);
+    if (!sketch_buf)
+    {
+      log_error("qe_aggregate: failed to allocate APPROX_COUNT_DISTINCT sketch GPU buffer (%llu bytes)", sketch_size);
+      scratch_end(scratch);
+      ProfEnd();
+      return result;
+    }
+    sketch_readback = push_array(scratch.arena, U32, Max(num_groups, 1) * num_hll_exprs * hll_words);
+  }
+  
+  // tec: APPROX_PERCENTILE keeps one t-digest centroid per GPU thread per chunk
+  // (one real sampled value from that thread's rows, weighted by how many)
+  U32 pct_slot_of_expr[QE_AGG_MAX_EXPRS] = {0};
+  U32 num_pct_exprs = 0;
+  for (U32 e = 0; e < num_exprs; e++)
+  {
+    if (exprs[e].func_code == QE_AGG_FUNC_APPROX_PERCENTILE)
+    {
+      pct_slot_of_expr[e] = num_pct_exprs++;
+    }
+  }
+  
+  U64 digest_size = Max(total_chunks, 1) * Max(num_pct_exprs, 1) * QE_GPU_WORKGROUP_SIZE * sizeof(F32);
+  // tec: unused filler binding when there's no APPROX_PERCENTILE expr
+  GPU_Buffer* digest_mean_buf = repr_buf;  
+  GPU_Buffer* digest_weight_buf = repr_buf;
+  F32* digest_mean_readback = 0;
+  F32* digest_weight_readback = 0;
+  
+  if (num_pct_exprs > 0)
+  {
+    U64 digest_max_bytes = settings_u64(str8_lit("QE_TDIGEST_SKETCH_MAX_TOTAL_BYTES"), MB(64));
+    if (digest_size > gpu_device_max_storage_buffer_range())
+    {
+      log_error("qe_aggregate: APPROX_PERCENTILE digest buffer (%llu bytes) exceeds this GPU's maxStorageBufferRange "
+                "(%llu bytes) - total_chunks=%llu is too large for this device",
+                digest_size, gpu_device_max_storage_buffer_range(), total_chunks);
+      scratch_end(scratch);
+      ProfEnd();
+      return result;
+    }
+    if (digest_size * 2 > digest_max_bytes)
+    {
+      log_error("qe_aggregate: APPROX_PERCENTILE digest buffers (%llu bytes, total_chunks=%llu) exceed "
+                "QE_TDIGEST_SKETCH_MAX_TOTAL_BYTES (%llu bytes) - increase QE_AGG_ROWS_PER_CHUNK to shrink total_chunks",
+                digest_size * 2, total_chunks, digest_max_bytes);
+      scratch_end(scratch);
+      ProfEnd();
+      return result;
+    }
+    
+    digest_mean_buf = gpu_buffer_alloc_pooled(str8_lit("agg_digest_mean_buf"), digest_size, GPU_BufferFlag_ReadWrite, 0);
+    digest_weight_buf = gpu_buffer_alloc_pooled(str8_lit("agg_digest_weight_buf"), digest_size, GPU_BufferFlag_ReadWrite, 0);
+    if (!digest_mean_buf || !digest_weight_buf)
+    {
+      log_error("qe_aggregate: failed to allocate APPROX_PERCENTILE digest GPU buffers (%llu bytes each)", digest_size);
+      scratch_end(scratch);
+      ProfEnd();
+      return result;
+    }
+    U64 digest_elems = Max(total_chunks, 1) * num_pct_exprs * QE_GPU_WORKGROUP_SIZE;
+    digest_mean_readback = push_array(scratch.arena, F32, digest_elems);
+    digest_weight_readback = push_array(scratch.arena, F32, digest_elems);
+  }
+  
   gpu_kernel_set_arg_buffer(reduce_kernel, 0, identity_mode ? chunk_range_buf : members_buf);
   gpu_kernel_set_arg_buffer(reduce_kernel, 1, chunk_range_buf);
   gpu_kernel_set_arg_buffer(reduce_kernel, 2, chunk_group_buf);
@@ -2686,14 +2949,35 @@ qe_aggregate(Arena* arena, GDB_Database* database, PLAN_RowSet* input, IR_Node* 
   {
     gpu_kernel_set_arg_buffer(reduce_kernel, 5 + e, arg_bufs[e] ? arg_bufs[e] : repr_buf);
   }
+  gpu_kernel_set_arg_buffer(reduce_kernel, 13, sketch_buf);
+  gpu_kernel_set_arg_buffer(reduce_kernel, 14, digest_mean_buf);
+  gpu_kernel_set_arg_buffer(reduce_kernel, 15, digest_weight_buf);
   
   U32 func_codes_packed = 0;
-  for (U32 e = 0; e < num_exprs; e++) func_codes_packed |= (exprs[e].func_code & 0xfu) << (e * 4u);
+  U32 hll_slot_packed = 0;
+  U32 pct_slot_packed = 0;
+  for (U32 e = 0; e < num_exprs; e++)
+  {
+    func_codes_packed |= (exprs[e].func_code & 0xfu) << (e * 4u);
+    if (exprs[e].func_code == QE_AGG_FUNC_APPROX_COUNT_DISTINCT)
+    {
+      hll_slot_packed |= (hll_slot_of_expr[e] & 0xfu) << (e * 4u);
+    }
+    if (exprs[e].func_code == QE_AGG_FUNC_APPROX_PERCENTILE)
+    {
+      pct_slot_packed |= (pct_slot_of_expr[e] & 0xfu) << (e * 4u);
+    }
+  }
   
   gpu_kernel_set_arg_u64(reduce_kernel, 0, total_chunks);
   gpu_kernel_set_arg_u64(reduce_kernel, 1, num_exprs);
   gpu_kernel_set_arg_u64(reduce_kernel, 2, func_codes_packed);
   gpu_kernel_set_arg_u64(reduce_kernel, 3, identity_mode ? 1 : 0);
+  gpu_kernel_set_arg_u64(reduce_kernel, 4, hll_precision);
+  gpu_kernel_set_arg_u64(reduce_kernel, 5, hll_slot_packed);
+  gpu_kernel_set_arg_u64(reduce_kernel, 6, num_hll_exprs);
+  // tec: pack both remaining values into the two 32-bit halves of the last U64 slot instead
+  gpu_kernel_set_arg_u64(reduce_kernel, 7, ((U64)pct_slot_packed << 32) | (U64)num_pct_exprs);
   
   U64 arg_elem_size = arg_narrow ? sizeof(F32) : sizeof(F64);
   U64 reduce_upload_bytes = cursor_size + chunk_range_size + chunk_group_size;
@@ -2704,7 +2988,7 @@ qe_aggregate(Arena* arena, GDB_Database* database, PLAN_RowSet* input, IR_Node* 
       reduce_upload_bytes += row_count * arg_elem_size;
     }
   }
-  U64 reduce_download_bytes = repr_size + partials_size;
+  U64 reduce_download_bytes = repr_size + partials_size + (num_hll_exprs > 0 ? sketch_size : 0) + (num_pct_exprs > 0 ? digest_size * 2 : 0);
   
   U32* repr32 = push_array(scratch.arena, U32, Max(num_groups, 1));
   F64* partials_readback = push_array(scratch.arena, F64, Max(total_chunks, 1) * Max(num_exprs, 1) * 4);
@@ -2743,10 +3027,23 @@ qe_aggregate(Arena* arena, GDB_Database* database, PLAN_RowSet* input, IR_Node* 
   gpu_batch_end(scatter_batch);
   
   GPU_Batch* reduce_batch = gpu_batch_begin(0, reduce_download_bytes);
+  if (num_hll_exprs > 0)
+  {
+    gpu_batch_buffer_zero(reduce_batch, sketch_buf, sketch_size);
+  }
   // tec: one workgroup per chunk (a group with many rows spans many chunks/workgroups)
   gpu_batch_kernel_execute(reduce_batch, reduce_kernel, (U32)Max(total_chunks, 1) * QE_GPU_WORKGROUP_SIZE, QE_GPU_WORKGROUP_SIZE);
   gpu_batch_buffer_read(reduce_batch, repr_buf, repr32, repr_size);
   gpu_batch_buffer_read(reduce_batch, partials_buf, partials_readback, partials_size);
+  if (num_hll_exprs > 0)
+  {
+    gpu_batch_buffer_read(reduce_batch, sketch_buf, sketch_readback, sketch_size);
+  }
+  if (num_pct_exprs > 0)
+  {
+    gpu_batch_buffer_read(reduce_batch, digest_mean_buf, digest_mean_readback, digest_size);
+    gpu_batch_buffer_read(reduce_batch, digest_weight_buf, digest_weight_readback, digest_size);
+  }
   gpu_batch_end(reduce_batch);
   log_info("qe_aggregate: reduce batch (row_count=%llu, is_string=%d, total_chunks=%llu) GPU time: %llu microseconds",
            row_count, (group_string_mask != 0), total_chunks, gpu_get_executed_kernel_time_microseconds());
@@ -2768,15 +3065,66 @@ qe_aggregate(Arena* arena, GDB_Database* database, PLAN_RowSet* input, IR_Node* 
         F64* p = &partials_readback[(chunk_idx * num_exprs + e) * 4];
         acc += p[0];
         count += (U64)p[1];
-        if (p[2] < mn) mn = p[2];
-        if (p[3] > mx) mx = p[3];
+        if (p[2] < mn) 
+        {
+          mn = p[2];
+        }
+        if (p[3] > mx) 
+        {
+          mx = p[3];
+        }
       }
       
       F64 result;
-      if (exprs[e].func_code == 0) result = (F64)count;
-      else if (exprs[e].func_code == 1) result = acc;
-      else if (exprs[e].func_code == 2) result = (count > 0) ? (acc / (F64)count) : 0.0;
-      else if (exprs[e].func_code == 3) result = mn;
+      if (exprs[e].func_code == QE_AGG_FUNC_COUNT) 
+      {
+        result = (F64)count;
+      }
+      else if (exprs[e].func_code == QE_AGG_FUNC_SUM) 
+      {
+        result = acc;
+      }
+      else if (exprs[e].func_code == QE_AGG_FUNC_AVG) 
+      {
+        result = (count > 0) ? (acc / (F64)count) : 0.0;
+      }
+      else if (exprs[e].func_code == QE_AGG_FUNC_MIN) 
+      {
+        result = mn;
+      }
+      else if (exprs[e].func_code == QE_AGG_FUNC_MAX)
+      {
+        result = mx;
+      }
+      else if (exprs[e].func_code == QE_AGG_FUNC_APPROX_COUNT_DISTINCT)
+      {
+        U32* registers = &sketch_readback[(g * num_hll_exprs + hll_slot_of_expr[e]) * hll_words];
+        // tec: round rather than truncate
+        result = round_f64(qe_hll_estimate_cardinality(registers, hll_words));
+      }
+      else if (exprs[e].func_code == QE_AGG_FUNC_APPROX_PERCENTILE)
+      {
+        U32 pct_slot = pct_slot_of_expr[e];
+        U64 max_centroids = chunks_per_group[g] * QE_GPU_WORKGROUP_SIZE;
+        QE_TDigestCentroid* centroids = push_array(scratch.arena, QE_TDigestCentroid, Max(max_centroids, 1));
+        U64 valid_count = 0;
+        for (U64 k = 0; k < chunks_per_group[g]; k++)
+        {
+          U64 chunk_idx = chunk_base_of_group[g] + k;
+          U64 base = (chunk_idx * num_pct_exprs + pct_slot) * QE_GPU_WORKGROUP_SIZE;
+          for (U32 t = 0; t < QE_GPU_WORKGROUP_SIZE; t++)
+          {
+            F32 w = digest_weight_readback[base + t];
+            if (w > 0.0f)
+            {
+              centroids[valid_count].mean = digest_mean_readback[base + t];
+              centroids[valid_count].weight = w;
+              valid_count++;
+            }
+          }
+        }
+        result = qe_tdigest_estimate_percentile(centroids, valid_count, exprs[e].f64_param);
+      }
       else result = mx;
       
       results_readback[g * num_exprs + e] = result;

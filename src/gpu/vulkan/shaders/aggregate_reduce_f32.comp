@@ -8,11 +8,13 @@
 
 layout(local_size_x = 256) in;
 
-#define FUNC_COUNT 0u
-#define FUNC_SUM   1u
-#define FUNC_AVG   2u
-#define FUNC_MIN   3u
-#define FUNC_MAX   4u
+#define FUNC_COUNT                 0u
+#define FUNC_SUM                   1u
+#define FUNC_AVG                   2u
+#define FUNC_MIN                   3u
+#define FUNC_MAX                   4u
+#define FUNC_APPROX_COUNT_DISTINCT 5u
+#define FUNC_APPROX_PERCENTILE     6u
 
 layout(std430, binding = 0) readonly buffer MembersBuf    { uint group_member_rows[]; };
 layout(std430, binding = 1) readonly buffer ChunkRangeBuf { uint chunk_range[]; };
@@ -28,6 +30,14 @@ layout(std430, binding = 9)  readonly buffer Arg4Buf { float arg4[]; };
 layout(std430, binding = 10) readonly buffer Arg5Buf { float arg5[]; };
 layout(std430, binding = 11) readonly buffer Arg6Buf { float arg6[]; };
 layout(std430, binding = 12) readonly buffer Arg7Buf { float arg7[]; };
+
+// tec: one HyperLogLog sketch (hll_words registers) per (group, hll-slot), 
+// merged in place via atomicMax. sized by num_groups rather than total_chunks
+layout(std430, binding = 13) buffer SketchBuf { uint sketch[]; };
+
+// tec: one t-digest centroid (mean, weight) per GPU thread per chunk per pct slot
+layout(std430, binding = 14) buffer DigestMeanBuf   { float digest_mean[]; };
+layout(std430, binding = 15) buffer DigestWeightBuf { float digest_weight[]; };
 
 layout(push_constant) uniform PushConstants
 {
@@ -51,6 +61,34 @@ read_arg(uint e, uint row)
   return 0.0LF;
 }
 
+uint
+hash_u32(uint x)
+{
+  x ^= x >> 16u; x *= 0x7feb352du;
+  x ^= x >> 15u; x *= 0x846ca68bu;
+  x ^= x >> 16u;
+  return x;
+}
+
+// tec: standard HLL construction
+void
+hll_add(uint hll_slot, uint g, uint num_hll_exprs, uint hll_precision, double value)
+{
+  uvec2 bits = unpackDouble2x32(value);
+  uint h = hash_u32(bits.x ^ hash_u32(bits.y));
+
+  uint remaining_bits = 32u - hll_precision;
+  uint bucket = h >> remaining_bits;
+  uint remaining = h & ((1u << remaining_bits) - 1u);
+
+  int msb = findMSB(remaining);
+  uint rho = (msb < 0) ? (remaining_bits + 1u) : (remaining_bits - uint(msb));
+
+  uint hll_words = 1u << hll_precision;
+  uint base_idx = (g * num_hll_exprs + hll_slot) * hll_words + bucket;
+  atomicMax(sketch[base_idx], rho);
+}
+
 shared double sh_acc[256];
 shared double sh_mn[256];
 shared double sh_mx[256];
@@ -63,6 +101,12 @@ main()
   uint num_exprs     = pc.words[2];
   uint func_codes    = pc.words[4];
   bool identity_mode = pc.words[6] != 0u;
+  uint hll_precision  = pc.words[8];
+  uint hll_slot_packed = pc.words[10];
+  uint num_hll_exprs  = pc.words[12];
+  // tec: these two share the last slot's low/high 32 bits instead of getting one each
+  uint num_pct_exprs  = pc.words[14];
+  uint pct_slot_packed = pc.words[15];
 
   uint chunk_id = gl_WorkGroupID.x;
   if (chunk_id >= total_chunks) return;
@@ -81,11 +125,14 @@ main()
   for (uint e = 0u; e < num_exprs; e++)
   {
     uint func = (func_codes >> (e * 4u)) & 0xfu;
+    uint hll_slot = (hll_slot_packed >> (e * 4u)) & 0xfu;
+    uint pct_slot = (pct_slot_packed >> (e * 4u)) & 0xfu;
 
     double acc = 0.0LF;
     double mn = 1.0e300LF;
     double mx = -1.0e300LF;
     uint count = 0u;
+    double pct_sample = 0.0LF;
 
     for (uint m = start + tid; m < end; m += 256u)
     {
@@ -106,6 +153,21 @@ main()
         double v = read_arg(e, row);
         if (v > mx) mx = v;
       }
+      else if (func == FUNC_APPROX_COUNT_DISTINCT)
+      {
+        hll_add(hll_slot, g, num_hll_exprs, hll_precision, read_arg(e, row));
+      }
+      else if (func == FUNC_APPROX_PERCENTILE && count == 1u)
+      {
+        pct_sample = read_arg(e, row);
+      }
+    }
+
+    if (func == FUNC_APPROX_PERCENTILE)
+    {
+      uint digest_idx = (chunk_id * num_pct_exprs + pct_slot) * 256u + tid;
+      digest_mean[digest_idx] = float(pct_sample);
+      digest_weight[digest_idx] = float(count);
     }
 
     sh_acc[tid] = acc;
