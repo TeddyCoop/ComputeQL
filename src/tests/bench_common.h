@@ -208,6 +208,11 @@ bench_gdb_consume_result(PLAN_ExecResult* result, IR_Node* select_node, U64* out
           {
             row_hash = bench_fnv_mix_u64(row_hash, (U64)col->numeric_values[i]);
           }
+          else if (col->type == GDB_ColumnType_I32 || col->type == GDB_ColumnType_I64)
+          {
+            // tec: truncate to S64 (sign-preserving) before reinterpreting as U64
+            row_hash = bench_fnv_mix_u64(row_hash, (U64)(S64)col->numeric_values[i]);
+          }
           else
           {
             row_hash = bench_fnv_mix_u64(row_hash, bench_scaled_round(col->numeric_values[i]));

@@ -2190,6 +2190,36 @@ qe_aggregate_collect_exprs(Arena* arena, PLAN_RowSet* input, IR_Node* node, QE_A
   return 1;
 }
 
+internal void
+qe_agg_output_type_for_expr(QE_AggExprInfo* expr, GDB_ColumnType* out_type, U32* out_decimal_scale, GDB_EnumType** out_enum_type)
+{
+  *out_type = qe_agg_func_policy[expr->func_code].output_type;
+  *out_decimal_scale = 0;
+  *out_enum_type = NULL;
+
+  if (!expr->arg_column) return;
+
+  if (expr->func_code == QE_AGG_FUNC_MIN || expr->func_code == QE_AGG_FUNC_MAX)
+  {
+    *out_type = expr->arg_column->type;
+    *out_decimal_scale = expr->arg_column->decimal_scale;
+    *out_enum_type = expr->arg_column->enum_type;
+  }
+  else if (expr->func_code == QE_AGG_FUNC_SUM)
+  {
+    switch (expr->arg_column->type)
+    {
+      case GDB_ColumnType_U32: case GDB_ColumnType_U64: case GDB_ColumnType_Bool:
+        *out_type = GDB_ColumnType_U64;
+        break;
+      case GDB_ColumnType_I32: case GDB_ColumnType_I64:
+        *out_type = GDB_ColumnType_I64;
+        break;
+      default: break;
+    }
+  }
+}
+
 // tec: assembles the final materialized result in column_list order
 internal PLAN_Materialized
 qe_aggregate_build_output(Arena* arena, PLAN_RowSet* input, IR_Node* column_list_ir, QE_AggExprInfo* exprs, U32 num_exprs,
@@ -2219,7 +2249,7 @@ qe_aggregate_build_output(Arena* arena, PLAN_RowSet* input, IR_Node* column_list
       }
       
       dst->name = name;
-      dst->type = qe_agg_func_policy[exprs[e].func_code].output_type;
+      qe_agg_output_type_for_expr(&exprs[e], &dst->type, &dst->decimal_scale, &dst->enum_type);
       dst->numeric_values = push_array(arena, F64, Max(num_groups, 1));
       for (U64 g = 0; g < num_groups; g++) dst->numeric_values[g] = results_readback[g * num_exprs + e];
       out_count++;
@@ -2319,7 +2349,7 @@ qe_aggregate_build_output(Arena* arena, PLAN_RowSet* input, IR_Node* column_list
     
     PLAN_AggColumn* dst = &out_columns[out_count];
     dst->name = exprs[e].display_name;
-    dst->type = qe_agg_func_policy[exprs[e].func_code].output_type;
+    qe_agg_output_type_for_expr(&exprs[e], &dst->type, &dst->decimal_scale, &dst->enum_type);
     dst->numeric_values = push_array(arena, F64, Max(num_groups, 1));
     for (U64 g = 0; g < num_groups; g++) dst->numeric_values[g] = results_readback[g * num_exprs + e];
     out_count++;

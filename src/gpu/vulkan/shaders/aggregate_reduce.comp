@@ -105,7 +105,7 @@ main()
   bool identity_mode = pc.words[6] != 0u;
   uint hll_precision  = pc.words[8];
   uint hll_slot_packed = pc.words[10];
-  uint num_hll_exprs  = pc.words[12];c
+  uint num_hll_exprs  = pc.words[12];
   // tec: these two share the last slot's low/high 32 bits instead of getting one each
   uint num_pct_exprs  = pc.words[14];
   uint pct_slot_packed = pc.words[15];
