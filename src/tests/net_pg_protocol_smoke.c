@@ -13,6 +13,7 @@
 #include "gdb/gdb_inc.h"
 #include "ir_gen/ir_gen_inc.h"
 #include "gpu/gpu_inc.h"
+#include "planner/plan_node.h"
 #include "query_exec/query_exec.h"
 #include "planner/planner.h"
 #include "application.h"

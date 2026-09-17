@@ -408,21 +408,21 @@ internal THREAD_POOL_TASK_FUNC(app_select_format_task)
   B32 capture_structured = task->capture_structured;
   APP_ResultSet* out_result_set = task->out_result_set;
   String8List local_out = {0};
-
+  
   for (U64 i = range.min; i < range.max; i++)
   {
     U64 ci = 0;
     for (IR_Node* column_node = task->select_output_columns->first; column_node != NULL; column_node = column_node->next, ci++)
     {
       U64 cell_i = i * task->column_count + ci;
-
+      
       if (!task->gathered[ci].resolved)
       {
         if (!capture_structured) { str8_list_push(arena, &local_out, str8_lit("? ")); }
         if (capture_structured) { out_result_set->cell_is_null[cell_i] = 1; }
         continue;
       }
-
+      
       U64 row_index = task->rows->row_indices[task->gathered[ci].table_slot][i];
       if (row_index == PLAN_NULL_ROW || gdb_column_is_null(task->gathered[ci].column, row_index))
       {
@@ -430,7 +430,7 @@ internal THREAD_POOL_TASK_FUNC(app_select_format_task)
         if (capture_structured) { out_result_set->cell_is_null[cell_i] = 1; }
         continue;
       }
-
+      
       switch (task->gathered[ci].type)
       {
         case GDB_ColumnType_U32:
@@ -518,18 +518,18 @@ internal THREAD_POOL_TASK_FUNC(app_select_format_task)
     }
     if (!capture_structured) { str8_list_push(arena, &local_out, str8_lit("\n")); }
   }
-
+  
   if (!capture_structured) { task->worker_lists[task_id] = local_out; }
 }
 
 internal void
 app_select_format_dispatch(Arena* arena, String8List* out, IR_Node* select_output_columns, SelectColGather* gathered,
-                            U64 column_count, PLAN_RowSet* rows, U64 result_count, B32 capture_structured, APP_ResultSet* out_result_set)
+                           U64 column_count, PLAN_RowSet* rows, U64 result_count, B32 capture_structured, APP_ResultSet* out_result_set)
 {
   Temp scratch = scratch_begin(&arena, 1);
   TP_Context* pool = app_thread_pool();
   U64 task_count = (result_count > 1) ? Min((U64)pool->worker_count, result_count) : 1;
-
+  
   APP_SelectFormatTask task = {0};
   task.ranges = tp_divide_work(scratch.arena, result_count, (U32)task_count);
   task.select_output_columns = select_output_columns;
@@ -539,11 +539,11 @@ app_select_format_dispatch(Arena* arena, String8List* out, IR_Node* select_outpu
   task.capture_structured = capture_structured;
   task.out_result_set = out_result_set;
   task.worker_lists = push_array(scratch.arena, String8List, task_count);
-
+  
   TP_Arena* pool_arena = app_thread_pool_arena();
   TP_Temp temp = tp_temp_begin(pool_arena);
   tp_for_parallel(pool, pool_arena, task_count, app_select_format_task, &task);
-
+  
   if (capture_structured)
   {
     // tec: copy cell_text into caller's arena
@@ -564,7 +564,7 @@ app_select_format_dispatch(Arena* arena, String8List* out, IR_Node* select_outpu
     }
   }
   tp_temp_end(temp);
-
+  
   scratch_end(scratch);
 }
 
@@ -572,9 +572,9 @@ internal APP_QueryResult
 app_execute_query_capture(Arena* arena, String8 sql_query, GDB_Database** io_database, APP_ResultSet* out_result_set)
 {
   ProfBeginFunction();
-
+  
   if (out_result_set) { MemoryZeroStruct(out_result_set); }
-
+  
   APP_QueryResult result = {0};
   String8List out = {0};
   
@@ -697,6 +697,7 @@ app_execute_query_capture(Arena* arena, String8 sql_query, GDB_Database** io_dat
       case IR_NodeType_Explain:
       {
         IR_Node* select_ir_node = ir_node_find_child(ir_execution_node, IR_NodeType_Select);
+        B32 is_analyze = str8_match(ir_execution_node->value, str8_lit("analyze"), 0);
         
         if (!database)
         {
@@ -704,15 +705,45 @@ app_execute_query_capture(Arena* arena, String8 sql_query, GDB_Database** io_dat
         }
         else if (!select_ir_node)
         {
-          log_error("explain: only 'explain select ...' is supported");
+          log_error("explain: only 'explain [analyze] select ...' is supported");
         }
         else
         {
           ir_expand_star_to_columns(arena, database, select_ir_node);
           
           PLAN_Node* plan = plan_build_from_select(arena, database, select_ir_node);
-          APP_EMIT("Query plan:\n");
-          plan_print(arena, &out, plan, 0);
+          
+          if (is_analyze)
+          {
+            QE_TraceCtx* trace = qe_trace_ctx_alloc(arena);
+            // tec: EXPLAIN ANALYZE reports plan+stats text
+            PLAN_ExecResult result = plan_execute(arena, database, plan, select_ir_node, trace);
+            APP_EMIT("Query plan (analyzed):\n");
+            plan_print_analyzed(arena, &out, plan, trace, 0);
+            if (!result.supported)
+            {
+              APP_EMIT("\n(note: query has no supported execution path - stats above reflect only the portion that ran)\n");
+            }
+            
+            B32 any_warm_cache = 0;
+            for (QE_NodeTrace* record = trace->records; record != 0 && !any_warm_cache; record = record->next)
+            {
+              if (record->node_type == PLAN_NodeType_Scan || record->node_type == PLAN_NodeType_Filter)
+              {
+                any_warm_cache = record->scan.gpu_cache_hit_count > 0;
+              }
+            }
+            if (any_warm_cache)
+            {
+              APP_EMIT("\n(note: one or more scans reused a warm GPU-resident buffer from a prior query - "
+                       "re-run after DDL/reload to see cold-cache timings)\n");
+            }
+          }
+          else
+          {
+            APP_EMIT("Query plan:\n");
+            plan_print(arena, &out, plan, 0);
+          }
         }
       } break;
       
@@ -1306,14 +1337,14 @@ app_execute_query_capture(Arena* arena, String8 sql_query, GDB_Database** io_dat
         }
         else if (gdb_table_may_have_nulls(table))
         {
-          scan = qe_cpu_scan_filter(arena, table, where_clause);
+          scan = qe_cpu_scan_filter(arena, table, where_clause, NULL);
         }
         else
         {
-          scan = qe_scan_filter(arena, database, table, where_clause);
+          scan = qe_scan_filter(arena, database, table, where_clause, NULL);
         }
         
-        // tec: FOREIGN KEY RESTRICT 
+        // tec: FOREIGN KEY RESTRICT
         // check every row before removing any of them, so a violation partway through doesnt leave the delete half applied
         B32 restricted = 0;
         for (U64 i = 0; i < scan.count; i++)
@@ -1522,7 +1553,7 @@ app_execute_query_capture(Arena* arena, String8 sql_query, GDB_Database** io_dat
           {
             U64 column_count = 0;
             for (IR_Node* c = select_output_columns->first; c != NULL; c = c->next) column_count++;
-
+            
             SelectColGather* gathered = push_array(scratch.arena, SelectColGather, Max(column_count, 1));
             
             U64 gather_start = os_now_microseconds();
@@ -1568,7 +1599,7 @@ app_execute_query_capture(Arena* arena, String8 sql_query, GDB_Database** io_dat
             U64 format_start = os_now_microseconds();
             
             app_select_format_dispatch(arena, &out, select_output_columns, gathered, column_count,
-                                        &result.rows, result_count, capture_structured, out_result_set);
+                                       &result.rows, result_count, capture_structured, out_result_set);
             log_info("select cell format/emit total time: %llu microseconds", os_now_microseconds() - format_start);
           }
           
@@ -1619,7 +1650,7 @@ app_perform_kernel(Arena* arena, GDB_Database* database, IR_Node* root_node)
   ProfBeginFunction();
   
   PLAN_Node* plan = plan_build_from_select(arena, database, root_node);
-  PLAN_ExecResult result = plan_execute(arena, database, plan, root_node);
+  PLAN_ExecResult result = plan_execute(arena, database, plan, root_node, NULL);
   
   if (!result.supported)
   {

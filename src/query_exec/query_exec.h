@@ -102,6 +102,99 @@ struct QE_StringConstRef
   U32 byte_len;
 };
 
+//~ tec: EXPLAIN ANALYZE trace/stats
+typedef enum QE_TraceStrategy
+{
+  QE_TraceStrategy_None,
+  QE_TraceStrategy_IndexScan,
+  QE_TraceStrategy_CpuScan,
+  QE_TraceStrategy_GpuScan,
+} QE_TraceStrategy;
+
+typedef struct QE_ScanTrace QE_ScanTrace;
+struct QE_ScanTrace
+{
+  QE_TraceStrategy strategy;
+  String8 strategy_reason;
+  
+  U64 rows_before, rows_after;
+  U64 zonemap_pruned_rows, zonemap_chunk_count;
+  String8 zonemap_column_name; 
+  
+  // dict_hit=0 with dict_decision_made=1 means "literal not in dict, 0 rows scanned"
+  B32 dict_decision_made;
+  B32 dict_hit; 
+  U64 dict_size;
+  
+  U64 gpu_cache_hit_bytes;
+  U64 gpu_cache_hit_count;
+  U64 gpu_cache_miss_bytes;
+  U64 gpu_cache_miss_count;
+  
+  U64 gpu_kernel_time_us;
+  U64 submit_wait_time_us;
+  U64 load_from_disk_time_us;
+  U64 buffer_alloc_time_us;
+  U64 prefetch_stall_time_us;
+  U64 chunk_count;
+};
+
+typedef struct QE_JoinTrace QE_JoinTrace;
+struct QE_JoinTrace
+{
+  U64 build_row_count;
+  U64 probe_row_count;
+  U64 output_row_count;
+  U64 build_time_us;
+  U64 probe_dispatch_time_us;
+  U64 probe_download_time_us;
+};
+
+typedef struct QE_AggregateTrace QE_AggregateTrace;
+struct QE_AggregateTrace
+{
+  U64 input_row_count;
+  U64 group_count;
+  U64 gather_time_us;
+  U64 assign_time_us;
+  U64 reduce_time_us;
+  U64 combine_time_us;
+};
+
+typedef struct QE_SortTrace QE_SortTrace;
+struct QE_SortTrace
+{
+  U64 row_count;
+  U64 gpu_time_us;
+};
+
+typedef struct QE_NodeTrace QE_NodeTrace;
+struct QE_NodeTrace
+{
+  QE_NodeTrace* next;
+  PLAN_Node* plan_node; // tec: PLAN_Node/PLAN_NodeType come from planner/plan_node.h, included before this file (see main.c)
+  PLAN_NodeType node_type;
+  union
+  {
+    QE_ScanTrace scan;
+    QE_JoinTrace join;
+    QE_AggregateTrace aggregate;
+    QE_SortTrace sort;
+  };
+};
+
+typedef struct QE_TraceCtx QE_TraceCtx;
+struct QE_TraceCtx
+{
+  Arena* arena;
+  QE_NodeTrace* records;
+  QE_NodeTrace* records_last;
+};
+
+internal QE_TraceCtx* qe_trace_ctx_alloc(Arena* arena);
+internal QE_NodeTrace* qe_trace_record_begin(QE_TraceCtx* trace, PLAN_Node* plan_node, PLAN_NodeType node_type);
+internal QE_NodeTrace* qe_trace_find(QE_TraceCtx* trace, PLAN_Node* plan_node);
+
 internal void qe_bytecode_emit(QE_BytecodeProgram* prog, U32 word);
 internal U32 qe_add_numeric_const(QE_BytecodeProgram* prog, F64 value);
 internal QE_StringConstRef qe_add_string_const(QE_BytecodeProgram* prog, String8 str);
@@ -109,7 +202,7 @@ internal QE_ColumnBinding* qe_find_binding(QE_BytecodeProgram* prog, String8 col
 internal QE_ColumnBinding* qe_bind_column(QE_BytecodeProgram* prog, GDB_Table* table, String8 column_name);
 internal QE_Opcode qe_opcode_from_comparison_operator(String8 op);
 internal void qe_compile_load_value(QE_BytecodeProgram* prog, GDB_Table* table, IR_Node* node);
-internal void qe_compile_condition(QE_BytecodeProgram* prog, GDB_Table* table, IR_Node* condition);
+internal void qe_compile_condition(QE_BytecodeProgram* prog, GDB_Table* table, IR_Node* condition, QE_ScanTrace* out_trace);
 
 typedef struct QE_ScanResult QE_ScanResult;
 struct QE_ScanResult
@@ -118,18 +211,19 @@ struct QE_ScanResult
   U64 count;
 };
 
-internal void qe_bytecode_program_build(Arena* arena, QE_BytecodeProgram* prog, GDB_Database* database, GDB_Table* table, IR_Node* root_node, IR_Node* where_clause);
+internal void qe_bytecode_program_build(Arena* arena, QE_BytecodeProgram* prog, GDB_Database* database, GDB_Table* table, IR_Node* root_node, IR_Node* where_clause, QE_ScanTrace* out_trace);
 internal U32 qe_bytecode_program_max_stack_depth(QE_BytecodeProgram* prog);
-internal QE_ScanResult qe_scan_filter(Arena* arena, GDB_Database* database, GDB_Table* table, IR_Node* where_clause);
+internal QE_ScanResult qe_scan_filter(Arena* arena, GDB_Database* database, GDB_Table* table, IR_Node* where_clause, QE_ScanTrace* out_trace);
 internal B32 qe_try_index_scan(Arena* arena, GDB_Table* table, IR_Node* where_clause, QE_ScanResult* out_result);
-internal QE_ScanResult qe_cpu_scan_filter(Arena* arena, GDB_Table* table, IR_Node* where_clause);
+internal QE_ScanResult qe_cpu_scan_filter(Arena* arena, GDB_Table* table, IR_Node* where_clause, QE_ScanTrace* out_trace);
 
 internal B32 qe_resolve_leaf_comparison(GDB_Table* table, IR_Node* condition,
                                         GDB_Column** out_column,
                                         B32* out_is_eq, B32* out_is_lt, B32* out_is_le, B32* out_is_gt, B32* out_is_ge,
                                         B32* out_is_string, F64* out_target_numeric, String8* out_target_string);
 internal Rng1U64* qe_scan_build_dispatch_ranges(Arena* arena, GDB_Table* table, IR_Node* where_clause,
-                                                U64 rows_per_chunk, U64* out_range_count, U64* out_pruned_rows);
+                                                U64 rows_per_chunk, U64* out_range_count, U64* out_pruned_rows,
+                                                String8* out_pruned_column_name);
 
 //~ tec: shared query-result representation
 #define PLAN_NULL_ROW max_U64 // tec: unmatched side of a LEFT JOIN - treat a column read against this as NULL
@@ -188,7 +282,7 @@ internal GDB_StringDataChunk qe_gather_string_column(Arena* arena, PLAN_RowSet* 
 // so they cant be configured via settings
 #define QE_SORT_MAX_KEYS   4
 #define QE_SORT_MAX_TABLES 4
-internal PLAN_RowSet qe_sort_rows(Arena* arena, PLAN_RowSet* rows, IR_Node* order_by_ir);
+internal PLAN_RowSet qe_sort_rows(Arena* arena, PLAN_RowSet* rows, IR_Node* order_by_ir, QE_SortTrace* out_trace);
 internal PLAN_Materialized qe_sort_materialized(Arena* arena, PLAN_Materialized* m, IR_Node* order_by_ir);
 
 //~ tec: aggregate
@@ -197,12 +291,12 @@ internal PLAN_Materialized qe_sort_materialized(Arena* arena, PLAN_Materialized*
 #define QE_AGG_MAX_EXPRS      8
 
 // tec: aggregate func_codes. must stay in sync with aggregate_reduce.comp/aggregate_reduce_f32.comp's FUNC_* defines
-#define QE_AGG_FUNC_COUNT                 0
+#define QE_AGG_FUNC_COUNT                  0
 #define QE_AGG_FUNC_SUM                    1
 #define QE_AGG_FUNC_AVG                    2
 #define QE_AGG_FUNC_MIN                    3
 #define QE_AGG_FUNC_MAX                    4
-#define QE_AGG_FUNC_APPROX_COUNT_DISTINCT 5
+#define QE_AGG_FUNC_APPROX_COUNT_DISTINCT  5
 #define QE_AGG_FUNC_APPROX_PERCENTILE      6
 #define QE_AGG_FUNC_COUNT_CODES            7 // tec: one past the last valid func_code, for policy table sizing
 
@@ -225,11 +319,11 @@ global QE_AggFuncPolicy qe_agg_func_policy[QE_AGG_FUNC_COUNT_CODES] =
 
 internal F64 qe_hll_estimate_cardinality(U32* registers, U64 num_registers);
 
-internal PLAN_Materialized qe_aggregate(Arena* arena, GDB_Database* database, PLAN_RowSet* input, IR_Node* group_by_ir, IR_Node* column_list_ir, IR_Node* having_ir);
+internal PLAN_Materialized qe_aggregate(Arena* arena, GDB_Database* database, PLAN_RowSet* input, IR_Node* group_by_ir, IR_Node* column_list_ir, IR_Node* having_ir, QE_AggregateTrace* out_trace);
 internal PLAN_Materialized qe_apply_having(Arena* arena, PLAN_Materialized* m, IR_Node* having_ir);
 
 //~ tec: GPU build/probe equi-join
-internal PLAN_RowSet qe_hash_join(Arena* arena, PLAN_RowSet* left, GDB_Table* right_table, String8 right_alias, String8 join_type, IR_Node* condition);
+internal PLAN_RowSet qe_hash_join(Arena* arena, PLAN_RowSet* left, GDB_Table* right_table, String8 right_alias, String8 join_type, IR_Node* condition, QE_JoinTrace* out_trace);
 internal B32 qe_column_belongs_to_table(GDB_Table* table, String8 alias, String8 column_name);
 internal IR_Node* qe_find_equi_condition(PLAN_RowSet* left_rows, GDB_Table* right_table, String8 right_alias, IR_Node* condition);
 internal PLAN_RowSet qe_filter_joined_rows(Arena* arena, PLAN_RowSet* rows, IR_Node* condition);

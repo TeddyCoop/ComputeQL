@@ -200,7 +200,7 @@ qe_compile_load_value(QE_BytecodeProgram* prog, GDB_Table* table, IR_Node* node)
 }
 
 internal void
-qe_compile_condition(QE_BytecodeProgram* prog, GDB_Table* table, IR_Node* condition)
+qe_compile_condition(QE_BytecodeProgram* prog, GDB_Table* table, IR_Node* condition, QE_ScanTrace* out_trace)
 {
   if (!condition) return;
   
@@ -218,15 +218,15 @@ qe_compile_condition(QE_BytecodeProgram* prog, GDB_Table* table, IR_Node* condit
   
   if (str8_match(op, str8_lit("and"), StringMatchFlag_CaseInsensitive))
   {
-    qe_compile_condition(prog, table, left);
-    qe_compile_condition(prog, table, right);
+    qe_compile_condition(prog, table, left, out_trace);
+    qe_compile_condition(prog, table, right, out_trace);
     qe_bytecode_emit(prog, QE_Opcode_And);
     return;
   }
   else if (str8_match(op, str8_lit("or"), StringMatchFlag_CaseInsensitive))
   {
-    qe_compile_condition(prog, table, left);
-    qe_compile_condition(prog, table, right);
+    qe_compile_condition(prog, table, left, out_trace);
+    qe_compile_condition(prog, table, right, out_trace);
     qe_bytecode_emit(prog, QE_Opcode_Or);
     return;
   }
@@ -277,12 +277,20 @@ qe_compile_condition(QE_BytecodeProgram* prog, GDB_Table* table, IR_Node* condit
         gdb_column_ensure_string_dict(binding->column);
         if (binding->column->has_dict)
         {
+          if (out_trace)
+          {
+            out_trace->dict_decision_made = 1;
+            out_trace->dict_size = binding->column->dict->value_count;
+          }
+          
           U32 code = 0;
           if (!gdb_string_dict_code_from_value(binding->column->dict, right->value, &code))
           {
+            if (out_trace) out_trace->dict_hit = 0;
             qe_bytecode_emit(prog, QE_Opcode_PushFalse);
             return;
           }
+          if (out_trace) out_trace->dict_hit = 1;
           
           QE_ColumnBinding* dict_binding = qe_bind_column_dict_codes(prog, table, left->value);
           if (dict_binding)
@@ -376,7 +384,7 @@ qe_compile_condition(QE_BytecodeProgram* prog, GDB_Table* table, IR_Node* condit
 }
 
 internal void
-qe_bytecode_program_build(Arena* arena, QE_BytecodeProgram* prog, GDB_Database* database, GDB_Table* table, IR_Node* root_node, IR_Node* where_clause)
+qe_bytecode_program_build(Arena* arena, QE_BytecodeProgram* prog, GDB_Database* database, GDB_Table* table, IR_Node* root_node, IR_Node* where_clause, QE_ScanTrace* out_trace)
 {
   MemoryZeroStruct(prog);
   prog->arena = arena;
@@ -389,7 +397,7 @@ qe_bytecode_program_build(Arena* arena, QE_BytecodeProgram* prog, GDB_Database* 
   
   if (where_clause && where_clause->first)
   {
-    qe_compile_condition(prog, table, where_clause->first);
+    qe_compile_condition(prog, table, where_clause->first, out_trace);
   }
   else
   {
@@ -614,15 +622,58 @@ qe_prefetch_stop(QE_PrefetchCtx* ctx)
   arena_release(ctx->slots[1].arena);
 }
 
+//~ tec: EXPLAIN ANALYZE trace/stats
+
+internal QE_TraceCtx*
+qe_trace_ctx_alloc(Arena* arena)
+{
+  QE_TraceCtx* trace = push_array(arena, QE_TraceCtx, 1);
+  trace->arena = arena;
+  return trace;
+}
+
+internal QE_NodeTrace*
+qe_trace_record_begin(QE_TraceCtx* trace, PLAN_Node* plan_node, PLAN_NodeType node_type)
+{
+  if (!trace) return 0;
+  
+  QE_NodeTrace* record = push_array(trace->arena, QE_NodeTrace, 1);
+  record->plan_node = plan_node;
+  record->node_type = node_type;
+  
+  if (trace->records_last)
+  {
+    trace->records_last->next = record;
+    trace->records_last = record;
+  }
+  else
+  {
+    trace->records = trace->records_last = record;
+  }
+  
+  return record;
+}
+
+internal QE_NodeTrace*
+qe_trace_find(QE_TraceCtx* trace, PLAN_Node* plan_node)
+{
+  if (!trace) return 0;
+  for (QE_NodeTrace* record = trace->records; record != 0; record = record->next)
+  {
+    if (record->plan_node == plan_node) return record;
+  }
+  return 0;
+}
+
 internal QE_ScanResult
-qe_scan_filter(Arena* arena, GDB_Database* database, GDB_Table* table, IR_Node* where_clause)
+qe_scan_filter(Arena* arena, GDB_Database* database, GDB_Table* table, IR_Node* where_clause, QE_ScanTrace* out_trace)
 {
   ProfBeginFunction();
   
   QE_ScanResult result = {0};
   
   QE_BytecodeProgram* prog = push_array(arena, QE_BytecodeProgram, 1);
-  qe_bytecode_program_build(arena, prog, database, table, NULL, where_clause);
+  qe_bytecode_program_build(arena, prog, database, table, NULL, where_clause, out_trace);
   
   U32 stack_depth = qe_bytecode_program_max_stack_depth(prog);
   log_info("scan_filter bytecode peak operand-stack depth: %u (of MAX_STACK=%u)", stack_depth, (U32)QE_SCAN_MAX_STACK);
@@ -631,8 +682,13 @@ qe_scan_filter(Arena* arena, GDB_Database* database, GDB_Table* table, IR_Node* 
   {
     log_error("qe_scan_filter: WHERE clause needs operand-stack depth %u, exceeding scan_filter.comp's MAX_STACK (%u) - falling back to CPU scan to avoid a GPU stack overflow",
               stack_depth, (U32)QE_SCAN_MAX_STACK);
+    if (out_trace)
+    {
+      out_trace->strategy = QE_TraceStrategy_CpuScan;
+      out_trace->strategy_reason = str8_lit("WHERE clause exceeds GPU operand-stack depth");
+    }
     ProfEnd();
-    return qe_cpu_scan_filter(arena, table, where_clause);
+    return qe_cpu_scan_filter(arena, table, where_clause, out_trace);
   }
   
   GPU_Kernel* kernel = gpu_kernel_alloc(str8_lit("scan_filter"));
@@ -692,6 +748,8 @@ qe_scan_filter(Arena* arena, GDB_Database* database, GDB_Table* table, IR_Node* 
   U64 prefetch_stall_time = 0;
   U64 buffer_alloc_time = 0;
   U64 submit_wait_time = 0;
+  U64 gpu_cache_hit_bytes = 0, gpu_cache_hit_count = 0;
+  U64 gpu_cache_miss_bytes = 0, gpu_cache_miss_count = 0;
   
   U64 gpu_max_buffer_size = settings_u64(str8_lit("GPU_MAX_BUFFER_SIZE"), GPU_MAX_BUFFER_SIZE);
   B32 needs_chunking = largest_column_size > gpu_max_buffer_size;
@@ -716,11 +774,20 @@ qe_scan_filter(Arena* arena, GDB_Database* database, GDB_Table* table, IR_Node* 
   // fewer, differently sized dispatches. fall back to chunk_index*rows_per_chunk if no leaf of the where clause is prunable
   U64 chunk_count = 0;
   U64 pruned_rows = 0;
-  Rng1U64* dispatch_ranges = qe_scan_build_dispatch_ranges(arena, table, where_clause, rows_per_chunk, &chunk_count, &pruned_rows);
+  String8 pruned_column_name = {0};
+  Rng1U64* dispatch_ranges = qe_scan_build_dispatch_ranges(arena, table, where_clause, rows_per_chunk, &chunk_count, &pruned_rows, &pruned_column_name);
   if (pruned_rows > 0)
   {
     log_info("qe_scan_filter: zone-map pruning skipped %llu of %llu rows, %llu dispatch range(s) remain",
              pruned_rows, table->row_count, chunk_count);
+  }
+  if (out_trace)
+  {
+    out_trace->rows_before = table->row_count;
+    out_trace->zonemap_pruned_rows = pruned_rows;
+    out_trace->zonemap_chunk_count = chunk_count;
+    out_trace->zonemap_column_name = pruned_column_name;
+    out_trace->chunk_count = chunk_count;
   }
   
   // tec: only worth a background thread + two extra arenas when there's a next chunk to hide IO for the common single-chunk case
@@ -788,6 +855,8 @@ qe_scan_filter(Arena* arena, GDB_Database* database, GDB_Table* table, IR_Node* 
       {
         log_info("qe_scan_filter: reusing GPU-resident buffer for column '%.*s' (generation %llu, %llu bytes) - no read, no re-upload",
                  str8_varg(binding->name), binding->column->gpu_upload_generation, binding->column->gpu_upload_data_size);
+        gpu_cache_hit_count++;
+        gpu_cache_hit_bytes += binding->column->gpu_upload_data_size;
       }
       
       if (binding->use_dict_codes)
@@ -808,6 +877,8 @@ qe_scan_filter(Arena* arena, GDB_Database* database, GDB_Table* table, IR_Node* 
           {
             binding->column->gpu_upload_generation = binding->column->write_generation;
             binding->column->gpu_upload_data_size = in->size;
+            gpu_cache_miss_count++;
+            gpu_cache_miss_bytes += in->size;
           }
         }
         else
@@ -854,6 +925,8 @@ qe_scan_filter(Arena* arena, GDB_Database* database, GDB_Table* table, IR_Node* 
         column_slot_used[binding->first_slot] = 1;
         binding->column->gpu_upload_generation = binding->column->write_generation;
         binding->column->gpu_upload_data_size = in->size;
+        gpu_cache_miss_count++;
+        gpu_cache_miss_bytes += in->size;
       }
       else if (in->valid)
       {
@@ -969,6 +1042,18 @@ qe_scan_filter(Arena* arena, GDB_Database* database, GDB_Table* table, IR_Node* 
   {
     log_info("prefetch stall time (time the GPU sat idle waiting on disk I/O the pipeline failed to hide): %llu microseconds", prefetch_stall_time);
   }
+  if (out_trace)
+  {
+    out_trace->gpu_kernel_time_us = gpu_kernel_execution_time;
+    out_trace->load_from_disk_time_us = load_data_from_disk_time;
+    out_trace->buffer_alloc_time_us = buffer_alloc_time;
+    out_trace->submit_wait_time_us = submit_wait_time;
+    out_trace->prefetch_stall_time_us = prefetch_stall_time;
+    out_trace->gpu_cache_hit_bytes = gpu_cache_hit_bytes;
+    out_trace->gpu_cache_hit_count = gpu_cache_hit_count;
+    out_trace->gpu_cache_miss_bytes = gpu_cache_miss_bytes;
+    out_trace->gpu_cache_miss_count = gpu_cache_miss_count;
+  }
   
   ProfBegin("flatten result chunks");
   {
@@ -988,6 +1073,8 @@ qe_scan_filter(Arena* arena, GDB_Database* database, GDB_Table* table, IR_Node* 
     }
   }
   ProfEnd();
+  
+  if (out_trace) out_trace->rows_after = result.count;
   
   ProfEnd();
   return result;
@@ -1647,7 +1734,7 @@ qe_sort_rows_compare(const void* a, const void* b)
 }
 
 internal PLAN_RowSet
-qe_sort_rows(Arena* arena, PLAN_RowSet* rows, IR_Node* order_by_ir)
+qe_sort_rows(Arena* arena, PLAN_RowSet* rows, IR_Node* order_by_ir, QE_SortTrace* out_trace)
 {
   ProfBeginFunction();
   
@@ -1845,8 +1932,14 @@ qe_sort_rows(Arena* arena, PLAN_RowSet* rows, IR_Node* order_by_ir)
   U32* sorted_payload = push_array(scratch.arena, U32, padded_count * 9);
   gpu_batch_buffer_read(sort_batch, payload_buf, sorted_payload, payload_size);
   gpu_batch_end(sort_batch);
+  U64 sort_gpu_time_us = gpu_get_executed_kernel_time_microseconds();
   log_info("qe_sort_rows: bitonic sort (real_count=%llu, padded_count=%llu, num_stages=%u, keys=%s) GPU kernel time: %llu microseconds",
-           real_count, padded_count, num_stages, use_narrow_keys ? "f32" : "f64", gpu_get_executed_kernel_time_microseconds());
+           real_count, padded_count, num_stages, use_narrow_keys ? "f32" : "f64", sort_gpu_time_us);
+  if (out_trace)
+  {
+    out_trace->row_count = real_count;
+    out_trace->gpu_time_us = sort_gpu_time_us;
+  }
   
   gpu_buffer_release(keys_buf);
   gpu_buffer_release(payload_buf);
@@ -2196,9 +2289,9 @@ qe_agg_output_type_for_expr(QE_AggExprInfo* expr, GDB_ColumnType* out_type, U32*
   *out_type = qe_agg_func_policy[expr->func_code].output_type;
   *out_decimal_scale = 0;
   *out_enum_type = NULL;
-
+  
   if (!expr->arg_column) return;
-
+  
   if (expr->func_code == QE_AGG_FUNC_MIN || expr->func_code == QE_AGG_FUNC_MAX)
   {
     *out_type = expr->arg_column->type;
@@ -2210,11 +2303,11 @@ qe_agg_output_type_for_expr(QE_AggExprInfo* expr, GDB_ColumnType* out_type, U32*
     switch (expr->arg_column->type)
     {
       case GDB_ColumnType_U32: case GDB_ColumnType_U64: case GDB_ColumnType_Bool:
-        *out_type = GDB_ColumnType_U64;
-        break;
+      *out_type = GDB_ColumnType_U64;
+      break;
       case GDB_ColumnType_I32: case GDB_ColumnType_I64:
-        *out_type = GDB_ColumnType_I64;
-        break;
+      *out_type = GDB_ColumnType_I64;
+      break;
       default: break;
     }
   }
@@ -2362,7 +2455,7 @@ qe_aggregate_build_output(Arena* arena, PLAN_RowSet* input, IR_Node* column_list
 }
 
 internal PLAN_Materialized
-qe_aggregate(Arena* arena, GDB_Database* database, PLAN_RowSet* input, IR_Node* group_by_ir, IR_Node* column_list_ir, IR_Node* having_ir)
+qe_aggregate(Arena* arena, GDB_Database* database, PLAN_RowSet* input, IR_Node* group_by_ir, IR_Node* column_list_ir, IR_Node* having_ir, QE_AggregateTrace* out_trace)
 {
   ProfBeginFunction();
   
@@ -3176,6 +3269,15 @@ qe_aggregate(Arena* arena, GDB_Database* database, PLAN_RowSet* input, IR_Node* 
            qe_agg_t_reduced - qe_agg_t_assigned,
            qe_agg_t_combined - qe_agg_t_reduced,
            qe_agg_t_combined - qe_agg_t_start);
+  if (out_trace)
+  {
+    out_trace->input_row_count = row_count;
+    out_trace->group_count = num_groups;
+    out_trace->gather_time_us = qe_agg_t_gathered - qe_agg_t_start;
+    out_trace->assign_time_us = qe_agg_t_assigned - qe_agg_t_gathered;
+    out_trace->reduce_time_us = qe_agg_t_reduced - qe_agg_t_assigned;
+    out_trace->combine_time_us = qe_agg_t_combined - qe_agg_t_reduced;
+  }
   
   scratch_end(scratch);
   ProfEnd();
@@ -3709,9 +3811,11 @@ qe_zonemap_chunk_is_prunable(QE_ZonemapLeaf* leaf, GDB_ZoneMapChunk* chunk)
 
 internal Rng1U64*
 qe_scan_build_dispatch_ranges(Arena* arena, GDB_Table* table, IR_Node* where_clause,
-                              U64 rows_per_chunk, U64* out_range_count, U64* out_pruned_rows)
+                              U64 rows_per_chunk, U64* out_range_count, U64* out_pruned_rows,
+                              String8* out_pruned_column_name)
 {
   *out_pruned_rows = 0;
+  *out_pruned_column_name = (String8){0};
   
   U64 uniform_range_count = (table->row_count == 0) ? 0 : (table->row_count + rows_per_chunk - 1) / rows_per_chunk;
   
@@ -3807,7 +3911,9 @@ qe_scan_build_dispatch_ranges(Arena* arena, GDB_Table* table, IR_Node* where_cla
   }
   
   //- tec: mark each zone map chunk prunable if any kept leaf proves it empty
+  // tec: if multiple columns are independently eligible, this reports whichever leaf's column happened to prune the first chunk its checked against
   B32* chunk_prunable = push_array(scratch.arena, B32, zone_map_chunk_count);
+  String8 first_pruned_column_name = {0};
   for (U64 z = 0; z < zone_map_chunk_count; z++)
   {
     for (U32 i = 0; i < zonemap_leaf_count; i++)
@@ -3816,6 +3922,7 @@ qe_scan_build_dispatch_ranges(Arena* arena, GDB_Table* table, IR_Node* where_cla
       if (qe_zonemap_chunk_is_prunable(&zonemap_leaves[i], chunk))
       {
         chunk_prunable[z] = 1;
+        if (first_pruned_column_name.size == 0) first_pruned_column_name = zonemap_leaves[i].column->name;
         break;
       }
     }
@@ -3861,6 +3968,7 @@ qe_scan_build_dispatch_ranges(Arena* arena, GDB_Table* table, IR_Node* where_cla
   
   *out_range_count = range_count;
   *out_pruned_rows = pruned_rows;
+  *out_pruned_column_name = first_pruned_column_name;
   scratch_end(scratch);
   return ranges;
 }
@@ -3899,12 +4007,24 @@ qe_column_belongs_to_rowset(PLAN_RowSet* rows, String8 column_name)
 internal IR_Node*
 qe_validate_equi_condition(PLAN_RowSet* left_rows, GDB_Table* right_table, String8 right_alias, IR_Node* condition)
 {
-  if (!condition || condition->type != IR_NodeType_Operator) return NULL;
-  if (!(str8_match(condition->value, str8_lit("="), 0) || str8_match(condition->value, str8_lit("=="), 0))) return NULL;
+  if (!condition || condition->type != IR_NodeType_Operator) 
+  {
+    return NULL;
+  }
+  if (!(str8_match(condition->value, str8_lit("="), 0) || 
+        str8_match(condition->value, str8_lit("=="), 0))) 
+  {
+    return NULL;
+  }
   
   IR_Node* left = condition->first;
   IR_Node* right = left ? left->next : NULL;
-  if (!left || !right || left->type != IR_NodeType_Column || right->type != IR_NodeType_Column) return NULL;
+  if (!left || !right || 
+      left->type != IR_NodeType_Column || 
+      right->type != IR_NodeType_Column) 
+  {
+    return NULL;
+  }
   
   B32 left_is_right = qe_column_belongs_to_table(right_table, right_alias, left->value);
   B32 right_is_right = qe_column_belongs_to_table(right_table, right_alias, right->value);
@@ -3918,7 +4038,10 @@ qe_validate_equi_condition(PLAN_RowSet* left_rows, GDB_Table* right_table, Strin
 internal IR_Node*
 qe_find_equi_condition(PLAN_RowSet* left_rows, GDB_Table* right_table, String8 right_alias, IR_Node* condition)
 {
-  if (!condition) return NULL;
+  if (!condition) 
+  {
+    return NULL;
+  }
   
   if (condition->type == IR_NodeType_Operator && str8_match(condition->value, str8_lit("and"), StringMatchFlag_CaseInsensitive))
   {
@@ -3926,7 +4049,10 @@ qe_find_equi_condition(PLAN_RowSet* left_rows, GDB_Table* right_table, String8 r
     IR_Node* right = left ? left->next : NULL;
     
     IR_Node* found = qe_find_equi_condition(left_rows, right_table, right_alias, left);
-    if (found) return found;
+    if (found)
+    {
+      return found;
+    }
     return qe_find_equi_condition(left_rows, right_table, right_alias, right);
   }
   
@@ -3944,15 +4070,29 @@ qe_row_load_value(Arena* arena, PLAN_RowSet* rows, IR_Node* node, U64 output_row
     String8 bare = {0};
     U64 slot = max_U64;
     GDB_Table* table = qe_resolve_column_table(rows, node->value, &bare, &slot);
-    if (!table) return 0.0;
+    if (!table) 
+    {
+      return 0.0;
+    }
     
     U64 row = rows->row_indices[slot][output_row];
-    if (row == PLAN_NULL_ROW) { *out_is_null = 1; return 0.0; }
+    if (row == PLAN_NULL_ROW) 
+    {
+      *out_is_null = 1; 
+      return 0.0; 
+    }
     
     GDB_Column* column = gdb_table_find_column(table, bare);
-    if (!column) return 0.0;
+    if (!column) 
+    {
+      return 0.0;
+    }
     
-    if (gdb_column_is_null(column, row)) { *out_is_null = 1; return 0.0; }
+    if (gdb_column_is_null(column, row)) 
+    { 
+      *out_is_null = 1; 
+      return 0.0; 
+    }
     
     if (column->type == GDB_ColumnType_String8)
     {
@@ -3982,7 +4122,10 @@ qe_row_condition_eval(Arena* arena, PLAN_RowSet* rows, IR_Node* condition, U64 o
     B32 is_str = 0, is_null = 0;
     String8 s = {0};
     F64 v = qe_row_load_value(arena, rows, condition, output_row, &is_str, &s, &is_null);
-    if (is_null) return 0;
+    if (is_null) 
+    {
+      return 0;
+    }
     return is_str ? (s.size > 0) : (v != 0.0);
   }
   
@@ -4119,10 +4262,11 @@ internal THREAD_POOL_TASK_FUNC(qe_cpu_scan_filter_task)
 }
 
 internal QE_ScanResult
-qe_cpu_scan_filter(Arena* arena, GDB_Table* table, IR_Node* where_clause)
+qe_cpu_scan_filter(Arena* arena, GDB_Table* table, IR_Node* where_clause, QE_ScanTrace* out_trace)
 {
   QE_ScanResult result = {0};
   U64 row_count = table->row_count;
+  if (out_trace) out_trace->rows_before = row_count;
   
   Temp scratch = scratch_begin(&arena, 1);
   
@@ -4172,10 +4316,18 @@ qe_cpu_scan_filter(Arena* arena, GDB_Table* table, IR_Node* where_clause)
     out_i += task.task_matched_counts[t];
   }
   
-  log_info("qe_cpu_scan_filter: CPU scan (row_count=%llu) total time: %llu microseconds", row_count, os_now_microseconds() - cpu_scan_start);
+  U64 cpu_scan_time_us = os_now_microseconds() - cpu_scan_start;
+  log_info("qe_cpu_scan_filter: CPU scan (row_count=%llu) total time: %llu microseconds", row_count, cpu_scan_time_us);
   
   result.indices = matched;
   result.count = matched_count;
+  
+  if (out_trace)
+  {
+    out_trace->rows_after = matched_count;
+    out_trace->gpu_kernel_time_us = 0; // tec: no GPU involved 
+    out_trace->submit_wait_time_us = cpu_scan_time_us;
+  }
   
   scratch_end(scratch);
   return result;
@@ -4209,7 +4361,7 @@ qe_filter_joined_rows(Arena* arena, PLAN_RowSet* rows, IR_Node* condition)
 }
 
 internal PLAN_RowSet
-qe_hash_join(Arena* arena, PLAN_RowSet* left, GDB_Table* right_table, String8 right_alias, String8 join_type, IR_Node* condition)
+qe_hash_join(Arena* arena, PLAN_RowSet* left, GDB_Table* right_table, String8 right_alias, String8 join_type, IR_Node* condition, QE_JoinTrace* out_trace)
 {
   ProfBeginFunction();
   PLAN_RowSet result = {0};
@@ -4399,6 +4551,7 @@ qe_hash_join(Arena* arena, PLAN_RowSet* left, GDB_Table* right_table, String8 ri
   
   U32* bucket_count_readback = push_array(scratch.arena, U32, num_buckets);
   
+  U64 build_start_us = out_trace ? os_now_microseconds() : 0;
   GPU_Batch* build_batch = gpu_batch_begin(build_data_size + build_off_size, num_buckets * sizeof(U32));
   gpu_batch_buffer_write(build_batch, build_data_buf, build_data, build_data_size);
   if (is_string_key) gpu_batch_buffer_write(build_batch, build_off_buf, build_offsets, build_off_size);
@@ -4409,6 +4562,7 @@ qe_hash_join(Arena* arena, PLAN_RowSet* left, GDB_Table* right_table, String8 ri
   }
   gpu_batch_buffer_read(build_batch, bucket_count_buf, bucket_count_readback, num_buckets * sizeof(U32));
   gpu_batch_end(build_batch);
+  if (out_trace) out_trace->build_time_us = os_now_microseconds() - build_start_us;
   
   gpu_kernel_release(build_kernel);
   
@@ -4506,6 +4660,7 @@ qe_hash_join(Arena* arena, PLAN_RowSet* left, GDB_Table* right_table, String8 ri
   if (is_string_key) probe_upload_bytes += probe_off_size;
   
   U64 match_count = 0;
+  U64 probe_dispatch_start_us = out_trace ? os_now_microseconds() : 0;
   for (;;)
   {
     U32 match_count32 = 0;
@@ -4567,15 +4722,27 @@ qe_hash_join(Arena* arena, PLAN_RowSet* left, GDB_Table* right_table, String8 ri
     gpu_kernel_set_arg_u64(probe_kernel, 4, out_capacity);
   }
   
+  if (out_trace) out_trace->probe_dispatch_time_us = os_now_microseconds() - probe_dispatch_start_us;
   gpu_kernel_release(scatter_kernel);
   
+  U64 download_start_us = out_trace ? os_now_microseconds() : 0;
   U32* pairs_readback = push_array(scratch.arena, U32, Max(match_count, 1) * 4);
   if (match_count > 0)
   {
     gpu_buffer_read(out_pairs_buf, pairs_readback, match_count * 4 * sizeof(U32));
   }
+  if (out_trace) out_trace->probe_download_time_us = os_now_microseconds() - download_start_us;
   
   gpu_kernel_release(probe_kernel);
+  
+  if (out_trace)
+  {
+    out_trace->build_row_count = build_row_count;
+    out_trace->probe_row_count = probe_row_count;
+    out_trace->output_row_count = match_count;
+    log_info("qe_hash_join: build_row_count=%llu probe_row_count=%llu phases (us): build=%llu probe_dispatch=%llu probe_download=%llu",
+             build_row_count, probe_row_count, out_trace->build_time_us, out_trace->probe_dispatch_time_us, out_trace->probe_download_time_us);
+  }
   
   // tec: expand (probe_array_index, build_row) pairs into the final multi-table row set
   // the left sides existing table columns come along unchanged, the right table is appended

@@ -47,6 +47,7 @@ global String8 g_sql_keywords[] =
   str8_lit_comp("create"),
   str8_lit_comp("describe"),
   str8_lit_comp("explain"),
+  str8_lit_comp("analyze"),
   str8_lit_comp("contains"),
   str8_lit_comp("equals"),
   str8_lit_comp("drop"),

@@ -11,6 +11,7 @@
 #include "gdb/gdb_inc.h"
 #include "ir_gen/ir_gen_inc.h"
 #include "gpu/gpu_inc.h"
+#include "planner/plan_node.h"
 #include "query_exec/query_exec.h"
 #include "planner/planner.h"
 #include "application.h"
@@ -163,7 +164,7 @@ aa_run_gdb(Arena* arena, GDB_Database* database, String8 sql_text)
   IR_Node* select_node = ir_query->execution_nodes;
   ir_expand_star_to_columns(arena, database, select_node);
   PLAN_Node* plan = plan_build_from_select(arena, database, select_node);
-  PLAN_ExecResult result = plan_execute(arena, database, plan, select_node);
+  PLAN_ExecResult result = plan_execute(arena, database, plan, select_node, NULL);
   return result.materialized;
 }
 

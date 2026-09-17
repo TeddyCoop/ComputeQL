@@ -645,10 +645,15 @@ sql_parse_explain_clause(SQL_ParseCtx *ctx)
 {
   sql_advance(ctx, 1); // move past 'explain'
   
+  // tec: EXPLAIN ANALYZE actually runs the query and reports real stats
+  // plain EXPLAIN stays a static plan shape dump
+  B32 analyze = sql_match(ctx, SQL_TokenType_Keyword, str8_lit("analyze"));
+  
   if (!sql_check(ctx, SQL_TokenType_Keyword, str8_lit("select")))
   {
     sql_parse_error_at(sql_ctx_error_range(ctx),
-                       "expected 'select' after 'explain', found '%.*s'",
+                       "expected 'select' after 'explain%s', found '%.*s'",
+                       analyze ? " analyze" : "",
                        str8_varg(sql_ctx_text_or_eof(ctx)));
     return NULL;
   }
@@ -658,6 +663,8 @@ sql_parse_explain_clause(SQL_ParseCtx *ctx)
   
   SQL_Node* explain_node = push_array(ctx->arena, SQL_Node, 1);
   explain_node->type = SQL_NodeType_Explain;
+  // tec: explain_node->value is otherwise unused
+  explain_node->value = analyze ? str8_lit("analyze") : (String8){0};
   explain_node->first = explain_node->last = select_node;
   select_node->parent = explain_node;
   

@@ -320,7 +320,7 @@ bench_run_gdb_query(GDB_Database* database, String8 sql_text, U64* out_row_count
     IR_Node* select_node = ir_query->execution_nodes;
     ir_expand_star_to_columns(arena, database, select_node);
     PLAN_Node* plan = plan_build_from_select(arena, database, select_node);
-    PLAN_ExecResult result = plan_execute(arena, database, plan, select_node);
+    PLAN_ExecResult result = plan_execute(arena, database, plan, select_node, NULL);
     U64 row_count = 0;
     bench_gdb_consume_result(&result, select_node, &row_count);
 
@@ -349,7 +349,7 @@ bench_run_gdb_query(GDB_Database* database, String8 sql_text, U64* out_row_count
 
     U64 t1 = os_now_microseconds();
 
-    PLAN_ExecResult result = plan_execute(arena, database, plan, select_node);
+    PLAN_ExecResult result = plan_execute(arena, database, plan, select_node, NULL);
     U64 row_count = 0;
     U64 checksum = bench_gdb_consume_result(&result, select_node, &row_count);
 
