@@ -23,6 +23,11 @@ layout(local_size_x = 256) in;
 #define OP_STR_CONTAINS  12
 #define OP_HALT          13
 #define OP_PUSH_FALSE    14
+#define OP_TRIGRAM_SIM   15
+#define OP_EDIT_DISTANCE 16
+
+// tec: QE_TRIGRAM_MAX_NEEDLE_LEN/QE_EDIT_DISTANCE_MAX_NEEDLE_LEN settings can only lower this cap. cause this is done at compile time
+#define QE_FUZZY_MAX_NEEDLE_LEN 64
 
 #define COLTYPE_U32      1
 #define COLTYPE_U64      2
@@ -193,12 +198,109 @@ str_contains(uint slot, uint row, uint const_word_offset, uint const_len)
   return false;
 }
 
+//~ tec: Jaccard-style trigram similarity in [0,1]. greedy needle gram matching
+double
+trigram_similarity(uint slot, uint row, uint const_word_offset, uint const_len, uint n)
+{
+  uint start = read_str_offset(slot + 1u, row);
+  uint end = read_str_offset(slot + 1u, row + 1u);
+  uint len = end - start;
+
+  if (len < n || const_len < n)
+  {
+    if (len != const_len) return 0.0LF;
+    for (uint i = 0u; i < len; i++)
+    {
+      if (read_col_byte(slot, start + i) != read_str_const_byte(const_word_offset, i))
+			{
+				return 0.0LF;
+			}
+    }
+    return 1.0LF;
+  }
+  if (len > MAX_SANE_STRING_LEN) return 0.0LF;
+
+  uint needle_grams = min(const_len - n + 1u, QE_FUZZY_MAX_NEEDLE_LEN);
+  bool needle_used[QE_FUZZY_MAX_NEEDLE_LEN];
+  for (uint j = 0u; j < needle_grams; j++) needle_used[j] = false;
+
+  uint haystack_grams = len - n + 1u;
+  uint shared_grams = 0u;
+  for (uint i = 0u; i < haystack_grams; i++)
+  {
+    for (uint j = 0u; j < needle_grams; j++)
+    {
+      if (needle_used[j]) continue;
+      bool match = true;
+      for (uint k = 0u; k < n; k++)
+      {
+        if (read_col_byte(slot, start + i + k) != read_str_const_byte(const_word_offset, j + k))
+        {
+          match = false;
+          break;
+        }
+      }
+      if (match)
+      {
+        needle_used[j] = true;
+        shared_grams++;
+        break;
+      }
+    }
+  }
+
+  uint union_size = haystack_grams + needle_grams - shared_grams;
+  return (union_size == 0u) ? 0.0LF : double(shared_grams) / double(union_size);
+}
+
+//~ tec: bounded rolling row Levenshtein distance 
+double
+edit_distance(uint slot, uint row, uint const_word_offset, uint const_len)
+{
+  uint start = read_str_offset(slot + 1u, row);
+  uint end = read_str_offset(slot + 1u, row + 1u);
+  uint len = end - start;
+
+  if (len > MAX_SANE_STRING_LEN) return double(MAX_SANE_STRING_LEN);
+
+  uint needle_len = min(const_len, QE_FUZZY_MAX_NEEDLE_LEN);
+  uint dp[QE_FUZZY_MAX_NEEDLE_LEN + 1u];
+  for (uint j = 0u; j <= needle_len; j++) dp[j] = j;
+
+  for (uint i = 1u; i <= len; i++)
+  {
+    uint prev_diag = dp[0];
+    dp[0] = i;
+    uint haystack_byte = read_col_byte(slot, start + i - 1u);
+    for (uint j = 1u; j <= needle_len; j++)
+    {
+      uint tmp = dp[j];
+      uint needle_byte = read_str_const_byte(const_word_offset, j - 1u);
+      uint cost = (haystack_byte == needle_byte) ? 0u : 1u;
+      uint del = dp[j] + 1u;
+      uint ins = dp[j - 1u] + 1u;
+      uint sub = prev_diag + cost;
+      dp[j] = min(min(del, ins), sub);
+      prev_diag = tmp;
+    }
+  }
+
+  return double(dp[needle_len]);
+}
+
 void
 main()
 {
   uint row_count = pc.words[0];
   uint row = gl_GlobalInvocationID.x;
   if (row >= row_count) return;
+
+  // tec: pc.words[2]/[4] are the lo words of push-constant slots
+	// score_flags bit0=has_aux_score, bit1=score_is_distance
+  uint score_flags = pc.words[2];
+  bool has_aux_score = (score_flags & 1u) != 0u;
+  uint trigram_n = max(pc.words[4], 1u);
+  uint aux_score_bits = 0u;
 
   double stack[MAX_STACK];
   int sp = 0;
@@ -320,6 +422,26 @@ main()
         stack[sp++] = str_contains(slot, row, const_word_offset, const_len) ? 1.0LF : 0.0LF;
       } break;
 
+      case OP_TRIGRAM_SIM:
+      {
+        uint slot = bytecode[ip++];
+        uint const_word_offset = bytecode[ip++];
+        uint const_len = bytecode[ip++];
+        double score = trigram_similarity(slot, row, const_word_offset, const_len, trigram_n);
+        aux_score_bits = floatBitsToUint(float(score));
+        stack[sp++] = score;
+      } break;
+
+      case OP_EDIT_DISTANCE:
+      {
+        uint slot = bytecode[ip++];
+        uint const_word_offset = bytecode[ip++];
+        uint const_len = bytecode[ip++];
+        double score = edit_distance(slot, row, const_word_offset, const_len);
+        aux_score_bits = uint(score);
+        stack[sp++] = score;
+      } break;
+
       default:
       {
         running = false;
@@ -334,7 +456,7 @@ main()
     if (pos < out_indices.length() / 2u)
     {
       out_indices[pos * 2u + 0u] = row;
-      out_indices[pos * 2u + 1u] = 0u;
+      out_indices[pos * 2u + 1u] = has_aux_score ? aux_score_bits : 0u;
     }
   }
 }

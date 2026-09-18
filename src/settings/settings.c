@@ -13,15 +13,23 @@ settings_init(void)
   settings_set(str8_lit("GPU_BATCH_MAX_PENDING_READS"), str8_lit("8"));
   settings_set(str8_lit("GPU_VULKAN_MEM_BLOCK_SIZE"), str8_lit("1mb"));
   settings_set(str8_lit("GPU_VULKAN_MAX_MEM_BLOCKS"), str8_lit("64"));
+  
   settings_set(str8_lit("QE_BYTECODE_MAX_WORDS"), str8_lit("4096"));
   settings_set(str8_lit("QE_MAX_NUMERIC_CONSTS"), str8_lit("256"));
   settings_set(str8_lit("QE_STRING_CONST_POOL_SIZE"), str8_lit("64kb"));
   settings_set(str8_lit("QE_SCAN_OUTPUT_DEFAULT_CAP_ROWS"), str8_lit("65536"));
   settings_set(str8_lit("QE_AGG_ROWS_PER_CHUNK"), str8_lit("4096"));
+  
   settings_set(str8_lit("QE_HLL_PRECISION"), str8_lit("10"));
   settings_set(str8_lit("QE_HLL_SKETCH_MAX_TOTAL_BYTES"), str8_lit("64mb"));
+  
   settings_set(str8_lit("QE_TDIGEST_SKETCH_MAX_TOTAL_BYTES"), str8_lit("64mb"));
   settings_set(str8_lit("QE_INDEX_SCAN_MAX_AND_LEAVES"), str8_lit("16"));
+  
+  settings_set(str8_lit("QE_TRIGRAM_N"), str8_lit("3"));
+  settings_set(str8_lit("QE_TRIGRAM_MAX_NEEDLE_LEN"), str8_lit("64"));
+  settings_set(str8_lit("QE_EDIT_DISTANCE_MAX_NEEDLE_LEN"), str8_lit("64"));
+  
   settings_set(str8_lit("APP_THREAD_POOL_WORKER_COUNT"), str8_lit("0"));
 }
 

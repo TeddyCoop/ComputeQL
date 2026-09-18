@@ -380,6 +380,7 @@ typedef struct SelectColGather SelectColGather;
 struct SelectColGather
 {
   B32 resolved;
+  B32 is_score;
   GDB_Table* col_table;
   GDB_Column* column;
   U64 table_slot;
@@ -424,7 +425,8 @@ internal THREAD_POOL_TASK_FUNC(app_select_format_task)
       }
       
       U64 row_index = task->rows->row_indices[task->gathered[ci].table_slot][i];
-      if (row_index == PLAN_NULL_ROW || gdb_column_is_null(task->gathered[ci].column, row_index))
+      if (row_index == PLAN_NULL_ROW ||
+          (!task->gathered[ci].is_score && gdb_column_is_null(task->gathered[ci].column, row_index)))
       {
         if (!capture_structured) { str8_list_push(arena, &local_out, str8_lit("NULL ")); }
         if (capture_structured) { out_result_set->cell_is_null[cell_i] = 1; }
@@ -461,7 +463,9 @@ internal THREAD_POOL_TASK_FUNC(app_select_format_task)
         if (!capture_structured) { str8_list_push(arena, &local_out, push_str8f(arena, "%lf ", task->gathered[ci].numeric_values[i])); }
         if (capture_structured)
         {
-          out_result_set->cell_text[cell_i] = app_format_cell_text(arena, task->gathered[ci].type, task->gathered[ci].numeric_values[i], (String8){0}, task->gathered[ci].column->decimal_scale, task->gathered[ci].column->enum_type);
+          U32 decimal_scale = task->gathered[ci].column ? task->gathered[ci].column->decimal_scale : 0;
+          GDB_EnumType* enum_type = task->gathered[ci].column ? task->gathered[ci].column->enum_type : 0;
+          out_result_set->cell_text[cell_i] = app_format_cell_text(arena, task->gathered[ci].type, task->gathered[ci].numeric_values[i], (String8){0}, decimal_scale, enum_type);
           out_result_set->cell_numeric[cell_i] = task->gathered[ci].numeric_values[i];
         }
         break;
@@ -1559,10 +1563,49 @@ app_execute_query_capture(Arena* arena, String8 sql_query, GDB_Database** io_dat
             U64 gather_start = os_now_microseconds();
             
             U64 ci = 0;
-            for (IR_Node* column_node = select_output_columns->first; 
-                 column_node != NULL; 
+            for (IR_Node* column_node = select_output_columns->first;
+                 column_node != NULL;
                  column_node = column_node->next, ci++)
             {
+              B32 is_distance = 0;
+              if (qe_ir_is_fuzzy_call(column_node, &is_distance))
+              {
+                if (result.rows.table_count != 1)
+                {
+                  log_error("SELECT %.*s(): fuzzy search is only supported over a single base table", str8_varg(column_node->value));
+                  continue;
+                }
+                
+                IR_Node* col_arg = column_node->first;
+                IR_Node* needle_arg = col_arg ? col_arg->next : 0;
+                
+                B32 scores_match = result.rows.scores && col_arg && needle_arg &&
+                  result.rows.score_is_distance == is_distance &&
+                  str8_match(result.rows.score_column_name, col_arg->value, 0) &&
+                  str8_match(result.rows.score_needle, needle_arg->value, 0);
+                
+                F64* score_values;
+                if (scores_match)
+                {
+                  score_values = result.rows.scores;
+                }
+                else
+                {
+                  score_values = push_array(scratch.arena, F64, Max(result_count, 1));
+                  for (U64 i = 0; i < result_count; i++)
+                  {
+                    score_values[i] = qe_row_eval_fuzzy_call(scratch.arena, &result.rows, column_node, i, is_distance);
+                  }
+                }
+                
+                gathered[ci].resolved = 1;
+                gathered[ci].is_score = 1;
+                gathered[ci].table_slot = 0;
+                gathered[ci].type = GDB_ColumnType_F64;
+                gathered[ci].numeric_values = score_values;
+                continue;
+              }
+              
               String8 bare_name = {0};
               U64 table_slot = max_U64;
               GDB_Table* col_table = qe_resolve_column_table(&result.rows, column_node->value, &bare_name, &table_slot);

@@ -11,8 +11,11 @@ plan_ir_contains_aggregate(IR_Node* node)
 {
   for (IR_Node* n = node; n != NULL; n = n->next)
   {
-    if (n->type == IR_NodeType_AggregateCall) return 1;
-    if (plan_ir_contains_aggregate(n->first)) return 1;
+    if ((n->type == IR_NodeType_AggregateCall && !qe_ir_is_fuzzy_call(n, 0)) ||
+        plan_ir_contains_aggregate(n->first)) 
+    {
+      return 1;
+    }
   }
   return 0;
 }
@@ -162,6 +165,10 @@ plan_wrap_scan_result(Arena* arena, GDB_Table* table, String8 alias, QE_ScanResu
   result.rows.row_indices = push_array(arena, U64*, 1);
   result.rows.row_indices[0] = scan_result.indices;
   result.rows.count = scan_result.count;
+  result.rows.scores = scan_result.scores;
+  result.rows.score_is_distance = scan_result.score_is_distance;
+  result.rows.score_column_name = scan_result.score_column_name;
+  result.rows.score_needle = scan_result.score_needle;
   result.supported = 1;
   return result;
 }

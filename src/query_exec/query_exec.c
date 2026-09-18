@@ -231,8 +231,7 @@ qe_compile_condition(QE_BytecodeProgram* prog, GDB_Table* table, IR_Node* condit
     return;
   }
   
-  // tec: because null checking is weird, theres no right side operand.
-  // so this needs to be checked now
+  // tec: because null checking is weird, theres no right side operand. so this needs to be checked now
   if (str8_match(op, str8_lit("is null"), StringMatchFlag_CaseInsensitive) ||
       str8_match(op, str8_lit("is not null"), StringMatchFlag_CaseInsensitive))
   {
@@ -246,6 +245,50 @@ qe_compile_condition(QE_BytecodeProgram* prog, GDB_Table* table, IR_Node* condit
       qe_bytecode_emit(prog, QE_Opcode_PushConst);
       qe_bytecode_emit(prog, qe_add_numeric_const(prog, 0.0));
     }
+    return;
+  }
+  
+  // tec: fuzzy search. SIMILARITY(col,'term')/EDIT_DISTANCE(col,'term') op threshold
+  if (left && qe_ir_is_fuzzy_call(left, 0))
+  {
+    B32 is_distance = 0;
+    qe_ir_is_fuzzy_call(left, &is_distance);
+    
+    IR_Node* col_arg = left->first;
+    IR_Node* needle_arg = col_arg ? col_arg->next : 0;
+    QE_ColumnBinding* binding = (col_arg && col_arg->type == IR_NodeType_Column) ? qe_bind_column(prog, table, col_arg->value) : 0;
+    
+    if (!right || !col_arg || !needle_arg || !binding || binding->type != GDB_ColumnType_String8)
+    {
+      log_error("qe_compile_condition: %.*s() requires (string column, string literal) and a comparison", str8_varg(left->value));
+      qe_bytecode_emit(prog, QE_Opcode_PushTrue);
+      return;
+    }
+    
+    U64 max_needle_len = is_distance
+      ? settings_u64(str8_lit("QE_EDIT_DISTANCE_MAX_NEEDLE_LEN"), 64)
+      : settings_u64(str8_lit("QE_TRIGRAM_MAX_NEEDLE_LEN"), 64);
+    String8 needle = needle_arg->value;
+    if (needle.size > max_needle_len)
+    {
+      log_error("qe_compile_condition: %.*s() needle longer than max %llu bytes, truncating", str8_varg(left->value), max_needle_len);
+      needle = str8_prefix(needle, max_needle_len);
+    }
+    
+    QE_StringConstRef ref = qe_add_string_const(prog, needle);
+    
+    qe_bytecode_emit(prog, is_distance ? QE_Opcode_EditDistance : QE_Opcode_TrigramSim);
+    qe_bytecode_emit(prog, binding->first_slot);
+    qe_bytecode_emit(prog, ref.word_offset);
+    qe_bytecode_emit(prog, ref.byte_len);
+    
+    prog->has_score_output = 1;
+    prog->score_is_distance = is_distance;
+    prog->score_column_name = col_arg->value;
+    prog->score_needle = needle_arg->value;
+    
+    qe_compile_load_value(prog, table, right);
+    qe_bytecode_emit(prog, qe_opcode_from_comparison_operator(op));
     return;
   }
   
@@ -450,13 +493,15 @@ qe_bytecode_program_max_stack_depth(QE_BytecodeProgram* prog)
       } break;
       
       case QE_Opcode_StrEq:
-      case QE_Opcode_StrContains: 
-      { 
+      case QE_Opcode_StrContains:
+      case QE_Opcode_TrigramSim:
+      case QE_Opcode_EditDistance:
+      {
         ip += 3;
-        depth += 1; 
+        depth += 1;
       } break;
       
-      case QE_Opcode_Halt: 
+      case QE_Opcode_Halt:
       {
         ip = prog->word_count; 
       } break;
@@ -726,11 +771,17 @@ qe_scan_filter(Arena* arena, GDB_Database* database, GDB_Table* table, IR_Node* 
   gpu_kernel_set_arg_buffer(kernel, QE_BINDING_NUM_CONSTS, num_consts_buffer);
   gpu_kernel_set_arg_buffer(kernel, QE_BINDING_STR_CONSTS, str_consts_buffer);
   
+  // tec: query invariant fuzzy search push constants
+  U64 score_flags = prog->has_score_output ? (1u | (prog->score_is_distance ? 2u : 0u)) : 0u;
+  gpu_kernel_set_arg_u64(kernel, QE_PUSH_CONSTANT_SCORE_FLAGS, score_flags);
+  gpu_kernel_set_arg_u64(kernel, QE_PUSH_CONSTANT_TRIGRAM_N, settings_u64(str8_lit("QE_TRIGRAM_N"), 3));
+  
   typedef struct QE_ResultChunk QE_ResultChunk;
   struct QE_ResultChunk
   {
     U64* indices;
     U64 count;
+    F64* scores;
     QE_ResultChunk* next;
   };
   
@@ -1013,13 +1064,28 @@ qe_scan_filter(Arena* arena, GDB_Database* database, GDB_Table* table, IR_Node* 
       gpu_buffer_read(output_buffer, raw_indices, result_count * 2 * sizeof(U32));
       
       U64* chunk_data = push_array(arena, U64, result_count);
+      F64* chunk_scores = prog->has_score_output ? push_array(arena, F64, result_count) : 0;
       for (U64 i = 0; i < result_count; i++)
       {
         chunk_data[i] = chunk_row_start + raw_indices[i * 2 + 0];
+        if (chunk_scores)
+        {
+          U32 bits = raw_indices[i * 2 + 1];
+          if (prog->score_is_distance)
+          {
+            chunk_scores[i] = (F64)bits;
+          }
+          else
+          {
+            F32 f; MemoryCopy(&f, &bits, sizeof(f));
+            chunk_scores[i] = (F64)f;
+          }
+        }
       }
       
       QE_ResultChunk* rc = push_array(arena, QE_ResultChunk, 1);
       rc->indices = chunk_data;
+      rc->scores = chunk_scores;
       rc->count = result_count;
       rc->next = 0;
       *tail = rc;
@@ -1064,12 +1130,25 @@ qe_scan_filter(Arena* arena, GDB_Database* database, GDB_Table* table, IR_Node* 
     }
     result.indices = push_array(arena, U64, Max(total_count, 1));
     result.count = total_count;
+    if (prog->has_score_output)
+    {
+      result.scores = push_array(arena, F64, Max(total_count, 1));
+      result.score_is_distance = prog->score_is_distance;
+      result.score_column_name = prog->score_column_name;
+      result.score_needle = prog->score_needle;
+    }
     
     U64* out_ptr = result.indices;
+    F64* out_scores_ptr = result.scores;
     for (QE_ResultChunk* chunk = result_chunks; chunk; chunk = chunk->next)
     {
       MemoryCopy(out_ptr, chunk->indices, chunk->count * sizeof(U64));
       out_ptr += chunk->count;
+      if (out_scores_ptr && chunk->scores)
+      {
+        MemoryCopy(out_scores_ptr, chunk->scores, chunk->count * sizeof(F64));
+        out_scores_ptr += chunk->count;
+      }
     }
   }
   ProfEnd();
@@ -1757,8 +1836,10 @@ qe_sort_rows(Arena* arena, PLAN_RowSet* rows, IR_Node* order_by_ir, QE_SortTrace
   U64 key_slots[QE_SORT_MAX_KEYS];
   B32 key_desc[QE_SORT_MAX_KEYS];
   B32 key_is_string[QE_SORT_MAX_KEYS];
+  F64* key_fuzzy_scores[QE_SORT_MAX_KEYS];
   U32 num_keys = 0;
   B32 any_string_key = 0;
+  B32 any_fuzzy_key = 0;
   
   for (IR_Node* col_node = order_by_ir->first; col_node != NULL; col_node = col_node->next)
   {
@@ -1768,6 +1849,30 @@ qe_sort_rows(Arena* arena, PLAN_RowSet* rows, IR_Node* order_by_ir, QE_SortTrace
       break;
     }
     
+    key_fuzzy_scores[num_keys] = 0;
+    
+    B32 is_distance = 0;
+    if (qe_ir_is_fuzzy_call(col_node, &is_distance))
+    {
+      if (rows->table_count != 1)
+      {
+        log_error("qe_sort_rows: ORDER BY %.*s() is only supported over a single base table, ignoring", str8_varg(col_node->value));
+        continue;
+      }
+      
+      B32 desc = (col_node->last && col_node->last->type == IR_NodeType_Descending);
+      
+      IR_Node* order_col_arg = col_node->first;
+      IR_Node* order_needle_arg = order_col_arg ? order_col_arg->next : 0;
+      
+      B32 scores_match = rows->scores && order_col_arg && order_needle_arg &&
+        rows->score_is_distance == is_distance &&
+        str8_match(rows->score_column_name, order_col_arg->value, 0) &&
+        str8_match(rows->score_needle, order_needle_arg->value, 0);
+      F64* scores = scores_match ? rows->scores : 0;
+      if (!scores)
+      {
+        scores = push_array(arena, F64, Max(rows->count, 1));
     String8 bare_name = {0};
     U64 slot = max_U64;
     GDB_Table* table = qe_resolve_column_table(rows, col_node->value, &bare_name, &slot);
@@ -1796,9 +1901,8 @@ qe_sort_rows(Arena* arena, PLAN_RowSet* rows, IR_Node* order_by_ir, QE_SortTrace
   
   U64 real_count = rows->count;
   
-  // tec: no GPU string-comparison kernel exists, so a string key (alone or mixed with numeric
-  // keys) sorts a plain row-index array on the CPU instead of going through the bitonic path below
-  if (any_string_key)
+  // tec: no GPU string comparison kernel exists, so a string or fuzzy score key sorts a plain row-index array on the CPU instead of the bitonic path below
+  if (any_string_key || any_fuzzy_key)
   {
     Temp scratch = scratch_begin(&arena, 1);
     
@@ -1806,14 +1910,19 @@ qe_sort_rows(Arena* arena, PLAN_RowSet* rows, IR_Node* order_by_ir, QE_SortTrace
     ctx.num_keys = num_keys;
     for (U32 k = 0; k < num_keys; k++)
     {
-      ctx.key_is_string[k] = key_is_string[k];
       ctx.key_desc[k] = key_desc[k];
-      if (key_is_string[k])
+      if (key_fuzzy_scores[k])
       {
+        ctx.key_is_string[k] = 0;
+        ctx.numeric_keys[k] = key_fuzzy_scores[k];
+      else if (key_is_string[k])
+      {
+        ctx.key_is_string[k] = 1;
         ctx.string_keys[k] = qe_gather_string_column(scratch.arena, rows, key_slots[k], key_columns[k]);
       }
       else
       {
+        ctx.key_is_string[k] = 0;
         ctx.numeric_keys[k] = qe_gather_numeric_column(scratch.arena, rows, key_slots[k], key_columns[k]);
       }
     }
@@ -1836,6 +1945,13 @@ qe_sort_rows(Arena* arena, PLAN_RowSet* rows, IR_Node* order_by_ir, QE_SortTrace
       }
     }
     
+    if (rows->scores)
+    {
+      F64* sorted_scores = push_array(arena, F64, real_count);
+      for (U64 i = 0; i < real_count; i++)
+      {
+        sorted_scores[i] = rows->scores[order[i]];
+      }
     scratch_end(scratch);
     ProfEnd();
     return result;
@@ -3298,6 +3414,93 @@ qe_str8_contains(String8 haystack, String8 needle)
   return 0;
 }
 
+// tec: reference for fuzzy search
+internal F64
+qe_str8_trigram_similarity(String8 haystack, String8 needle)
+{
+  U64 n = settings_u64(str8_lit("QE_TRIGRAM_N"), 3);
+  if (n == 0) n = 3;
+  
+  if (haystack.size < n || needle.size < n)
+  {
+    return (haystack.size == needle.size && MemoryMatch(haystack.str, needle.str, haystack.size)) ? 1.0 : 0.0;
+  }
+  
+  U64 haystack_grams = haystack.size - n + 1;
+  U64 needle_grams = needle.size - n + 1;
+  
+  Temp scratch = scratch_begin(0, 0);
+  B32* needle_used = push_array(scratch.arena, B32, needle_grams);
+  
+  U64 shared = 0;
+  for (U64 i = 0; i < haystack_grams; i++)
+  {
+    for (U64 j = 0; j < needle_grams; j++)
+    {
+      if (!needle_used[j] && MemoryMatch(haystack.str + i, needle.str + j, n))
+      {
+        needle_used[j] = 1;
+        shared++;
+        break;
+      }
+    }
+  }
+  
+  U64 union_size = haystack_grams + needle_grams - shared;
+  F64 result = (union_size == 0) ? 0.0 : (F64)shared / (F64)union_size;
+  
+  scratch_end(scratch);
+  return result;
+}
+
+internal U64
+qe_str8_edit_distance(String8 haystack, String8 needle)
+{
+  Temp scratch = scratch_begin(0, 0);
+  U64 row_len = needle.size + 1;
+  U64* dp = push_array(scratch.arena, U64, row_len);
+  for (U64 j = 0; j < row_len; j++) dp[j] = j;
+  
+  for (U64 i = 1; i <= haystack.size; i++)
+  {
+    U64 prev_diag = dp[0];
+    dp[0] = i;
+    for (U64 j = 1; j <= needle.size; j++)
+    {
+      U64 tmp = dp[j];
+      U64 cost = (haystack.str[i - 1] == needle.str[j - 1]) ? 0 : 1;
+      U64 del = dp[j] + 1;
+      U64 ins = dp[j - 1] + 1;
+      U64 sub = prev_diag + cost;
+      dp[j] = Min(Min(del, ins), sub);
+      prev_diag = tmp;
+    }
+  }
+  
+  U64 result = dp[needle.size];
+  scratch_end(scratch);
+  return result;
+}
+
+internal B32
+qe_ir_is_fuzzy_call(IR_Node* node, B32* out_is_distance)
+{
+  if (!node || node->type != IR_NodeType_AggregateCall) return 0;
+  
+  if (str8_match(node->value, str8_lit("similarity"), StringMatchFlag_CaseInsensitive))
+  {
+    if (out_is_distance) *out_is_distance = 0;
+    return 1;
+  }
+  if (str8_match(node->value, str8_lit("edit_distance"), StringMatchFlag_CaseInsensitive) ||
+      str8_match(node->value, str8_lit("levenshtein"), StringMatchFlag_CaseInsensitive))
+  {
+    if (out_is_distance) *out_is_distance = 1;
+    return 1;
+  }
+  return 0;
+}
+
 internal F64
 qe_having_load_value(PLAN_Materialized* m, IR_Node* node, U64 row, B32* out_is_string, String8* out_string)
 {
@@ -4112,6 +4315,26 @@ qe_row_load_value(Arena* arena, PLAN_RowSet* rows, IR_Node* node, U64 output_row
   return f64_from_str8(node->value);
 }
 
+internal F64
+qe_row_eval_fuzzy_call(Arena* arena, PLAN_RowSet* rows, IR_Node* call, U64 output_row, B32 is_distance)
+{
+  IR_Node* col_arg = call->first;
+  IR_Node* needle_arg = col_arg ? col_arg->next : 0;
+  if (!col_arg || !needle_arg)
+  {
+    log_error("qe_row_eval_fuzzy_call: %.*s() requires (column, string literal)", str8_varg(call->value));
+    return 0.0;
+  }
+  
+  B32 is_str = 0, is_null = 0;
+  String8 haystack = {0};
+  qe_row_load_value(arena, rows, col_arg, output_row, &is_str, &haystack, &is_null);
+  if (is_null || !is_str) return is_distance ? (F64)needle_arg->value.size : 0.0;
+  
+  return is_distance ? (F64)qe_str8_edit_distance(haystack, needle_arg->value)
+    : qe_str8_trigram_similarity(haystack, needle_arg->value);
+}
+
 internal B32
 qe_row_condition_eval(Arena* arena, PLAN_RowSet* rows, IR_Node* condition, U64 output_row)
 {
@@ -4157,6 +4380,35 @@ qe_row_condition_eval(Arena* arena, PLAN_RowSet* rows, IR_Node* condition, U64 o
     
     B32 is_not = str8_match(op, str8_lit("is not null"), StringMatchFlag_CaseInsensitive);
     return is_not ? !lnull : lnull;
+  }
+  
+  // tec: fuzzy search
+  if (left && qe_ir_is_fuzzy_call(left, 0))
+  {
+    if (!right)
+    {
+      log_error("qe_row_condition_eval: %.*s() used without a comparison", str8_varg(left->value));
+      return 1;
+    }
+    
+    B32 is_distance = 0;
+    qe_ir_is_fuzzy_call(left, &is_distance);
+    F64 score = qe_row_eval_fuzzy_call(arena, rows, left, output_row, is_distance);
+    
+    B32 rstr = 0, rnull = 0;
+    String8 rs = {0};
+    F64 rv = qe_row_load_value(arena, rows, right, output_row, &rstr, &rs, &rnull);
+    if (rnull) return 0;
+    
+    if (str8_match(op, str8_lit("="), 0) || str8_match(op, str8_lit("=="), 0)) return score == rv;
+    if (str8_match(op, str8_lit("!="), 0)) return score != rv;
+    if (str8_match(op, str8_lit("<="), 0)) return score <= rv;
+    if (str8_match(op, str8_lit(">="), 0)) return score >= rv;
+    if (str8_match(op, str8_lit("<"), 0)) return score < rv;
+    if (str8_match(op, str8_lit(">"), 0)) return score > rv;
+    
+    log_error("qe_row_condition_eval: unsupported operator '%.*s' for fuzzy predicate", str8_varg(op));
+    return 1;
   }
   
   if (!left || !right)

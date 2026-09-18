@@ -11,7 +11,9 @@
 //  binding 5: reserved
 //  binding 6..15: dynamically bound column buffers (up to QE_MAX_COLUMN_BINDINGS slots)
 //
-//  push constant word 0 (U64 index 0): row_count
+//  push constant U64 slot 0: row_count
+//  push constant U64 slot 1: fuzzy-search score flags (bit0 has_aux_score, bit1 score_is_distance)
+//  push constant U64 slot 2: trigram N (gram length)
 
 #define QE_BINDING_BYTECODE     0
 #define QE_BINDING_NUM_CONSTS   1
@@ -25,7 +27,10 @@
 // tec: must match every kernel .comp's `layout(local_size_x = ...)`
 #define QE_GPU_WORKGROUP_SIZE 256
 
-#define QE_PUSH_CONSTANT_ROW_COUNT 0
+#define QE_PUSH_CONSTANT_ROW_COUNT  0
+// tec: bit0 = has_aux_scorebit1 = score_is_distance (0 = similarity float score, 1 = edit distance)
+#define QE_PUSH_CONSTANT_SCORE_FLAGS 1
+#define QE_PUSH_CONSTANT_TRIGRAM_N   2
 
 // tec: must match scan_filter.comp's MAX_STACK exactly. settings configurable,
 #define QE_SCAN_MAX_STACK 8
@@ -60,6 +65,8 @@ typedef enum QE_Opcode
   QE_Opcode_StrContains = 12,
   QE_Opcode_Halt        = 13,
   QE_Opcode_PushFalse   = 14,
+  QE_Opcode_TrigramSim  = 15,
+  QE_Opcode_EditDistance = 16,
 } QE_Opcode;
 
 typedef struct QE_ColumnBinding QE_ColumnBinding;
@@ -93,6 +100,12 @@ struct QE_BytecodeProgram
   QE_ColumnBinding bindings[QE_MAX_COLUMN_BINDINGS];
   U32 binding_count;
   U32 next_slot;
+  
+  //- tec: used when a SIMILARITY()/EDIT_DISTANCE() call is compiled
+  B32 has_score_output;
+  B32 score_is_distance; // tec: 0 = similarity (float score), 1 = edit distance (integer score)
+  String8 score_column_name;
+  String8 score_needle;
 };
 
 typedef struct QE_StringConstRef QE_StringConstRef;
@@ -204,11 +217,20 @@ internal QE_Opcode qe_opcode_from_comparison_operator(String8 op);
 internal void qe_compile_load_value(QE_BytecodeProgram* prog, GDB_Table* table, IR_Node* node);
 internal void qe_compile_condition(QE_BytecodeProgram* prog, GDB_Table* table, IR_Node* condition, QE_ScanTrace* out_trace);
 
+//~ tec: fuzzy search SIMILARITY()/EDIT_DISTANCE()
+internal B32 qe_ir_is_fuzzy_call(IR_Node* node, B32* out_is_distance);
+internal F64 qe_str8_trigram_similarity(String8 a, String8 b);
+internal U64 qe_str8_edit_distance(String8 a, String8 b);
+
 typedef struct QE_ScanResult QE_ScanResult;
 struct QE_ScanResult
 {
   U64* indices;
   U64 count;
+  F64* scores;
+  B32 score_is_distance;
+  String8 score_column_name;
+  String8 score_needle;
 };
 
 internal void qe_bytecode_program_build(Arena* arena, QE_BytecodeProgram* prog, GDB_Database* database, GDB_Table* table, IR_Node* root_node, IR_Node* where_clause, QE_ScanTrace* out_trace);
@@ -236,6 +258,10 @@ struct PLAN_RowSet
   U64 table_count;
   U64** row_indices;
   U64 count;
+  F64* scores;
+  B32 score_is_distance;
+  String8 score_column_name;
+  String8 score_needle;
 };
 
 typedef struct PLAN_AggColumn PLAN_AggColumn;
@@ -275,6 +301,8 @@ internal U64 qe_rowset_table_slot(PLAN_RowSet* rows, GDB_Table* table);
 
 internal F64* qe_gather_numeric_column(Arena* arena, PLAN_RowSet* rows, U64 table_slot, GDB_Column* column);
 internal GDB_StringDataChunk qe_gather_string_column(Arena* arena, PLAN_RowSet* rows, U64 table_slot, GDB_Column* column);
+
+internal F64 qe_row_eval_fuzzy_call(Arena* arena, PLAN_RowSet* rows, IR_Node* call, U64 output_row, B32 is_distance);
 
 //~ tec: sort
 

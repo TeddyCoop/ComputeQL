@@ -764,6 +764,13 @@ sql_parse_aggregate_call(SQL_ParseCtx *ctx, String8 func_name)
       arg->type = SQL_NodeType_Numeric;
       arg->value = sql_take(ctx).value;
     }
+    else if (sql_check(ctx, SQL_TokenType_String, (String8){0}))
+    {
+      // tec: a quoted string arg, like SIMILARITY(col, 'term') is not a real aggregate
+      arg = push_array(ctx->arena, SQL_Node, 1);
+      arg->type = SQL_NodeType_Literal;
+      arg->value = sql_take(ctx).value;
+    }
     else
     {
       arg = sql_parse_column_ref(ctx);
@@ -2316,7 +2323,13 @@ sql_parse_order_by_clause(SQL_ParseCtx *ctx)
   
   for (;;)
   {
-    SQL_Node* column_node = sql_parse_column_ref(ctx);
+    SQL_Token first_tok = sql_peek(ctx, 0);
+    B32 is_call = (first_tok.type == SQL_TokenType_Identifier &&
+                   sql_peek(ctx, 1).type == SQL_TokenType_Symbol &&
+                   str8_match(sql_peek(ctx, 1).value, str8_lit("("), 0));
+    
+    // tec: identifier(args) -> e.g. ORDER BY SIMILARITY(col,'term') DESC
+    SQL_Node* column_node = is_call ? sql_parse_aggregate_call(ctx, first_tok.value) : sql_parse_column_ref(ctx);
     if (!column_node) return NULL;
     
     if (sql_check(ctx, SQL_TokenType_Keyword, (String8){0}))
@@ -2328,15 +2341,24 @@ sql_parse_order_by_clause(SQL_ParseCtx *ctx)
       if (str8_match(tok.value, str8_lit("asc"), StringMatchFlag_CaseInsensitive))
       {
         sort_node->type = SQL_NodeType_Ascending;
-        column_node->first = sort_node;
-        sort_node->parent = column_node;
-        sql_advance(ctx, 1);
       }
       else if (str8_match(tok.value, str8_lit("desc"), StringMatchFlag_CaseInsensitive))
       {
         sort_node->type = SQL_NodeType_Descending;
-        column_node->first = sort_node;
+      }
+      
+      if (sort_node->type == SQL_NodeType_Ascending || sort_node->type == SQL_NodeType_Descending)
+      {
         sort_node->parent = column_node;
+        if (is_call)
+        {
+          // tec: a call node's ->first/->last already point at its argument list. append instead
+          DLLPushBack(column_node->first, column_node->last, sort_node);
+        }
+        else
+        {
+          column_node->first = sort_node;
+        }
         sql_advance(ctx, 1);
       }
     }
