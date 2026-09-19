@@ -67,6 +67,11 @@ typedef enum QE_Opcode
   QE_Opcode_PushFalse   = 14,
   QE_Opcode_TrigramSim  = 15,
   QE_Opcode_EditDistance = 16,
+  QE_Opcode_StrNe       = 17,
+  QE_Opcode_StrLt       = 18,
+  QE_Opcode_StrGt       = 19,
+  QE_Opcode_StrLe       = 20,
+  QE_Opcode_StrGe       = 21,
 } QE_Opcode;
 
 typedef struct QE_ColumnBinding QE_ColumnBinding;

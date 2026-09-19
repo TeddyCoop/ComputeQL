@@ -136,6 +136,8 @@ ea_run_suite(Arena* arena, Bench_Report* report)
     APP_QueryResult result = app_execute_query_capture(query_arena, str8_lit("EXPLAIN ANALYZE SELECT * FROM fact WHERE value > 45000;"), &database, NULL);
     ea_check_contains(report, str8_lit("zone-map pruning: 'pruned'"), result.output_text, "pruned");
     ea_check_contains(report, str8_lit("zone-map pruning: 'zone map'"), result.output_text, "zone map");
+    ea_check_contains(report, str8_lit("zone-map pruning: scan timing ('gpu=')"), result.output_text, "gpu=");
+    ea_check_contains(report, str8_lit("zone-map pruning: scan timing ('ms')"), result.output_text, "ms");
     arena_clear(query_arena);
   }
   
@@ -143,15 +145,16 @@ ea_run_suite(Arena* arena, Bench_Report* report)
   {
     APP_QueryResult result = app_execute_query_capture(query_arena, str8_lit("EXPLAIN ANALYZE SELECT * FROM fact WHERE category = 'apple';"), &database, NULL);
     ea_check_contains(report, str8_lit("dict hit: 'dict=hit'"), result.output_text, "dict=hit");
+    ea_check_contains(report, str8_lit("dict hit: scan timing ('gpu=')"), result.output_text, "gpu=");
     arena_clear(query_arena);
   }
   
-  //- tec: dictionary miss - the literal isn't in the category dictionary at all, proven false at
-  // compile time (0 rows scanned)
+  //- tec: dictionary miss
   {
     APP_QueryResult result = app_execute_query_capture(query_arena, str8_lit("EXPLAIN ANALYZE SELECT * FROM fact WHERE category = 'nonexistent';"), &database, NULL);
     ea_check_contains(report, str8_lit("dict miss: 'dict=miss'"), result.output_text, "dict=miss");
     ea_check_contains(report, str8_lit("dict miss: '0 rows scanned'"), result.output_text, "0 rows scanned");
+    ea_check_contains(report, str8_lit("dict miss: scan still timed ('ms')"), result.output_text, "ms");
     arena_clear(query_arena);
   }
   
@@ -160,6 +163,10 @@ ea_run_suite(Arena* arena, Bench_Report* report)
     APP_QueryResult result = app_execute_query_capture(query_arena, str8_lit("EXPLAIN ANALYZE SELECT group_key, COUNT(*) FROM fact GROUP BY group_key;"), &database, NULL);
     ea_check_contains(report, str8_lit("GROUP BY: '[Aggregate]'"), result.output_text, "[Aggregate]");
     ea_check_contains(report, str8_lit("GROUP BY: 'groups'"), result.output_text, "groups");
+    ea_check_contains(report, str8_lit("GROUP BY: gather phase timing ('gather=')"), result.output_text, "gather=");
+    ea_check_contains(report, str8_lit("GROUP BY: assign phase timing ('assign=')"), result.output_text, "assign=");
+    ea_check_contains(report, str8_lit("GROUP BY: reduce phase timing ('reduce=')"), result.output_text, "reduce=");
+    ea_check_contains(report, str8_lit("GROUP BY: combine phase timing ('combine=')"), result.output_text, "combine=");
     arena_clear(query_arena);
   }
   
@@ -169,6 +176,9 @@ ea_run_suite(Arena* arena, Bench_Report* report)
     ea_check_contains(report, str8_lit("JOIN: '[Join]'"), result.output_text, "[Join]");
     ea_check_contains(report, str8_lit("JOIN: 'build_rows'"), result.output_text, "build_rows");
     ea_check_contains(report, str8_lit("JOIN: 'probe_rows'"), result.output_text, "probe_rows");
+    ea_check_contains(report, str8_lit("JOIN: build phase timing ('build=')"), result.output_text, "build=");
+    ea_check_contains(report, str8_lit("JOIN: probe phase timing ('probe=')"), result.output_text, "probe=");
+    ea_check_contains(report, str8_lit("JOIN: download phase timing ('download=')"), result.output_text, "download=");
     arena_clear(query_arena);
   }
   
@@ -177,6 +187,16 @@ ea_run_suite(Arena* arena, Bench_Report* report)
     APP_QueryResult result = app_execute_query_capture(query_arena, str8_lit("EXPLAIN ANALYZE SELECT * FROM nullable_fact WHERE flag > 5;"), &database, NULL);
     ea_check_contains(report, str8_lit("CPU fallback: 'CPU scan'"), result.output_text, "CPU scan");
     ea_check_contains(report, str8_lit("CPU fallback: 'NULLs'"), result.output_text, "NULLs");
+    ea_check_contains(report, str8_lit("CPU fallback: scan timing ('time=')"), result.output_text, "time=");
+    arena_clear(query_arena);
+  }
+  
+  //- tec: ORDER BY on a plain (non aggregated) row set
+  // exercises the bitonic sort GPU timing
+  {
+    APP_QueryResult result = app_execute_query_capture(query_arena, str8_lit("EXPLAIN ANALYZE SELECT * FROM fact ORDER BY value DESC LIMIT 10;"), &database, NULL);
+    ea_check_contains(report, str8_lit("ORDER BY: '[Sort]'"), result.output_text, "[Sort]");
+    ea_check_contains(report, str8_lit("ORDER BY: sort phase timing ('gpu=')"), result.output_text, "gpu=");
     arena_clear(query_arena);
   }
   
@@ -186,6 +206,7 @@ ea_run_suite(Arena* arena, Bench_Report* report)
     ea_check_not_contains(report, str8_lit("plain EXPLAIN: no 'pruned'"), result.output_text, "pruned");
     ea_check_not_contains(report, str8_lit("plain EXPLAIN: no 'gpu='"), result.output_text, "gpu=");
     ea_check_not_contains(report, str8_lit("plain EXPLAIN: no 'analyzed'"), result.output_text, "analyzed");
+    ea_check_not_contains(report, str8_lit("plain EXPLAIN: no timing ('ms')"), result.output_text, "ms");
     ea_check_contains(report, str8_lit("plain EXPLAIN: still has 'Query plan:'"), result.output_text, "Query plan:");
     arena_clear(query_arena);
   }

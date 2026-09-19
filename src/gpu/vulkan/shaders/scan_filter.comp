@@ -25,6 +25,11 @@ layout(local_size_x = 256) in;
 #define OP_PUSH_FALSE    14
 #define OP_TRIGRAM_SIM   15
 #define OP_EDIT_DISTANCE 16
+#define OP_STR_NE        17
+#define OP_STR_LT        18
+#define OP_STR_GT        19
+#define OP_STR_LE        20
+#define OP_STR_GE        21
 
 // tec: QE_TRIGRAM_MAX_NEEDLE_LEN/QE_EDIT_DISTANCE_MAX_NEEDLE_LEN settings can only lower this cap. cause this is done at compile time
 #define QE_FUZZY_MAX_NEEDLE_LEN 64
@@ -168,7 +173,30 @@ str_eq(uint slot, uint row, uint const_word_offset, uint const_len)
   return true;
 }
 
-// tec: defensive cap on string length considered by the byte-scan loops below
+// tec: this matches qe_str8_compare. 3 way compare
+int
+str_cmp3(uint slot, uint row, uint const_word_offset, uint const_len)
+{
+  uint start = read_str_offset(slot + 1u, row);
+  uint end = read_str_offset(slot + 1u, row + 1u);
+  uint len = end - start;
+
+  uint min_len = min(len, const_len);
+  for (uint i = 0u; i < min_len; i++)
+  {
+    uint a = read_col_byte(slot, start + i);
+    uint b = read_str_const_byte(const_word_offset, i);
+    if (a != b) 
+		{
+			return (a < b) ? -1 : 1;
+		}
+  }
+  if (len < const_len) return -1;
+  if (len > const_len) return 1;
+  return 0;
+}
+
+// tec: cap on string length considered by the byte scan loops below
 #define MAX_SANE_STRING_LEN 1048576u
 
 bool
@@ -420,6 +448,46 @@ main()
         uint const_word_offset = bytecode[ip++];
         uint const_len = bytecode[ip++];
         stack[sp++] = str_contains(slot, row, const_word_offset, const_len) ? 1.0LF : 0.0LF;
+      } break;
+
+      case OP_STR_NE:
+      {
+        uint slot = bytecode[ip++];
+        uint const_word_offset = bytecode[ip++];
+        uint const_len = bytecode[ip++];
+        stack[sp++] = str_eq(slot, row, const_word_offset, const_len) ? 0.0LF : 1.0LF;
+      } break;
+
+      case OP_STR_LT:
+      {
+        uint slot = bytecode[ip++];
+        uint const_word_offset = bytecode[ip++];
+        uint const_len = bytecode[ip++];
+        stack[sp++] = (str_cmp3(slot, row, const_word_offset, const_len) < 0) ? 1.0LF : 0.0LF;
+      } break;
+
+      case OP_STR_GT:
+      {
+        uint slot = bytecode[ip++];
+        uint const_word_offset = bytecode[ip++];
+        uint const_len = bytecode[ip++];
+        stack[sp++] = (str_cmp3(slot, row, const_word_offset, const_len) > 0) ? 1.0LF : 0.0LF;
+      } break;
+
+      case OP_STR_LE:
+      {
+        uint slot = bytecode[ip++];
+        uint const_word_offset = bytecode[ip++];
+        uint const_len = bytecode[ip++];
+        stack[sp++] = (str_cmp3(slot, row, const_word_offset, const_len) <= 0) ? 1.0LF : 0.0LF;
+      } break;
+
+      case OP_STR_GE:
+      {
+        uint slot = bytecode[ip++];
+        uint const_word_offset = bytecode[ip++];
+        uint const_len = bytecode[ip++];
+        stack[sp++] = (str_cmp3(slot, row, const_word_offset, const_len) >= 0) ? 1.0LF : 0.0LF;
       } break;
 
       case OP_TRIGRAM_SIM:

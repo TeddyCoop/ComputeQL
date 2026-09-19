@@ -307,15 +307,22 @@ qe_compile_condition(QE_BytecodeProgram* prog, GDB_Table* table, IR_Node* condit
     {
       B32 is_contains = str8_match(op, str8_lit("contains"), StringMatchFlag_CaseInsensitive);
       B32 is_eq = str8_match(op, str8_lit("="), 0) || str8_match(op, str8_lit("=="), 0);
+      B32 is_ne = str8_match(op, str8_lit("!="), 0);
+      B32 is_lt = str8_match(op, str8_lit("<"), 0);
+      B32 is_gt = str8_match(op, str8_lit(">"), 0);
+      B32 is_le = str8_match(op, str8_lit("<="), 0);
+      B32 is_ge = str8_match(op, str8_lit(">="), 0);
       
-      if (!is_contains && !is_eq)
+      if (!is_contains && !is_eq && !is_ne && !is_lt && !is_gt && !is_le && !is_ge)
       {
-        log_error("qe_compile_condition: unsupported string operator '%.*s', defaulting to '='", str8_varg(op));
-        is_eq = 1;
+        log_error("qe_compile_condition: unsupported string operator '%.*s'", str8_varg(op));
+        qe_bytecode_emit(prog, QE_Opcode_PushTrue);
+        return;
       }
       
-      // tec: dictionary encoded equality
-      if (is_eq)
+      // tec: dict codes are assigned by insert order during dict build, not sorted.
+      // so only equality/inequality can use them, relational ops must always compare the raw bytes
+      if (is_eq || is_ne)
       {
         gdb_column_ensure_string_dict(binding->column);
         if (binding->column->has_dict)
@@ -330,7 +337,8 @@ qe_compile_condition(QE_BytecodeProgram* prog, GDB_Table* table, IR_Node* condit
           if (!gdb_string_dict_code_from_value(binding->column->dict, right->value, &code))
           {
             if (out_trace) out_trace->dict_hit = 0;
-            qe_bytecode_emit(prog, QE_Opcode_PushFalse);
+            // tec: literal absent from the dictionary matches no row for '=', every row for '!='
+            qe_bytecode_emit(prog, is_ne ? QE_Opcode_PushTrue : QE_Opcode_PushFalse);
             return;
           }
           if (out_trace) out_trace->dict_hit = 1;
@@ -343,15 +351,23 @@ qe_compile_condition(QE_BytecodeProgram* prog, GDB_Table* table, IR_Node* condit
             qe_bytecode_emit(prog, operand);
             qe_bytecode_emit(prog, QE_Opcode_PushConst);
             qe_bytecode_emit(prog, qe_add_numeric_const(prog, (F64)code));
-            qe_bytecode_emit(prog, QE_Opcode_CmpEq);
+            qe_bytecode_emit(prog, is_ne ? QE_Opcode_CmpNe : QE_Opcode_CmpEq);
             return;
           }
         }
       }
       
+      QE_Opcode string_opcode = QE_Opcode_StrEq;
+      if (is_contains) string_opcode = QE_Opcode_StrContains;
+      else if (is_ne) string_opcode = QE_Opcode_StrNe;
+      else if (is_lt) string_opcode = QE_Opcode_StrLt;
+      else if (is_gt) string_opcode = QE_Opcode_StrGt;
+      else if (is_le) string_opcode = QE_Opcode_StrLe;
+      else if (is_ge) string_opcode = QE_Opcode_StrGe;
+      
       QE_StringConstRef ref = qe_add_string_const(prog, right->value);
       
-      qe_bytecode_emit(prog, is_contains ? QE_Opcode_StrContains : QE_Opcode_StrEq);
+      qe_bytecode_emit(prog, string_opcode);
       qe_bytecode_emit(prog, binding->first_slot);
       qe_bytecode_emit(prog, ref.word_offset);
       qe_bytecode_emit(prog, ref.byte_len);
@@ -496,6 +512,11 @@ qe_bytecode_program_max_stack_depth(QE_BytecodeProgram* prog)
       case QE_Opcode_StrContains:
       case QE_Opcode_TrigramSim:
       case QE_Opcode_EditDistance:
+      case QE_Opcode_StrNe:
+      case QE_Opcode_StrLt:
+      case QE_Opcode_StrGt:
+      case QE_Opcode_StrLe:
+      case QE_Opcode_StrGe:
       {
         ip += 3;
         depth += 1;
@@ -1873,6 +1894,19 @@ qe_sort_rows(Arena* arena, PLAN_RowSet* rows, IR_Node* order_by_ir, QE_SortTrace
       if (!scores)
       {
         scores = push_array(arena, F64, Max(rows->count, 1));
+        for (U64 i = 0; i < rows->count; i++)
+        {
+          scores[i] = qe_row_eval_fuzzy_call(arena, rows, col_node, i, is_distance);
+        }
+      }
+      
+      key_fuzzy_scores[num_keys] = scores;
+      key_desc[num_keys] = desc;
+      any_fuzzy_key = 1;
+      num_keys++;
+      continue;
+    }
+    
     String8 bare_name = {0};
     U64 slot = max_U64;
     GDB_Table* table = qe_resolve_column_table(rows, col_node->value, &bare_name, &slot);
@@ -1915,6 +1949,7 @@ qe_sort_rows(Arena* arena, PLAN_RowSet* rows, IR_Node* order_by_ir, QE_SortTrace
       {
         ctx.key_is_string[k] = 0;
         ctx.numeric_keys[k] = key_fuzzy_scores[k];
+      }
       else if (key_is_string[k])
       {
         ctx.key_is_string[k] = 1;
@@ -1952,6 +1987,9 @@ qe_sort_rows(Arena* arena, PLAN_RowSet* rows, IR_Node* order_by_ir, QE_SortTrace
       {
         sorted_scores[i] = rows->scores[order[i]];
       }
+      result.scores = sorted_scores;
+    }
+    
     scratch_end(scratch);
     ProfEnd();
     return result;
@@ -3642,12 +3680,13 @@ qe_having_eval(PLAN_Materialized* m, IR_Node* condition, U64 row)
       return qe_str8_contains(ls, rs);
     }
     
-    B32 eq = qe_str8_compare(ls, rs) == 0;
-    if (str8_match(op, str8_lit("!="), 0))
-    {
-      return !eq;
-    }
-    return eq; // tec: default '=' / '=='
+    S32 cmp = qe_str8_compare(ls, rs);
+    if (str8_match(op, str8_lit("!="), 0)) return cmp != 0;
+    if (str8_match(op, str8_lit("<"), 0)) return cmp < 0;
+    if (str8_match(op, str8_lit(">"), 0)) return cmp > 0;
+    if (str8_match(op, str8_lit("<="), 0)) return cmp <= 0;
+    if (str8_match(op, str8_lit(">="), 0)) return cmp >= 0;
+    return cmp == 0; // tec: default '=' / '=='
   }
   
   if (str8_match(op, str8_lit("="), 0) || str8_match(op, str8_lit("=="), 0)) return lv == rv;
@@ -4469,9 +4508,13 @@ qe_row_condition_eval(Arena* arena, PLAN_RowSet* rows, IR_Node* condition, U64 o
   {
     if (str8_match(op, str8_lit("contains"), StringMatchFlag_CaseInsensitive)) return qe_str8_contains(ls, rs);
     
-    B32 eq = qe_str8_compare(ls, rs) == 0;
-    if (str8_match(op, str8_lit("!="), 0)) return !eq;
-    return eq; // tec: default '=' / '=='
+    S32 cmp = qe_str8_compare(ls, rs);
+    if (str8_match(op, str8_lit("!="), 0)) return cmp != 0;
+    if (str8_match(op, str8_lit("<"), 0)) return cmp < 0;
+    if (str8_match(op, str8_lit(">"), 0)) return cmp > 0;
+    if (str8_match(op, str8_lit("<="), 0)) return cmp <= 0;
+    if (str8_match(op, str8_lit(">="), 0)) return cmp >= 0;
+    return cmp == 0; // tec: default '=' / '=='
   }
   
   if (str8_match(op, str8_lit("="), 0) || str8_match(op, str8_lit("=="), 0)) return lv == rv;
