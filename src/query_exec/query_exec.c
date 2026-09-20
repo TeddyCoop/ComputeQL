@@ -248,6 +248,62 @@ qe_compile_condition(QE_BytecodeProgram* prog, GDB_Table* table, IR_Node* condit
     return;
   }
   
+  // tec: IN expands to an OR chain of '=' (AND of '!=' for NOT IN)
+  // a list too long for the bytecode sets requires_cpu_scan
+  if (str8_match(op, str8_lit("in"), StringMatchFlag_CaseInsensitive) ||
+      str8_match(op, str8_lit("not in"), StringMatchFlag_CaseInsensitive))
+  {
+    B32 is_not = str8_match(op, str8_lit("not in"), StringMatchFlag_CaseInsensitive);
+    
+    if (!left || !right || right->type != IR_NodeType_InList)
+    {
+      log_error("qe_compile_condition: 'in' needs a value list on its right side");
+      qe_bytecode_emit(prog, QE_Opcode_PushFalse);
+      return;
+    }
+    
+    // tec: an empty list matches nothing, so 'not in' matches everything
+    if (!right->first)
+    {
+      qe_bytecode_emit(prog, is_not ? QE_Opcode_PushTrue : QE_Opcode_PushFalse);
+      return;
+    }
+    
+    U64 item_count = 0;
+    for (IR_Node* item = right->first; item != NULL; item = item->next) 
+    {
+      item_count++;
+    }
+    
+    if (left->type != IR_NodeType_Column || item_count > settings_u64(str8_lit("QE_IN_LIST_GPU_MAX_ITEMS"), 32))
+    {
+      prog->requires_cpu_scan = 1;
+      prog->cpu_scan_reason = str8_lit("IN list too long for GPU bytecode");
+      qe_bytecode_emit(prog, QE_Opcode_PushTrue);
+      return;
+    }
+    
+    B32 first_item = 1;
+    for (IR_Node* item = right->first; item != NULL; item = item->next)
+    {
+      // tec: fresh operand copies, since this function reads the right operand as left->next
+      IR_Node* lhs = ir_node_make(prog->arena, left->type, left->value);
+      IR_Node* rhs = ir_node_make(prog->arena, item->type, item->value);
+      lhs->next = rhs;
+      IR_Node* cmp = ir_node_make(prog->arena, IR_NodeType_Operator, is_not ? str8_lit("!=") : str8_lit("="));
+      cmp->first = lhs;
+      cmp->last = rhs;
+      
+      qe_compile_condition(prog, table, cmp, out_trace);
+      if (!first_item) 
+      {
+        qe_bytecode_emit(prog, is_not ? QE_Opcode_And : QE_Opcode_Or);
+      }
+      first_item = 0;
+    }
+    return;
+  }
+  
   // tec: fuzzy search. SIMILARITY(col,'term')/EDIT_DISTANCE(col,'term') op threshold
   if (left && qe_ir_is_fuzzy_call(left, 0))
   {
@@ -744,6 +800,18 @@ qe_scan_filter(Arena* arena, GDB_Database* database, GDB_Table* table, IR_Node* 
   U32 stack_depth = qe_bytecode_program_max_stack_depth(prog);
   log_info("scan_filter bytecode peak operand-stack depth: %u (of MAX_STACK=%u)", stack_depth, (U32)QE_SCAN_MAX_STACK);
   
+  if (prog->requires_cpu_scan)
+  {
+    log_info("qe_scan_filter: %.*s - running the scan on the CPU", str8_varg(prog->cpu_scan_reason));
+    if (out_trace)
+    {
+      out_trace->strategy = QE_TraceStrategy_CpuScan;
+      out_trace->strategy_reason = prog->cpu_scan_reason;
+    }
+    ProfEnd();
+    return qe_cpu_scan_filter(arena, table, where_clause, out_trace);
+  }
+  
   if (stack_depth > QE_SCAN_MAX_STACK)
   {
     log_error("qe_scan_filter: WHERE clause needs operand-stack depth %u, exceeding scan_filter.comp's MAX_STACK (%u) - falling back to CPU scan to avoid a GPU stack overflow",
@@ -1186,19 +1254,36 @@ internal String8
 qe_column_list_item_display_name(Arena* arena, IR_Node* item)
 {
   IR_Node* alias = ir_node_find_child(item, IR_NodeType_Alias);
-  if (alias) return alias->value;
+  if (alias)
+  {
+    return alias->value;
+  }
   
   if (item->type == IR_NodeType_AggregateCall)
   {
-    IR_Node* arg = item->first;
-    String8 arg_text = arg ? arg->value : str8_lit("*");
-    // tec: a second, nonalias argument must be part of the display name too
-    IR_Node* arg2 = (arg && arg->next && arg->next->type != IR_NodeType_Alias) ? arg->next : NULL;
-    if (arg2)
+    // tec: only the arguments belong in the name, not a trailing Window/Alias/sort direction
+    IR_Node* args[3] = {0};
+    U64 arg_count = 0;
+    for (IR_Node* c = item->first; c != NULL && arg_count < ArrayCount(args); c = c->next)
     {
-      return push_str8f(arena, "%.*s(%.*s, %.*s)", str8_varg(item->value), str8_varg(arg_text), str8_varg(arg2->value));
+      if (c->type == IR_NodeType_Column || 
+          c->type == IR_NodeType_Numeric || 
+          c->type == IR_NodeType_Literal)
+      {
+        args[arg_count++] = c;
+      }
     }
-    return push_str8f(arena, "%.*s(%.*s)", str8_varg(item->value), str8_varg(arg_text));
+    
+    B32 is_window = ir_node_find_child(item, IR_NodeType_Window) != NULL;
+    String8 arg_text = arg_count ? args[0]->value : (is_window ? (String8){0} : str8_lit("*"));
+    String8 suffix = is_window ? str8_lit(" OVER") : (String8){0};
+    
+    // tec: a second, nonalias argument must be part of the display name too
+    if (arg_count >= 2)
+    {
+      return push_str8f(arena, "%.*s(%.*s, %.*s)%.*s", str8_varg(item->value), str8_varg(arg_text), str8_varg(args[1]->value), str8_varg(suffix));
+    }
+    return push_str8f(arena, "%.*s(%.*s)%.*s", str8_varg(item->value), str8_varg(arg_text), str8_varg(suffix));
   }
   
   return item->value; // tec: plain Column
@@ -2163,14 +2248,20 @@ qe_materialized_row_less(PLAN_Materialized* m, IR_Node* order_by_ir, U64 a, U64 
 internal PLAN_Materialized
 qe_sort_materialized(Arena* arena, PLAN_Materialized* m, IR_Node* order_by_ir)
 {
-  // tec: post-aggregate row counts are always small (bounded by distinct group count), unlike qe_sort_rows which sorts the (potentially huge) base table rows
+  // tec: post aggregate row counts are always small (bounded by distinct group count)
   PLAN_Materialized result = *m;
-  if (!order_by_ir || m->count <= 1) return result;
+  if (!order_by_ir || m->count <= 1) 
+  {
+    return result;
+  }
   
   Temp scratch = scratch_begin(&arena, 1);
   
   U64* order = push_array(scratch.arena, U64, m->count);
-  for (U64 i = 0; i < m->count; i++) order[i] = i;
+  for (U64 i = 0; i < m->count; i++)
+  {
+    order[i] = i;
+  }
   
   for (U64 i = 1; i < m->count; i++)
   {
@@ -2191,16 +2282,33 @@ qe_sort_materialized(Arena* arena, PLAN_Materialized* m, IR_Node* order_by_ir)
     PLAN_AggColumn* dst = &result.columns[c];
     dst->name = src->name;
     dst->type = src->type;
+    dst->decimal_scale = src->decimal_scale;
+    dst->enum_type = src->enum_type;
     
     if (src->type == GDB_ColumnType_String8)
     {
       dst->string_values = push_array(arena, String8, m->count);
-      for (U64 i = 0; i < m->count; i++) dst->string_values[i] = src->string_values[order[i]];
+      for (U64 i = 0; i < m->count; i++) 
+      {
+        dst->string_values[i] = src->string_values[order[i]];
+      }
     }
     else
     {
       dst->numeric_values = push_array(arena, F64, m->count);
-      for (U64 i = 0; i < m->count; i++) dst->numeric_values[i] = src->numeric_values[order[i]];
+      for (U64 i = 0; i < m->count; i++)
+      {
+        dst->numeric_values[i] = src->numeric_values[order[i]];
+      }
+    }
+    
+    if (src->is_null)
+    {
+      dst->is_null = push_array(arena, U8, m->count);
+      for (U64 i = 0; i < m->count; i++) 
+      {
+        dst->is_null[i] = src->is_null[order[i]];
+      }
     }
   }
   
@@ -3615,6 +3723,33 @@ qe_having_eval(PLAN_Materialized* m, IR_Node* condition, U64 row)
     return 1;
   }
   
+  // tec: HAVING only sees the small post-aggregate result, so walking the list is fine
+  if (str8_match(op, str8_lit("in"), StringMatchFlag_CaseInsensitive) ||
+      str8_match(op, str8_lit("not in"), StringMatchFlag_CaseInsensitive))
+  {
+    if (right->type != IR_NodeType_InList)
+    {
+      log_error("qe_having_eval: 'in' needs a value list on its right side");
+      return 0;
+    }
+    
+    B32 lstr_in = 0;
+    String8 ls_in = {0};
+    F64 lv_in = qe_having_load_value(m, left, row, &lstr_in, &ls_in);
+    
+    B32 found = 0;
+    for (IR_Node* item = right->first; item != NULL && !found; item = item->next)
+    {
+      B32 item_is_string = (item->type == IR_NodeType_Literal);
+      if (item_is_string != lstr_in) 
+      {
+        continue;
+      }
+      found = item_is_string ? (qe_str8_compare(ls_in, item->value) == 0) : (lv_in == f64_from_str8(item->value));
+    }
+    return str8_match(op, str8_lit("not in"), StringMatchFlag_CaseInsensitive) ? !found : found;
+  }
+  
   B32 lstr = 0, rstr = 0;
   String8 ls = {0}, rs = {0};
   F64 lv = qe_having_load_value(m, left, row, &lstr, &ls);
@@ -3726,6 +3861,8 @@ qe_apply_having(Arena* arena, PLAN_Materialized* m, IR_Node* having_ir)
     PLAN_AggColumn* dst = &result.columns[c];
     dst->name = src->name;
     dst->type = src->type;
+    dst->decimal_scale = src->decimal_scale;
+    dst->enum_type = src->enum_type;
     
     if (src->type == GDB_ColumnType_String8)
     {
@@ -3736,6 +3873,12 @@ qe_apply_having(Arena* arena, PLAN_Materialized* m, IR_Node* having_ir)
     {
       dst->numeric_values = push_array(arena, F64, Max(keep_count, 1));
       for (U64 i = 0; i < keep_count; i++) dst->numeric_values[i] = src->numeric_values[keep[i]];
+    }
+    
+    if (src->is_null)
+    {
+      dst->is_null = push_array(arena, U8, Max(keep_count, 1));
+      for (U64 i = 0; i < keep_count; i++) dst->is_null[i] = src->is_null[keep[i]];
     }
   }
   
@@ -4374,6 +4517,188 @@ qe_row_eval_fuzzy_call(Arena* arena, PLAN_RowSet* rows, IR_Node* call, U64 outpu
     : qe_str8_trigram_similarity(haystack, needle_arg->value);
 }
 
+//~ tec: 'col [NOT] IN (list)' on the CPU
+
+typedef struct QE_InSet QE_InSet;
+struct QE_InSet
+{
+  QE_InSet* next;
+  IR_Node* list_node;
+  F64* nums;
+  U64 num_count;
+  String8* strs;
+  U64 str_count;
+};
+
+global QE_InSet* g_qe_in_sets = 0;
+
+internal S32
+qe_f64_compare_for_sort(const void* a, const void* b)
+{
+  F64 x = *(const F64*)a;
+  F64 y = *(const F64*)b;
+  return (x < y) ? -1 : (x > y) ? 1 : 0;
+}
+
+internal S32
+qe_str8_compare_for_sort(const void* a, const void* b)
+{
+  return qe_str8_compare(*(const String8*)a, *(const String8*)b);
+}
+
+internal B32
+qe_in_item_resolve(GDB_Column* column, IR_Node* item, B32* out_is_string, F64* out_num, String8* out_str)
+{
+  *out_is_string = 0;
+  *out_num = 0.0;
+  *out_str = (String8){0};
+  
+  GDB_ColumnType type = column ? column->type : GDB_ColumnType_Invalid;
+  
+  if (type == GDB_ColumnType_String8 || (!column && item->type == IR_NodeType_Literal))
+  {
+    *out_is_string = 1;
+    *out_str = item->value;
+    return 1;
+  }
+  if (type == GDB_ColumnType_Date || type == GDB_ColumnType_Timestamp)
+  {
+    return item->type == IR_NodeType_Literal && qe_resolve_date_literal_value(type, item, out_num);
+  }
+  if (type == GDB_ColumnType_Enum)
+  {
+    return item->type == IR_NodeType_Literal && qe_resolve_enum_literal_value(column, item, out_num);
+  }
+  if (type == GDB_ColumnType_Decimal)
+  {
+    return qe_resolve_decimal_literal_value(column, item, out_num);
+  }
+  
+  *out_num = f64_from_str8(item->value);
+  return 1;
+}
+
+internal GDB_Column*
+qe_in_left_column(PLAN_RowSet* rows, IR_Node* left)
+{
+  if (!left || left->type != IR_NodeType_Column) 
+  {
+    return NULL;
+  }
+  String8 bare = {0};
+  U64 slot = max_U64;
+  GDB_Table* table = qe_resolve_column_table(rows, left->value, &bare, &slot);
+  return table ? gdb_table_find_column(table, bare) : NULL;
+}
+
+internal void
+qe_in_sets_register(Arena* arena, PLAN_RowSet* rows, IR_Node* condition)
+{
+  if (!condition || condition->type != IR_NodeType_Operator) return;
+  
+  String8 op = condition->value;
+  IR_Node* left = condition->first;
+  IR_Node* right = left ? left->next : NULL;
+  
+  if (str8_match(op, str8_lit("and"), StringMatchFlag_CaseInsensitive) ||
+      str8_match(op, str8_lit("or"), StringMatchFlag_CaseInsensitive))
+  {
+    qe_in_sets_register(arena, rows, left);
+    qe_in_sets_register(arena, rows, right);
+    return;
+  }
+  
+  if (!(str8_match(op, str8_lit("in"), StringMatchFlag_CaseInsensitive) ||
+        str8_match(op, str8_lit("not in"), StringMatchFlag_CaseInsensitive)) ||
+      !right || right->type != IR_NodeType_InList)
+  {
+    return;
+  }
+  
+  U64 item_count = 0;
+  for (IR_Node* item = right->first; item != NULL; item = item->next) item_count++;
+  
+  GDB_Column* column = qe_in_left_column(rows, left);
+  QE_InSet* set = push_array(arena, QE_InSet, 1);
+  set->list_node = right;
+  set->nums = push_array(arena, F64, Max(item_count, 1));
+  set->strs = push_array(arena, String8, Max(item_count, 1));
+  
+  for (IR_Node* item = right->first; item != NULL; item = item->next)
+  {
+    B32 is_string = 0;
+    F64 num = 0.0;
+    String8 str = {0};
+    if (!qe_in_item_resolve(column, item, &is_string, &num, &str)) 
+    {
+      continue;
+    }
+    if (is_string) 
+    {
+      set->strs[set->str_count++] = str;
+    }
+    else
+    {
+      set->nums[set->num_count++] = num;
+    }
+  }
+  
+  if (set->num_count) 
+  {
+    quick_sort(set->nums, set->num_count, sizeof(F64), qe_f64_compare_for_sort);
+  }
+  if (set->str_count) 
+  {
+    quick_sort(set->strs, set->str_count, sizeof(String8), qe_str8_compare_for_sort);
+  }
+  
+  set->next = g_qe_in_sets;
+  g_qe_in_sets = set;
+}
+
+internal void
+qe_in_sets_unregister_all(void)
+{
+  g_qe_in_sets = 0;
+}
+
+internal B32
+qe_in_list_contains(PLAN_RowSet* rows, IR_Node* left, IR_Node* list_node, B32 lstr, F64 lv, String8 ls)
+{
+  for (QE_InSet* set = g_qe_in_sets; set != NULL; set = set->next)
+  {
+    if (set->list_node != list_node) 
+    {
+      continue;
+    }
+    
+    U64 lo = 0, hi = lstr ? set->str_count : set->num_count;
+    while (lo < hi)
+    {
+      U64 mid = lo + (hi - lo) / 2;
+      S32 cmp = lstr ? qe_str8_compare(set->strs[mid], ls)
+        : ((set->nums[mid] < lv) ? -1 : (set->nums[mid] > lv) ? 1 : 0);
+      if (cmp == 0) return 1;
+      if (cmp < 0) lo = mid + 1;
+      else hi = mid;
+    }
+    return 0;
+  }
+  
+  // tec: not registered, walk the list
+  GDB_Column* column = rows ? qe_in_left_column(rows, left) : NULL;
+  for (IR_Node* item = list_node->first; item != NULL; item = item->next)
+  {
+    B32 is_string = 0;
+    F64 num = 0.0;
+    String8 str = {0};
+    if (!qe_in_item_resolve(column, item, &is_string, &num, &str)) continue;
+    if (is_string != lstr) continue;
+    if (is_string ? (qe_str8_compare(ls, str) == 0) : (lv == num)) return 1;
+  }
+  return 0;
+}
+
 internal B32
 qe_row_condition_eval(Arena* arena, PLAN_RowSet* rows, IR_Node* condition, U64 output_row)
 {
@@ -4419,6 +4744,24 @@ qe_row_condition_eval(Arena* arena, PLAN_RowSet* rows, IR_Node* condition, U64 o
     
     B32 is_not = str8_match(op, str8_lit("is not null"), StringMatchFlag_CaseInsensitive);
     return is_not ? !lnull : lnull;
+  }
+  
+  if (str8_match(op, str8_lit("in"), StringMatchFlag_CaseInsensitive) ||
+      str8_match(op, str8_lit("not in"), StringMatchFlag_CaseInsensitive))
+  {
+    if (!left || !right || right->type != IR_NodeType_InList)
+    {
+      log_error("qe_row_condition_eval: 'in' needs a value list on its right side");
+      return 0;
+    }
+    
+    B32 lstr = 0, lnull = 0;
+    String8 ls = {0};
+    F64 lv = qe_row_load_value(arena, rows, left, output_row, &lstr, &ls, &lnull);
+    if (lnull) return 0; // tec: NULL [NOT] IN (...) is never true
+    
+    B32 found = qe_in_list_contains(rows, left, right, lstr, lv, ls);
+    return str8_match(op, str8_lit("not in"), StringMatchFlag_CaseInsensitive) ? !found : found;
   }
   
   // tec: fuzzy search
@@ -4577,6 +4920,7 @@ qe_cpu_scan_filter(Arena* arena, GDB_Table* table, IR_Node* where_clause, QE_Sca
   rows.count = row_count;
   
   IR_Node* condition_root = where_clause ? where_clause->first : NULL;
+  qe_in_sets_register(scratch.arena, &rows, condition_root);
   
   U64 cpu_scan_start = os_now_microseconds();
   
@@ -4599,6 +4943,7 @@ qe_cpu_scan_filter(Arena* arena, GDB_Table* table, IR_Node* where_clause, QE_Sca
   TP_Temp temp = tp_temp_begin(pool_arena);
   tp_for_parallel(pool, pool_arena, task_count, qe_cpu_scan_filter_task, &task);
   tp_temp_end(temp);
+  qe_in_sets_unregister_all();
   
   U64 matched_count = 0;
   for (U64 t = 0; t < task_count; t++) matched_count += task.task_matched_counts[t];
@@ -4638,10 +4983,12 @@ qe_filter_joined_rows(Arena* arena, PLAN_RowSet* rows, IR_Node* condition)
   U64* keep = push_array(scratch.arena, U64, Max(rows->count, 1));
   U64 keep_count = 0;
   
+  qe_in_sets_register(scratch.arena, rows, condition);
   for (U64 i = 0; i < rows->count; i++)
   {
     if (qe_row_condition_eval(arena, rows, condition, i)) keep[keep_count++] = i;
   }
+  qe_in_sets_unregister_all();
   
   result.row_indices = push_array(arena, U64*, rows->table_count);
   for (U64 t = 0; t < rows->table_count; t++)

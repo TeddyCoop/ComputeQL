@@ -88,6 +88,11 @@ global String8 g_sql_keywords[] =
   str8_lit_comp("numeric"),
   str8_lit_comp("type"),
   str8_lit_comp("enum"),
+  str8_lit_comp("with"),
+  str8_lit_comp("in"),
+  str8_lit_comp("exists"),
+  str8_lit_comp("over"),
+  str8_lit_comp("partition"),
 };
 
 global String8 g_sql_operators[] =
@@ -217,6 +222,13 @@ typedef enum SQL_NodeType
   SQL_NodeType_Explain,
   SQL_NodeType_EnumDef,
   SQL_NodeType_EnumValue,
+  SQL_NodeType_CteList,
+  SQL_NodeType_Cte,
+  SQL_NodeType_Subquery,
+  SQL_NodeType_InList,
+  SQL_NodeType_Exists,
+  SQL_NodeType_Window,
+  SQL_NodeType_PartitionBy,
 } SQL_NodeType;
 
 typedef struct SQL_Node SQL_Node;
@@ -234,6 +246,10 @@ struct SQL_Node
 
 internal SQL_Node* sql_parse_use_clause(SQL_ParseCtx *ctx);
 internal SQL_Node* sql_parse_select_clause(SQL_ParseCtx *ctx);
+internal SQL_Node* sql_parse_select_statement(SQL_ParseCtx *ctx);
+internal SQL_Node* sql_parse_with_clause(SQL_ParseCtx *ctx);
+internal SQL_Node* sql_parse_window_spec(SQL_ParseCtx *ctx);
+internal SQL_Node* sql_parse_parenthesized_select(SQL_ParseCtx *ctx);
 internal SQL_Node* sql_parse_select_item(SQL_ParseCtx *ctx);
 internal SQL_Node* sql_parse_aggregate_call(SQL_ParseCtx *ctx, String8 func_name);
 internal SQL_Node* sql_parse_column_ref(SQL_ParseCtx *ctx);

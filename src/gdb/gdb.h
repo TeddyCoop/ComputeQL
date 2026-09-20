@@ -260,6 +260,9 @@ struct GDB_Table
   GDB_Index** indexes;
   
   GDB_Database* parent_database;
+  
+  // tec: query scoped tables (cte, temps, etc)
+  B32 is_ephemeral;
 };
 
 struct GDB_Database
@@ -274,6 +277,10 @@ struct GDB_Database
   U64 enum_type_count;
   U64 enum_type_capacity;
   GDB_EnumType** enum_types;
+  
+  U64 temp_table_count;
+  U64 temp_table_capacity;
+  GDB_Table** temp_tables;
 };
 
 //~ tec: csv loading
@@ -339,6 +346,8 @@ internal void gdb_database_close(GDB_Database* database);
 internal GDB_Table* gdb_database_find_table(GDB_Database* database, String8 table_name);
 internal GDB_Table* gdb_database_build_column_catalog(GDB_Database* database);
 internal GDB_Table* gdb_database_find_table_or_catalog(GDB_Database* database, String8 name);
+internal void gdb_database_add_temp_table(GDB_Database* database, GDB_Table* table);
+internal void gdb_database_release_temp_tables_from(GDB_Database* database, U64 first_temp_index);
 
 //~ tec: enum types
 internal void gdb_database_add_enum_type(GDB_Database* database, GDB_EnumType* enum_type);

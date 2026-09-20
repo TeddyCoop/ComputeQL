@@ -12,6 +12,7 @@ typedef enum PLAN_NodeType
   PLAN_NodeType_Project,
   PLAN_NodeType_Sort,
   PLAN_NodeType_Limit,
+  PLAN_NodeType_Window,
 } PLAN_NodeType;
 
 typedef struct PLAN_Node PLAN_Node;
@@ -29,7 +30,7 @@ struct PLAN_Node
   // tec: these all point back into the IR tree rather than owning a copy
   IR_Node* condition;   // tec: Filter = the Where IR node, Having = the Having IR node, Join = the ON condition expression
   IR_Node* group_by;    // tec: Aggregate only - GroupBy IR node, NULL means the whole input is a single group
-  IR_Node* column_list; // tec: Aggregate/Project - the select list (ColumnList IR node: columns/aliases/aggregate calls)
+  IR_Node* column_list; // tec: Aggregate/Project/Window - the select list (ColumnList IR node: columns/aliases/aggregate calls)
   IR_Node* order_by;    // tec: Sort only - OrderBy IR node
   IR_Node* limit_node;  // tec: Limit only - Limit IR node, NULL if no LIMIT was given
   IR_Node* offset_node; // tec: Limit only - Offset IR node, NULL if no OFFSET was given

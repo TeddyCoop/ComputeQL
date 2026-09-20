@@ -318,11 +318,11 @@ bench_run_gdb_query(GDB_Database* database, String8 sql_text, U64* out_row_count
     SQL_Node* ast = sql_parse(arena, tok.tokens, tok.count, sql_text);
     IR_Query* ir_query = ir_generate_from_ast(arena, ast);
     IR_Node* select_node = ir_query->execution_nodes;
-    ir_expand_star_to_columns(arena, database, select_node);
-    PLAN_Node* plan = plan_build_from_select(arena, database, select_node);
-    PLAN_ExecResult result = plan_execute(arena, database, plan, select_node, NULL);
+    U64 temp_mark = database->temp_table_count;
+    PLAN_ExecResult result = plan_run_select(arena, database, select_node, NULL);
     U64 row_count = 0;
     bench_gdb_consume_result(&result, select_node, &row_count);
+    gdb_database_release_temp_tables_from(database, temp_mark);
 
     scratch_end(scratch);
   }
@@ -344,14 +344,15 @@ bench_run_gdb_query(GDB_Database* database, String8 sql_text, U64* out_row_count
     SQL_Node* ast = sql_parse(arena, tok.tokens, tok.count, sql_text);
     IR_Query* ir_query = ir_generate_from_ast(arena, ast);
     IR_Node* select_node = ir_query->execution_nodes;
-    ir_expand_star_to_columns(arena, database, select_node);
-    PLAN_Node* plan = plan_build_from_select(arena, database, select_node);
 
     U64 t1 = os_now_microseconds();
 
-    PLAN_ExecResult result = plan_execute(arena, database, plan, select_node, NULL);
+    // tec: CTEs and derived tables run (and are timed) inside plan_run_select
+    U64 temp_mark = database->temp_table_count;
+    PLAN_ExecResult result = plan_run_select(arena, database, select_node, NULL);
     U64 row_count = 0;
     U64 checksum = bench_gdb_consume_result(&result, select_node, &row_count);
+    gdb_database_release_temp_tables_from(database, temp_mark);
 
     U64 t2 = os_now_microseconds();
 

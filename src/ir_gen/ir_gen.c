@@ -114,6 +114,13 @@ ir_type_from_sql_node_type(SQL_NodeType sql_type)
     case SQL_NodeType_Check:        return IR_NodeType_Check;
     case SQL_NodeType_EnumDef:      return IR_NodeType_EnumDef;
     case SQL_NodeType_EnumValue:    return IR_NodeType_EnumValue;
+    case SQL_NodeType_CteList:      return IR_NodeType_CteList;
+    case SQL_NodeType_Cte:          return IR_NodeType_Cte;
+    case SQL_NodeType_Subquery:     return IR_NodeType_Subquery;
+    case SQL_NodeType_InList:       return IR_NodeType_InList;
+    case SQL_NodeType_Exists:       return IR_NodeType_Exists;
+    case SQL_NodeType_Window:       return IR_NodeType_Window;
+    case SQL_NodeType_PartitionBy:  return IR_NodeType_PartitionBy;
 
     // special cases
     case SQL_NodeType_Row:           return IR_NodeType_ValueGroup;
@@ -179,6 +186,13 @@ ir_node_type_to_string(IR_NodeType type)
     case IR_NodeType_PrimaryKey: result = str8_lit("IR_NodeType_PrimaryKey"); break;
     case IR_NodeType_ForeignKey: result = str8_lit("IR_NodeType_ForeignKey"); break;
     case IR_NodeType_Check: result = str8_lit("IR_NodeType_Check"); break;
+    case IR_NodeType_CteList: result = str8_lit("IR_NodeType_CteList"); break;
+    case IR_NodeType_Cte: result = str8_lit("IR_NodeType_Cte"); break;
+    case IR_NodeType_Subquery: result = str8_lit("IR_NodeType_Subquery"); break;
+    case IR_NodeType_InList: result = str8_lit("IR_NodeType_InList"); break;
+    case IR_NodeType_Exists: result = str8_lit("IR_NodeType_Exists"); break;
+    case IR_NodeType_Window: result = str8_lit("IR_NodeType_Window"); break;
+    case IR_NodeType_PartitionBy: result = str8_lit("IR_NodeType_PartitionBy"); break;
   }
   
   return result;
@@ -252,8 +266,8 @@ ir_expand_star_to_columns(Arena *arena, GDB_Database *db, IR_Node *select_node)
   // tec: only a bare 'SELECT *' needs expanding
   B32 is_bare_star = column_list && column_list->first && column_list->first == column_list->last &&
     column_list->first->type == IR_NodeType_Column && str8_match(column_list->first->value, str8_lit("*"), 0);
-  if (!is_bare_star) return;
-  
+  if (!is_bare_star || !table_node) return;
+
   column_list->first = column_list->last = NULL;
 
   GDB_Table *table = gdb_database_find_table_or_catalog(db, table_node->value);

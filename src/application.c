@@ -1419,8 +1419,8 @@ app_execute_query_capture(Arena* arena, String8 sql_query, GDB_Database** io_dat
           break;
         }
         
-        ir_expand_star_to_columns(arena, database, ir_execution_node);
-        
+        // tec: a row set result points into the temp tables, so release them after formatting
+        U64 temp_table_mark = database->temp_table_count;
         PLAN_ExecResult result = app_perform_kernel(arena, database, ir_execution_node);
         
         IR_Node* select_output_columns = ir_node_find_child(ir_execution_node, IR_NodeType_ColumnList);
@@ -1649,6 +1649,8 @@ app_execute_query_capture(Arena* arena, String8 sql_query, GDB_Database** io_dat
           scratch_end(scratch);
         }
         
+        gdb_database_release_temp_tables_from(database, temp_table_mark);
+        
         log_info("total 'SELECT' query time: %.4f ms", (os_now_microseconds() - start_time) / 1000.0f);
         
         ProfEnd();
@@ -1692,8 +1694,7 @@ app_perform_kernel(Arena* arena, GDB_Database* database, IR_Node* root_node)
 {
   ProfBeginFunction();
   
-  PLAN_Node* plan = plan_build_from_select(arena, database, root_node);
-  PLAN_ExecResult result = plan_execute(arena, database, plan, root_node, NULL);
+  PLAN_ExecResult result = plan_run_select(arena, database, root_node, NULL);
   
   if (!result.supported)
   {

@@ -42,7 +42,8 @@ sql_tokenize_from_text(Arena* arena, String8 text)
 {
   ProfBeginFunction();
   
-  SQL_Token* tokens = push_array(arena, SQL_Token, 2056);
+  // tec: a token is at least one char, so text.size bounds the count
+  SQL_Token* tokens = push_array(arena, SQL_Token, Max((U64)2056, text.size + 1));
   U64 token_count = 0;
   
   U64 pos = 0;
@@ -406,31 +407,49 @@ sql_parse(Arena* arena, SQL_Token* tokens, U64 token_count, String8 source_text)
   SQL_Node *root = NULL;
   SQL_Node *current_node = NULL;
   SQL_Node *last_select_node = NULL;
-  
+  SQL_Node *pending_with = NULL;
+
   while (!sql_at_end(ctx))
   {
     SQL_Token token = sql_peek(ctx, 0);
     B32 attach_to_select = 0;
-    
+
     if (token.type == SQL_TokenType_Symbol && str8_match(token.value, str8_lit(";"), 0))
     {
       sql_advance(ctx, 1);
       last_select_node = NULL;
       continue;
     }
-    
+
     if (token.type == SQL_TokenType_Keyword)
     {
       SQL_Node *new_node = NULL;
-      
+
       if (str8_match(token.value, str8_lit("use"), StringMatchFlag_CaseInsensitive))
       {
         new_node = sql_parse_use_clause(ctx);
+      }
+      else if (str8_match(token.value, str8_lit("with"), StringMatchFlag_CaseInsensitive))
+      {
+        // tec: the CteList rides along as a child of the select that follows
+        pending_with = sql_parse_with_clause(ctx);
+        if (pending_with && !sql_check(ctx, SQL_TokenType_Keyword, str8_lit("select")))
+        {
+          sql_parse_error_at(sql_ctx_error_range(ctx),
+                             "expected 'select' after 'with' clause, found '%.*s'",
+                             str8_varg(sql_ctx_text_or_eof(ctx)));
+        }
       }
       else if (str8_match(token.value, str8_lit("select"), StringMatchFlag_CaseInsensitive))
       {
         new_node = sql_parse_select_clause(ctx);
         last_select_node = new_node;
+        if (new_node && pending_with)
+        {
+          pending_with->parent = new_node;
+          DLLPushBack(new_node->first, new_node->last, pending_with);
+          pending_with = NULL;
+        }
       }
       else if (str8_match(token.value, str8_lit("from"), StringMatchFlag_CaseInsensitive))
       {
@@ -703,23 +722,64 @@ sql_parse_column_ref(SQL_ParseCtx *ctx)
   return node;
 }
 
+// tec: the caller has already checked for '(' 'select'
 internal SQL_Node*
-sql_parse_table_ref(SQL_ParseCtx *ctx)
+sql_parse_parenthesized_select(SQL_ParseCtx *ctx)
 {
-  if (!sql_check(ctx, SQL_TokenType_Identifier, (String8){0}))
+  sql_advance(ctx, 1); // move past '('
+
+  SQL_Node *select_node = sql_parse_select_statement(ctx);
+  if (!select_node) return NULL;
+
+  if (!sql_match(ctx, SQL_TokenType_Symbol, str8_lit(")")))
   {
     sql_parse_error_at(sql_ctx_error_range(ctx),
-                       "expected table name, found '%.*s'",
+                       "expected ')' after subquery, found '%.*s'",
                        str8_varg(sql_ctx_text_or_eof(ctx)));
     return NULL;
   }
-  
+  return select_node;
+}
+
+internal B32
+sql_check_paren_select(SQL_ParseCtx *ctx)
+{
+  return sql_check(ctx, SQL_TokenType_Symbol, str8_lit("(")) &&
+    sql_peek(ctx, 1).type == SQL_TokenType_Keyword &&
+    str8_match(sql_peek(ctx, 1).value, str8_lit("select"), StringMatchFlag_CaseInsensitive);
+}
+
+internal SQL_Node*
+sql_parse_table_ref(SQL_ParseCtx *ctx)
+{
   SQL_Node *table_node = push_array(ctx->arena, SQL_Node, 1);
   table_node->type = SQL_NodeType_Table;
-  table_node->value = sql_take(ctx).value;
-  
-  // tec: optional 'AS alias'
-  if (sql_match(ctx, SQL_TokenType_Keyword, str8_lit("as")))
+  B32 is_derived = 0;
+
+  if (sql_check_paren_select(ctx))
+  {
+    // tec: a derived table's Table node has no name, and its first child is the Select
+    SQL_Node *select_node = sql_parse_parenthesized_select(ctx);
+    if (!select_node) return NULL;
+    select_node->parent = table_node;
+    table_node->first = table_node->last = select_node;
+    is_derived = 1;
+  }
+  else
+  {
+    if (!sql_check(ctx, SQL_TokenType_Identifier, (String8){0}))
+    {
+      sql_parse_error_at(sql_ctx_error_range(ctx),
+                         "expected table name, found '%.*s'",
+                         str8_varg(sql_ctx_text_or_eof(ctx)));
+      return NULL;
+    }
+    table_node->value = sql_take(ctx).value;
+  }
+
+  // tec: optional 'AS alias', or a bare alias identifier
+  B32 has_as = sql_match(ctx, SQL_TokenType_Keyword, str8_lit("as"));
+  if (has_as || sql_check(ctx, SQL_TokenType_Identifier, (String8){0}))
   {
     if (!sql_check(ctx, SQL_TokenType_Identifier, (String8){0}))
     {
@@ -728,14 +788,21 @@ sql_parse_table_ref(SQL_ParseCtx *ctx)
                          str8_varg(sql_ctx_text_or_eof(ctx)));
       return NULL;
     }
-    
+
     SQL_Node *alias_node = push_array(ctx->arena, SQL_Node, 1);
     alias_node->type = SQL_NodeType_Alias;
     alias_node->value = sql_take(ctx).value;
     alias_node->parent = table_node;
-    table_node->first = table_node->last = alias_node;
+    DLLPushBack(table_node->first, table_node->last, alias_node);
   }
-  
+  else if (is_derived)
+  {
+    sql_parse_error_at(sql_ctx_error_range(ctx),
+                       "a subquery in 'from' needs an alias, found '%.*s'",
+                       str8_varg(sql_ctx_text_or_eof(ctx)));
+    return NULL;
+  }
+
   return table_node;
 }
 
@@ -747,8 +814,11 @@ sql_parse_aggregate_call(SQL_ParseCtx *ctx, String8 func_name)
   SQL_Node *call_node = push_array(ctx->arena, SQL_Node, 1);
   call_node->type = SQL_NodeType_AggregateCall;
   call_node->value = func_name;
-  
-  for (;;)
+
+  // tec: zero-argument call, e.g. ROW_NUMBER()
+  B32 no_args = sql_check(ctx, SQL_TokenType_Symbol, str8_lit(")"));
+
+  for (; !no_args;)
   {
     SQL_Node *arg = NULL;
     if (sql_check(ctx, SQL_TokenType_Symbol, str8_lit("*")))
@@ -801,7 +871,17 @@ sql_parse_aggregate_call(SQL_ParseCtx *ctx, String8 func_name)
     return NULL;
   }
   sql_advance(ctx, 1); // move past ')'
-  
+
+  // tec: the Window node is the last child, after the args
+  if (sql_check(ctx, SQL_TokenType_Keyword, str8_lit("over")))
+  {
+    sql_advance(ctx, 1); // move past 'over'
+    SQL_Node *window_node = sql_parse_window_spec(ctx);
+    if (!window_node) return NULL;
+    window_node->parent = call_node;
+    DLLPushBack(call_node->first, call_node->last, window_node);
+  }
+
   return call_node;
 }
 
@@ -910,6 +990,157 @@ sql_parse_select_clause(SQL_ParseCtx *ctx)
   return select_node;
 }
 
+// tec: for nested selects. the top level keeps its own loop because DELETE/EXPLAIN attach clauses through last_select_node
+internal SQL_Node*
+sql_parse_select_statement(SQL_ParseCtx *ctx)
+{
+  if (!sql_check(ctx, SQL_TokenType_Keyword, str8_lit("select")))
+  {
+    sql_parse_error_at(sql_ctx_error_range(ctx),
+                       "expected 'select', found '%.*s'",
+                       str8_varg(sql_ctx_text_or_eof(ctx)));
+    return NULL;
+  }
+
+  SQL_Node *select_node = sql_parse_select_clause(ctx);
+  if (!select_node) return NULL;
+
+  for (;;)
+  {
+    SQL_Node *clause = NULL;
+
+    if (sql_check(ctx, SQL_TokenType_Keyword, str8_lit("from")))
+    {
+      if (!sql_parse_from_clause(ctx, select_node)) return NULL;
+      continue;
+    }
+    else if (sql_check(ctx, SQL_TokenType_Keyword, str8_lit("where")))  clause = sql_parse_where_clause(ctx);
+    else if (sql_check(ctx, SQL_TokenType_Keyword, str8_lit("group")))  clause = sql_parse_group_by_clause(ctx);
+    else if (sql_check(ctx, SQL_TokenType_Keyword, str8_lit("having"))) clause = sql_parse_having_clause(ctx);
+    else if (sql_check(ctx, SQL_TokenType_Keyword, str8_lit("order")))  clause = sql_parse_order_by_clause(ctx);
+    else if (sql_check(ctx, SQL_TokenType_Keyword, str8_lit("limit")))  clause = sql_parse_limit_clause(ctx);
+    else if (sql_check(ctx, SQL_TokenType_Keyword, str8_lit("offset"))) clause = sql_parse_offset_clause(ctx);
+    else break;
+
+    if (!clause) return NULL;
+    clause->parent = select_node;
+    DLLPushBack(select_node->first, select_node->last, clause);
+  }
+
+  return select_node;
+}
+
+internal SQL_Node*
+sql_parse_with_clause(SQL_ParseCtx *ctx)
+{
+  sql_advance(ctx, 1); // move past 'with'
+
+  SQL_Node *list_node = push_array(ctx->arena, SQL_Node, 1);
+  list_node->type = SQL_NodeType_CteList;
+
+  for (;;)
+  {
+    if (!sql_check(ctx, SQL_TokenType_Identifier, (String8){0}))
+    {
+      sql_parse_error_at(sql_ctx_error_range(ctx),
+                         "expected a name for the common table expression, found '%.*s'",
+                         str8_varg(sql_ctx_text_or_eof(ctx)));
+      return NULL;
+    }
+    SQL_Node *cte_node = push_array(ctx->arena, SQL_Node, 1);
+    cte_node->type = SQL_NodeType_Cte;
+    cte_node->value = sql_take(ctx).value;
+
+    if (!sql_match(ctx, SQL_TokenType_Keyword, str8_lit("as")))
+    {
+      sql_parse_error_at(sql_ctx_error_range(ctx),
+                         "expected 'as' after common table expression name, found '%.*s'",
+                         str8_varg(sql_ctx_text_or_eof(ctx)));
+      return NULL;
+    }
+
+    if (!sql_check_paren_select(ctx))
+    {
+      sql_parse_error_at(sql_ctx_error_range(ctx),
+                         "expected '(select ...)' after 'as', found '%.*s'",
+                         str8_varg(sql_ctx_text_or_eof(ctx)));
+      return NULL;
+    }
+    SQL_Node *body = sql_parse_parenthesized_select(ctx);
+    if (!body) return NULL;
+    body->parent = cte_node;
+    cte_node->first = cte_node->last = body;
+
+    cte_node->parent = list_node;
+    DLLPushBack(list_node->first, list_node->last, cte_node);
+
+    if (sql_match(ctx, SQL_TokenType_Symbol, str8_lit(","))) continue;
+    break;
+  }
+
+  return list_node;
+}
+
+// tec: children are an optional PartitionBy, then an optional OrderBy
+internal SQL_Node*
+sql_parse_window_spec(SQL_ParseCtx *ctx)
+{
+  if (!sql_match(ctx, SQL_TokenType_Symbol, str8_lit("(")))
+  {
+    sql_parse_error_at(sql_ctx_error_range(ctx),
+                       "expected '(' after 'over', found '%.*s'",
+                       str8_varg(sql_ctx_text_or_eof(ctx)));
+    return NULL;
+  }
+
+  SQL_Node *window_node = push_array(ctx->arena, SQL_Node, 1);
+  window_node->type = SQL_NodeType_Window;
+
+  if (sql_match(ctx, SQL_TokenType_Keyword, str8_lit("partition")))
+  {
+    if (!sql_match(ctx, SQL_TokenType_Keyword, str8_lit("by")))
+    {
+      sql_parse_error_at(sql_ctx_error_range(ctx),
+                         "expected 'by' after 'partition', found '%.*s'",
+                         str8_varg(sql_ctx_text_or_eof(ctx)));
+      return NULL;
+    }
+
+    SQL_Node *partition_node = push_array(ctx->arena, SQL_Node, 1);
+    partition_node->type = SQL_NodeType_PartitionBy;
+    partition_node->parent = window_node;
+
+    for (;;)
+    {
+      SQL_Node *column_node = sql_parse_column_ref(ctx);
+      if (!column_node) return NULL;
+      column_node->parent = partition_node;
+      DLLPushBack(partition_node->first, partition_node->last, column_node);
+      if (sql_match(ctx, SQL_TokenType_Symbol, str8_lit(","))) continue;
+      break;
+    }
+    DLLPushBack(window_node->first, window_node->last, partition_node);
+  }
+
+  if (sql_check(ctx, SQL_TokenType_Keyword, str8_lit("order")))
+  {
+    SQL_Node *order_node = sql_parse_order_by_clause(ctx);
+    if (!order_node) return NULL;
+    order_node->parent = window_node;
+    DLLPushBack(window_node->first, window_node->last, order_node);
+  }
+
+  if (!sql_match(ctx, SQL_TokenType_Symbol, str8_lit(")")))
+  {
+    sql_parse_error_at(sql_ctx_error_range(ctx),
+                       "expected ')' to close 'over (...)', found '%.*s'",
+                       str8_varg(sql_ctx_text_or_eof(ctx)));
+    return NULL;
+  }
+
+  return window_node;
+}
+
 internal SQL_Node*
 sql_parse_join_clause(SQL_ParseCtx *ctx)
 {
@@ -1016,8 +1247,35 @@ sql_parse_from_clause(SQL_ParseCtx *ctx, SQL_Node *select_node)
 internal SQL_Node*
 sql_parse_comparison_expression(SQL_ParseCtx *ctx)
 {
-  // tec: expressions inside parentheses
-  if (sql_match(ctx, SQL_TokenType_Symbol, str8_lit("(")))
+  // tec: '[NOT] EXISTS (select ...)'
+  {
+    B32 negate_exists = sql_check(ctx, SQL_TokenType_Keyword, str8_lit("not")) &&
+      sql_peek(ctx, 1).type == SQL_TokenType_Keyword &&
+      str8_match(sql_peek(ctx, 1).value, str8_lit("exists"), StringMatchFlag_CaseInsensitive);
+    if (negate_exists || sql_check(ctx, SQL_TokenType_Keyword, str8_lit("exists")))
+    {
+      sql_advance(ctx, negate_exists ? 2 : 1);
+      if (!sql_check_paren_select(ctx))
+      {
+        sql_parse_error_at(sql_ctx_error_range(ctx),
+                           "expected '(select ...)' after 'exists', found '%.*s'",
+                           str8_varg(sql_ctx_text_or_eof(ctx)));
+        return NULL;
+      }
+      SQL_Node *select_node = sql_parse_parenthesized_select(ctx);
+      if (!select_node) return NULL;
+
+      SQL_Node *exists_node = push_array(ctx->arena, SQL_Node, 1);
+      exists_node->type = SQL_NodeType_Exists;
+      exists_node->value = negate_exists ? str8_lit("not") : (String8){0};
+      select_node->parent = exists_node;
+      exists_node->first = exists_node->last = select_node;
+      return exists_node;
+    }
+  }
+
+  // tec: '(select' is a scalar subquery operand, not a group
+  if (!sql_check_paren_select(ctx) && sql_match(ctx, SQL_TokenType_Symbol, str8_lit("(")))
   {
     SQL_Node *expr = sql_parse_logical_expression(ctx);
     if (!expr)
@@ -1067,6 +1325,77 @@ sql_parse_comparison_expression(SQL_ParseCtx *ctx)
     return is_null_node;
   }
   
+  // tec: must come before the generic operator path, which would take 'in' as an ordinary keyword operator
+  {
+    B32 negate_in = sql_check(ctx, SQL_TokenType_Keyword, str8_lit("not")) &&
+      sql_peek(ctx, 1).type == SQL_TokenType_Keyword &&
+      str8_match(sql_peek(ctx, 1).value, str8_lit("in"), StringMatchFlag_CaseInsensitive);
+    if (negate_in || sql_check(ctx, SQL_TokenType_Keyword, str8_lit("in")))
+    {
+      sql_advance(ctx, negate_in ? 2 : 1);
+
+      SQL_Node *right = NULL;
+      if (sql_check_paren_select(ctx))
+      {
+        SQL_Node *select_node = sql_parse_parenthesized_select(ctx);
+        if (!select_node) return NULL;
+        right = push_array(ctx->arena, SQL_Node, 1);
+        right->type = SQL_NodeType_Subquery;
+        select_node->parent = right;
+        right->first = right->last = select_node;
+      }
+      else
+      {
+        if (!sql_match(ctx, SQL_TokenType_Symbol, str8_lit("(")))
+        {
+          sql_parse_error_at(sql_ctx_error_range(ctx),
+                             "expected '(' after 'in', found '%.*s'",
+                             str8_varg(sql_ctx_text_or_eof(ctx)));
+          return NULL;
+        }
+        right = push_array(ctx->arena, SQL_Node, 1);
+        right->type = SQL_NodeType_InList;
+        for (;;)
+        {
+          SQL_Token item_tok = sql_peek(ctx, 0);
+          if (item_tok.type != SQL_TokenType_Number && item_tok.type != SQL_TokenType_String)
+          {
+            sql_parse_error_at(sql_ctx_error_range(ctx),
+                               "expected a number or string literal in 'in' list, found '%.*s'",
+                               str8_varg(sql_ctx_text_or_eof(ctx)));
+            return NULL;
+          }
+          SQL_Node *item = push_array(ctx->arena, SQL_Node, 1);
+          item->type = (item_tok.type == SQL_TokenType_Number) ? SQL_NodeType_Numeric : SQL_NodeType_Literal;
+          item->value = item_tok.value;
+          sql_advance(ctx, 1);
+          item->parent = right;
+          DLLPushBack(right->first, right->last, item);
+          if (sql_match(ctx, SQL_TokenType_Symbol, str8_lit(","))) continue;
+          break;
+        }
+        if (!sql_match(ctx, SQL_TokenType_Symbol, str8_lit(")")))
+        {
+          sql_parse_error_at(sql_ctx_error_range(ctx),
+                             "expected ')' to close 'in' list, found '%.*s'",
+                             str8_varg(sql_ctx_text_or_eof(ctx)));
+          return NULL;
+        }
+      }
+
+      SQL_Node *in_node = push_array(ctx->arena, SQL_Node, 1);
+      in_node->type = SQL_NodeType_Operator;
+      in_node->value = negate_in ? str8_lit("not in") : str8_lit("in");
+      in_node->first = left;
+      in_node->last = right;
+      left->next = right;
+      right->prev = left;
+      left->parent = in_node;
+      right->parent = in_node;
+      return in_node;
+    }
+  }
+
   // Expect comparison operator
   SQL_Token op_token = sql_peek(ctx, 0);
   if (!(op_token.type == SQL_TokenType_Operator || op_token.type == SQL_TokenType_Keyword))
@@ -2449,7 +2778,19 @@ sql_parse_expression(SQL_ParseCtx *ctx)
   }
   
   SQL_Token token = sql_peek(ctx, 0);
-  
+
+  // tec: scalar subquery operand, 'col > (select ...)'
+  if (sql_check_paren_select(ctx))
+  {
+    SQL_Node *select_node = sql_parse_parenthesized_select(ctx);
+    if (!select_node) return NULL;
+    SQL_Node *subquery_node = push_array(ctx->arena, SQL_Node, 1);
+    subquery_node->type = SQL_NodeType_Subquery;
+    select_node->parent = subquery_node;
+    subquery_node->first = subquery_node->last = select_node;
+    return subquery_node;
+  }
+
   if (token.type == SQL_TokenType_Identifier)
   {
     // tec: identifier immediately followed by '(' -> aggregate/function call, e.g. HAVING COUNT(*) > 1
@@ -2543,6 +2884,13 @@ sql_node_type_to_string(SQL_NodeType type)
     case SQL_NodeType_Limit: result = str8_lit("SQL_NodeType_Limit"); break;
     case SQL_NodeType_Offset: result = str8_lit("SQL_NodeType_Offset"); break;
     case SQL_NodeType_AggregateCall: result = str8_lit("SQL_NodeType_AggregateCall"); break;
+    case SQL_NodeType_CteList: result = str8_lit("SQL_NodeType_CteList"); break;
+    case SQL_NodeType_Cte: result = str8_lit("SQL_NodeType_Cte"); break;
+    case SQL_NodeType_Subquery: result = str8_lit("SQL_NodeType_Subquery"); break;
+    case SQL_NodeType_InList: result = str8_lit("SQL_NodeType_InList"); break;
+    case SQL_NodeType_Exists: result = str8_lit("SQL_NodeType_Exists"); break;
+    case SQL_NodeType_Window: result = str8_lit("SQL_NodeType_Window"); break;
+    case SQL_NodeType_PartitionBy: result = str8_lit("SQL_NodeType_PartitionBy"); break;
   }
   
   return result;

@@ -111,6 +111,9 @@ struct QE_BytecodeProgram
   B32 score_is_distance; // tec: 0 = similarity (float score), 1 = edit distance (integer score)
   String8 score_column_name;
   String8 score_needle;
+  
+  B32 requires_cpu_scan;
+  String8 cpu_scan_reason;
 };
 
 typedef struct QE_StringConstRef QE_StringConstRef;
@@ -190,7 +193,7 @@ typedef struct QE_NodeTrace QE_NodeTrace;
 struct QE_NodeTrace
 {
   QE_NodeTrace* next;
-  PLAN_Node* plan_node; // tec: PLAN_Node/PLAN_NodeType come from planner/plan_node.h, included before this file (see main.c)
+  PLAN_Node* plan_node;
   PLAN_NodeType node_type;
   union
   {
@@ -278,6 +281,7 @@ struct PLAN_AggColumn
   GDB_EnumType* enum_type;
   F64* numeric_values;
   String8* string_values;
+  U8* is_null;
 };
 
 typedef struct PLAN_Materialized PLAN_Materialized;
@@ -291,8 +295,8 @@ struct PLAN_Materialized
 typedef struct PLAN_ExecResult PLAN_ExecResult;
 struct PLAN_ExecResult
 {
-  B32 supported;        // tec: 0 if this plan (or a node beneath it) has no kernel to execute it yet
-  B32 is_materialized;  // tec: 0 -> 'rows' is valid, 1 -> 'materialized' is valid
+  B32 supported;
+  B32 is_materialized;
   PLAN_RowSet rows;
   PLAN_Materialized materialized;
 };

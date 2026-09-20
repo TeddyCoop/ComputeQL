@@ -47,6 +47,13 @@ typedef enum IR_NodeType
   IR_NodeType_Explain,
   IR_NodeType_EnumDef,
   IR_NodeType_EnumValue,
+  IR_NodeType_CteList,
+  IR_NodeType_Cte,
+  IR_NodeType_Subquery,
+  IR_NodeType_InList,
+  IR_NodeType_Exists,
+  IR_NodeType_Window,
+  IR_NodeType_PartitionBy,
 } IR_NodeType;
 
 typedef struct IR_Node IR_Node;
