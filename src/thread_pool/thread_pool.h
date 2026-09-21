@@ -54,4 +54,9 @@ internal void         tp_temp_end(TP_Temp temp);
 internal void         tp_for_parallel(TP_Context *pool, TP_Arena *arena, U64 task_count, TP_TaskFunc *task_func, void *task_data);
 internal Rng1U64 *    tp_divide_work(Arena *arena, U64 item_count, U32 worker_count);
 
+//~ tec: workers
+internal void tp_run_tasks(TP_Context *pool, TP_Worker *worker);
+internal void tp_worker_main(void *raw_worker);
+internal void tp_worker_main_shared(void *raw_worker);
+
 #endif //THREAD_POOL_H

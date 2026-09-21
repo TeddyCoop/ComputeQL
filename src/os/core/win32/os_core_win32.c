@@ -1,12 +1,4 @@
 ////////////////////////////////
-//~ tec: Modern Windows SDK Functions
-//
-// (We must dynamically link to them, since they can be missing in older SDKs)
-
-typedef HRESULT W32_SetThreadDescription_Type(HANDLE hThread, PCWSTR lpThreadDescription);
-global W32_SetThreadDescription_Type *w32_SetThreadDescription_func = 0;
-
-////////////////////////////////
 //~ tec: File Info Conversion Helpers
 
 internal FilePropertyFlags
@@ -247,16 +239,6 @@ os_set_thread_name(String8 name)
   // tec: raise-exception style
   {
     String8 name_copy = push_str8_copy(scratch.arena, name);
-#pragma pack(push,8)
-    typedef struct THREADNAME_INFO THREADNAME_INFO;
-    struct THREADNAME_INFO
-    {
-      U32 dwType;     // Must be 0x1000.
-      char *szName;   // Pointer to name (in user addr space).
-      U32 dwThreadID; // Thread ID (-1=caller thread).
-      U32 dwFlags;    // Reserved for future use, must be zero.
-    };
-#pragma pack(pop)
     THREADNAME_INFO info;
     info.dwType = 0x1000;
     info.szName = (char *)name_copy.str;
@@ -1445,8 +1427,6 @@ os_make_guid(void)
 #include <dbghelp.h>
 #undef OS_WINDOWS // shlwapi uses its own OS_WINDOWS include inside
 #include <shlwapi.h>
-
-internal B32 win32_g_is_quiet = 0;
 
 internal HRESULT WINAPI
 win32_dialog_callback(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam, LONG_PTR data)

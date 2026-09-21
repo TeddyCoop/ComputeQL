@@ -376,32 +376,6 @@ app_format_cell_text(Arena* arena, GDB_ColumnType type, F64 numeric_value, Strin
   }
 }
 
-typedef struct SelectColGather SelectColGather;
-struct SelectColGather
-{
-  B32 resolved;
-  B32 is_score;
-  GDB_Table* col_table;
-  GDB_Column* column;
-  U64 table_slot;
-  GDB_ColumnType type;
-  F64* numeric_values;
-  GDB_StringDataChunk strings;
-};
-
-typedef struct APP_SelectFormatTask APP_SelectFormatTask;
-struct APP_SelectFormatTask
-{
-  Rng1U64* ranges;
-  IR_Node* select_output_columns;
-  SelectColGather* gathered;
-  U64 column_count;
-  PLAN_RowSet* rows;
-  B32 capture_structured;
-  APP_ResultSet* out_result_set;
-  String8List* worker_lists;
-};
-
 internal THREAD_POOL_TASK_FUNC(app_select_format_task)
 {
   APP_SelectFormatTask* task = (APP_SelectFormatTask*)raw_task;

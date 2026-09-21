@@ -704,7 +704,7 @@ gpu_vulkan_end_and_submit_cmd_tagged(VkCommandBuffer cmd, const char* tag)
   {
     // tec: the fence was never signaled if the submit itself failed
     gpu_vulkan_note_result(submit_result);
-    log_error("vkQueueSubmit failed with VkResult %d - not waiting on the fence", (int)submit_result);
+    log_error("vkQueueSubmit failed with VkResult %d - not waiting on the fence", (S32)submit_result);
     return 0;
   }
   
@@ -718,6 +718,7 @@ gpu_vulkan_end_and_submit_cmd_tagged(VkCommandBuffer cmd, const char* tag)
     os_abort(1);
   }
   
+  g_vulkan_state->submit_count += 1;
   log_info("submit+wait wall time [%s]: %llu microseconds", tag, os_now_microseconds() - t0);
   return 1;
 }

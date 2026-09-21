@@ -44,4 +44,45 @@ internal PLAN_ExecResult app_perform_kernel(Arena* arena, GDB_Database* database
 internal TP_Context* app_thread_pool(void);
 internal TP_Arena* app_thread_pool_arena(void);
 
+//~ tec: row constraints
+internal int delete_row_index_compare_descending(const void* a, const void* b);
+internal void* gdb_zero_value_for_type(Arena* arena, GDB_ColumnType type);
+internal B32 gdb_candidate_value_equals_row(Arena* arena, GDB_Column* column, void* candidate, U64 existing_row);
+internal B32 gdb_stored_values_equal(Arena* arena, GDB_Column* col_a, U64 row_a, GDB_Column* col_b, U64 row_b);
+internal F64 gdb_check_load_value(GDB_Table* table, void** row_data, B32* row_null, IR_Node* node, B32* out_is_string, String8* out_string, B32* out_is_null);
+internal B32 gdb_check_eval(GDB_Table* table, void** row_data, B32* row_null, IR_Node* condition);
+internal B32 gdb_table_validate_row_constraints(Arena* arena, GDB_Database* database, GDB_Table* table, void** row_data, B32* row_null);
+internal B32 gdb_row_has_referencing_children(Arena* arena, GDB_Database* database, GDB_Table* table, U64 row_index);
+
+//~ tec: select formatting
+typedef struct SelectColGather SelectColGather;
+struct SelectColGather
+{
+  B32 resolved;
+  B32 is_score;
+  GDB_Table* col_table;
+  GDB_Column* column;
+  U64 table_slot;
+  GDB_ColumnType type;
+  F64* numeric_values;
+  GDB_StringDataChunk strings;
+};
+
+typedef struct APP_SelectFormatTask APP_SelectFormatTask;
+struct APP_SelectFormatTask
+{
+  Rng1U64* ranges;
+  IR_Node* select_output_columns;
+  SelectColGather* gathered;
+  U64 column_count;
+  PLAN_RowSet* rows;
+  B32 capture_structured;
+  APP_ResultSet* out_result_set;
+  String8List* worker_lists;
+};
+
+internal String8 app_format_cell_text(Arena* arena, GDB_ColumnType type, F64 numeric_value, String8 string_value, U32 decimal_scale, GDB_EnumType* enum_type);
+internal THREAD_POOL_TASK_FUNC(app_select_format_task);
+internal void app_select_format_dispatch(Arena* arena, String8List* out, IR_Node* select_output_columns, SelectColGather* gathered, U64 column_count, PLAN_RowSet* rows, U64 result_count, B32 capture_structured, APP_ResultSet* out_result_set);
+
 #endif //APPLICATION_H

@@ -174,9 +174,6 @@ plan_build_from_select(Arena* arena, GDB_Database* database, IR_Node* select_ir_
   return plan;
 }
 
-internal PLAN_ExecResult plan_execute_join(Arena* arena, GDB_Database* database, PLAN_Node* join_plan, IR_Node* select_ir_node, IR_Node* residual_where_root, QE_TraceCtx* trace);
-internal B32 plan_window_apply(Arena* arena, PLAN_RowSet* rows, IR_Node* column_list_ir, IR_Node* order_by_ir, PLAN_Materialized* out);
-
 internal PLAN_ExecResult
 plan_wrap_scan_result(Arena* arena, GDB_Table* table, String8 alias, QE_ScanResult scan_result)
 {
@@ -875,8 +872,6 @@ plan_materialized_to_temp_table(GDB_Database* database, String8 name, PLAN_Mater
   return table;
 }
 
-internal B32 plan_run_select_materialized(Arena* arena, GDB_Database* database, IR_Node* select_ir, PLAN_Materialized* out);
-
 // tec: runs the inner select into a temp table named after the alias, and turns the Table node into a plain reference to it
 internal B32
 plan_bind_derived_table(Arena* arena, GDB_Database* database, IR_Node* table_ir)
@@ -980,13 +975,6 @@ plan_make_constant_condition(Arena* arena, IR_Node* node, B32 value)
   ir_node_add_child(node, ir_node_make(arena, IR_NodeType_Numeric, str8_lit("1")));
   ir_node_add_child(node, ir_node_make(arena, IR_NodeType_Numeric, value ? str8_lit("1") : str8_lit("0")));
 }
-
-typedef struct PLAN_SubqueryTable PLAN_SubqueryTable;
-struct PLAN_SubqueryTable
-{
-  GDB_Table* table;
-  String8 alias;
-};
 
 internal GDB_Table*
 plan_find_table_quiet(GDB_Database* database, String8 name)
@@ -1218,26 +1206,6 @@ plan_rewrite_predicates(Arena* arena, GDB_Database* database, IR_Node* node)
 
 //~ tec: window functions
 
-typedef struct PLAN_WindowKey PLAN_WindowKey;
-struct PLAN_WindowKey
-{
-  B32 is_string;
-  B32 descending;
-  F64* nums;
-  String8* strs;
-  U8* is_null;
-};
-
-typedef struct PLAN_WindowSortCtx PLAN_WindowSortCtx;
-struct PLAN_WindowSortCtx
-{
-  PLAN_WindowKey* keys;
-  U64 key_count;
-};
-
-// tec: qsort has no user pointer
-global PLAN_WindowSortCtx* g_plan_window_sort_ctx = 0;
-
 // tec: NULLs sort as the smallest value, ahead of everything else
 internal S32
 plan_window_key_compare(PLAN_WindowKey* key, U64 a, U64 b)
@@ -1304,18 +1272,6 @@ plan_window_gather_key(Arena* arena, PLAN_RowSet* rows, String8 column_name, B32
   out->is_null = col.is_null;
   return 1;
 }
-
-#define PLAN_WINDOW_MAX_KEYS 8
-
-typedef enum PLAN_WindowFunc
-{
-  PLAN_WindowFunc_RowNumber,
-  PLAN_WindowFunc_Rank,
-  PLAN_WindowFunc_DenseRank,
-  PLAN_WindowFunc_Lag,
-  PLAN_WindowFunc_Lead,
-  PLAN_WindowFunc_Agg,
-} PLAN_WindowFunc;
 
 internal B32
 plan_window_compute(Arena* arena, PLAN_RowSet* rows, IR_Node* call, PLAN_AggColumn* out_col)

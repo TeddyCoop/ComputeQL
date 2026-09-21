@@ -99,4 +99,9 @@ internal GDB_ColumnType ir_find_column_type(GDB_Database* database, IR_Node* sel
 internal void ir_print_node(IR_Node *node, U64 depth);
 internal void ir_print_query(IR_Query *query);
 
+//~ tec: generation helpers
+internal IR_Node* ir_generate_recursive(Arena* arena, SQL_Node* sql_node);
+internal void ir_create_active_column_list(Arena* arena, IR_Node* parent_node, String8List* used_columns);
+internal void ir_expand_star_to_columns(Arena *arena, GDB_Database *db, IR_Node *select_node);
+
 #endif //IR_GEN_H

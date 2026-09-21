@@ -603,25 +603,6 @@ main thread because the dispatch path uses shared sync stuff
 
 the next chunk is not prefetched until the current chunk has finished uploading and any mapped string data has been closed
 */
-typedef struct QE_PrefetchBindingResult QE_PrefetchBindingResult;
-struct QE_PrefetchBindingResult
-{
-  B32 valid;
-  B32 is_string;
-  B32 cached;
-  void* data_ptr;
-  U64 size;
-  GDB_StringDataChunk str_chunk;
-};
-
-typedef struct QE_PrefetchSlot QE_PrefetchSlot;
-struct QE_PrefetchSlot
-{
-  Arena* arena;
-  Rng1U64 chunk_range;
-  U64 chunk_rows;
-  QE_PrefetchBindingResult bindings[QE_MAX_COLUMN_BINDINGS];
-};
 
 internal void
 qe_prefetch_read_slot(QE_PrefetchSlot* slot, QE_BytecodeProgram* prog, Rng1U64 range, U64 rows)
@@ -661,24 +642,6 @@ qe_prefetch_read_slot(QE_PrefetchSlot* slot, QE_BytecodeProgram* prog, Rng1U64 r
     }
   }
 }
-
-typedef struct QE_PrefetchCtx QE_PrefetchCtx;
-struct QE_PrefetchCtx
-{
-  QE_BytecodeProgram* prog;
-  QE_PrefetchSlot slots[2];
-  
-  OS_Handle worker;
-  // tec: main -> worker, "a request is pending" (mailbox depth 1)
-  OS_Handle request_sem; 
-  // tec: worker -> main, "the requested slot is filled"
-  OS_Handle ready_sem;   
-  
-  U32 pending_slot;
-  Rng1U64 pending_range;
-  U64 pending_rows;
-  B32 stop;
-};
 
 internal void
 qe_prefetch_worker_main(void* raw_ctx)
@@ -864,15 +827,6 @@ qe_scan_filter(Arena* arena, GDB_Database* database, GDB_Table* table, IR_Node* 
   U64 score_flags = prog->has_score_output ? (1u | (prog->score_is_distance ? 2u : 0u)) : 0u;
   gpu_kernel_set_arg_u64(kernel, QE_PUSH_CONSTANT_SCORE_FLAGS, score_flags);
   gpu_kernel_set_arg_u64(kernel, QE_PUSH_CONSTANT_TRIGRAM_N, settings_u64(str8_lit("QE_TRIGRAM_N"), 3));
-  
-  typedef struct QE_ResultChunk QE_ResultChunk;
-  struct QE_ResultChunk
-  {
-    U64* indices;
-    U64 count;
-    F64* scores;
-    QE_ResultChunk* next;
-  };
   
   QE_ResultChunk* result_chunks = 0;
   QE_ResultChunk** tail = &result_chunks;
@@ -1446,18 +1400,6 @@ qe_rowset_table_slot(PLAN_RowSet* rows, GDB_Table* table)
   return max_U64;
 }
 
-typedef struct QE_GatherNumericTask QE_GatherNumericTask;
-struct QE_GatherNumericTask
-{
-  Rng1U64* ranges;
-  U64* table_rows;
-  void* base_ptr;
-  U64 min_row;
-  GDB_ColumnType column_type;
-  U64 column_size;
-  F64* values;
-};
-
 internal THREAD_POOL_TASK_FUNC(qe_gather_numeric_task)
 {
   QE_GatherNumericTask* task = (QE_GatherNumericTask*)raw_task;
@@ -1549,15 +1491,6 @@ qe_gather_numeric_column(Arena* arena, PLAN_RowSet* rows, U64 table_slot, GDB_Co
   return values;
 }
 
-typedef struct QE_GatherDictCodesTask QE_GatherDictCodesTask;
-struct QE_GatherDictCodesTask
-{
-  Rng1U64* ranges;
-  U64* table_rows;
-  U32* dict_codes;
-  F64* values;
-};
-
 internal THREAD_POOL_TASK_FUNC(qe_gather_dict_codes_task)
 {
   QE_GatherDictCodesTask* task = (QE_GatherDictCodesTask*)raw_task;
@@ -1605,15 +1538,6 @@ qe_gather_string_dict_codes(Arena* arena, PLAN_RowSet* rows, U64 table_slot, GDB
   return values;
 }
 
-typedef struct QE_DictLookupTask QE_DictLookupTask;
-struct QE_DictLookupTask
-{
-  Rng1U64* ranges;
-  GDB_StringDataChunk chunk;
-  GDB_StringDict* dict;
-  F64* values;
-};
-
 internal THREAD_POOL_TASK_FUNC(qe_dict_lookup_task)
 {
   QE_DictLookupTask* task = (QE_DictLookupTask*)raw_task;
@@ -1627,14 +1551,6 @@ internal THREAD_POOL_TASK_FUNC(qe_dict_lookup_task)
     task->values[i] = (F64)gdb_string_dict_code_or_sentinel(task->dict, s);
   }
 }
-
-typedef struct QE_DenseDictCodesTask QE_DenseDictCodesTask;
-struct QE_DenseDictCodesTask
-{
-  Rng1U64* ranges;
-  U32* codes;
-  F64* values;
-};
 
 internal THREAD_POOL_TASK_FUNC(qe_dense_dict_codes_task)
 {
@@ -1696,14 +1612,6 @@ qe_dict_codes_from_string_chunk(Arena* arena, GDB_StringDataChunk* chunk, GDB_St
   return values;
 }
 
-typedef struct QE_NarrowCheckTask QE_NarrowCheckTask;
-struct QE_NarrowCheckTask
-{
-  Rng1U64* ranges;
-  F64* values;
-  B32* task_narrow;
-};
-
 internal THREAD_POOL_TASK_FUNC(qe_narrow_check_task)
 {
   QE_NarrowCheckTask* task = (QE_NarrowCheckTask*)raw_task;
@@ -1742,14 +1650,6 @@ qe_values_round_trip_f32(F64* values, U64 count)
   scratch_end(scratch);
   return all_narrow;
 }
-
-typedef struct QE_NarrowConvertTask QE_NarrowConvertTask;
-struct QE_NarrowConvertTask
-{
-  Rng1U64* ranges;
-  F64* src;
-  F32* dst;
-};
 
 internal THREAD_POOL_TASK_FUNC(qe_narrow_convert_task)
 {
@@ -1875,18 +1775,6 @@ qe_str8_compare(String8 a, String8 b)
   if (a.size > b.size) return 1;
   return 0;
 }
-
-typedef struct QE_SortRowsCtx QE_SortRowsCtx;
-struct QE_SortRowsCtx
-{
-  U32 num_keys;
-  B32 key_is_string[QE_SORT_MAX_KEYS];
-  B32 key_desc[QE_SORT_MAX_KEYS];
-  F64* numeric_keys[QE_SORT_MAX_KEYS];        // tec: dense, indexed by output-row position (0..count-1)
-  GDB_StringDataChunk string_keys[QE_SORT_MAX_KEYS];
-};
-
-global QE_SortRowsCtx* g_qe_sort_rows_ctx = 0;
 
 internal int
 qe_sort_rows_compare(const void* a, const void* b)
@@ -2318,18 +2206,6 @@ qe_sort_materialized(Arena* arena, PLAN_Materialized* m, IR_Node* order_by_ir)
 
 //~ tec: aggregate/HAVING
 
-typedef struct QE_AggExprInfo QE_AggExprInfo;
-struct QE_AggExprInfo
-{
-  String8 display_name;
-  U32 func_code;
-  GDB_Table* arg_table;
-  U64 arg_slot;
-  GDB_Column* arg_column;
-  // tec: APPROX_PERCENTILE's fraction argument
-  F64 f64_param;   
-};
-
 internal B32
 qe_agg_func_code_from_name(String8 name, U32* out_func_code)
 {
@@ -2401,14 +2277,6 @@ qe_hll_estimate_cardinality(U32* registers, U64 num_registers)
   
   return estimate;
 }
-
-// tec: a t-digest centroid - a (mean, weight) pair.
-typedef struct QE_TDigestCentroid QE_TDigestCentroid;
-struct QE_TDigestCentroid
-{
-  F32 mean;
-  F32 weight;
-};
 
 internal int
 qe_tdigest_centroid_compare(const void* a, const void* b)
@@ -4172,14 +4040,6 @@ qe_try_index_scan(Arena* arena, GDB_Table* table, IR_Node* where_clause, QE_Scan
   return 0;
 }
 
-typedef struct QE_ZonemapLeaf QE_ZonemapLeaf;
-struct QE_ZonemapLeaf
-{
-  GDB_Column* column;
-  B32 is_eq, is_lt, is_le, is_gt, is_ge;
-  F64 target;
-};
-
 // tec: does column's [min,max] over a chunk provably rule out every row satisfying `leaf`?
 internal B32
 qe_zonemap_chunk_is_prunable(QE_ZonemapLeaf* leaf, GDB_ZoneMapChunk* chunk)
@@ -4519,19 +4379,6 @@ qe_row_eval_fuzzy_call(Arena* arena, PLAN_RowSet* rows, IR_Node* call, U64 outpu
 
 //~ tec: 'col [NOT] IN (list)' on the CPU
 
-typedef struct QE_InSet QE_InSet;
-struct QE_InSet
-{
-  QE_InSet* next;
-  IR_Node* list_node;
-  F64* nums;
-  U64 num_count;
-  String8* strs;
-  U64 str_count;
-};
-
-global QE_InSet* g_qe_in_sets = 0;
-
 internal S32
 qe_f64_compare_for_sort(const void* a, const void* b)
 {
@@ -4870,16 +4717,6 @@ qe_row_condition_eval(Arena* arena, PLAN_RowSet* rows, IR_Node* condition, U64 o
   log_error("qe_row_condition_eval: unsupported operator '%.*s'", str8_varg(op));
   return 1;
 }
-
-typedef struct QE_CpuScanTask QE_CpuScanTask;
-struct QE_CpuScanTask
-{
-  Rng1U64* ranges;
-  PLAN_RowSet* rows;
-  IR_Node* condition_root;
-  U64* task_matched_counts;
-  U64** task_matched_indices;
-};
 
 internal THREAD_POOL_TASK_FUNC(qe_cpu_scan_filter_task)
 {

@@ -1,59 +1,3 @@
-global Arena *g_pg_server_arena = 0;
-
-typedef struct PG_ConnCtx PG_ConnCtx;
-struct PG_ConnCtx
-{
-  OS_Handle socket;
-};
-
-//~ tec: extended query protocol session state
-// tec: a prepared statement holds unsubstituted '$N' text; a portal holds it with values filled in
-#define PG_MAX_PREPARED_STATEMENTS 64
-#define PG_MAX_PORTALS 64
-#define PG_MAX_BIND_PARAMS 100
-
-typedef struct PG_PreparedStatement PG_PreparedStatement;
-struct PG_PreparedStatement
-{
-  B32 in_use;
-  String8 name;
-  String8 sql_text; // unsubstituted '$1'/'$2'/... placeholders
-  U32 param_count;
-  U32 param_oids[PG_MAX_BIND_PARAMS]; // 0 = unknown
-};
-
-typedef struct PG_Portal PG_Portal;
-struct PG_Portal
-{
-  B32 in_use;
-  String8 name;
-  String8 bound_sql_text;
-  B32 looks_like_select;
-  // pe column, reuses the bind-param cap
-  U16 result_format_codes[PG_MAX_BIND_PARAMS];
-  U16 result_format_code_count;
-
-  // tec: run lazily by Describe or Execute (whichever comes first) and cached
-  B32 executed;
-  B32 had_error;
-  String8 error_message;
-  APP_ResultSet result_set;
-  U64 rows_sent; // for a max_rows limited Execute / PortalSuspended
-};
-
-typedef struct PG_Session PG_Session;
-struct PG_Session
-{
-  Arena *arena;
-  
-  GDB_Database *current_database;
-
-  // tec: after an error, Parse/Bind/Describe/Execute/Close are discarded until the next Sync
-  B32 in_failed_pipeline;
-
-  PG_PreparedStatement statements[PG_MAX_PREPARED_STATEMENTS];
-  PG_Portal portals[PG_MAX_PORTALS];
-};
 
 internal PG_PreparedStatement*
 pg_session_find_statement(PG_Session *session, String8 name)
@@ -162,14 +106,6 @@ pg_portal_ensure_executed(PG_Session *session, PG_Portal *portal)
 }
 
 //~ tec: cursor reader for extended-protocol message bodies
-typedef struct PG_Reader PG_Reader;
-struct PG_Reader
-{
-  U8 *data;
-  U64 size;
-  U64 pos;
-  B32 error;
-};
 
 internal PG_Reader
 pg_reader_make(String8 body)

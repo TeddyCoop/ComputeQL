@@ -212,8 +212,6 @@ gdb_enum_type_label_from_code(GDB_EnumType* enum_type, U32 code)
   return enum_type->value_labels[code];
 }
 
-global String8 g_gdb_database_save_path = str8_lit_comp("gdb_data/");
-
 internal B32
 gdb_database_save(GDB_Database* database, String8 directory)
 {
@@ -2054,16 +2052,6 @@ gdb_index_numeric_value(GDB_Column* column, U64 row_index)
   }
 }
 
-typedef struct GDB_IndexBuildCtx GDB_IndexBuildCtx;
-struct GDB_IndexBuildCtx
-{
-  B32 is_string;
-  F64* numeric_keys; // tec: dense, indexed by row (0..row_count-1)
-  GDB_StringDataChunk string_keys;
-};
-
-global GDB_IndexBuildCtx* g_gdb_index_build_ctx = 0;
-
 internal int
 gdb_index_build_compare(const void* a, const void* b)
 {
@@ -3199,8 +3187,6 @@ gdb_string_dict_code_or_sentinel(GDB_StringDict* dict, String8 value)
   return gdb_string_dict_code_from_value(dict, value, &code) ? code : GDB_DICT_NOT_FOUND;
 }
 
-read_only global String8 g_gdb_dict_empty_str8 = {0};
-
 internal String8
 gdb_dict_row_string(GDB_StringDataChunk* chunk, U64 row)
 {
@@ -3212,16 +3198,6 @@ gdb_dict_row_string(GDB_StringDataChunk* chunk, U64 row)
   U64 len = chunk->offsets[row + 1] - start;
   return str8((U8*)chunk->data + start, len);
 }
-
-typedef struct GDB_DictBuildCtx GDB_DictBuildCtx;
-struct GDB_DictBuildCtx
-{
-  GDB_StringDataChunk chunk;
-  Rng1U64* ranges;
-  U32* owner_row;
-  U64 capacity;
-  U32 overflow_flag;
-};
 
 internal THREAD_POOL_TASK_FUNC(gdb_dict_claim_task)
 {
@@ -3263,15 +3239,6 @@ internal THREAD_POOL_TASK_FUNC(gdb_dict_claim_task)
     }
   }
 }
-
-typedef struct GDB_DictFillCtx GDB_DictFillCtx;
-struct GDB_DictFillCtx
-{
-  GDB_StringDataChunk chunk;
-  Rng1U64* ranges;
-  GDB_StringDict* dict;
-  U32* dict_codes;
-};
 
 internal THREAD_POOL_TASK_FUNC(gdb_dict_fill_codes_task)
 {
@@ -3413,19 +3380,6 @@ gdb_column_ensure_string_dict(GDB_Column* column)
   scratch_end(scratch);
   ProfEnd();
 }
-
-typedef struct GDB_ZoneMapBuildCtx GDB_ZoneMapBuildCtx;
-struct GDB_ZoneMapBuildCtx
-{
-  GDB_Column* column;
-  GDB_ZoneMapChunk* zone_map;
-  
-  // tec: in CHUNK-index units, not row units
-  Rng1U64* chunk_ranges;
-  
-  U64 chunk_rows;
-  void* base_ptr;
-};
 
 internal THREAD_POOL_TASK_FUNC(gdb_zone_map_build_task)
 {

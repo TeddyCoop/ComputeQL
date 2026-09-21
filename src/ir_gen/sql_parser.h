@@ -172,6 +172,8 @@ internal Rng1U64 sql_ctx_range_at(SQL_ParseCtx *ctx, U64 pos);
 internal Rng1U64 sql_ctx_error_range(SQL_ParseCtx *ctx);
 internal String8  sql_ctx_text_or_eof(SQL_ParseCtx *ctx);
 
+internal B32 sql_check_paren_select(SQL_ParseCtx *ctx);
+
 //~ tec: sql ast
 typedef enum SQL_NodeType
 {

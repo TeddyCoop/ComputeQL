@@ -150,11 +150,12 @@ struct GPU_VulkanState
   void* download_staging_mapped;
   U64 download_staging_capacity;
   
+  U64 submit_count;
+  
   GPU_VulkanBatch active_batch;
 };
 
 global GPU_VulkanState* g_vulkan_state = 0;
-
 
 internal void gpu_vulkan_init(void);
 internal void gpu_vulkan_release(void);

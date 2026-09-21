@@ -1,14 +1,4 @@
 ////////////////////////////////
-//~ tec: Modern Windows SDK Functions
-//
-// (We must dynamically link to them, since they can be missing in older SDKs)
-
-typedef BOOL w32_SetProcessDpiAwarenessContext_Type(void* value);
-typedef UINT w32_GetDpiForWindow_Type(HWND hwnd);
-#define w32_DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 ((void*)-4)
-global w32_GetDpiForWindow_Type *w32_GetDpiForWindow_func = 0;
-
-////////////////////////////////
 //~ tec: Basic Helpers
 
 internal Rng2F32

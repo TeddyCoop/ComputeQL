@@ -1,10 +1,3 @@
-global Arena *g_server_arena = 0;
-
-typedef struct SRV_ConnCtx SRV_ConnCtx;
-struct SRV_ConnCtx
-{
-  OS_Handle socket;
-};
 
 internal void
 server_connection_thread_proc(void *ptr)

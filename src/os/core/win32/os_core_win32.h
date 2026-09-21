@@ -98,6 +98,7 @@ global OS_W32_State os_w32_state = {0};
 
 internal FilePropertyFlags os_w32_file_property_flags_from_dwFileAttributes(DWORD dwFileAttributes);
 internal void os_w32_file_properties_from_attribute_data(FileProperties *properties, WIN32_FILE_ATTRIBUTE_DATA *attributes);
+internal B32 os_file_set_time(OS_Handle file, DateTime time);
 
 ////////////////////////////////
 //~ tec: Time Conversion Helpers
@@ -117,5 +118,40 @@ internal void os_w32_entity_release(OS_W32_Entity *entity);
 //~ tec: Thread Entry Point
 
 internal DWORD os_w32_thread_entry_point(void *ptr);
+
+////////////////////////////////
+//~ tec: Modern Windows SDK Functions
+//
+// (We must dynamically link to them, since they can be missing in older SDKs)
+
+typedef HRESULT W32_SetThreadDescription_Type(HANDLE hThread, PCWSTR lpThreadDescription);
+global W32_SetThreadDescription_Type *w32_SetThreadDescription_func = 0;
+
+////////////////////////////////
+//~ tec: Thread Naming
+
+#pragma pack(push,8)
+typedef struct THREADNAME_INFO THREADNAME_INFO;
+struct THREADNAME_INFO
+{
+  U32 dwType;     // Must be 0x1000.
+  char *szName;   // Pointer to name (in user addr space).
+  U32 dwThreadID; // Thread ID (-1=caller thread).
+  U32 dwFlags;    // Reserved for future use, must be zero.
+};
+#pragma pack(pop)
+
+////////////////////////////////
+//~ tec: Crash Handling
+
+global B32 win32_g_is_quiet = 0;
+
+internal HRESULT WINAPI win32_dialog_callback(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam, LONG_PTR data);
+internal LONG WINAPI win32_exception_filter(EXCEPTION_POINTERS* exception_ptrs);
+
+////////////////////////////////
+//~ tec: Entry Point
+
+internal void w32_entry_point_caller(int argc, WCHAR **wargv);
 
 #endif //OS_CORE_WIN32_H

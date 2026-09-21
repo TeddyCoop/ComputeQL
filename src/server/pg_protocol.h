@@ -23,6 +23,11 @@ internal B32 pg_recv_typed(Arena* arena, OS_Handle conn, U8* out_type, String8* 
 internal B32 pg_send_raw_byte(OS_Handle conn, U8 b);
 internal B32 pg_send_msg(OS_Handle conn, Arena* arena, U8 type, String8List* body_parts);
 
+internal String8 pg_be32(Arena* arena, U32 v);
+internal String8 pg_be16(Arena* arena, U16 v);
+internal U32 pg_read_be32(U8* bytes);
+internal String8 pg_cstr(Arena* arena, String8 s);
+
 //~ tec: backend messages
 internal B32 pg_send_authentication_ok(OS_Handle conn, Arena* arena);
 internal B32 pg_send_parameter_status(OS_Handle conn, Arena* arena, String8 name, String8 value);
@@ -35,6 +40,9 @@ internal B32 pg_send_row_description_from_result_set(OS_Handle conn, Arena* aren
 internal B32 pg_send_row_description_single_text_column(OS_Handle conn, Arena* arena, String8 column_name);
 internal B32 pg_send_data_rows_from_result_set(OS_Handle conn, Arena* arena, APP_ResultSet* result_set);
 internal B32 pg_send_data_row_single_text_column(OS_Handle conn, Arena* arena, String8 value);
+
+internal U16 pg_result_format_code_for_column(U16* format_codes, U16 format_code_count, U64 column_index);
+internal String8 pg_encode_binary_numeric(Arena* arena, GDB_ColumnType type, F64 value);
 
 //~ tec: extended protocol
 // tec: result_format_codes: 0 entries = all text, 1 entry = applies to every column, else one per column
@@ -71,5 +79,8 @@ internal B32 pg_param_to_sql_literal(Arena* arena, U32 declared_oid, U16 format,
 
 // tec: replaces '$N' (1-based) outside quoted strings with literals[N-1]; out-of-range is left as is
 internal String8 pg_substitute_params(Arena* arena, String8 sql_text, String8* literals, U32 literal_count);
+
+internal String8 pg_quote_sql_string_literal(Arena* arena, String8 value);
+internal B32 pg_text_looks_numeric(String8 s);
 
 #endif //PG_PROTOCOL_H
