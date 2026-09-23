@@ -45,6 +45,7 @@ typedef enum IR_NodeType
   IR_NodeType_Check,
   IR_NodeType_Describe,
   IR_NodeType_Explain,
+  IR_NodeType_Analyze,
   IR_NodeType_EnumDef,
   IR_NodeType_EnumValue,
   IR_NodeType_CteList,
@@ -54,6 +55,10 @@ typedef enum IR_NodeType
   IR_NodeType_Exists,
   IR_NodeType_Window,
   IR_NodeType_PartitionBy,
+  
+  // tec: planner only, value is "semi" or "anti"
+  // children are the outer key, the inner key, the inner Table and an optional Where
+  IR_NodeType_SemiJoin, 
 } IR_NodeType;
 
 typedef struct IR_Node IR_Node;

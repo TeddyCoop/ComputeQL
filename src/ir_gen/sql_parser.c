@@ -529,6 +529,10 @@ sql_parse(Arena* arena, SQL_Token* tokens, U64 token_count, String8 source_text)
         new_node = sql_parse_explain_clause(ctx);
         last_select_node = new_node ? new_node->first : NULL;
       }
+      else if (str8_match(token.value, str8_lit("analyze"), StringMatchFlag_CaseInsensitive))
+      {
+        new_node = sql_parse_analyze_clause(ctx);
+      }
       else
       {
         sql_parse_error_at(token.range, "unexpected keyword '%.*s'", str8_varg(token.value));
@@ -668,6 +672,17 @@ sql_parse_explain_clause(SQL_ParseCtx *ctx)
   // plain EXPLAIN stays a static plan shape dump
   B32 analyze = sql_match(ctx, SQL_TokenType_Keyword, str8_lit("analyze"));
   
+  // tec: EXPLAIN [ANALYZE] WITH ... SELECT, the CteList rides along as a child of the select like it does at the top level
+  SQL_Node* with_node = NULL;
+  if (sql_check(ctx, SQL_TokenType_Keyword, str8_lit("with")))
+  {
+    with_node = sql_parse_with_clause(ctx);
+    if (!with_node)
+    {
+      return NULL;
+    }
+  }
+  
   if (!sql_check(ctx, SQL_TokenType_Keyword, str8_lit("select")))
   {
     sql_parse_error_at(sql_ctx_error_range(ctx),
@@ -680,6 +695,12 @@ sql_parse_explain_clause(SQL_ParseCtx *ctx)
   SQL_Node* select_node = sql_parse_select_clause(ctx);
   if (!select_node) return NULL;
   
+  if (with_node)
+  {
+    with_node->parent = select_node;
+    DLLPushBack(select_node->first, select_node->last, with_node);
+  }
+  
   SQL_Node* explain_node = push_array(ctx->arena, SQL_Node, 1);
   explain_node->type = SQL_NodeType_Explain;
   // tec: explain_node->value is otherwise unused
@@ -688,6 +709,28 @@ sql_parse_explain_clause(SQL_ParseCtx *ctx)
   select_node->parent = explain_node;
   
   return explain_node;
+}
+
+// tec: ANALYZE [table], no table means every table in the database
+internal SQL_Node*
+sql_parse_analyze_clause(SQL_ParseCtx *ctx)
+{
+  sql_advance(ctx, 1); // move past 'analyze'
+  
+  SQL_Node* analyze_node = push_array(ctx->arena, SQL_Node, 1);
+  analyze_node->type = SQL_NodeType_Analyze;
+  
+  if (sql_check(ctx, SQL_TokenType_Identifier, (String8){0}))
+  {
+    SQL_Node* table_node = push_array(ctx->arena, SQL_Node, 1);
+    table_node->type = SQL_NodeType_Table;
+    table_node->value = sql_take(ctx).value;
+    table_node->parent = analyze_node;
+    analyze_node->first = table_node;
+    analyze_node->last = table_node;
+  }
+  
+  return analyze_node;
 }
 
 //~ tec: shared helpers used by SELECT / FROM / WHERE / GROUP BY / ORDER BY
@@ -2840,6 +2883,7 @@ sql_node_type_to_string(SQL_NodeType type)
     case SQL_NodeType_Use: result = str8_lit("SQL_NodeType_Use"); break;
     case SQL_NodeType_Describe: result = str8_lit("SQL_NodeType_Describe"); break;
     case SQL_NodeType_Explain: result = str8_lit("SQL_NodeType_Explain"); break;
+    case SQL_NodeType_Analyze: result = str8_lit("SQL_NodeType_Analyze"); break;
     case SQL_NodeType_EnumDef: result = str8_lit("SQL_NodeType_EnumDef"); break;
     case SQL_NodeType_EnumValue: result = str8_lit("SQL_NodeType_EnumValue"); break;
     case SQL_NodeType_Select: result = str8_lit("SQL_NodeType_Select"); break;

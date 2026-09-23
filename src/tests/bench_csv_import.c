@@ -13,6 +13,7 @@
 #include "gpu/gpu_inc.h"
 #include "planner/plan_node.h"
 #include "query_exec/query_exec.h"
+#include "optimizer/optimizer_inc.h"
 #include "planner/planner.h"
 #include "application.h"
 #include "third_party/sqlite/sqlite3.h"
@@ -26,6 +27,7 @@
 #include "ir_gen/ir_gen_inc.c"
 #include "gdb/gdb_inc.c"
 #include "query_exec/query_exec.c"
+#include "optimizer/optimizer_inc.c"
 #include "planner/planner.c"
 #include "application.c"
 // tec: sqlite3 is compiled own its own

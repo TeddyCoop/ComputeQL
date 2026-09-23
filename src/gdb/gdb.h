@@ -153,6 +153,41 @@ struct GDB_ZoneMapChunk
   B32 has_values;
 };
 
+//~ tec: column statistics
+#define GDB_STATS_HISTOGRAM_BUCKETS 64
+#define GDB_STATS_MCV_COUNT 8
+#define GDB_STATS_SAMPLE_ROWS 65536
+#define GDB_STATS_HLL_PRECISION 14
+#define GDB_STATS_HLL_REGISTER_COUNT (1 << GDB_STATS_HLL_PRECISION)
+
+typedef struct GDB_ColumnMcvEntry GDB_ColumnMcvEntry;
+struct GDB_ColumnMcvEntry
+{
+  U64 key;
+  F64 fraction; // tec: of non-null rows
+};
+
+typedef struct GDB_ColumnStats GDB_ColumnStats;
+struct GDB_ColumnStats
+{
+  B32 is_computed;
+  U64 computed_generation;
+  U64 row_count;
+  U64 null_count;
+  U64 distinct_count;
+  
+  B32 has_range;
+  F64 min_value;
+  F64 max_value;
+  
+  // tec: every bucket will hold an equal share of non null rows
+  U32 histogram_bucket_count;
+  F64 histogram_bounds[GDB_STATS_HISTOGRAM_BUCKETS + 1];
+  
+  U32 mcv_count;
+  GDB_ColumnMcvEntry mcv[GDB_STATS_MCV_COUNT];
+};
+
 //~ tec: declare db structs
 typedef struct GDB_Column GDB_Column;
 typedef struct GDB_Table GDB_Table;
@@ -190,6 +225,9 @@ struct GDB_Column
   GDB_ZoneMapChunk* zone_map;
   U64 zone_map_chunk_count;
   U64 zone_map_capacity;
+  
+  //- tec: optimizer statistics, lazily computed
+  GDB_ColumnStats stats;
   
   U64 gpu_upload_generation;
   U64 gpu_upload_data_size;

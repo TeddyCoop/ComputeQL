@@ -222,6 +222,7 @@ typedef enum SQL_NodeType
   SQL_NodeType_AggregateCall,
   SQL_NodeType_Describe,
   SQL_NodeType_Explain,
+  SQL_NodeType_Analyze,
   SQL_NodeType_EnumDef,
   SQL_NodeType_EnumValue,
   SQL_NodeType_CteList,
@@ -277,6 +278,7 @@ internal SQL_Node* sql_parse_limit_clause(SQL_ParseCtx *ctx);
 internal SQL_Node* sql_parse_offset_clause(SQL_ParseCtx *ctx);
 internal SQL_Node* sql_parse_describe_clause(SQL_ParseCtx *ctx);
 internal SQL_Node* sql_parse_explain_clause(SQL_ParseCtx *ctx);
+internal SQL_Node* sql_parse_analyze_clause(SQL_ParseCtx *ctx);
 internal SQL_Node* sql_parse(Arena* arena, SQL_Token* tokens, U64 token_count, String8 source_text);
 
 internal String8 sql_node_type_to_string(SQL_NodeType type);

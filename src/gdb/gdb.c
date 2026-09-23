@@ -677,7 +677,19 @@ gdb_table_save(GDB_Table* table, String8 table_dir)
       meta_size += sizeof(U64) + column->name.size + sizeof(U64) +
         column->zone_map_chunk_count * (sizeof(F64) * 2 + sizeof(U32));
     }
-    
+
+    // tec: trailing, optional per column statistics section
+    meta_size += sizeof(U64);
+    for (U64 i = 0; i < table->column_count; i++)
+    {
+      GDB_Column* column = table->columns[i];
+      if (!gdb_column_stats_is_current(column))
+      {
+        continue;
+      }
+      meta_size += gdb_column_stats_record_size(column);
+    }
+
     U8* meta_buffer = push_array(scratch.arena, U8, meta_size);
     U8* meta_ptr = meta_buffer;
     
@@ -840,7 +852,27 @@ gdb_table_save(GDB_Table* table, String8 table_dir)
         *(U32*)meta_ptr = chunk->has_values; meta_ptr += sizeof(U32);
       }
     }
-    
+
+    U64 stats_column_count = 0;
+    for (U64 i = 0; i < table->column_count; i++)
+    {
+      if (gdb_column_stats_is_current(table->columns[i]))
+      {
+        stats_column_count += 1;
+      }
+    }
+
+    *(U64*)meta_ptr = stats_column_count; meta_ptr += sizeof(U64);
+    for (U64 i = 0; i < table->column_count; i++)
+    {
+      GDB_Column* column = table->columns[i];
+      if (!gdb_column_stats_is_current(column))
+      {
+        continue;
+      }
+      meta_ptr = gdb_column_stats_write_record(meta_ptr, column);
+    }
+
     os_file_write(meta_file, r1u64(0, meta_size), meta_buffer);
     os_file_close(meta_file);
   }
@@ -1447,7 +1479,35 @@ gdb_table_load(GDB_Database* database, String8 table_dir, String8 meta_path)
       column->zonemap_checked_generation = column->write_generation;
     }
   }
-  
+
+  //- tec: optional trailing statistics section
+  if (read_ptr + sizeof(U64) <= meta_data.str + meta_data.size)
+  {
+    U8* meta_end = meta_data.str + meta_data.size;
+    U64 stats_column_count = *(U64*)read_ptr; read_ptr += sizeof(U64);
+
+    for (U64 i = 0; i < stats_column_count; i++)
+    {
+      String8 column_name = {0};
+      GDB_ColumnStats loaded_stats = {0};
+      if (!gdb_column_stats_read_record(&read_ptr, meta_end, &column_name, &loaded_stats))
+      {
+        break;
+      }
+
+      GDB_Column* column = gdb_table_find_column(table, column_name);
+      // tec: a row count mismatch means the stats predate the data on disk
+      if (!column || loaded_stats.row_count != column->row_count)
+      {
+        continue;
+      }
+
+      column->stats = loaded_stats;
+      column->stats.is_computed = 1;
+      column->stats.computed_generation = column->write_generation;
+    }
+  }
+
   table->name = push_str8_copy(table->arena, str8_skip_last_slash(table_dir));
   temp_end(scratch);
   
@@ -3817,7 +3877,9 @@ gdb_database_build_column_catalog(GDB_Database* database)
   gdb_table_add_column(catalog, gdb_column_schema_create(str8_lit("index_name"), GDB_ColumnType_String8));
   gdb_table_add_column(catalog, gdb_column_schema_create(str8_lit("is_disk_backed"), GDB_ColumnType_U32));
   gdb_table_add_column(catalog, gdb_column_schema_create(str8_lit("row_count"), GDB_ColumnType_U64));
-  
+  gdb_table_add_column(catalog, gdb_column_schema_create(str8_lit("distinct_count"), GDB_ColumnType_U64));
+  gdb_table_add_column(catalog, gdb_column_schema_create(str8_lit("null_count"), GDB_ColumnType_U64));
+
   String8 empty = str8_lit("");
   
   for (U64 t = 0; t < database->table_count; t++)
@@ -3845,13 +3907,22 @@ gdb_database_build_column_catalog(GDB_Database* database)
       String8 check_text = column->has_check ? column->check_text : empty;
       String8 index_name = index_on_column ? index_on_column->name : empty;
       
-      void* row_data[16] = {
+      // tec: stats only show up after ANALYZE or a query that needed them, this never computes them
+      B32 has_stats = gdb_column_stats_is_current(column);
+      U64 distinct_count = column->stats.distinct_count;
+      U64 null_count = column->stats.null_count;
+
+      void* row_data[18] = {
         &table->name, &column->name, &type_name, &ordinal, &nullable, &is_unique,
         &is_primary_key, &is_foreign_key, &fk_ref_table, &fk_ref_column, &has_check,
         &check_text, &is_indexed, &index_name, &is_disk_backed, &row_count,
+        &distinct_count, &null_count,
       };
-      
-      gdb_table_add_row(catalog, row_data, NULL);
+      B32 null_flags[18] = {0};
+      null_flags[16] = !has_stats;
+      null_flags[17] = !has_stats;
+
+      gdb_table_add_row(catalog, row_data, null_flags);
     }
   }
   

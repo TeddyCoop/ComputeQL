@@ -6,18 +6,39 @@ internal PLAN_Node* plan_build_from_select(Arena* arena, GDB_Database* database,
 internal B32 plan_ir_contains_aggregate(IR_Node* node);
 
 internal PLAN_ExecResult plan_execute(Arena* arena, GDB_Database* database, PLAN_Node* plan, IR_Node* select_ir_node, QE_TraceCtx* trace);
+internal PLAN_ExecResult plan_execute_node(Arena* arena, GDB_Database* database, PLAN_Node* plan, IR_Node* select_ir_node, QE_TraceCtx* trace);
+internal PLAN_ExecResult plan_execute_top_n(Arena* arena, GDB_Database* database, PLAN_Node* plan, IR_Node* select_ir_node, QE_TraceCtx* trace);
+internal PLAN_Node* plan_add_semi_join(Arena* arena, GDB_Database* database, PLAN_Node* input, IR_Node* semi_ir);
+internal B32 plan_node_is_join(PLAN_Node* plan);
+internal void plan_apply_limit(PLAN_ExecResult* result, IR_Node* offset_node, IR_Node* limit_node);
+internal PLAN_RowSet plan_reverse_rowset(Arena* arena, PLAN_RowSet* rows);
+internal U64 plan_result_row_count(PLAN_ExecResult* result);
+internal B32 plan_node_records_rows_only(PLAN_Node* plan);
 
 // tec: leaves temp tables registered on `database`. release them with gdb_database_release_temp_tables_from()
 internal PLAN_ExecResult plan_run_select(Arena* arena, GDB_Database* database, IR_Node* select_ir, QE_TraceCtx* trace);
+internal PLAN_ExecResult plan_run_select_with_plan(Arena* arena, GDB_Database* database, IR_Node* select_ir, QE_TraceCtx* trace, PLAN_Node** out_plan);
+internal PLAN_Node* plan_build_for_explain(Arena* arena, GDB_Database* database, IR_Node* select_ir, OPT_SourceEstimates* inherited);
 
 internal String8 plan_node_type_to_string(PLAN_NodeType type);
 internal void plan_print(Arena* arena, String8List* out, PLAN_Node* plan, U64 depth);
 internal void plan_print_analyzed(Arena* arena, String8List* out, PLAN_Node* plan, QE_TraceCtx* trace, U64 depth);
+internal String8 plan_format_rows(Arena* arena, F64 rows);
+internal F64 plan_q_error(F64 estimated, F64 actual);
+internal String8 plan_estimate_suffix(Arena* arena, PLAN_Node* plan, B32 has_actual, U64 actual_rows);
+internal String8 plan_scan_strategy_suffix(Arena* arena, PLAN_Node* plan);
+internal String8 plan_sort_strategy_suffix(Arena* arena, PLAN_Node* plan);
+internal String8 plan_indent_string(Arena* arena, U64 depth);
+internal void plan_print_plain_line(Arena* arena, String8List* out, PLAN_Node* plan, String8 indent, String8 estimate_suffix);
+internal void plan_print_scan_trace(Arena* arena, String8List* out, PLAN_Node* plan, QE_NodeTrace* node_trace, String8 indent);
 
 //~ tec: join execution
+#define PLAN_JOIN_MAX_ON_CONDITIONS 16
 internal String8 plan_alias_from_table_ir(IR_Node* table_ir);
 internal PLAN_ExecResult plan_wrap_scan_result(Arena* arena, GDB_Table* table, String8 alias, QE_ScanResult scan_result);
 internal PLAN_ExecResult plan_execute_join(Arena* arena, GDB_Database* database, PLAN_Node* join_plan, IR_Node* select_ir_node, IR_Node* residual_where_root, QE_TraceCtx* trace);
+internal PLAN_RowSet plan_make_empty_join_rowset(Arena* arena, PLAN_RowSet* left, GDB_Table* right_table, String8 right_alias);
+internal PLAN_ExecResult plan_execute_identity_scan(Arena* arena, PLAN_Node* scan, QE_ScanTrace* trace);
 internal F64 plan_us_to_ms(U64 us);
 
 //~ tec: materialization
@@ -44,6 +65,7 @@ internal B32 plan_column_resolves(PLAN_SubqueryTable* tables, U64 table_count, S
 internal B32 plan_check_uncorrelated(Arena* arena, GDB_Database* database, IR_Node* select_ir);
 internal B32 plan_run_subquery_values(Arena* arena, GDB_Database* database, IR_Node* subquery_ir, PLAN_Materialized* out);
 internal B32 plan_rewrite_predicates(Arena* arena, GDB_Database* database, IR_Node* node);
+internal void plan_apply_subquery_in_list(Arena* arena, IR_Node* node, IR_Node* subquery_node, PLAN_Materialized* values, B32 is_not_in);
 
 //~ tec: window functions
 typedef struct PLAN_WindowKey PLAN_WindowKey;

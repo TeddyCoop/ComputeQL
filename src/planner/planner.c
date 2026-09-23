@@ -33,6 +33,51 @@ plan_alias_from_table_ir(IR_Node* table_ir)
   return alias_ir ? alias_ir->value : (String8){0};
 }
 
+// tec: children of the IR node are the outer key, the inner key, the inner table and an optional filter on it
+internal PLAN_Node*
+plan_add_semi_join(Arena* arena, GDB_Database* database, PLAN_Node* input, IR_Node* semi_ir)
+{
+  IR_Node* outer_key = semi_ir->first;
+  IR_Node* inner_key = outer_key->next;
+  IR_Node* table_ir = inner_key->next;
+  IR_Node* filter_ir = table_ir->next;
+
+  PLAN_Node* scan = plan_node_make(arena, PLAN_NodeType_Scan);
+  scan->value = table_ir->value;
+  scan->table = gdb_database_find_table_or_catalog(database, table_ir->value);
+  scan->alias = plan_alias_from_table_ir(table_ir);
+
+  PLAN_Node* right = scan;
+  if (filter_ir)
+  {
+    PLAN_Node* filter = plan_node_make(arena, PLAN_NodeType_Filter);
+    filter->input = scan;
+    filter->condition = filter_ir;
+    right = filter;
+  }
+
+  B32 is_anti = str8_match(semi_ir->value, str8_lit("anti"), 0);
+  PLAN_Node* join = plan_node_make(arena, is_anti ? PLAN_NodeType_AntiJoin : PLAN_NodeType_SemiJoin);
+  join->value = semi_ir->value;
+  join->input = input;
+  join->input2 = right;
+
+  IR_Node* equality = ir_node_make(arena, IR_NodeType_Operator, str8_lit("="));
+  ir_node_add_child(equality, optimizer_ir_clone(arena, outer_key));
+  ir_node_add_child(equality, optimizer_ir_clone(arena, inner_key));
+  join->condition = equality;
+  return join;
+}
+
+internal B32
+plan_node_is_join(PLAN_Node* plan)
+{
+  B32 is_join = plan->type == PLAN_NodeType_Join;
+  B32 is_semi = plan->type == PLAN_NodeType_SemiJoin;
+  B32 is_anti = plan->type == PLAN_NodeType_AntiJoin;
+  return is_join || is_semi || is_anti;
+}
+
 internal PLAN_Node*
 plan_build_from_select(Arena* arena, GDB_Database* database, IR_Node* select_ir_node)
 {
@@ -86,9 +131,26 @@ plan_build_from_select(Arena* arena, GDB_Database* database, IR_Node* select_ir_
   
   PLAN_Node* plan = from_plan;
   
-  //- tec: WHERE
+  //- tec: WHERE, with predicates pushed toward the scans when the optimizer can place them
   IR_Node* where_ir = ir_node_find_child(select_ir_node, IR_NodeType_Where);
-  if (where_ir)
+  
+  // tec: a scan over one table binds bare column names, so 'alias.col' in its WHERE has to become 'col'
+  if (where_ir && from_plan && from_plan->type == PLAN_NodeType_Scan)
+  {
+    optimizer_ir_strip_column_qualifiers(where_ir);
+  }
+  
+  PLAN_Node* rewritten_plan = NULL;
+  if (from_plan && optimizer_enabled())
+  {
+    rewritten_plan = optimizer_rewrite_from_where(arena, from_plan, where_ir, select_ir_node);
+  }
+  
+  if (rewritten_plan)
+  {
+    plan = rewritten_plan;
+  }
+  else if (where_ir)
   {
     PLAN_Node* filter = plan_node_make(arena, PLAN_NodeType_Filter);
     filter->input = plan;
@@ -96,6 +158,15 @@ plan_build_from_select(Arena* arena, GDB_Database* database, IR_Node* select_ir_
     plan = filter;
   }
   
+  //- tec: semi and anti joins from IN subqueries and EXISTS, they only filter the rows the FROM and WHERE produced
+  for (IR_Node* child = select_ir_node->first; child != NULL; child = child->next)
+  {
+    if (child->type == IR_NodeType_SemiJoin && plan)
+    {
+      plan = plan_add_semi_join(arena, database, plan, child);
+    }
+  }
+
   //- tec: GROUP BY / aggregates - needed whenever there's an explicit GROUP BY, or an
   // aggregate call anywhere in the select list or HAVING (ie "SELECT COUNT(*) FROM t"
   // has no GROUP BY but still aggregates into a single group)
@@ -170,7 +241,18 @@ plan_build_from_select(Arena* arena, GDB_Database* database, IR_Node* select_ir_
     limit->offset_node = offset_ir;
     plan = limit;
   }
-  
+
+  if (optimizer_scan_costing_enabled())
+  {
+    optimizer_choose_scan_strategies(arena, plan);
+  }
+
+  if (optimizer_sizing_enabled() && optimizer_plan_uses_estimates(plan))
+  {
+    optimizer_annotate_plan(arena, plan);
+  }
+  plan = optimizer_plan_ordering(arena, plan);
+
   return plan;
 }
 
@@ -194,8 +276,59 @@ plan_wrap_scan_result(Arena* arena, GDB_Table* table, String8 alias, QE_ScanResu
   return result;
 }
 
+internal U64
+plan_result_row_count(PLAN_ExecResult* result)
+{
+  if (result->is_materialized)
+  {
+    return result->materialized.count;
+  }
+  return result->rows.count;
+}
+
+// tec: Filter over a scan records its own scan trace, every other node without an operator trace only reports rows here
+internal B32
+plan_node_records_rows_only(PLAN_Node* plan)
+{
+  switch (plan->type)
+  {
+    case PLAN_NodeType_Having:
+    case PLAN_NodeType_Window:
+    case PLAN_NodeType_Limit:
+    case PLAN_NodeType_Project:
+    {
+      return 1;
+    }
+    
+    case PLAN_NodeType_Filter:
+    {
+      B32 over_scan = plan->input && plan->input->type == PLAN_NodeType_Scan;
+      return !over_scan;
+    }
+    
+    default:
+    {
+      return 0;
+    }
+  }
+}
+
 internal PLAN_ExecResult
 plan_execute(Arena* arena, GDB_Database* database, PLAN_Node* plan, IR_Node* select_ir_node, QE_TraceCtx* trace)
+{
+  PLAN_ExecResult result = plan_execute_node(arena, database, plan, select_ir_node, trace);
+  
+  B32 wants_rows = trace && plan && result.supported && plan_node_records_rows_only(plan);
+  if (wants_rows)
+  {
+    QE_NodeTrace* node_trace = qe_trace_record_begin(trace, plan, plan->type);
+    node_trace->rows.rows_out = plan_result_row_count(&result);
+  }
+  return result;
+}
+
+internal PLAN_ExecResult
+plan_execute_node(Arena* arena, GDB_Database* database, PLAN_Node* plan, IR_Node* select_ir_node, QE_TraceCtx* trace)
 {
   PLAN_ExecResult result = {0};
   if (!plan) return result;
@@ -212,6 +345,13 @@ plan_execute(Arena* arena, GDB_Database* database, PLAN_Node* plan, IR_Node* sel
       
       QE_NodeTrace* node_trace = qe_trace_record_begin(trace, plan, PLAN_NodeType_Scan);
       QE_ScanTrace* strace = node_trace ? &node_trace->scan : NULL;
+
+      if (plan->scan_strategy == PLAN_ScanStrategy_Identity)
+      {
+        result = plan_execute_identity_scan(arena, plan, strace);
+        break;
+      }
+
       if (strace) strace->strategy = QE_TraceStrategy_GpuScan;
       
       // tec: a bare Scan is always unfiltered (no where_clause)
@@ -232,7 +372,43 @@ plan_execute(Arena* arena, GDB_Database* database, PLAN_Node* plan, IR_Node* sel
         
         // tec: try an index lookup first
         QE_ScanResult scan_result = {0};
-        if (qe_try_index_scan(arena, plan->input->table, plan->condition, &scan_result))
+        B32 impossible = optimizer_enabled() && plan->condition && optimizer_ir_is_constant_false(plan->condition->first);
+        if (impossible)
+        {
+          scan_result.indices = push_array(arena, U64, 1);
+          if (strace)
+          {
+            strace->rows_before = plan->input->table->row_count;
+            strace->strategy_reason = str8_lit("condition is always false");
+          }
+        }
+        else if (plan->scan_strategy == PLAN_ScanStrategy_Cpu)
+        {
+          if (strace)
+          {
+            strace->strategy = QE_TraceStrategy_CpuScan;
+            strace->strategy_reason = plan->scan_reason;
+          }
+          scan_result = qe_cpu_scan_filter(arena, plan->input->table, plan->condition, strace);
+        }
+        else if (plan->scan_strategy == PLAN_ScanStrategy_Gpu)
+        {
+          if (strace)
+          {
+            strace->strategy = QE_TraceStrategy_GpuScan;
+          }
+          scan_result = qe_scan_filter(arena, database, plan->input->table, plan->condition, strace);
+        }
+        else if (plan->scan_strategy == PLAN_ScanStrategy_Index && qe_index_scan_with_leaf(arena, plan->input->table, plan->condition, plan->index_leaf, &scan_result))
+        {
+          if (strace)
+          {
+            strace->strategy = QE_TraceStrategy_IndexScan;
+            strace->rows_before = plan->input->table->row_count;
+            strace->rows_after = scan_result.count;
+          }
+        }
+        else if (qe_try_index_scan(arena, plan->input->table, plan->condition, &scan_result))
         {
           // tec: index hit
           if (strace)
@@ -274,6 +450,8 @@ plan_execute(Arena* arena, GDB_Database* database, PLAN_Node* plan, IR_Node* sel
     } break;
     
     case PLAN_NodeType_Join:
+    case PLAN_NodeType_SemiJoin:
+    case PLAN_NodeType_AntiJoin:
     {
       result = plan_execute_join(arena, database, plan, select_ir_node, NULL, trace);
     } break;
@@ -292,7 +470,9 @@ plan_execute(Arena* arena, GDB_Database* database, PLAN_Node* plan, IR_Node* sel
         {
           IR_Node* having_ir = ir_node_find_child(select_ir_node, IR_NodeType_Having);
           QE_NodeTrace* node_trace = qe_trace_record_begin(trace, plan, PLAN_NodeType_Aggregate);
-          PLAN_Materialized materialized = qe_aggregate(arena, database, &result.rows, plan->group_by, plan->column_list, having_ir, node_trace ? &node_trace->aggregate : NULL);
+          QE_AggregateHints hints = {0};
+          optimizer_aggregate_hints(plan, &hints);
+          PLAN_Materialized materialized = qe_aggregate(arena, database, &result.rows, plan->group_by, plan->column_list, having_ir, &hints, node_trace ? &node_trace->aggregate : NULL);
           
           result.rows = (PLAN_RowSet){0};
           result.is_materialized = 1;
@@ -354,70 +534,233 @@ plan_execute(Arena* arena, GDB_Database* database, PLAN_Node* plan, IR_Node* sel
     case PLAN_NodeType_Sort:
     {
       result = plan_execute(arena, database, plan->input, select_ir_node, trace);
-      if (result.supported)
+      if (result.supported && plan->sort_strategy == PLAN_SortStrategy_Presorted)
       {
+        if (plan->order_descending && !result.is_materialized)
+        {
+          result.rows = plan_reverse_rowset(arena, &result.rows);
+        }
+      }
+      else if (result.supported)
+      {
+        QE_SortHints hints = {0};
+        optimizer_sort_hints(plan, &hints);
         if (result.is_materialized)
         {
-          result.materialized = qe_sort_materialized(arena, &result.materialized, plan->order_by);
+          result.materialized = qe_sort_materialized(arena, &result.materialized, plan->order_by, &hints);
         }
         else
         {
           QE_NodeTrace* node_trace = qe_trace_record_begin(trace, plan, PLAN_NodeType_Sort);
-          result.rows = qe_sort_rows(arena, &result.rows, plan->order_by, node_trace ? &node_trace->sort : NULL);
+          result.rows = qe_sort_rows(arena, &result.rows, plan->order_by, &hints, node_trace ? &node_trace->sort : NULL);
         }
       }
     } break;
-    
+
     case PLAN_NodeType_Limit:
     {
       result = plan_execute(arena, database, plan->input, select_ir_node, trace);
       if (result.supported)
       {
-        U64 offset = plan->offset_node ? u64_from_str8(plan->offset_node->value, 10) : 0;
-        U64 limit = plan->limit_node ? u64_from_str8(plan->limit_node->value, 10) : max_U64;
-        
-        if (result.is_materialized)
-        {
-          PLAN_Materialized* m = &result.materialized;
-          if (offset >= m->count)
-          {
-            m->count = 0;
-          }
-          else
-          {
-            U64 new_count = Min(m->count - offset, limit);
-            for (U64 c = 0; c < m->column_count; c++)
-            {
-              PLAN_AggColumn* col = &m->columns[c];
-              if (col->numeric_values) col->numeric_values = col->numeric_values + offset;
-              if (col->string_values) col->string_values = col->string_values + offset;
-              if (col->is_null) col->is_null = col->is_null + offset;
-            }
-            m->count = new_count;
-          }
-        }
-        else
-        {
-          PLAN_RowSet* rs = &result.rows;
-          if (offset >= rs->count)
-          {
-            rs->count = 0;
-          }
-          else
-          {
-            U64 new_count = Min(rs->count - offset, limit);
-            for (U64 t = 0; t < rs->table_count; t++)
-            {
-              rs->row_indices[t] = rs->row_indices[t] + offset;
-            }
-            rs->count = new_count;
-          }
-        }
+        plan_apply_limit(&result, plan->offset_node, plan->limit_node);
       }
+    } break;
+
+    case PLAN_NodeType_TopN:
+    {
+      result = plan_execute_top_n(arena, database, plan, select_ir_node, trace);
     } break;
   }
   
   return result;
+}
+
+internal void
+plan_apply_limit(PLAN_ExecResult* result, IR_Node* offset_node, IR_Node* limit_node)
+{
+  U64 offset = 0;
+  if (offset_node)
+  {
+    offset = u64_from_str8(offset_node->value, 10);
+  }
+  U64 limit = max_U64;
+  if (limit_node)
+  {
+    limit = u64_from_str8(limit_node->value, 10);
+  }
+
+  if (result->is_materialized)
+  {
+    PLAN_Materialized* m = &result->materialized;
+    if (offset >= m->count)
+    {
+      m->count = 0;
+      return;
+    }
+
+    U64 new_count = Min(m->count - offset, limit);
+    for (U64 c = 0; c < m->column_count; c++)
+    {
+      PLAN_AggColumn* col = &m->columns[c];
+      if (col->numeric_values)
+      {
+        col->numeric_values = col->numeric_values + offset;
+      }
+      if (col->string_values)
+      {
+        col->string_values = col->string_values + offset;
+      }
+      if (col->is_null)
+      {
+        col->is_null = col->is_null + offset;
+      }
+    }
+    m->count = new_count;
+    return;
+  }
+
+  PLAN_RowSet* rs = &result->rows;
+  if (offset >= rs->count)
+  {
+    rs->count = 0;
+    return;
+  }
+
+  U64 new_count = Min(rs->count - offset, limit);
+  for (U64 t = 0; t < rs->table_count; t++)
+  {
+    rs->row_indices[t] = rs->row_indices[t] + offset;
+  }
+  rs->count = new_count;
+}
+
+internal PLAN_RowSet
+plan_reverse_rowset(Arena* arena, PLAN_RowSet* rows)
+{
+  PLAN_RowSet reversed = *rows;
+  reversed.row_indices = push_array(arena, U64*, rows->table_count);
+  for (U64 table_index = 0; table_index < rows->table_count; table_index += 1)
+  {
+    reversed.row_indices[table_index] = push_array(arena, U64, Max(rows->count, (U64)1));
+    for (U64 row = 0; row < rows->count; row += 1)
+    {
+      reversed.row_indices[table_index][row] = rows->row_indices[table_index][rows->count - 1 - row];
+    }
+  }
+
+  if (rows->scores)
+  {
+    reversed.scores = push_array(arena, F64, Max(rows->count, (U64)1));
+    for (U64 row = 0; row < rows->count; row += 1)
+    {
+      reversed.scores[row] = rows->scores[rows->count - 1 - row];
+    }
+  }
+  return reversed;
+}
+
+// tec: an IndexWalk answers from the index alone, so its input plan is never executed
+internal PLAN_ExecResult
+plan_execute_top_n(Arena* arena, GDB_Database* database, PLAN_Node* plan, IR_Node* select_ir_node, QE_TraceCtx* trace)
+{
+  PLAN_ExecResult result = {0};
+
+  QE_SortHints hints = {0};
+  optimizer_sort_hints(plan, &hints);
+
+  OPT_OrderSource source = {0};
+  B32 walk = plan->sort_strategy == PLAN_SortStrategy_IndexWalk && plan->order_index && optimizer_find_order_source(plan->input, &source);
+  if (walk)
+  {
+    QE_NodeTrace* node_trace = qe_trace_record_begin(trace, plan, PLAN_NodeType_TopN);
+    QE_ScanResult walked = {0};
+    qe_index_ordered_scan(arena, source.table, source.scan->alias, plan->order_index, source.condition, plan->order_descending, hints.top_k, &walked);
+    if (node_trace)
+    {
+      node_trace->sort.row_count = walked.count;
+      node_trace->sort.kept_rows = walked.count;
+      node_trace->sort.used_cpu = 1;
+    }
+    result = plan_wrap_scan_result(arena, source.table, source.scan->alias, walked);
+    plan_apply_limit(&result, plan->offset_node, plan->limit_node);
+    return result;
+  }
+
+  result = plan_execute(arena, database, plan->input, select_ir_node, trace);
+  if (!result.supported)
+  {
+    return result;
+  }
+
+  QE_NodeTrace* node_trace = qe_trace_record_begin(trace, plan, PLAN_NodeType_TopN);
+  QE_SortTrace* sort_trace = node_trace ? &node_trace->sort : NULL;
+  if (result.is_materialized)
+  {
+    U64 input_count = result.materialized.count;
+    result.materialized = qe_sort_materialized(arena, &result.materialized, plan->order_by, &hints);
+    if (sort_trace)
+    {
+      sort_trace->row_count = input_count;
+      sort_trace->kept_rows = result.materialized.count;
+      sort_trace->used_cpu = 1;
+    }
+  }
+  else
+  {
+    result.rows = qe_sort_rows(arena, &result.rows, plan->order_by, &hints, sort_trace);
+  }
+
+  plan_apply_limit(&result, plan->offset_node, plan->limit_node);
+  return result;
+}
+
+// tec: every row id in order, filled on the CPU because that is cheaper than a GPU pass that only lists them
+internal PLAN_ExecResult
+plan_execute_identity_scan(Arena* arena, PLAN_Node* scan, QE_ScanTrace* trace)
+{
+  U64 row_count = scan->table->row_count;
+
+  QE_ScanResult scan_result = {0};
+  scan_result.indices = push_array(arena, U64, Max(row_count, (U64)1));
+  scan_result.count = row_count;
+  for (U64 row = 0; row < row_count; row += 1)
+  {
+    scan_result.indices[row] = row;
+  }
+
+  if (trace)
+  {
+    trace->strategy = QE_TraceStrategy_Identity;
+    trace->strategy_reason = scan->scan_reason;
+    trace->rows_before = row_count;
+    trace->rows_after = row_count;
+  }
+  return plan_wrap_scan_result(arena, scan->table, scan->alias, scan_result);
+}
+
+internal PLAN_RowSet
+plan_make_empty_join_rowset(Arena* arena, PLAN_RowSet* left, GDB_Table* right_table, String8 right_alias)
+{
+  PLAN_RowSet empty = {0};
+  empty.table_count = left->table_count + 1;
+  empty.tables = push_array(arena, GDB_Table*, empty.table_count);
+  MemoryCopy(empty.tables, left->tables, left->table_count * sizeof(GDB_Table*));
+  empty.tables[left->table_count] = right_table;
+  
+  empty.aliases = push_array(arena, String8, empty.table_count);
+  if (left->aliases)
+  {
+    MemoryCopy(empty.aliases, left->aliases, left->table_count * sizeof(String8));
+  }
+  empty.aliases[left->table_count] = right_alias;
+  
+  empty.row_indices = push_array(arena, U64*, empty.table_count);
+  for (U64 table_index = 0; table_index < empty.table_count; table_index += 1)
+  {
+    empty.row_indices[table_index] = push_array(arena, U64, 1);
+  }
+  empty.count = 0;
+  return empty;
 }
 
 internal PLAN_ExecResult
@@ -432,26 +775,95 @@ plan_execute_join(Arena* arena, GDB_Database* database, PLAN_Node* join_plan, IR
     return result;
   }
   
-  GDB_Table* right_table = join_plan->input2 ? join_plan->input2->table : NULL;
-  if (!right_table)
+  PLAN_Node* right_plan = join_plan->input2;
+  PLAN_Node* right_scan = right_plan;
+  if (right_plan && right_plan->type == PLAN_NodeType_Filter)
+  {
+    right_scan = right_plan->input;
+  }
+  
+  B32 right_is_table = right_scan && right_scan->type == PLAN_NodeType_Scan && right_scan->table;
+  if (!right_is_table)
   {
     log_error("plan_execute: join's right-hand side must resolve to a real table");
     return result;
   }
   
-  String8 right_alias = join_plan->input2 ? join_plan->input2->alias : (String8){0};
+  GDB_Table* right_table = right_scan->table;
+  String8 right_alias = right_scan->alias;
+  
+  B32 is_filter_join = join_plan->type == PLAN_NodeType_SemiJoin || join_plan->type == PLAN_NodeType_AntiJoin;
+
+  // tec: nothing on the left means nothing to join, for inner and left joins alike
+  if (optimizer_enabled() && left_result.rows.count == 0)
+  {
+    result.rows = left_result.rows;
+    if (!is_filter_join)
+    {
+      result.rows = plan_make_empty_join_rowset(arena, &left_result.rows, right_table, right_alias);
+    }
+    result.supported = 1;
+    return result;
+  }
+  
+  // tec: a NULL right_rows means the whole table, so a filtered right side that matched nothing needs a real pointer
+  U64* right_rows = NULL;
+  U64 right_count = 0;
+  if (right_plan->type == PLAN_NodeType_Filter)
+  {
+    PLAN_ExecResult right_result = plan_execute(arena, database, right_plan, select_ir_node, trace);
+    if (!right_result.supported || right_result.is_materialized || right_result.rows.table_count != 1)
+    {
+      log_error("plan_execute: join's filtered right-hand side has no usable row set");
+      return result;
+    }
+    right_rows = right_result.rows.row_indices[0];
+    right_count = right_result.rows.count;
+    if (!right_rows)
+    {
+      right_rows = push_array(arena, U64, 1);
+    }
+    
+    // tec: nothing on the right, so a semi join keeps nothing and an anti join keeps everything
+    if (optimizer_enabled() && is_filter_join && right_count == 0)
+    {
+      result.rows = left_result.rows;
+      if (join_plan->type == PLAN_NodeType_SemiJoin)
+      {
+        result.rows.count = 0;
+      }
+      result.supported = 1;
+      return result;
+    }
+
+    B32 inner_join = !str8_match(join_plan->value, str8_lit("left"), StringMatchFlag_CaseInsensitive);
+    if (optimizer_enabled() && inner_join && !is_filter_join && right_count == 0)
+    {
+      result.rows = plan_make_empty_join_rowset(arena, &left_result.rows, right_table, right_alias);
+      result.supported = 1;
+      return result;
+    }
+  }
+  
   String8 join_type = join_plan->value;
   IR_Node* equi_condition = NULL;
+  IR_Node* on_leaves[PLAN_JOIN_MAX_ON_CONDITIONS] = {0};
+  U32 on_leaf_count = 0;
   B32 is_cross = str8_match(join_plan->value, str8_lit("cross"), 0);
+  B32 is_left_join = str8_match(join_plan->value, str8_lit("left"), StringMatchFlag_CaseInsensitive);
   
   if (!is_cross)
   {
     equi_condition = qe_find_equi_condition(&left_result.rows, right_table, right_alias, join_plan->condition);
+    on_leaf_count = qe_collect_and_leaves(join_plan->condition, on_leaves, 0, PLAN_JOIN_MAX_ON_CONDITIONS);
   }
   else
   {
     join_type = str8_lit("inner"); // tec: a comma-join's real predicate lives in WHERE, not here
-    equi_condition = residual_where_root ? qe_find_equi_condition(&left_result.rows, right_table, right_alias, residual_where_root) : NULL;
+    if (residual_where_root)
+    {
+      equi_condition = qe_find_equi_condition(&left_result.rows, right_table, right_alias, residual_where_root);
+    }
   }
   
   if (!equi_condition)
@@ -460,10 +872,43 @@ plan_execute_join(Arena* arena, GDB_Database* database, PLAN_Node* join_plan, IR
     return result;
   }
   
-  QE_NodeTrace* node_trace = qe_trace_record_begin(trace, join_plan, PLAN_NodeType_Join);
-  PLAN_RowSet joined_rows = qe_hash_join(arena, &left_result.rows, right_table, right_alias, join_type, equi_condition, node_trace ? &node_trace->join : NULL);
+  IR_Node* residual_on_leaves[PLAN_JOIN_MAX_ON_CONDITIONS] = {0};
+  U32 residual_on_count = 0;
+  for (U32 leaf_index = 0; leaf_index < on_leaf_count; leaf_index += 1)
+  {
+    if (on_leaves[leaf_index] != equi_condition)
+    {
+      residual_on_leaves[residual_on_count] = on_leaves[leaf_index];
+      residual_on_count += 1;
+    }
+  }
   
-  result.rows = residual_where_root ? qe_filter_joined_rows(arena, &joined_rows, residual_where_root) : joined_rows;
+  // tec: a left join has to keep unmatched left rows, so it cannot post-filter its ON conditions
+  if (is_left_join && residual_on_count > 0)
+  {
+    log_error("plan_execute: a LEFT JOIN supports one equality plus conditions on the joined table only, other ON conditions are not supported yet");
+    return result;
+  }
+  
+  QE_NodeTrace* node_trace = qe_trace_record_begin(trace, join_plan, PLAN_NodeType_Join);
+  QE_JoinTrace* join_trace = node_trace ? &node_trace->join : NULL;
+  QE_JoinHints join_hints = {0};
+  optimizer_join_hints(join_plan, &join_hints);
+  PLAN_RowSet joined_rows = qe_hash_join(arena, &left_result.rows, right_table, right_alias, right_rows, right_count, join_type, equi_condition, &join_hints, join_trace);
+  
+  for (U32 leaf_index = 0; leaf_index < residual_on_count; leaf_index += 1)
+  {
+    joined_rows = qe_filter_joined_rows(arena, &joined_rows, residual_on_leaves[leaf_index]);
+  }
+  
+  if (residual_where_root)
+  {
+    result.rows = qe_filter_joined_rows(arena, &joined_rows, residual_where_root);
+  }
+  else
+  {
+    result.rows = joined_rows;
+  }
   result.supported = 1;
   return result;
 }
@@ -483,39 +928,150 @@ plan_node_type_to_string(PLAN_NodeType type)
     case PLAN_NodeType_Sort: result = str8_lit("PLAN_NodeType_Sort"); break;
     case PLAN_NodeType_Limit: result = str8_lit("PLAN_NodeType_Limit"); break;
     case PLAN_NodeType_Window: result = str8_lit("PLAN_NodeType_Window"); break;
+    case PLAN_NodeType_TopN: result = str8_lit("PLAN_NodeType_TopN"); break;
+    case PLAN_NodeType_SemiJoin: result = str8_lit("PLAN_NodeType_SemiJoin"); break;
+    case PLAN_NodeType_AntiJoin: result = str8_lit("PLAN_NodeType_AntiJoin"); break;
   }
   return result;
+}
+
+internal String8
+plan_format_rows(Arena* arena, F64 rows)
+{
+  B32 is_fractional = rows < 10.0 && rows != (F64)(U64)rows;
+  if (is_fractional)
+  {
+    return push_str8f(arena, "%.1f", rows);
+  }
+  return push_str8f(arena, "%.0f", rows);
+}
+
+// tec: both sides are clamped to one row so an empty result does not divide by zero
+internal F64
+plan_q_error(F64 estimated, F64 actual)
+{
+  F64 estimate = Max(estimated, 1.0);
+  F64 truth = Max(actual, 1.0);
+  return Max(estimate / truth, truth / estimate);
+}
+
+internal String8
+plan_estimate_suffix(Arena* arena, PLAN_Node* plan, B32 has_actual, U64 actual_rows)
+{
+  if (!plan->has_estimate)
+  {
+    return str8_lit("");
+  }
+
+  String8 estimate = plan_format_rows(arena, plan->est_rows);
+  String8 trips = str8_lit("");
+  if (plan->est_round_trips > 0.0)
+  {
+    trips = push_str8f(arena, " est_trips=%.0f", plan->est_round_trips);
+  }
+  if (!has_actual)
+  {
+    return push_str8f(arena, " est_rows=%.*s%.*s", str8_varg(estimate), str8_varg(trips));
+  }
+
+  F64 q_error = plan_q_error(plan->est_rows, (F64)actual_rows);
+  return push_str8f(arena, " est_rows=%.*s q_error=%.2f%.*s", str8_varg(estimate), q_error, str8_varg(trips));
+}
+
+internal String8
+plan_indent_string(Arena* arena, U64 depth)
+{
+  Temp scratch = scratch_begin(&arena, 1);
+  String8List parts = {0};
+  for (U64 level = 0; level < depth; level += 1)
+  {
+    str8_list_push(scratch.arena, &parts, str8_lit("  "));
+  }
+  String8 indent = str8_list_join(arena, &parts, 0);
+  scratch_end(scratch);
+  return indent;
+}
+
+internal String8
+plan_scan_strategy_suffix(Arena* arena, PLAN_Node* plan)
+{
+  char* name = NULL;
+  switch (plan->scan_strategy)
+  {
+    case PLAN_ScanStrategy_Identity: name = "identity"; break;
+    case PLAN_ScanStrategy_Index: name = "index"; break;
+    case PLAN_ScanStrategy_Cpu: name = "cpu"; break;
+    case PLAN_ScanStrategy_Gpu: name = "gpu"; break;
+    default: break;
+  }
+  if (!name)
+  {
+    return str8_lit("");
+  }
+  return push_str8f(arena, " strategy=%s (%.*s) cost=%.0fus", name, str8_varg(plan->scan_reason), plan->est_cost_us);
+}
+
+internal String8
+plan_sort_strategy_suffix(Arena* arena, PLAN_Node* plan)
+{
+  char* name = NULL;
+  switch (plan->sort_strategy)
+  {
+    case PLAN_SortStrategy_Presorted: name = "presorted"; break;
+    case PLAN_SortStrategy_Heap: name = "heap"; break;
+    case PLAN_SortStrategy_IndexWalk: name = "index walk"; break;
+    default: break;
+  }
+  if (!name)
+  {
+    return str8_lit("");
+  }
+  return push_str8f(arena, " strategy=%s (%.*s)", name, str8_varg(plan->sort_reason));
+}
+
+internal void
+plan_print_plain_line(Arena* arena, String8List* out, PLAN_Node* plan, String8 indent, String8 estimate_suffix)
+{
+  String8 strategy_suffix = plan_scan_strategy_suffix(arena, plan);
+  String8 sort_suffix = plan_sort_strategy_suffix(arena, plan);
+  estimate_suffix = push_str8f(arena, "%.*s%.*s%.*s", str8_varg(estimate_suffix), str8_varg(strategy_suffix), str8_varg(sort_suffix));
+  String8 type_name = plan_node_type_to_string(plan->type);
+
+  if (plan->type == PLAN_NodeType_Scan)
+  {
+    char* resolution = "resolved";
+    if (!plan->table)
+    {
+      resolution = plan->has_estimate ? "derived" : "NOT FOUND";
+    }
+    str8_list_push(arena, out, push_str8f(arena, "%.*s- [%.*s] table='%.*s' (%s)%.*s\n", str8_varg(indent), str8_varg(type_name), str8_varg(plan->value),
+                                          resolution, str8_varg(estimate_suffix)));
+  }
+  else if (plan_node_is_join(plan))
+  {
+    str8_list_push(arena, out, push_str8f(arena, "%.*s- [%.*s] type='%.*s'%.*s\n", str8_varg(indent), str8_varg(type_name), str8_varg(plan->value),
+                                          str8_varg(estimate_suffix)));
+  }
+  else
+  {
+    str8_list_push(arena, out, push_str8f(arena, "%.*s- [%.*s]%.*s\n", str8_varg(indent), str8_varg(type_name), str8_varg(estimate_suffix)));
+  }
 }
 
 internal void
 plan_print(Arena* arena, String8List* out, PLAN_Node* plan, U64 depth)
 {
-  if (!plan) return;
-  
-  Temp scratch = scratch_begin(&arena, 1);
-  String8List indent_parts = {0};
-  for (U64 i = 0; i < depth; i++) str8_list_push(scratch.arena, &indent_parts, str8_lit("  "));
-  String8 indent = str8_list_join(scratch.arena, &indent_parts, 0);
-  scratch_end(scratch);
-  
-  String8 type_name = plan_node_type_to_string(plan->type);
-  
-  if (plan->type == PLAN_NodeType_Scan)
+  if (!plan)
   {
-    str8_list_push(arena, out, push_str8f(arena, "%.*s- [%.*s] table='%.*s' (%s)\n", str8_varg(indent), str8_varg(type_name), str8_varg(plan->value),
-                                          plan->table ? "resolved" : "NOT FOUND"));
+    return;
   }
-  else if (plan->type == PLAN_NodeType_Join)
-  {
-    str8_list_push(arena, out, push_str8f(arena, "%.*s- [%.*s] type='%.*s'\n", str8_varg(indent), str8_varg(type_name), str8_varg(plan->value)));
-  }
-  else
-  {
-    str8_list_push(arena, out, push_str8f(arena, "%.*s- [%.*s]\n", str8_varg(indent), str8_varg(type_name)));
-  }
-  
-  if (plan->input) plan_print(arena, out, plan->input, depth + 1);
-  if (plan->input2) plan_print(arena, out, plan->input2, depth + 1);
+
+  String8 indent = plan_indent_string(arena, depth);
+  String8 estimate_suffix = plan_estimate_suffix(arena, plan, 0, 0);
+  plan_print_plain_line(arena, out, plan, indent, estimate_suffix);
+
+  plan_print(arena, out, plan->input, depth + 1);
+  plan_print(arena, out, plan->input2, depth + 1);
 }
 
 internal F64
@@ -525,121 +1081,161 @@ plan_us_to_ms(U64 us)
 }
 
 internal void
+plan_print_scan_trace(Arena* arena, String8List* out, PLAN_Node* plan, QE_NodeTrace* node_trace, String8 indent)
+{
+  String8 table_name = plan->value;
+  if (plan->type == PLAN_NodeType_Filter && plan->input)
+  {
+    table_name = plan->input->value;
+  }
+  QE_ScanTrace* s = &node_trace->scan;
+
+  String8List line = {0};
+  str8_list_pushf(arena, &line, "%.*s- [Scan] table='%.*s' rows=%llu", str8_varg(indent), str8_varg(table_name), s->rows_before);
+  if (s->rows_after != s->rows_before)
+  {
+    str8_list_pushf(arena, &line, "->%llu", s->rows_after);
+  }
+  if (s->zonemap_pruned_rows > 0)
+  {
+    F64 pct = (s->rows_before > 0) ? (100.0 * (F64)s->zonemap_pruned_rows / (F64)s->rows_before) : 0.0;
+    if (s->zonemap_column_name.size > 0)
+    {
+      str8_list_pushf(arena, &line, " (%.0f%% pruned via zone map on '%.*s')", pct, str8_varg(s->zonemap_column_name));
+    }
+    else
+    {
+      str8_list_pushf(arena, &line, " (%.0f%% pruned via zone map)", pct);
+    }
+  }
+
+  if (s->strategy == QE_TraceStrategy_Identity)
+  {
+    str8_list_pushf(arena, &line, " strategy=identity (%.*s)", str8_varg(s->strategy_reason));
+  }
+  else if (s->strategy == QE_TraceStrategy_IndexScan)
+  {
+    str8_list_pushf(arena, &line, " strategy=index scan");
+  }
+  else if (s->strategy == QE_TraceStrategy_CpuScan)
+  {
+    str8_list_pushf(arena, &line, " strategy=CPU scan (%.*s) time=%.1fms", str8_varg(s->strategy_reason), plan_us_to_ms(s->submit_wait_time_us));
+  }
+  else if (s->gpu_kernel_time_us > 0 || s->submit_wait_time_us > 0)
+  {
+    str8_list_pushf(arena, &line, " gpu=%.1fms submit/wait=%.1fms", plan_us_to_ms(s->gpu_kernel_time_us), plan_us_to_ms(s->submit_wait_time_us));
+  }
+
+  if (s->dict_decision_made)
+  {
+    if (s->dict_hit)
+    {
+      str8_list_pushf(arena, &line, " dict=hit (dict_size=%llu)", s->dict_size);
+    }
+    else
+    {
+      str8_list_pushf(arena, &line, " dict=miss (0 rows scanned)");
+    }
+  }
+
+  if (s->gpu_cache_hit_count > 0)
+  {
+    str8_list_pushf(arena, &line, " gpu-cache=reused (%.1fMB)", (F64)s->gpu_cache_hit_bytes / (1024.0 * 1024.0));
+  }
+  else if (s->gpu_cache_miss_count > 0)
+  {
+    str8_list_pushf(arena, &line, " gpu-cache=miss, re-uploaded (%.1fMB)", (F64)s->gpu_cache_miss_bytes / (1024.0 * 1024.0));
+  }
+
+  B32 is_filter = plan->type == PLAN_NodeType_Filter;
+  U64 actual_rows = is_filter ? s->rows_after : s->rows_before;
+  String8 suffix = plan_estimate_suffix(arena, plan, 1, actual_rows);
+  str8_list_pushf(arena, &line, "%.*s\n", str8_varg(suffix));
+  str8_list_push(arena, out, str8_list_join(arena, &line, 0));
+}
+
+internal void
 plan_print_analyzed(Arena* arena, String8List* out, PLAN_Node* plan, QE_TraceCtx* trace, U64 depth)
 {
-  if (!plan) 
+  if (!plan)
   {
     return;
   }
-  
-  Temp scratch = scratch_begin(&arena, 1);
-  String8List indent_parts = {0};
-  for (U64 i = 0; i < depth; i++) 
-  {
-    str8_list_push(scratch.arena, &indent_parts, str8_lit("  "));
-  }
-  String8 indent = str8_list_join(scratch.arena, &indent_parts, 0);
-  scratch_end(scratch);
-  
+
+  String8 indent = plan_indent_string(arena, depth);
   QE_NodeTrace* node_trace = qe_trace_find(trace, plan);
-  
-  if ((plan->type == PLAN_NodeType_Scan || plan->type == PLAN_NodeType_Filter) && node_trace)
+
+  B32 is_scan_trace = node_trace && (plan->type == PLAN_NodeType_Scan || (plan->type == PLAN_NodeType_Filter && plan->input && plan->input->type == PLAN_NodeType_Scan));
+  B32 filter_over_scan = plan->type == PLAN_NodeType_Filter && plan->input && plan->input->type == PLAN_NodeType_Scan;
+
+  if (is_scan_trace)
   {
-    String8 table_name = (plan->type == PLAN_NodeType_Scan) ? plan->value: (plan->input ? plan->input->value : plan->value);
-    QE_ScanTrace* s = &node_trace->scan;
-    
-    String8List line = {0};
-    str8_list_pushf(arena, &line, "%.*s- [Scan] table='%.*s' rows=%llu", str8_varg(indent), str8_varg(table_name), s->rows_before);
-    if (s->rows_after != s->rows_before)
-    {
-      str8_list_pushf(arena, &line, "->%llu", s->rows_after);
-    }
-    if (s->zonemap_pruned_rows > 0)
-    {
-      F64 pct = (s->rows_before > 0) ? (100.0 * (F64)s->zonemap_pruned_rows / (F64)s->rows_before) : 0.0;
-      if (s->zonemap_column_name.size > 0)
-      {
-        str8_list_pushf(arena, &line, " (%.0f%% pruned via zone map on '%.*s')", pct, str8_varg(s->zonemap_column_name));
-      }
-      else
-      {
-        str8_list_pushf(arena, &line, " (%.0f%% pruned via zone map)", pct);
-      }
-    }
-    
-    if (s->strategy == QE_TraceStrategy_IndexScan)
-    {
-      str8_list_pushf(arena, &line, " strategy=index scan");
-    }
-    else if (s->strategy == QE_TraceStrategy_CpuScan)
-    {
-      str8_list_pushf(arena, &line, " strategy=CPU scan (%.*s) time=%.1fms", str8_varg(s->strategy_reason), plan_us_to_ms(s->submit_wait_time_us));
-    }
-    else if (s->gpu_kernel_time_us > 0 || s->submit_wait_time_us > 0)
-    {
-      str8_list_pushf(arena, &line, " gpu=%.1fms submit/wait=%.1fms", plan_us_to_ms(s->gpu_kernel_time_us), plan_us_to_ms(s->submit_wait_time_us));
-    }
-    
-    if (s->dict_decision_made)
-    {
-      if (s->dict_hit) str8_list_pushf(arena, &line, " dict=hit (dict_size=%llu)", s->dict_size);
-      else str8_list_pushf(arena, &line, " dict=miss (0 rows scanned)");
-    }
-    
-    if (s->gpu_cache_hit_count > 0)
-    {
-      str8_list_pushf(arena, &line, " gpu-cache=reused (%.1fMB)", (F64)s->gpu_cache_hit_bytes / (1024.0 * 1024.0));
-    }
-    else if (s->gpu_cache_miss_count > 0)
-    {
-      str8_list_pushf(arena, &line, " gpu-cache=miss, re-uploaded (%.1fMB)", (F64)s->gpu_cache_miss_bytes / (1024.0 * 1024.0));
-    }
-    
-    str8_list_pushf(arena, &line, "\n");
-    str8_list_push(arena, out, str8_list_join(arena, &line, 0));
+    plan_print_scan_trace(arena, out, plan, node_trace, indent);
   }
-  else if (plan->type == PLAN_NodeType_Join && node_trace)
+  else if (plan_node_is_join(plan) && node_trace)
   {
     QE_JoinTrace* j = &node_trace->join;
+    String8 suffix = plan_estimate_suffix(arena, plan, 1, j->output_row_count);
+    String8 join_label = str8_skip(plan_node_type_to_string(plan->type), str8_lit("PLAN_NodeType_").size);
     str8_list_push(arena, out, push_str8f(arena,
-                                          "%.*s- [Join] type='%.*s' build_rows=%llu probe_rows=%llu -> %llu build=%.1fms probe=%.1fms download=%.1fms\n",
-                                          str8_varg(indent), str8_varg(plan->value), j->build_row_count, j->probe_row_count, j->output_row_count,
-                                          plan_us_to_ms(j->build_time_us), plan_us_to_ms(j->probe_dispatch_time_us), plan_us_to_ms(j->probe_download_time_us)));
+                                          "%.*s- [%.*s] type='%.*s' build_rows=%llu probe_rows=%llu -> %llu build=%.1fms probe=%.1fms download=%.1fms%.*s\n",
+                                          str8_varg(indent), str8_varg(join_label), str8_varg(plan->value), j->build_row_count, j->probe_row_count, j->output_row_count,
+                                          plan_us_to_ms(j->build_time_us), plan_us_to_ms(j->probe_dispatch_time_us), plan_us_to_ms(j->probe_download_time_us),
+                                          str8_varg(suffix)));
   }
   else if (plan->type == PLAN_NodeType_Aggregate && node_trace)
   {
     QE_AggregateTrace* a = &node_trace->aggregate;
+    String8 suffix = plan_estimate_suffix(arena, plan, 1, a->group_count);
     str8_list_push(arena, out, push_str8f(arena,
-                                          "%.*s- [Aggregate] rows=%llu->%llu groups gather=%.1fms assign=%.1fms reduce=%.1fms combine=%.1fms\n",
+                                          "%.*s- [Aggregate] rows=%llu->%llu groups gather=%.1fms assign=%.1fms reduce=%.1fms combine=%.1fms%.*s\n",
                                           str8_varg(indent), a->input_row_count, a->group_count,
-                                          plan_us_to_ms(a->gather_time_us), plan_us_to_ms(a->assign_time_us), plan_us_to_ms(a->reduce_time_us), plan_us_to_ms(a->combine_time_us)));
+                                          plan_us_to_ms(a->gather_time_us), plan_us_to_ms(a->assign_time_us), plan_us_to_ms(a->reduce_time_us), plan_us_to_ms(a->combine_time_us),
+                                          str8_varg(suffix)));
   }
   else if (plan->type == PLAN_NodeType_Sort && node_trace)
   {
     QE_SortTrace* s = &node_trace->sort;
-    str8_list_push(arena, out, push_str8f(arena, "%.*s- [Sort] rows=%llu gpu=%.1fms\n", str8_varg(indent), s->row_count, plan_us_to_ms(s->gpu_time_us)));
+    String8 suffix = plan_estimate_suffix(arena, plan, 1, s->row_count);
+    String8 strategy = plan_sort_strategy_suffix(arena, plan);
+    char* device = s->used_cpu ? "cpu" : "gpu";
+    str8_list_push(arena, out, push_str8f(arena, "%.*s- [Sort] rows=%llu %s=%.1fms%.*s%.*s\n", str8_varg(indent), s->row_count, device, plan_us_to_ms(s->gpu_time_us),
+                                          str8_varg(strategy), str8_varg(suffix)));
+  }
+  else if (plan->type == PLAN_NodeType_TopN && node_trace)
+  {
+    QE_SortTrace* s = &node_trace->sort;
+    U64 actual_rows = s->kept_rows;
+    if (plan->offset_node)
+    {
+      U64 offset = u64_from_str8(plan->offset_node->value, 10);
+      actual_rows = (actual_rows > offset) ? actual_rows - offset : 0;
+    }
+    String8 suffix = plan_estimate_suffix(arena, plan, 1, actual_rows);
+    String8 strategy = plan_sort_strategy_suffix(arena, plan);
+    str8_list_push(arena, out, push_str8f(arena, "%.*s- [TopN] rows=%llu->%llu%.*s%.*s\n", str8_varg(indent), s->row_count, s->kept_rows,
+                                          str8_varg(strategy), str8_varg(suffix)));
+  }
+  else if (node_trace && plan_node_records_rows_only(plan))
+  {
+    String8 type_name = plan_node_type_to_string(plan->type);
+    String8 short_name = str8_skip(type_name, str8_lit("PLAN_NodeType_").size);
+    String8 suffix = plan_estimate_suffix(arena, plan, 1, node_trace->rows.rows_out);
+    str8_list_push(arena, out, push_str8f(arena, "%.*s- [%.*s] rows=%llu%.*s\n", str8_varg(indent), str8_varg(short_name), node_trace->rows.rows_out,
+                                          str8_varg(suffix)));
   }
   else
   {
-    // tec: Having/Project/Limit, or a node this pass has no trace for same line as plan_print
-    String8 type_name = plan_node_type_to_string(plan->type);
-    if (plan->type == PLAN_NodeType_Scan)
-    {
-      str8_list_push(arena, out, push_str8f(arena, "%.*s- [%.*s] table='%.*s' (%s)\n", str8_varg(indent), str8_varg(type_name), str8_varg(plan->value),
-                                            plan->table ? "resolved" : "NOT FOUND"));
-    }
-    else if (plan->type == PLAN_NodeType_Join)
-    {
-      str8_list_push(arena, out, push_str8f(arena, "%.*s- [%.*s] type='%.*s'\n", str8_varg(indent), str8_varg(type_name), str8_varg(plan->value)));
-    }
-    else
-    {
-      str8_list_push(arena, out, push_str8f(arena, "%.*s- [%.*s]\n", str8_varg(indent), str8_varg(type_name)));
-    }
+    String8 suffix = plan_estimate_suffix(arena, plan, 0, 0);
+    plan_print_plain_line(arena, out, plan, indent, suffix);
   }
-  
-  if (plan->input) plan_print_analyzed(arena, out, plan->input, trace, depth + 1);
-  if (plan->input2) plan_print_analyzed(arena, out, plan->input2, trace, depth + 1);
+
+  // tec: the scan line above already covers the scan under a filter
+  if (!(is_scan_trace && filter_over_scan))
+  {
+    plan_print_analyzed(arena, out, plan->input, trace, depth + 1);
+  }
+  plan_print_analyzed(arena, out, plan->input2, trace, depth + 1);
 }
 
 //~ tec: nested SELECT execution
@@ -1114,6 +1710,32 @@ plan_run_subquery_values(Arena* arena, GDB_Database* database, IR_Node* subquery
   return 1;
 }
 
+// tec: the subquery's values become the literals of an IN list
+internal void
+plan_apply_subquery_in_list(Arena* arena, IR_Node* node, IR_Node* subquery_node, PLAN_Materialized* values, B32 is_not_in)
+{
+  subquery_node->type = IR_NodeType_InList;
+  subquery_node->first = subquery_node->last = NULL;
+
+  B32 saw_null = 0;
+  for (U64 row = 0; row < values->count; row += 1)
+  {
+    IR_Node* item = ir_node_make(arena, IR_NodeType_Literal, (String8){0});
+    if (!plan_value_to_ir_node(arena, &values->columns[0], row, item))
+    {
+      saw_null = 1;
+      continue;
+    }
+    ir_node_add_child(subquery_node, item);
+  }
+
+  // tec: x NOT IN (..., NULL) is never true
+  if (saw_null && is_not_in)
+  {
+    plan_make_constant_condition(arena, node, 0);
+  }
+}
+
 internal B32
 plan_rewrite_predicates(Arena* arena, GDB_Database* database, IR_Node* node)
 {
@@ -1159,23 +1781,9 @@ plan_rewrite_predicates(Arena* arena, GDB_Database* database, IR_Node* node)
     
     PLAN_Materialized m = {0};
     if (!plan_run_subquery_values(arena, database, right, &m)) return 0;
-    
-    right->type = IR_NodeType_InList;
-    right->first = right->last = NULL;
-    
-    B32 saw_null = 0;
-    for (U64 r = 0; r < m.count; r++)
-    {
-      IR_Node* item = ir_node_make(arena, IR_NodeType_Literal, (String8){0});
-      if (!plan_value_to_ir_node(arena, &m.columns[0], r, item)) { saw_null = 1; continue; }
-      ir_node_add_child(right, item);
-    }
-    
-    // tec: x NOT IN (..., NULL) is never true
-    if (saw_null && str8_match(op, str8_lit("not in"), StringMatchFlag_CaseInsensitive))
-    {
-      plan_make_constant_condition(arena, node, 0);
-    }
+
+    B32 is_not_in = str8_match(op, str8_lit("not in"), StringMatchFlag_CaseInsensitive);
+    plan_apply_subquery_in_list(arena, node, right, &m, is_not_in);
     return 1;
   }
   
@@ -1727,11 +2335,26 @@ plan_window_apply(Arena* arena, PLAN_RowSet* rows, IR_Node* column_list_ir, IR_N
   return 1;
 }
 
-// tec: leaves its temp tables registered, since a row set result still points into them
 internal PLAN_ExecResult
 plan_run_select(Arena* arena, GDB_Database* database, IR_Node* select_ir, QE_TraceCtx* trace)
 {
+  return plan_run_select_with_plan(arena, database, select_ir, trace, NULL);
+}
+
+// tec: leaves its temp tables registered, since a row set result still points into them
+internal PLAN_ExecResult
+plan_run_select_with_plan(Arena* arena, GDB_Database* database, IR_Node* select_ir, QE_TraceCtx* trace, PLAN_Node** out_plan)
+{
   PLAN_ExecResult failed = {0};
+  if (out_plan)
+  {
+    *out_plan = NULL;
+  }
+  
+  if (optimizer_inline_enabled())
+  {
+    optimizer_inline_sources(arena, database, select_ir);
+  }
   
   IR_Node* cte_list = ir_node_find_child(select_ir, IR_NodeType_CteList);
   if (cte_list)
@@ -1769,6 +2392,11 @@ plan_run_select(Arena* arena, GDB_Database* database, IR_Node* select_ir, QE_Tra
     }
   }
   
+  if (!optimizer_extract_semi_joins(arena, database, select_ir, 1))
+  {
+    return failed;
+  }
+  
   IR_Node* where_ir = ir_node_find_child(select_ir, IR_NodeType_Where);
   if (where_ir && !plan_rewrite_predicates(arena, database, where_ir->first)) 
   {
@@ -1783,7 +2411,78 @@ plan_run_select(Arena* arena, GDB_Database* database, IR_Node* select_ir, QE_Tra
   ir_expand_star_to_columns(arena, database, select_ir);
   
   PLAN_Node* plan = plan_build_from_select(arena, database, select_ir);
+  if (out_plan)
+  {
+    *out_plan = plan;
+  }
   return plan_execute(arena, database, plan, select_ir, trace);
+}
+
+// tec: builds the plan EXPLAIN shows without running anything, CTEs and derived tables are estimated from their own plans
+internal PLAN_Node*
+plan_build_for_explain(Arena* arena, GDB_Database* database, IR_Node* select_ir, OPT_SourceEstimates* inherited)
+{
+  if (optimizer_inline_enabled())
+  {
+    optimizer_inline_sources(arena, database, select_ir);
+  }
+  
+  OPT_SourceEstimates sources = *inherited;
+  
+  IR_Node* cte_list = ir_node_find_child(select_ir, IR_NodeType_CteList);
+  if (cte_list)
+  {
+    for (IR_Node* cte = cte_list->first; cte != NULL; cte = cte->next)
+    {
+      if (!cte->first)
+      {
+        continue;
+      }
+      PLAN_Node* inner_plan = plan_build_for_explain(arena, database, cte->first, &sources);
+      optimizer_annotate_plan(arena, inner_plan);
+      if (inner_plan && inner_plan->has_estimate)
+      {
+        optimizer_source_estimates_add(&sources, cte->value, inner_plan->est_rows);
+      }
+    }
+  }
+  
+  for (IR_Node* child = select_ir->first; child != NULL; child = child->next)
+  {
+    IR_Node* table_ir = NULL;
+    if (child->type == IR_NodeType_Table)
+    {
+      table_ir = child;
+    }
+    else if (child->type == IR_NodeType_Join && child->first && child->first->type == IR_NodeType_Table)
+    {
+      table_ir = child->first;
+    }
+    if (!table_ir)
+    {
+      continue;
+    }
+    
+    IR_Node* inner_select = ir_node_find_child(table_ir, IR_NodeType_Select);
+    IR_Node* alias = ir_node_find_child(table_ir, IR_NodeType_Alias);
+    if (!inner_select || !alias)
+    {
+      continue;
+    }
+    
+    PLAN_Node* inner_plan = plan_build_for_explain(arena, database, inner_select, &sources);
+    optimizer_annotate_plan(arena, inner_plan);
+    if (inner_plan && inner_plan->has_estimate)
+    {
+      optimizer_source_estimates_add(&sources, alias->value, inner_plan->est_rows);
+    }
+  }
+  
+  optimizer_extract_semi_joins(arena, database, select_ir, 0);
+  ir_expand_star_to_columns(arena, database, select_ir);
+  PLAN_Node* plan = plan_build_from_select(arena, database, select_ir);
+  optimizer_apply_source_estimates(plan, &sources);
+  return plan;
 }
 
 internal B32

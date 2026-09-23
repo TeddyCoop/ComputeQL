@@ -74,6 +74,7 @@ ir_type_from_sql_node_type(SQL_NodeType sql_type)
     case SQL_NodeType_Use:           return IR_NodeType_Use;
     case SQL_NodeType_Describe:      return IR_NodeType_Describe;
     case SQL_NodeType_Explain:       return IR_NodeType_Explain;
+    case SQL_NodeType_Analyze:       return IR_NodeType_Analyze;
     case SQL_NodeType_Select:        return IR_NodeType_Select;
     case SQL_NodeType_Column:        return IR_NodeType_Column;
     case SQL_NodeType_Table:         return IR_NodeType_Table;
@@ -145,6 +146,7 @@ ir_node_type_to_string(IR_NodeType type)
     case IR_NodeType_Use: result = str8_lit("IR_NodeType_Use"); break;
     case IR_NodeType_Describe: result = str8_lit("IR_NodeType_Describe"); break;
     case IR_NodeType_Explain: result = str8_lit("IR_NodeType_Explain"); break;
+    case IR_NodeType_Analyze: result = str8_lit("IR_NodeType_Analyze"); break;
     case IR_NodeType_EnumDef: result = str8_lit("IR_NodeType_EnumDef"); break;
     case IR_NodeType_EnumValue: result = str8_lit("IR_NodeType_EnumValue"); break;
     case IR_NodeType_Select: result = str8_lit("IR_NodeType_Select"); break;
@@ -193,6 +195,7 @@ ir_node_type_to_string(IR_NodeType type)
     case IR_NodeType_Exists: result = str8_lit("IR_NodeType_Exists"); break;
     case IR_NodeType_Window: result = str8_lit("IR_NodeType_Window"); break;
     case IR_NodeType_PartitionBy: result = str8_lit("IR_NodeType_PartitionBy"); break;
+    case IR_NodeType_SemiJoin: result = str8_lit("IR_NodeType_SemiJoin"); break;
   }
   
   return result;

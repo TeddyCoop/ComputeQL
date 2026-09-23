@@ -1,0 +1,104 @@
+#version 450
+
+// tec: exclusive prefix sum of a bucket histogram in three dispatches, so qe_hash_join can go from the build pass
+// to the scatter pass without the counts ever visiting the CPU. The offsets buffer holds n + 1 entries, 
+// the cursor buffer is a copy of the first n that the scatter pass advances with atomics.
+//   mode 0: one workgroup per block of 256 counts, scans the block in shared memory (Hillis-Steele) and records the block total
+//   mode 1: one workgroup scans the block totals and writes the grand total to offsets[n]
+//   mode 2: adds each block's base to its entries and seeds the cursor
+//
+// NOTE: binding layout MUST stay in sync with qe_hash_join
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer CountBuf { uint counts[]; };
+layout(std430, binding = 1) buffer OffsetsBuf        { uint offsets[]; };
+layout(std430, binding = 2) buffer CursorBuf         { uint cursor[]; };
+layout(std430, binding = 3) buffer BlockSumBuf       { uint block_sums[]; };
+
+layout(push_constant) uniform PushConstants
+{
+  uint words[16];
+} pc;
+
+shared uint scan[256];
+
+void
+scan_shared(uint thread)
+{
+  for (uint stride = 1u; stride < 256u; stride <<= 1u)
+  {
+    uint added = (thread >= stride) ? scan[thread - stride] : 0u;
+    barrier();
+    scan[thread] += added;
+    barrier();
+  }
+}
+
+void
+main()
+{
+  uint n = pc.words[0];
+  uint mode = pc.words[2]; // tec: each U64 kernel argument takes two push constant words
+  uint thread = gl_LocalInvocationID.x;
+  uint block_count = (n + 255u) / 256u;
+
+  if (mode == 0u)
+  {
+    uint index = gl_GlobalInvocationID.x;
+    uint value = (index < n) ? counts[index] : 0u;
+    scan[thread] = value;
+    barrier();
+    scan_shared(thread);
+
+    uint inclusive = scan[thread];
+    if (index < n)
+    {
+      offsets[index] = inclusive - value;
+    }
+    if (thread == 255u)
+    {
+      block_sums[gl_WorkGroupID.x] = inclusive;
+    }
+  }
+  else if (mode == 1u)
+  {
+    uint chunk = (block_count + 255u) / 256u;
+    uint start = min(thread * chunk, block_count);
+    uint end = min(start + chunk, block_count);
+
+    uint sum = 0u;
+    for (uint i = start; i < end; i++)
+    {
+      sum += block_sums[i];
+    }
+
+    scan[thread] = sum;
+    barrier();
+    scan_shared(thread);
+
+    uint inclusive = scan[thread];
+    uint running = inclusive - sum;
+    for (uint i = start; i < end; i++)
+    {
+      uint block_total = block_sums[i];
+      block_sums[i] = running;
+      running += block_total;
+    }
+
+    if (thread == 255u)
+    {
+      offsets[n] = inclusive;
+    }
+  }
+  else
+  {
+    uint index = gl_GlobalInvocationID.x;
+    if (index < n)
+    {
+      uint total = offsets[index] + block_sums[index / 256u];
+      offsets[index] = total;
+      cursor[index] = total;
+    }
+  }
+}

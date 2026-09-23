@@ -118,10 +118,10 @@ gdb_check_load_value(GDB_Table* table, void** row_data, B32* row_null, IR_Node* 
     }
     if (slot >= table->column_count) return 0.0;
     
-    if (row_null[slot]) 
-    { 
+    if (row_null[slot])
+    {
       *out_is_null = 1;
-      return 0.0; 
+      return 0.0;
     }
     
     if (column->type == GDB_ColumnType_String8)
@@ -236,7 +236,7 @@ gdb_check_eval(GDB_Table* table, void** row_data, B32* row_null, IR_Node* condit
   
   if (lstr || rstr)
   {
-    if (str8_match(op, str8_lit("contains"), StringMatchFlag_CaseInsensitive)) 
+    if (str8_match(op, str8_lit("contains"), StringMatchFlag_CaseInsensitive))
       return qe_str8_contains(ls, rs)
       ;
     B32 eq = qe_str8_compare(ls, rs) == 0;
@@ -297,7 +297,7 @@ gdb_table_validate_row_constraints(Arena* arena, GDB_Database* database, GDB_Tab
         {
           if (gdb_column_is_null(ref_column, r)) continue;
           if (gdb_candidate_value_equals_row(arena, ref_column, row_data[i], r))
-          { 
+          {
             found = 1; break;
           }
         }
@@ -575,7 +575,7 @@ app_execute_query_capture(Arena* arena, String8 sql_query, GDB_Database** io_dat
   
   GDB_Database* database = io_database ? *io_database : NULL;
   
-  for (IR_Node* ir_execution_node = ir_query->execution_nodes; 
+  for (IR_Node* ir_execution_node = ir_query->execution_nodes;
        ir_execution_node != NULL;
        ir_execution_node = ir_execution_node->next)
   {
@@ -642,19 +642,19 @@ app_execute_query_capture(Arena* arena, String8 sql_query, GDB_Database** io_dat
               {
                 str8_list_push(scratch.arena, &extra_parts, str8_lit("disk-backed"));
               }
-              if (index_on_column) 
+              if (index_on_column)
               {
-                str8_list_push(scratch.arena, &extra_parts, 
+                str8_list_push(scratch.arena, &extra_parts,
                                push_str8f(scratch.arena, "indexed(%.*s)", str8_varg(index_on_column->name)));
               }
-              if (column->has_foreign_key) 
+              if (column->has_foreign_key)
               {
-                str8_list_push(scratch.arena, &extra_parts, 
+                str8_list_push(scratch.arena, &extra_parts,
                                push_str8f(scratch.arena, "references %.*s(%.*s)", str8_varg(column->fk_ref_table_name), str8_varg(column->fk_ref_column_name)));
               }
-              if (column->has_check) 
+              if (column->has_check)
               {
-                str8_list_push(scratch.arena, &extra_parts, 
+                str8_list_push(scratch.arena, &extra_parts,
                                push_str8f(scratch.arena, "check(%.*s)", str8_varg(column->check_text)));
               }
               String8 extra = str8_list_join(scratch.arena, &extra_parts, &(StringJoin){.sep = str8_lit(", ")});
@@ -667,6 +667,53 @@ app_execute_query_capture(Arena* arena, String8 sql_query, GDB_Database** io_dat
                        str8_varg(extra));
               
               scratch_end(scratch);
+            }
+          }
+        }
+      } break;
+      
+      case IR_NodeType_Analyze:
+      {
+        IR_Node* table_ir_node = ir_node_find_child(ir_execution_node, IR_NodeType_Table);
+        
+        if (!database)
+        {
+          log_error("no database selected - run 'use <database>' first");
+        }
+        else
+        {
+          GDB_Table* single_table = NULL;
+          if (table_ir_node)
+          {
+            single_table = gdb_database_find_table(database, table_ir_node->value);
+            if (!single_table)
+            {
+              log_error("table '%.*s' does not exist", str8_varg(table_ir_node->value));
+            }
+          }
+          
+          if (!table_ir_node || single_table)
+          {
+            U64 analyze_count = single_table ? 1 : database->table_count;
+            
+            for (U64 analyze_index = 0; analyze_index < analyze_count; analyze_index += 1)
+            {
+              GDB_Table* table = single_table;
+              if (!single_table)
+              {
+                table = database->tables[analyze_index];
+              }
+              gdb_table_ensure_stats(table);
+              
+              APP_EMIT("Table: %.*s (%llu row%s)\n", str8_varg(table->name), table->row_count,
+                       table->row_count == 1 ? "" : "s");
+              APP_EMIT("%-24s %12s %12s\n", "Column", "Distinct", "Nulls");
+              for (U64 column_index = 0; column_index < table->column_count; column_index += 1)
+              {
+                GDB_Column* column = table->columns[column_index];
+                APP_EMIT("%-24.*s %12llu %12llu\n", str8_varg(column->name), column->stats.distinct_count, column->stats.null_count);
+              }
+              APP_EMIT("\n");
             }
           }
         }
@@ -687,15 +734,15 @@ app_execute_query_capture(Arena* arena, String8 sql_query, GDB_Database** io_dat
         }
         else
         {
-          ir_expand_star_to_columns(arena, database, select_ir_node);
-          
-          PLAN_Node* plan = plan_build_from_select(arena, database, select_ir_node);
-          
           if (is_analyze)
           {
             QE_TraceCtx* trace = qe_trace_ctx_alloc(arena);
-            // tec: EXPLAIN ANALYZE reports plan+stats text
-            PLAN_ExecResult result = plan_execute(arena, database, plan, select_ir_node, trace);
+            U64 temp_mark = database->temp_table_count;
+            
+            // tec: EXPLAIN ANALYZE runs the whole statement, so CTEs and derived tables are bound like in a normal select
+            PLAN_Node* plan = NULL;
+            PLAN_ExecResult result = plan_run_select_with_plan(arena, database, select_ir_node, trace, &plan);
+            optimizer_annotate_plan(arena, plan);
             APP_EMIT("Query plan (analyzed):\n");
             plan_print_analyzed(arena, &out, plan, trace, 0);
             if (!result.supported)
@@ -706,7 +753,8 @@ app_execute_query_capture(Arena* arena, String8 sql_query, GDB_Database** io_dat
             B32 any_warm_cache = 0;
             for (QE_NodeTrace* record = trace->records; record != 0 && !any_warm_cache; record = record->next)
             {
-              if (record->node_type == PLAN_NodeType_Scan || record->node_type == PLAN_NodeType_Filter)
+              B32 is_scan_record = record->node_type == PLAN_NodeType_Scan || (record->node_type == PLAN_NodeType_Filter && !plan_node_records_rows_only(record->plan_node));
+              if (is_scan_record)
               {
                 any_warm_cache = record->scan.gpu_cache_hit_count > 0;
               }
@@ -716,9 +764,14 @@ app_execute_query_capture(Arena* arena, String8 sql_query, GDB_Database** io_dat
               APP_EMIT("\n(note: one or more scans reused a warm GPU-resident buffer from a prior query - "
                        "re-run after DDL/reload to see cold-cache timings)\n");
             }
+            
+            gdb_database_release_temp_tables_from(database, temp_mark);
           }
           else
           {
+            OPT_SourceEstimates sources = {0};
+            PLAN_Node* plan = plan_build_for_explain(arena, database, select_ir_node, &sources);
+            optimizer_annotate_plan(arena, plan);
             APP_EMIT("Query plan:\n");
             plan_print(arena, &out, plan, 0);
           }
@@ -986,7 +1039,7 @@ app_execute_query_capture(Arena* arena, String8 sql_query, GDB_Database** io_dat
         B32* row_null = push_array(scratch.arena, B32, table->column_count);
         B32* slot_was_set = push_array(scratch.arena, B32, table->column_count);
         
-        for (IR_Node* value_group_node = values_object->first; 
+        for (IR_Node* value_group_node = values_object->first;
              value_group_node != 0;
              value_group_node = value_group_node->next)
         {

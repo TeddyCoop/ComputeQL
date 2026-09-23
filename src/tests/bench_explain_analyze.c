@@ -14,6 +14,7 @@
 #include "gpu/gpu_inc.h"
 #include "planner/plan_node.h"
 #include "query_exec/query_exec.h"
+#include "optimizer/optimizer_inc.h"
 #include "planner/planner.h"
 #include "application.h"
 #include "third_party/sqlite/sqlite3.h"
@@ -27,6 +28,7 @@
 #include "ir_gen/ir_gen_inc.c"
 #include "gdb/gdb_inc.c"
 #include "query_exec/query_exec.c"
+#include "optimizer/optimizer_inc.c"
 #include "planner/planner.c"
 #include "application.c"
 
@@ -191,12 +193,57 @@ ea_run_suite(Arena* arena, Bench_Report* report)
     arena_clear(query_arena);
   }
   
-  //- tec: ORDER BY on a plain (non aggregated) row set
+  //- tec: ORDER BY on a plain (non aggregated) row set, large enough that the bitonic sort beats the CPU
   // exercises the bitonic sort GPU timing
   {
-    APP_QueryResult result = app_execute_query_capture(query_arena, str8_lit("EXPLAIN ANALYZE SELECT * FROM fact ORDER BY value DESC LIMIT 10;"), &database, NULL);
+    APP_QueryResult result = app_execute_query_capture(query_arena, str8_lit("EXPLAIN ANALYZE SELECT * FROM fact ORDER BY value DESC;"), &database, NULL);
     ea_check_contains(report, str8_lit("ORDER BY: '[Sort]'"), result.output_text, "[Sort]");
     ea_check_contains(report, str8_lit("ORDER BY: sort phase timing ('gpu=')"), result.output_text, "gpu=");
+    arena_clear(query_arena);
+  }
+  
+  //- tec: ORDER BY with LIMIT is one TopN node that only keeps the first rows
+  {
+    APP_QueryResult result = app_execute_query_capture(query_arena, str8_lit("EXPLAIN ANALYZE SELECT * FROM fact ORDER BY value DESC LIMIT 10;"), &database, NULL);
+    ea_check_contains(report, str8_lit("TOP N: '[TopN]'"), result.output_text, "[TopN]");
+    ea_check_contains(report, str8_lit("TOP N: rows read and kept ('rows=50000->10')"), result.output_text, "rows=50000->10");
+    ea_check_contains(report, str8_lit("TOP N: strategy ('strategy=heap')"), result.output_text, "strategy=heap");
+    arena_clear(query_arena);
+  }
+  
+  //- tec: estimates and how far off they were
+  {
+    APP_QueryResult result = app_execute_query_capture(query_arena, str8_lit("EXPLAIN SELECT * FROM fact WHERE value > 45000;"), &database, NULL);
+    ea_check_contains(report, str8_lit("plain EXPLAIN: 'est_rows='"), result.output_text, "est_rows=");
+    ea_check_not_contains(report, str8_lit("plain EXPLAIN: no 'q_error='"), result.output_text, "q_error=");
+    arena_clear(query_arena);
+  }
+  {
+    APP_QueryResult result = app_execute_query_capture(query_arena, str8_lit("EXPLAIN ANALYZE SELECT * FROM fact WHERE value > 45000;"), &database, NULL);
+    ea_check_contains(report, str8_lit("analyze: 'est_rows='"), result.output_text, "est_rows=");
+    ea_check_contains(report, str8_lit("analyze: 'q_error='"), result.output_text, "q_error=");
+    arena_clear(query_arena);
+  }
+  {
+    APP_QueryResult result = app_execute_query_capture(query_arena, str8_lit("EXPLAIN ANALYZE SELECT dim.dim_name, fact.id FROM dim JOIN fact ON dim.dim_key = fact.group_key WHERE dim.dim_key < 3;"), &database, NULL);
+    ea_check_contains(report, str8_lit("analyze join: join line has 'q_error='"), result.output_text, "build_rows");
+    ea_check_contains(report, str8_lit("analyze join: 'q_error='"), result.output_text, "q_error=");
+    arena_clear(query_arena);
+  }
+  
+  //- tec: EXPLAIN of a CTE parses, and an analyzed one binds the CTE like a normal select
+  {
+    String8 query = str8_lit("EXPLAIN ANALYZE WITH t AS (SELECT group_key, COUNT(*) AS c FROM fact GROUP BY group_key) SELECT group_key FROM t WHERE c > 10;");
+    APP_QueryResult result = app_execute_query_capture(query_arena, query, &database, NULL);
+    ea_check_contains(report, str8_lit("analyze cte: bound and executed"), result.output_text, "Query plan (analyzed)");
+    ea_check_not_contains(report, str8_lit("analyze cte: no 'NOT FOUND'"), result.output_text, "NOT FOUND");
+    arena_clear(query_arena);
+  }
+  {
+    String8 query = str8_lit("EXPLAIN WITH t AS (SELECT group_key, COUNT(*) AS c FROM fact GROUP BY group_key) SELECT group_key FROM t WHERE c > 10;");
+    APP_QueryResult result = app_execute_query_capture(query_arena, query, &database, NULL);
+    ea_check_contains(report, str8_lit("plain cte: shown as derived"), result.output_text, "(derived)");
+    ea_check_not_contains(report, str8_lit("plain cte: no 'NOT FOUND'"), result.output_text, "NOT FOUND");
     arena_clear(query_arena);
   }
   
