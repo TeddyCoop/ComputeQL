@@ -326,6 +326,8 @@ ch_run_suite(Arena* arena, Bench_Report* report, U64 row_count, char* label)
   bench_print_table_header(report, label);
   for (U64 i = 0; i < ArrayCount(cases); i++)
   {
+    g_bench_round_scale = (i == 0) ? 1000000.0 : 100.0;
+
     U64 gdb_rows = 0, gdb_checksum = 0;
     Bench_Stats gdb_stats = bench_run_gdb_query(database, cases[i].gdb_sql, &gdb_rows, &gdb_checksum);
     bench_print_table_row(report, cases[i].label, "gdb", gdb_rows, gdb_checksum, &gdb_stats);

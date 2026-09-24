@@ -121,11 +121,12 @@ bench_fnv_mix_string(U64 h, String8 s)
 }
 
 // tec: round to nearest before truncating so FP noise from independently reparsing the same
-// decimal text in two different engines cant flip the low digit and cause a false mismatch
+global F64 g_bench_round_scale = 100.0;
+
 internal U64
 bench_scaled_round(F64 v)
 {
-  return (U64)(v * 100.0 + (v >= 0 ? 0.5 : -0.5));
+  return (U64)(v * g_bench_round_scale + (v >= 0 ? 0.5 : -0.5));
 }
 
 //~ tec: timing stats
