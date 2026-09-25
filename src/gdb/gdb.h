@@ -232,6 +232,14 @@ struct GDB_Column
   U64 gpu_upload_generation;
   U64 gpu_upload_data_size;
   
+  //- tec: dense device copies kept for qe_aggregate, each is only valid while its generation equals write_generation
+  U64 agg_f64_generation;
+  U64 agg_f32_generation;
+  U64 agg_narrow_generation;
+  B32 agg_narrow;
+  void* agg_f64_buffer;
+  void* agg_f32_buffer;
+  
   //- tec: data storage
   U8 *data;
   U64 *offsets;

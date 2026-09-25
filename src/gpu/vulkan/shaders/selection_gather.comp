@@ -1,0 +1,79 @@
+#version 450
+
+// tec: reads columns through device rows, so a consumer of a scan or join output never needs the row ids on the host
+// the rows hold one index every stride words (a scan also keeps a score there, a join keeps a pair), row_offset is added to each
+// an index of 0xffffffff is no row, it reads as 0 and stays no row when it is passed on
+//
+// NOTE: binding layout and push constant slots stay in sync with qe_selection_gather_column, qe_selection_rows_for_positions and qe_rows_resolve
+
+layout(local_size_x = 256) in;
+
+#define MODE_F64            0u
+#define MODE_F32            1u
+#define MODE_POSITIONS      2u
+#define MODE_RESOLVE_MAP    3u
+#define MODE_RESOLVE_DIRECT 4u
+
+#define NO_ROW 0xffffffffu
+
+layout(std430, binding = 0) readonly buffer RowsBuf     { uint rows[]; };
+layout(std430, binding = 1) readonly buffer SourceBuf   { uint source[]; };
+layout(std430, binding = 2) buffer DestBuf              { uint dest[]; };
+layout(std430, binding = 3) readonly buffer PositionBuf { uint positions[]; };
+
+layout(push_constant) uniform PushConstants
+{
+  uint words[16];
+} pc;
+
+void
+main()
+{
+  uint count = pc.words[0];
+  uint stride_words = pc.words[2];
+  uint row_offset = pc.words[4];
+  uint mode = pc.words[6];
+  uint map_stride = pc.words[8];
+  uint word_offset = pc.words[10];
+  uint map_offset = pc.words[12];
+
+  uint i = gl_GlobalInvocationID.x;
+  if (i >= count)
+  {
+    return;
+  }
+
+  if (mode == MODE_POSITIONS)
+  {
+    uint index = rows[positions[i] * stride_words + word_offset];
+    dest[i] = (index == NO_ROW) ? NO_ROW : (index + row_offset);
+    return;
+  }
+
+  uint index = rows[i * stride_words + word_offset];
+
+  if (mode == MODE_RESOLVE_DIRECT)
+  {
+    dest[i] = (index == NO_ROW) ? NO_ROW : (index + row_offset);
+    return;
+  }
+
+  if (mode == MODE_RESOLVE_MAP)
+  {
+    uint mapped = (index == NO_ROW) ? NO_ROW : source[index * map_stride];
+    dest[i] = (mapped == NO_ROW) ? NO_ROW : (mapped + map_offset);
+    return;
+  }
+
+  bool has_row = index != NO_ROW;
+  uint row = index + row_offset;
+  if (mode == MODE_F64)
+  {
+    dest[i * 2u + 0u] = has_row ? source[row * 2u + 0u] : 0u;
+    dest[i * 2u + 1u] = has_row ? source[row * 2u + 1u] : 0u;
+  }
+  else
+  {
+    dest[i] = has_row ? source[row] : 0u;
+  }
+}

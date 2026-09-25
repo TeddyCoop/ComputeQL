@@ -313,6 +313,110 @@ plan_node_records_rows_only(PLAN_Node* plan)
   }
 }
 
+// tec: a GPU filter over a base table feeding straight into the aggregate
+internal B32
+plan_aggregate_reads_selection(PLAN_Node* aggregate)
+{
+  PLAN_Node* filter = aggregate->input;
+  if (!filter || filter->type != PLAN_NodeType_Filter || !filter->input || filter->input->type != PLAN_NodeType_Scan || !filter->input->table)
+  {
+    return 0;
+  }
+  if (filter->scan_strategy != PLAN_ScanStrategy_Gpu)
+  {
+    return 0;
+  }
+  return settings_u64(str8_lit("QE_AGG_DEVICE_SELECTION"), 1) != 0;
+}
+
+// tec: out_selection may be null. when it is given, a GPU scan can leave its rows on the GPU and report them there instead of in the row set
+internal PLAN_ExecResult
+plan_execute_filter_scan(Arena* arena, GDB_Database* database, PLAN_Node* plan, QE_TraceCtx* trace, QE_DeviceSelection* out_selection)
+{
+  PLAN_ExecResult result = {0};
+  if (out_selection)
+  {
+    MemoryZeroStruct(out_selection);
+  }
+
+  if (plan->input && plan->input->type == PLAN_NodeType_Scan && !plan->input->table)
+  {
+    log_error("plan_execute: table '%.*s' not found", str8_varg(plan->input->value));
+  }
+  else if (plan->input && plan->input->type == PLAN_NodeType_Scan)
+  {
+    QE_NodeTrace* node_trace = qe_trace_record_begin(trace, plan, PLAN_NodeType_Filter);
+    QE_ScanTrace* strace = node_trace ? &node_trace->scan : NULL;
+    
+    // tec: try an index lookup first
+    QE_ScanResult scan_result = {0};
+    B32 impossible = optimizer_enabled() && plan->condition && optimizer_ir_is_constant_false(plan->condition->first);
+    if (impossible)
+    {
+      scan_result.indices = push_array(arena, U64, 1);
+      if (strace)
+      {
+        strace->rows_before = plan->input->table->row_count;
+        strace->strategy_reason = str8_lit("condition is always false");
+      }
+    }
+    else if (plan->scan_strategy == PLAN_ScanStrategy_Cpu)
+    {
+      if (strace)
+      {
+        strace->strategy = QE_TraceStrategy_CpuScan;
+        strace->strategy_reason = plan->scan_reason;
+      }
+      scan_result = qe_cpu_scan_filter(arena, plan->input->table, plan->condition, strace);
+    }
+    else if (plan->scan_strategy == PLAN_ScanStrategy_Gpu)
+    {
+      if (strace)
+      {
+        strace->strategy = QE_TraceStrategy_GpuScan;
+      }
+      scan_result = qe_scan_filter_selected(arena, database, plan->input->table, plan->condition, strace, out_selection);
+    }
+    else if (plan->scan_strategy == PLAN_ScanStrategy_Index && qe_index_scan_with_leaf(arena, plan->input->table, plan->condition, plan->index_leaf, &scan_result))
+    {
+      if (strace)
+      {
+        strace->strategy = QE_TraceStrategy_IndexScan;
+        strace->rows_before = plan->input->table->row_count;
+        strace->rows_after = scan_result.count;
+      }
+    }
+    else if (qe_try_index_scan(arena, plan->input->table, plan->condition, &scan_result))
+    {
+      // tec: index hit
+      if (strace)
+      {
+        strace->strategy = QE_TraceStrategy_IndexScan;
+        strace->rows_before = plan->input->table->row_count;
+        strace->rows_after = scan_result.count;
+      }
+    }
+    // tec: then a NULL-aware CPU scan if the table has any NULLs
+    else if (gdb_table_may_have_nulls(plan->input->table))
+    {
+      if (strace)
+      {
+        strace->strategy = QE_TraceStrategy_CpuScan;
+        strace->strategy_reason = str8_lit("table has NULLs");
+      }
+      scan_result = qe_cpu_scan_filter(arena, plan->input->table, plan->condition, strace);
+    }
+    // tec: and then fall back to the normal GPU scan
+    else
+    {
+      if (strace) strace->strategy = QE_TraceStrategy_GpuScan;
+      scan_result = qe_scan_filter_selected(arena, database, plan->input->table, plan->condition, strace, out_selection);
+    }
+    result = plan_wrap_scan_result(arena, plan->input->table, plan->input->alias, scan_result);
+  }
+  return result;
+}
+
 internal PLAN_ExecResult
 plan_execute(Arena* arena, GDB_Database* database, PLAN_Node* plan, IR_Node* select_ir_node, QE_TraceCtx* trace)
 {
@@ -361,87 +465,16 @@ plan_execute_node(Arena* arena, GDB_Database* database, PLAN_Node* plan, IR_Node
     
     case PLAN_NodeType_Filter:
     {
-      if (plan->input && plan->input->type == PLAN_NodeType_Scan && !plan->input->table)
+      if (plan->input && plan->input->type == PLAN_NodeType_Scan)
       {
-        log_error("plan_execute: table '%.*s' not found", str8_varg(plan->input->value));
-      }
-      else if (plan->input && plan->input->type == PLAN_NodeType_Scan)
-      {
-        QE_NodeTrace* node_trace = qe_trace_record_begin(trace, plan, PLAN_NodeType_Filter);
-        QE_ScanTrace* strace = node_trace ? &node_trace->scan : NULL;
-        
-        // tec: try an index lookup first
-        QE_ScanResult scan_result = {0};
-        B32 impossible = optimizer_enabled() && plan->condition && optimizer_ir_is_constant_false(plan->condition->first);
-        if (impossible)
-        {
-          scan_result.indices = push_array(arena, U64, 1);
-          if (strace)
-          {
-            strace->rows_before = plan->input->table->row_count;
-            strace->strategy_reason = str8_lit("condition is always false");
-          }
-        }
-        else if (plan->scan_strategy == PLAN_ScanStrategy_Cpu)
-        {
-          if (strace)
-          {
-            strace->strategy = QE_TraceStrategy_CpuScan;
-            strace->strategy_reason = plan->scan_reason;
-          }
-          scan_result = qe_cpu_scan_filter(arena, plan->input->table, plan->condition, strace);
-        }
-        else if (plan->scan_strategy == PLAN_ScanStrategy_Gpu)
-        {
-          if (strace)
-          {
-            strace->strategy = QE_TraceStrategy_GpuScan;
-          }
-          scan_result = qe_scan_filter(arena, database, plan->input->table, plan->condition, strace);
-        }
-        else if (plan->scan_strategy == PLAN_ScanStrategy_Index && qe_index_scan_with_leaf(arena, plan->input->table, plan->condition, plan->index_leaf, &scan_result))
-        {
-          if (strace)
-          {
-            strace->strategy = QE_TraceStrategy_IndexScan;
-            strace->rows_before = plan->input->table->row_count;
-            strace->rows_after = scan_result.count;
-          }
-        }
-        else if (qe_try_index_scan(arena, plan->input->table, plan->condition, &scan_result))
-        {
-          // tec: index hit
-          if (strace)
-          {
-            strace->strategy = QE_TraceStrategy_IndexScan;
-            strace->rows_before = plan->input->table->row_count;
-            strace->rows_after = scan_result.count;
-          }
-        }
-        // tec: then a NULL-aware CPU scan if the table has any NULLs
-        else if (gdb_table_may_have_nulls(plan->input->table))
-        {
-          if (strace)
-          {
-            strace->strategy = QE_TraceStrategy_CpuScan;
-            strace->strategy_reason = str8_lit("table has NULLs");
-          }
-          scan_result = qe_cpu_scan_filter(arena, plan->input->table, plan->condition, strace);
-        }
-        // tec: and then fall back to the normal GPU scan
-        else
-        {
-          if (strace) strace->strategy = QE_TraceStrategy_GpuScan;
-          scan_result = qe_scan_filter(arena, database, plan->input->table, plan->condition, strace);
-        }
-        result = plan_wrap_scan_result(arena, plan->input->table, plan->input->alias, scan_result);
+        result = plan_execute_filter_scan(arena, database, plan, trace, NULL);
       }
       else if (plan->input && plan->input->type == PLAN_NodeType_Join)
       {
         // tec: plan->condition is the Where IR node itself - ->first is its actual condition
         // tree root (same convention as Having, see qe_apply_having)
         IR_Node* where_root = plan->condition ? plan->condition->first : NULL;
-        result = plan_execute_join(arena, database, plan->input, select_ir_node, where_root, trace);
+        result = plan_execute_join(arena, database, plan->input, select_ir_node, where_root, trace, NULL);
       }
       else
       {
@@ -453,12 +486,26 @@ plan_execute_node(Arena* arena, GDB_Database* database, PLAN_Node* plan, IR_Node
     case PLAN_NodeType_SemiJoin:
     case PLAN_NodeType_AntiJoin:
     {
-      result = plan_execute_join(arena, database, plan, select_ir_node, NULL, trace);
+      result = plan_execute_join(arena, database, plan, select_ir_node, NULL, trace, NULL);
     } break;
     
     case PLAN_NodeType_Aggregate:
     {
-      result = plan_execute(arena, database, plan->input, select_ir_node, trace);
+      // tec: a GPU filter directly below leaves its rows on the GPU for the aggregate to read there
+      QE_DeviceSelection selection = {0};
+      QE_DeviceRows join_device = {0};
+      if (plan_aggregate_reads_selection(plan))
+      {
+        result = plan_execute_filter_scan(arena, database, plan->input, trace, &selection);
+      }
+      else if (plan_aggregate_reads_join(plan))
+      {
+        result = plan_execute_join(arena, database, plan->input, select_ir_node, NULL, trace, &join_device);
+      }
+      else
+      {
+        result = plan_execute(arena, database, plan->input, select_ir_node, trace);
+      }
       if (result.supported)
       {
         if (result.is_materialized)
@@ -472,7 +519,25 @@ plan_execute_node(Arena* arena, GDB_Database* database, PLAN_Node* plan, IR_Node
           QE_NodeTrace* node_trace = qe_trace_record_begin(trace, plan, PLAN_NodeType_Aggregate);
           QE_AggregateHints hints = {0};
           optimizer_aggregate_hints(plan, &hints);
-          PLAN_Materialized materialized = qe_aggregate(arena, database, &result.rows, plan->group_by, plan->column_list, having_ir, &hints, node_trace ? &node_trace->aggregate : NULL);
+          PLAN_Materialized materialized = {0};
+          B32 aggregated = 0;
+          QE_DeviceRows device = join_device;
+          if (selection.valid)
+          {
+            device = qe_device_rows_from_selection(&selection, plan->input->input->alias);
+          }
+          if (device.valid)
+          {
+            aggregated = qe_aggregate_device(arena, database, &device, plan->group_by, plan->column_list, having_ir, &hints, node_trace ? &node_trace->aggregate : NULL, &materialized);
+            if (!aggregated)
+            {
+              result.rows = qe_device_rows_to_rowset(arena, &device);
+            }
+          }
+          if (!aggregated)
+          {
+            materialized = qe_aggregate(arena, database, &result.rows, plan->group_by, plan->column_list, having_ir, &hints, node_trace ? &node_trace->aggregate : NULL);
+          }
           
           result.rows = (PLAN_RowSet){0};
           result.is_materialized = 1;
@@ -763,12 +828,105 @@ plan_make_empty_join_rowset(Arena* arena, PLAN_RowSet* left, GDB_Table* right_ta
   return empty;
 }
 
+// tec: the left input of a join whose rows can stay on the GPU. out_left is valid when they did, and the row set is then only a stand in
+// for the tables and the count. every other input gives host rows as plan_execute does
 internal PLAN_ExecResult
-plan_execute_join(Arena* arena, GDB_Database* database, PLAN_Node* join_plan, IR_Node* select_ir_node, IR_Node* residual_where_root, QE_TraceCtx* trace)
+plan_execute_left_device(Arena* arena, GDB_Database* database, PLAN_Node* node, IR_Node* select_ir_node, QE_TraceCtx* trace, QE_DeviceRows* out_left)
+{
+  MemoryZeroStruct(out_left);
+
+  // tec: a whole table, its identity row ids are never built
+  if (node->type == PLAN_NodeType_Scan && node->table && node->scan_strategy == PLAN_ScanStrategy_Identity)
+  {
+    U64 row_count = node->table->row_count;
+    QE_NodeTrace* node_trace = qe_trace_record_begin(trace, node, PLAN_NodeType_Scan);
+    if (node_trace)
+    {
+      node_trace->scan.strategy = QE_TraceStrategy_Identity;
+      node_trace->scan.strategy_reason = node->scan_reason;
+      node_trace->scan.rows_before = row_count;
+      node_trace->scan.rows_after = row_count;
+    }
+
+    QE_ScanResult stub_scan = {0};
+    stub_scan.count = row_count;
+    PLAN_ExecResult result = plan_wrap_scan_result(arena, node->table, node->alias, stub_scan);
+
+    QE_DeviceSelection whole_table = {0};
+    whole_table.valid = 1;
+    whole_table.table = node->table;
+    whole_table.count = row_count;
+    whole_table.stride_words = 1;
+    *out_left = qe_device_rows_from_selection(&whole_table, node->alias);
+    return result;
+  }
+
+  // tec: a GPU filter over a base table leaves its rows on the GPU
+  if (node->type == PLAN_NodeType_Filter && node->input && node->input->type == PLAN_NodeType_Scan && node->input->table && node->scan_strategy == PLAN_ScanStrategy_Gpu)
+  {
+    QE_DeviceSelection selection = {0};
+    PLAN_ExecResult result = plan_execute_filter_scan(arena, database, node, trace, &selection);
+    if (result.supported && selection.valid)
+    {
+      // tec: the scan's output buffer is shared by every scan, and the join's right side may run one, so the rows get a buffer of their own
+      QE_DeviceSelection detached = selection;
+      detached.rows = qe_rows_resolve(selection.rows, selection.stride_words, 0, NULL, 1, selection.row_offset, selection.count, str8_lit("dev_left_rows"));
+      detached.stride_words = 1;
+      detached.row_offset = 0;
+      if (detached.rows)
+      {
+        *out_left = qe_device_rows_from_selection(&detached, node->input->alias);
+      }
+      else
+      {
+        QE_DeviceRows attached = qe_device_rows_from_selection(&selection, node->input->alias);
+        result.rows = qe_device_rows_to_rowset(arena, &attached);
+      }
+    }
+    return result;
+  }
+
+  // tec: a join below stays on the GPU the same way
+  if (node->type == PLAN_NodeType_Join)
+  {
+    return plan_execute_join(arena, database, node, select_ir_node, NULL, trace, out_left);
+  }
+
+  return plan_execute(arena, database, node, select_ir_node, trace);
+}
+
+// tec: an aggregate straight over a join, whose inputs the join can read on the GPU
+internal B32
+plan_aggregate_reads_join(PLAN_Node* aggregate)
+{
+  PLAN_Node* join = aggregate->input;
+  if (!join || join->type != PLAN_NodeType_Join)
+  {
+    return 0;
+  }
+  return settings_u64(str8_lit("QE_AGG_DEVICE_SELECTION"), 1) != 0;
+}
+
+internal PLAN_ExecResult
+plan_execute_join(Arena* arena, GDB_Database* database, PLAN_Node* join_plan, IR_Node* select_ir_node, IR_Node* residual_where_root, QE_TraceCtx* trace, QE_DeviceRows* out_device)
 {
   PLAN_ExecResult result = {0};
-  
-  PLAN_ExecResult left_result = plan_execute(arena, database, join_plan->input, select_ir_node, trace);
+  if (out_device)
+  {
+    MemoryZeroStruct(out_device);
+  }
+
+  // tec: with out_device the left rows may stay on the GPU, and so may the joined rows
+  QE_DeviceRows left_device = {0};
+  PLAN_ExecResult left_result = {0};
+  if (out_device)
+  {
+    left_result = plan_execute_left_device(arena, database, join_plan->input, select_ir_node, trace, &left_device);
+  }
+  else
+  {
+    left_result = plan_execute(arena, database, join_plan->input, select_ir_node, trace);
+  }
   if (!left_result.supported || left_result.is_materialized)
   {
     log_error("plan_execute: join's left-hand input has no usable row set");
@@ -793,6 +951,13 @@ plan_execute_join(Arena* arena, GDB_Database* database, PLAN_Node* join_plan, IR
   String8 right_alias = right_scan->alias;
   
   B32 is_filter_join = join_plan->type == PLAN_NodeType_SemiJoin || join_plan->type == PLAN_NodeType_AntiJoin;
+
+  // tec: these return or reshape the left rows themselves, so they need real row ids
+  if (left_device.valid && (is_filter_join || left_result.rows.count == 0))
+  {
+    left_result.rows = qe_device_rows_to_rowset(arena, &left_device);
+    MemoryZeroStruct(&left_device);
+  }
 
   // tec: nothing on the left means nothing to join, for inner and left joins alike
   if (optimizer_enabled() && left_result.rows.count == 0)
@@ -894,8 +1059,40 @@ plan_execute_join(Arena* arena, GDB_Database* database, PLAN_Node* join_plan, IR
   QE_JoinTrace* join_trace = node_trace ? &node_trace->join : NULL;
   QE_JoinHints join_hints = {0};
   optimizer_join_hints(join_plan, &join_hints);
-  PLAN_RowSet joined_rows = qe_hash_join(arena, &left_result.rows, right_table, right_alias, right_rows, right_count, join_type, equi_condition, &join_hints, join_trace);
-  
+  // tec: residual conditions filter the joined rows on the host, so they keep the join from staying on the GPU
+  B32 keep_on_device = left_device.valid && residual_on_count == 0 && !residual_where_root;
+  if (left_device.valid && !keep_on_device)
+  {
+    left_result.rows = qe_device_rows_to_rowset(arena, &left_device);
+    MemoryZeroStruct(&left_device);
+  }
+
+  PLAN_RowSet joined_rows = {0};
+  B32 joined = 0;
+  if (keep_on_device)
+  {
+    joined_rows = qe_hash_join_impl(arena, &left_result.rows, right_table, right_alias, right_rows, right_count, join_type, equi_condition, &join_hints, join_trace, &left_device, out_device);
+    if (out_device->valid)
+    {
+      result.rows = joined_rows;
+      result.supported = 1;
+      return result;
+    }
+    if (out_device->declined)
+    {
+      left_result.rows = qe_device_rows_to_rowset(arena, &left_device);
+      MemoryZeroStruct(out_device);
+    }
+    else
+    {
+      joined = 1;
+    }
+  }
+  if (!joined)
+  {
+    joined_rows = qe_hash_join(arena, &left_result.rows, right_table, right_alias, right_rows, right_count, join_type, equi_condition, &join_hints, join_trace);
+  }
+
   for (U32 leaf_index = 0; leaf_index < residual_on_count; leaf_index += 1)
   {
     joined_rows = qe_filter_joined_rows(arena, &joined_rows, residual_on_leaves[leaf_index]);

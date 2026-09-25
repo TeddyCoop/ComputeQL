@@ -282,6 +282,40 @@ struct QE_ScanResult
 internal void qe_bytecode_program_build(Arena* arena, QE_BytecodeProgram* prog, GDB_Database* database, GDB_Table* table, IR_Node* root_node, IR_Node* where_clause, QE_ScanTrace* out_trace);
 internal U32 qe_bytecode_program_max_stack_depth(QE_BytecodeProgram* prog);
 internal QE_ScanResult qe_scan_filter(Arena* arena, GDB_Database* database, GDB_Table* table, IR_Node* where_clause, QE_ScanTrace* out_trace);
+
+//~ tec: device selections
+// a scan can leave the rows it selected on the GPU instead of downloading them, for a consumer that reads its columns there.
+// the rows buffer is a pooled buffer that the next scan overwrites, so the consumer has to finish first
+
+typedef struct QE_DeviceSelection QE_DeviceSelection;
+struct QE_DeviceSelection
+{
+  B32 valid;
+  GDB_Table* table;
+  GPU_Buffer* rows;
+  U64 count;
+  U64 row_offset;
+  U32 stride_words;
+};
+
+// tec: the rows of one or more tables, held on the GPU. every view has the same count, view t belongs to table t of the stand in row set
+#define QE_DEVICE_ROWS_MAX_TABLES 4
+
+typedef struct QE_DeviceRows QE_DeviceRows;
+struct QE_DeviceRows
+{
+  B32 valid;
+  // tec: set by a consumer that could not use the rows, before it touched them
+  B32 declined;
+  U64 count;
+  U32 table_count;
+  QE_DeviceSelection views[QE_DEVICE_ROWS_MAX_TABLES];
+  String8 aliases[QE_DEVICE_ROWS_MAX_TABLES];
+};
+
+internal QE_ScanResult qe_scan_filter_selected(Arena* arena, GDB_Database* database, GDB_Table* table, IR_Node* where_clause, QE_ScanTrace* out_trace, QE_DeviceSelection* out_selection);
+internal QE_DeviceRows qe_device_rows_from_selection(QE_DeviceSelection* selection, String8 alias);
+internal QE_DeviceSelection* qe_device_view(QE_DeviceRows* device, U64 table_slot);
 internal B32 qe_try_index_scan(Arena* arena, GDB_Table* table, IR_Node* where_clause, QE_ScanResult* out_result);
 internal QE_ScanResult qe_cpu_scan_filter(Arena* arena, GDB_Table* table, IR_Node* where_clause, QE_ScanTrace* out_trace);
 
@@ -309,6 +343,8 @@ struct PLAN_RowSet
   String8 score_column_name;
   String8 score_needle;
 };
+
+internal PLAN_RowSet qe_device_rows_to_rowset(Arena* arena, QE_DeviceRows* device);
 
 typedef struct PLAN_AggColumn PLAN_AggColumn;
 struct PLAN_AggColumn
@@ -432,6 +468,40 @@ internal B32 qe_values_round_trip_f32(F64* values, U64 count);
 internal THREAD_POOL_TASK_FUNC(qe_narrow_convert_task);
 internal F32* qe_values_to_f32(Arena* arena, F64* values, U64 count);
 
+//- tec: gpu resident aggregate inputs
+#define QE_AGG_MAX_RESIDENT_SLOTS 8
+
+//- tec: baked into csr_scatter_tiled.comp as MAX_LOCAL_SLOTS and TILE_ROWS_PER_THREAD * 256
+#define QE_AGG_TILED_SCATTER_MAX_SLOTS 4096
+#define QE_AGG_TILED_SCATTER_TILE_ROWS 4096
+
+//- tec: baked into aggregate_tile_reduce.comp as its 256 threads and SUB_TILE
+#define QE_AGG_TILE_REDUCE_MAX_GROUPS 256
+#define QE_AGG_TILE_REDUCE_SUB_TILE   256
+#define QE_AGG_TILE_REDUCE_MAX_SLOTS  65536
+
+typedef struct QE_IdentityCheckTask QE_IdentityCheckTask;
+struct QE_IdentityCheckTask
+{
+  Rng1U64* ranges;
+  U64* table_rows;
+  B32* task_identity;
+};
+
+internal THREAD_POOL_TASK_FUNC(qe_identity_check_task);
+internal B32 qe_rowset_slot_is_identity(PLAN_RowSet* rows, U64 table_slot);
+internal B32 qe_aggregate_column_can_be_resident(PLAN_RowSet* rows, U64 table_slot, GDB_Column* column, B32* identity_known, B32* identity_value);
+internal String8 qe_aggregate_resident_key(GDB_Column* column, B32 as_f32);
+internal GPU_Buffer* qe_aggregate_resident_lookup(GDB_Column* column, B32 as_f32, U64 row_count);
+internal GPU_Buffer* qe_aggregate_resident_store(GDB_Column* column, B32 as_f32, void* data, U64 row_count);
+internal F64* qe_column_dense_f64(Arena* arena, GDB_Column* column);
+internal GPU_Buffer* qe_aggregate_full_column_f64(Arena* arena, GDB_Column* column, B32 dict_codes, B32* out_narrow);
+internal GPU_Buffer* qe_aggregate_full_column_f32(Arena* arena, GDB_Column* column, B32 dict_codes);
+internal GPU_Buffer* qe_selection_gather_column(QE_DeviceSelection* selection, GPU_Buffer* source, B32 as_f32, String8 dest_key);
+internal B32 qe_selection_rows_for_positions(QE_DeviceSelection* selection, U32* positions, U64 count, U64* out_rows);
+internal GPU_Buffer* qe_rows_resolve(GPU_Buffer* index_buffer, U32 index_stride, U32 index_word, GPU_Buffer* map_buffer, U32 map_stride, U64 offset, U64 count, String8 dest_key);
+internal PLAN_RowSet qe_device_representative_rows(Arena* arena, QE_DeviceRows* device, PLAN_RowSet* input, U64* representatives, U64 num_groups);
+
 //~ tec: sort
 
 // tec: baked into bitonic_sort.comp/bitonic_sort_f32.comp's PAYLOAD_STRIDE and key indexing
@@ -510,6 +580,8 @@ global QE_AggFuncPolicy qe_agg_func_policy[QE_AGG_FUNC_COUNT_CODES] =
 internal F64 qe_hll_estimate_cardinality(U32* registers, U64 num_registers);
 
 internal PLAN_Materialized qe_aggregate(Arena* arena, GDB_Database* database, PLAN_RowSet* input, IR_Node* group_by_ir, IR_Node* column_list_ir, IR_Node* having_ir, QE_AggregateHints* hints, QE_AggregateTrace* out_trace);
+internal PLAN_Materialized qe_aggregate_impl(Arena* arena, GDB_Database* database, PLAN_RowSet* input, IR_Node* group_by_ir, IR_Node* column_list_ir, IR_Node* having_ir, QE_AggregateHints* hints, QE_AggregateTrace* out_trace, QE_DeviceRows* device, B32* out_needs_host_rows);
+internal B32 qe_aggregate_device(Arena* arena, GDB_Database* database, QE_DeviceRows* device, IR_Node* group_by_ir, IR_Node* column_list_ir, IR_Node* having_ir, QE_AggregateHints* hints, QE_AggregateTrace* out_trace, PLAN_Materialized* out_result);
 internal PLAN_Materialized qe_apply_having(Arena* arena, PLAN_Materialized* m, IR_Node* having_ir);
 
 typedef struct QE_AggExprInfo QE_AggExprInfo;
@@ -572,6 +644,7 @@ internal B32 qe_having_eval(PLAN_Materialized* m, IR_Node* condition, U64 row);
 
 //~ tec: GPU build/probe equi-join
 internal PLAN_RowSet qe_hash_join(Arena* arena, PLAN_RowSet* left, GDB_Table* right_table, String8 right_alias, U64* right_rows, U64 right_count, String8 join_type, IR_Node* condition, QE_JoinHints* hints, QE_JoinTrace* out_trace);
+internal PLAN_RowSet qe_hash_join_impl(Arena* arena, PLAN_RowSet* left, GDB_Table* right_table, String8 right_alias, U64* right_rows, U64 right_count, String8 join_type, IR_Node* condition, QE_JoinHints* hints, QE_JoinTrace* out_trace, QE_DeviceRows* device_left, QE_DeviceRows* out_device);
 
 // tec: the pair buffer a hinted join allocates up front is capped so a wild overestimate cannot exhaust device memory
 #define QE_JOIN_HINT_MAX_PAIRS (16ull * 1024ull * 1024ull)

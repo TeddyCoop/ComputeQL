@@ -2057,11 +2057,14 @@ opt_run_fusion_suite(Arena* arena, Bench_Report* report, Opt_Fixture* fixture, O
   printf("\n---- round trips, fusion on against off ----\n");
   opt_set_optimizer(1);
   {
+    // tec: the tile reduce has no scatter to fuse, so switch it off to keep this on the member list reduce
     String8 sql = str8_lit("SELECT name, COUNT(*) AS c, SUM(value) AS s FROM big GROUP BY name;");
+    settings_load_from_string(str8_lit("QE_AGG_TILE_REDUCE: 0"));
     settings_load_from_string(str8_lit("QE_OPT_FUSE: false"));
     U64 trips_off = opt_count_round_trips(fixture->database, sql);
     settings_load_from_string(str8_lit("QE_OPT_FUSE: true"));
     U64 trips_on = opt_count_round_trips(fixture->database, sql);
+    settings_load_from_string(str8_lit("QE_AGG_TILE_REDUCE: 1"));
     B32 ok = trips_on + 1 == trips_off;
     printf("  %-56s %s (on %llu, off %llu round trips)\n", "aggregate: scatter and reduce share a submit", ok ? "OK" : "FAIL", trips_on, trips_off);
     if (!ok)

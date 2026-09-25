@@ -9,7 +9,9 @@ the checksum sums a per row FNV-1a hash across rows, since compute_ql and sqlite
 */
 
 #define BENCH_WARMUP_RUNS 1
-#define BENCH_TIMED_RUNS  20
+#ifndef BENCH_TIMED_RUNS
+# define BENCH_TIMED_RUNS 20
+#endif
 
 //~ tec: tiny deterministic PRNG (splitmix64)
 // fixed seed so compute_ql and sqlite always see byte identical generated data across runs

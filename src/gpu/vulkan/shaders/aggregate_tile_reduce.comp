@@ -1,0 +1,213 @@
+#version 450
+#extension GL_ARB_gpu_shader_fp64 : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+// tec: reduce for GROUP BYs with few groups
+// NOTE: SUB_TILE must match QE_AGG_TILE_REDUCE_SUB_TILE and 256 must match QE_AGG_TILE_REDUCE_MAX_GROUPS
+// NOTE: args are bound as raw words so one shader reads F32 or F64 buffers
+
+layout(local_size_x = 256) in;
+
+#define FUNC_COUNT 0u
+#define FUNC_SUM   1u
+#define FUNC_AVG   2u
+#define FUNC_MIN   3u
+#define FUNC_MAX   4u
+
+#define SUB_TILE   256u
+#define MAX_EXPRS  8u
+#define EMPTY      0xffffffffu
+
+layout(std430, binding = 0) readonly buffer RowSlotBuf   { uint row_slot[]; };
+layout(std430, binding = 1) readonly buffer SlotGroupBuf { uint slot_group[]; };
+layout(std430, binding = 2) buffer PartialsBuf           { double partials_out[]; };
+
+layout(std430, binding = 3)  readonly buffer Arg0Buf { uint arg0[]; };
+layout(std430, binding = 4)  readonly buffer Arg1Buf { uint arg1[]; };
+layout(std430, binding = 5)  readonly buffer Arg2Buf { uint arg2[]; };
+layout(std430, binding = 6)  readonly buffer Arg3Buf { uint arg3[]; };
+layout(std430, binding = 7)  readonly buffer Arg4Buf { uint arg4[]; };
+layout(std430, binding = 8)  readonly buffer Arg5Buf { uint arg5[]; };
+layout(std430, binding = 9)  readonly buffer Arg6Buf { uint arg6[]; };
+layout(std430, binding = 10) readonly buffer Arg7Buf { uint arg7[]; };
+
+layout(push_constant) uniform PushConstants
+{
+  uint words[16];
+} pc;
+
+shared uvec4  sh_group4[SUB_TILE / 4u];
+shared double sh_value[SUB_TILE * MAX_EXPRS];
+shared double red_acc[256];
+shared double red_mn[256];
+shared double red_mx[256];
+shared uint   red_cnt[256];
+
+uint
+arg_word(uint e, uint index)
+{
+  switch (e)
+  {
+    case 0u: return arg0[index];
+    case 1u: return arg1[index];
+    case 2u: return arg2[index];
+    case 3u: return arg3[index];
+    case 4u: return arg4[index];
+    case 5u: return arg5[index];
+    case 6u: return arg6[index];
+    case 7u: return arg7[index];
+  }
+  return 0u;
+}
+
+double
+read_arg(uint e, uint row, bool is_f64)
+{
+  if (is_f64)
+  {
+    return packDouble2x32(uvec2(arg_word(e, row * 2u), arg_word(e, row * 2u + 1u)));
+  }
+  return double(uintBitsToFloat(arg_word(e, row)));
+}
+
+void
+main()
+{
+  uint row_count   = pc.words[0];
+  uint num_groups  = pc.words[2];
+  uint num_exprs   = pc.words[4];
+  uint rows_per_wg = pc.words[6];
+  bool is_f64      = pc.words[8] != 0u;
+  uint arg_mask    = pc.words[10];
+  uint func_codes  = pc.words[12];
+
+  uint tid = gl_LocalInvocationID.x;
+  uint range_start = gl_WorkGroupID.x * rows_per_wg;
+  uint range_end = min(range_start + rows_per_wg, row_count);
+
+  // tec: p is at least 4 so each slice covers a whole number of uvec4 loads
+  uint p = 4u;
+  while (p < num_groups)
+  {
+    p <<= 1u;
+  }
+  uint slices = 256u / p;
+  uint mine = tid & (p - 1u);
+  uint slice = tid / p;
+  bool owns_group = mine < num_groups;
+  uint seg = SUB_TILE / slices;
+  uint seg_first = (slice * seg) / 4u;
+  uint seg_last = ((slice + 1u) * seg) / 4u;
+
+  double acc[MAX_EXPRS];
+  double mn[MAX_EXPRS];
+  double mx[MAX_EXPRS];
+  uint cnt = 0u;
+  [[unroll]] for (uint e = 0u; e < MAX_EXPRS; e++)
+  {
+    acc[e] = 0.0LF;
+    mn[e] = 1.0e300LF;
+    mx[e] = -1.0e300LF;
+  }
+
+  for (uint base = range_start; base < range_end; base += SUB_TILE)
+  {
+    uint row = base + tid;
+    bool in_range = row < range_end;
+    uint group = EMPTY;
+    if (in_range)
+    {
+      uint slot = row_slot[row];
+      if (slot != EMPTY)
+      {
+        group = slot_group[slot];
+      }
+    }
+    sh_group4[tid >> 2u][tid & 3u] = group;
+
+    [[unroll]] for (uint e = 0u; e < MAX_EXPRS; e++)
+    {
+      if (e < num_exprs)
+      {
+        double value = 0.0LF;
+        if (in_range && ((arg_mask >> e) & 1u) != 0u)
+        {
+          value = read_arg(e, row, is_f64);
+        }
+        sh_value[tid * MAX_EXPRS + e] = value;
+      }
+    }
+    barrier();
+
+    if (owns_group)
+    {
+      for (uint j = seg_first; j < seg_last; j++)
+      {
+        uvec4 g4 = sh_group4[j];
+        [[unroll]] for (uint k = 0u; k < 4u; k++)
+        {
+          if (g4[k] == mine)
+          {
+            uint r = j * 4u + k;
+            cnt++;
+            [[unroll]] for (uint e = 0u; e < MAX_EXPRS; e++)
+            {
+              if (e < num_exprs)
+              {
+                // tec: fp64 runs at a fraction of the fp32 rate, so each expr only does the one operation it needs
+                uint func = (func_codes >> (e * 4u)) & 0xfu;
+                if (func == FUNC_SUM || func == FUNC_AVG)
+                {
+                  acc[e] += sh_value[r * MAX_EXPRS + e];
+                }
+                else if (func == FUNC_MIN)
+                {
+                  mn[e] = min(mn[e], sh_value[r * MAX_EXPRS + e]);
+                }
+                else if (func == FUNC_MAX)
+                {
+                  mx[e] = max(mx[e], sh_value[r * MAX_EXPRS + e]);
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    barrier();
+  }
+
+  [[unroll]] for (uint e = 0u; e < MAX_EXPRS; e++)
+  {
+    if (e < num_exprs)
+    {
+      red_acc[tid] = acc[e];
+      red_mn[tid] = mn[e];
+      red_mx[tid] = mx[e];
+      red_cnt[tid] = cnt;
+      barrier();
+
+      if (slice == 0u && owns_group)
+      {
+        double a = 0.0LF;
+        double lo = 1.0e300LF;
+        double hi = -1.0e300LF;
+        uint c = 0u;
+        for (uint s = 0u; s < slices; s++)
+        {
+          uint idx = s * p + mine;
+          a += red_acc[idx];
+          lo = min(lo, red_mn[idx]);
+          hi = max(hi, red_mx[idx]);
+          c += red_cnt[idx];
+        }
+        uint out_index = ((gl_WorkGroupID.x * num_groups + mine) * num_exprs + e) * 4u;
+        partials_out[out_index + 0u] = a;
+        partials_out[out_index + 1u] = double(c);
+        partials_out[out_index + 2u] = lo;
+        partials_out[out_index + 3u] = hi;
+      }
+      barrier();
+    }
+  }
+}

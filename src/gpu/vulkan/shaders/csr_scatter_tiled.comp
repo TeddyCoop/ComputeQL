@@ -1,0 +1,77 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+
+// NOTE: binding layout and push constant slots stay in sync with csr_scatter.comp, plus num_slots in slot 1.
+// MAX_LOCAL_SLOTS must equal QE_AGG_TILED_SCATTER_MAX_SLOTS and TILE_ROWS_PER_THREAD * 256 must equal QE_AGG_TILED_SCATTER_TILE_ROWS
+
+layout(local_size_x = 256) in;
+
+#define TILE_ROWS_PER_THREAD 16u
+#define MAX_LOCAL_SLOTS      4096u
+#define EMPTY                0xffffffffu
+
+layout(std430, binding = 0) readonly buffer RowSlotBuf { uint row_slot[]; };
+layout(std430, binding = 1) buffer CursorBuf           { uint slot_cursor[]; };
+layout(std430, binding = 2) buffer OutRowsBuf          { uint out_rows[]; };
+
+layout(push_constant) uniform PushConstants
+{
+  uint words[16];
+} pc;
+
+shared uint local_count[MAX_LOCAL_SLOTS];
+shared uint local_base[MAX_LOCAL_SLOTS];
+
+void
+main()
+{
+  uint row_count = pc.words[0];
+  uint num_slots = pc.words[2];
+  uint tid = gl_LocalInvocationID.x;
+  uint tile_start = gl_WorkGroupID.x * (256u * TILE_ROWS_PER_THREAD);
+
+  for (uint s = tid; s < num_slots; s += 256u)
+  {
+    local_count[s] = 0u;
+  }
+  barrier();
+
+  uint slots[TILE_ROWS_PER_THREAD];
+  [[unroll]] for (uint r = 0u; r < TILE_ROWS_PER_THREAD; r++)
+  {
+    uint row = tile_start + r * 256u + tid;
+    uint slot = EMPTY;
+    if (row < row_count)
+    {
+      slot = row_slot[row];
+    }
+    slots[r] = slot;
+    if (slot != EMPTY)
+    {
+      atomicAdd(local_count[slot], 1u);
+    }
+  }
+  barrier();
+
+  for (uint s = tid; s < num_slots; s += 256u)
+  {
+    uint c = local_count[s];
+    if (c != 0u)
+    {
+      local_base[s] = atomicAdd(slot_cursor[s], c);
+    }
+    local_count[s] = 0u;
+  }
+  barrier();
+
+  [[unroll]] for (uint r = 0u; r < TILE_ROWS_PER_THREAD; r++)
+  {
+    uint slot = slots[r];
+    if (slot != EMPTY)
+    {
+      uint row = tile_start + r * 256u + tid;
+      uint offset = atomicAdd(local_count[slot], 1u);
+      out_rows[local_base[slot] + offset] = row;
+    }
+  }
+}

@@ -6,6 +6,8 @@ internal PLAN_Node* plan_build_from_select(Arena* arena, GDB_Database* database,
 internal B32 plan_ir_contains_aggregate(IR_Node* node);
 
 internal PLAN_ExecResult plan_execute(Arena* arena, GDB_Database* database, PLAN_Node* plan, IR_Node* select_ir_node, QE_TraceCtx* trace);
+internal B32 plan_aggregate_reads_selection(PLAN_Node* aggregate);
+internal PLAN_ExecResult plan_execute_filter_scan(Arena* arena, GDB_Database* database, PLAN_Node* plan, QE_TraceCtx* trace, QE_DeviceSelection* out_selection);
 internal PLAN_ExecResult plan_execute_node(Arena* arena, GDB_Database* database, PLAN_Node* plan, IR_Node* select_ir_node, QE_TraceCtx* trace);
 internal PLAN_ExecResult plan_execute_top_n(Arena* arena, GDB_Database* database, PLAN_Node* plan, IR_Node* select_ir_node, QE_TraceCtx* trace);
 internal PLAN_Node* plan_add_semi_join(Arena* arena, GDB_Database* database, PLAN_Node* input, IR_Node* semi_ir);
@@ -36,7 +38,9 @@ internal void plan_print_scan_trace(Arena* arena, String8List* out, PLAN_Node* p
 #define PLAN_JOIN_MAX_ON_CONDITIONS 16
 internal String8 plan_alias_from_table_ir(IR_Node* table_ir);
 internal PLAN_ExecResult plan_wrap_scan_result(Arena* arena, GDB_Table* table, String8 alias, QE_ScanResult scan_result);
-internal PLAN_ExecResult plan_execute_join(Arena* arena, GDB_Database* database, PLAN_Node* join_plan, IR_Node* select_ir_node, IR_Node* residual_where_root, QE_TraceCtx* trace);
+internal PLAN_ExecResult plan_execute_join(Arena* arena, GDB_Database* database, PLAN_Node* join_plan, IR_Node* select_ir_node, IR_Node* residual_where_root, QE_TraceCtx* trace, QE_DeviceRows* out_device);
+internal PLAN_ExecResult plan_execute_left_device(Arena* arena, GDB_Database* database, PLAN_Node* node, IR_Node* select_ir_node, QE_TraceCtx* trace, QE_DeviceRows* out_left);
+internal B32 plan_aggregate_reads_join(PLAN_Node* aggregate);
 internal PLAN_RowSet plan_make_empty_join_rowset(Arena* arena, PLAN_RowSet* left, GDB_Table* right_table, String8 right_alias);
 internal PLAN_ExecResult plan_execute_identity_scan(Arena* arena, PLAN_Node* scan, QE_ScanTrace* trace);
 internal F64 plan_us_to_ms(U64 us);

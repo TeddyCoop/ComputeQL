@@ -2051,7 +2051,7 @@ optimizer_stats_available(GDB_Column* column)
     return 1;
   }
   
-  U64 max_rows = settings_u64(str8_lit("QE_OPT_STATS_MAX_ROWS"), 4000000);
+  U64 max_rows = settings_u64(str8_lit("QE_OPT_STATS_MAX_ROWS"), 1000000000);
   if (column->row_count > max_rows)
   {
     return 0;
