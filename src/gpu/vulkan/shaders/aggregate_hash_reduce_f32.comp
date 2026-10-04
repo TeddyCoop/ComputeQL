@@ -1,0 +1,141 @@
+#version 450
+
+// tec: GPU hash aggregation for high-cardinality GROUP BY, one dispatch over every row folds it into its group with a global atomic
+// float atomics aren't core GLSL, so add/min/max go through a compare-and-swap loop on the F32 bit pattern
+// only chosen when rows per group is small (see qe_aggregate), it contends badly at low cardinality
+// F32 args only, which keeps every CAS loop on a plain 32 bit uint
+//
+// NOTE: binding layout/push-constant slot order MUST stay in sync with qe_aggregate
+
+layout(local_size_x = 256) in;
+
+#define FUNC_COUNT 0u
+#define FUNC_SUM   1u
+#define FUNC_AVG   2u
+#define FUNC_MIN   3u
+#define FUNC_MAX   4u
+#define EMPTY      0xffffffffu
+
+layout(std430, binding = 0) readonly buffer RowSlotBuf   { uint row_slot[]; };
+layout(std430, binding = 1) readonly buffer SlotGroupBuf { uint slot_group[]; };
+layout(std430, binding = 2) buffer SumBuf                { uint sum_bits[]; };
+layout(std430, binding = 3) buffer CountBuf              { uint count_out[]; };
+layout(std430, binding = 4) buffer MinBuf                { uint min_bits[]; };
+layout(std430, binding = 5) buffer MaxBuf                { uint max_bits[]; };
+
+layout(std430, binding = 6)  readonly buffer Arg0Buf { float arg0[]; };
+layout(std430, binding = 7)  readonly buffer Arg1Buf { float arg1[]; };
+layout(std430, binding = 8)  readonly buffer Arg2Buf { float arg2[]; };
+layout(std430, binding = 9)  readonly buffer Arg3Buf { float arg3[]; };
+layout(std430, binding = 10) readonly buffer Arg4Buf { float arg4[]; };
+layout(std430, binding = 11) readonly buffer Arg5Buf { float arg5[]; };
+layout(std430, binding = 12) readonly buffer Arg6Buf { float arg6[]; };
+layout(std430, binding = 13) readonly buffer Arg7Buf { float arg7[]; };
+
+layout(push_constant) uniform PushConstants
+{
+  uint words[16];
+} pc;
+
+float
+read_arg(uint e, uint row)
+{
+  switch (e)
+  {
+    case 0u: return arg0[row];
+    case 1u: return arg1[row];
+    case 2u: return arg2[row];
+    case 3u: return arg3[row];
+    case 4u: return arg4[row];
+    case 5u: return arg5[row];
+    case 6u: return arg6[row];
+    case 7u: return arg7[row];
+  }
+  return 0.0;
+}
+
+void
+atomic_add_f32(uint index, float val)
+{
+  uint old = sum_bits[index];
+  uint assumed;
+  do
+  {
+    assumed = old;
+    float updated = uintBitsToFloat(assumed) + val;
+    old = atomicCompSwap(sum_bits[index], assumed, floatBitsToUint(updated));
+  } while (assumed != old);
+}
+
+void
+atomic_min_f32(uint index, float val)
+{
+  uint old = min_bits[index];
+  uint assumed;
+  do
+  {
+    if (val >= uintBitsToFloat(old)) return;
+    assumed = old;
+    old = atomicCompSwap(min_bits[index], assumed, floatBitsToUint(val));
+  } while (assumed != old);
+}
+
+void
+atomic_max_f32(uint index, float val)
+{
+  uint old = max_bits[index];
+  uint assumed;
+  do
+  {
+    if (val <= uintBitsToFloat(old)) return;
+    assumed = old;
+    old = atomicCompSwap(max_bits[index], assumed, floatBitsToUint(val));
+  } while (assumed != old);
+}
+
+void
+main()
+{
+  uint row_count  = pc.words[0];
+  uint num_exprs  = pc.words[2];
+  uint func_codes = pc.words[4];
+
+  uint row = gl_GlobalInvocationID.x;
+  if (row >= row_count)
+  {
+    return;
+  }
+
+  uint slot = row_slot[row];
+  if (slot == EMPTY)
+  {
+    return;
+  }
+  uint g = slot_group[slot];
+  if (g == EMPTY)
+  {
+    return;
+  }
+
+  for (uint e = 0u; e < num_exprs; e++)
+  {
+    uint func = (func_codes >> (e * 4u)) & 0xfu;
+    uint index = g * num_exprs + e;
+
+    // tec: every func needs the row count (COUNT(*) IS this, AVG divides by it on the CPU afterward)
+    atomicAdd(count_out[index], 1u);
+
+    if (func == FUNC_SUM || func == FUNC_AVG)
+    {
+      atomic_add_f32(index, read_arg(e, row));
+    }
+    else if (func == FUNC_MIN)
+    {
+      atomic_min_f32(index, read_arg(e, row));
+    }
+    else if (func == FUNC_MAX)
+    {
+      atomic_max_f32(index, read_arg(e, row));
+    }
+  }
+}

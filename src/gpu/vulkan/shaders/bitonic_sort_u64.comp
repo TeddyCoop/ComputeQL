@@ -1,0 +1,118 @@
+#version 450
+
+// tec: bitonic sort of (64 bit key, 32 bit row) pairs, ascending, ties broken by the row. The key is two 32 bit words, low then high
+// same network as bitonic_sort.comp but most passes happen in shared memory:
+//   mode 0: every workgroup sorts its own tile of 1024 pairs completely (stages 1 to 10)
+//   mode 1: one compare and exchange pass over the whole array, for the strides too long for a tile
+//   mode 2: the strides inside a tile (512 down to 1) of one later stage, finished in shared memory
+// for a stage k above 10 the host runs mode 1 for each stride from 2^(k-1) down to 1024, then mode 2 once
+//
+// NOTE: binding layout/push-constant slot order MUST stay in sync with qe_window_rank_gpu_composite
+
+layout(local_size_x = 512) in;
+
+layout(std430, binding = 0) buffer KeyBuf { uvec2 keys[]; };
+layout(std430, binding = 1) buffer RowBuf { uint rows[]; };
+
+layout(push_constant) uniform PushConstants
+{
+  uint words[16];
+} pc;
+
+#define TILE 1024u
+
+shared uvec2 s_key[TILE];
+shared uint s_row[TILE];
+
+bool
+greater_than(uvec2 a_key, uint a_row, uvec2 b_key, uint b_row)
+{
+  if (a_key.y != b_key.y) return a_key.y > b_key.y;
+  if (a_key.x != b_key.x) return a_key.x > b_key.x;
+  return a_row > b_row;
+}
+
+// tec: the lower position of the thread's pair when each pair is `stride` apart
+uint
+pair_position(uint thread, uint stride)
+{
+  return 2u * stride * (thread / stride) + (thread % stride);
+}
+
+void
+exchange_shared(uint position, uint stride, bool ascending)
+{
+  uint partner = position + stride;
+  bool swap = greater_than(s_key[position], s_row[position], s_key[partner], s_row[partner]) == ascending;
+  if (swap)
+  {
+    uvec2 key = s_key[position];
+    uint row = s_row[position];
+    s_key[position] = s_key[partner];
+    s_row[position] = s_row[partner];
+    s_key[partner] = key;
+    s_row[partner] = row;
+  }
+}
+
+void
+main()
+{
+  uint mode = pc.words[2];
+  uint stage = pc.words[4];
+  uint stride = pc.words[6];
+  uint thread = gl_LocalInvocationID.x;
+
+  if (mode == 1u)
+  {
+    uint position = pair_position(gl_GlobalInvocationID.x, stride);
+    uint partner = position + stride;
+    bool ascending = (position & (1u << stage)) == 0u;
+    uvec2 a_key = keys[position];
+    uint a_row = rows[position];
+    uvec2 b_key = keys[partner];
+    uint b_row = rows[partner];
+    if (greater_than(a_key, a_row, b_key, b_row) == ascending)
+    {
+      keys[position] = b_key;
+      rows[position] = b_row;
+      keys[partner] = a_key;
+      rows[partner] = a_row;
+    }
+    return;
+  }
+
+  uint base = gl_WorkGroupID.x * TILE;
+  s_key[thread] = keys[base + thread];
+  s_row[thread] = rows[base + thread];
+  s_key[thread + 512u] = keys[base + thread + 512u];
+  s_row[thread + 512u] = rows[base + thread + 512u];
+  barrier();
+
+  if (mode == 0u)
+  {
+    for (uint k = 1u; k <= 10u; k++)
+    {
+      for (uint j = 1u << (k - 1u); j > 0u; j >>= 1u)
+      {
+        uint position = pair_position(thread, j);
+        exchange_shared(position, j, ((base + position) & (1u << k)) == 0u);
+        barrier();
+      }
+    }
+  }
+  else
+  {
+    for (uint j = TILE / 2u; j > 0u; j >>= 1u)
+    {
+      uint position = pair_position(thread, j);
+      exchange_shared(position, j, ((base + position) & (1u << stage)) == 0u);
+      barrier();
+    }
+  }
+
+  keys[base + thread] = s_key[thread];
+  rows[base + thread] = s_row[thread];
+  keys[base + thread + 512u] = s_key[thread + 512u];
+  rows[base + thread + 512u] = s_row[thread + 512u];
+}

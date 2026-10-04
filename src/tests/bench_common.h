@@ -185,22 +185,35 @@ bench_gdb_consume_result(PLAN_ExecResult* result, IR_Node* select_node, U64* out
 
     if (result->is_materialized)
     {
+      // tec: resolve the output columns once, not per cell
+      U64 output_count = 0;
+      for (IR_Node* column_node = select_output_columns->first; column_node != NULL; column_node = column_node->next)
+      {
+        output_count += 1;
+      }
+      PLAN_AggColumn** output_columns = push_array(scratch.arena, PLAN_AggColumn*, Max(output_count, 1));
+      U64 output_index = 0;
+      for (IR_Node* column_node = select_output_columns->first; column_node != NULL; column_node = column_node->next)
+      {
+        String8 name = qe_column_list_item_display_name(scratch.arena, column_node);
+        for (U64 c = 0; c < result->materialized.column_count; c++)
+        {
+          if (str8_match(result->materialized.columns[c].name, name, 0))
+          {
+            output_columns[output_index] = &result->materialized.columns[c];
+            break;
+          }
+        }
+        output_index += 1;
+      }
+
       for (U64 i = 0; i < result_count; i++)
       {
         U64 row_hash = BENCH_FNV_OFFSET_BASIS;
 
-        for (IR_Node* column_node = select_output_columns->first; column_node != NULL; column_node = column_node->next)
+        for (U64 output = 0; output < output_count; output++)
         {
-          String8 name = qe_column_list_item_display_name(scratch.arena, column_node);
-          PLAN_AggColumn* col = NULL;
-          for (U64 c = 0; c < result->materialized.column_count; c++)
-          {
-            if (str8_match(result->materialized.columns[c].name, name, 0))
-            {
-              col = &result->materialized.columns[c];
-              break;
-            }
-          }
+          PLAN_AggColumn* col = output_columns[output];
           if (!col) continue;
 
           if (col->type == GDB_ColumnType_String8)

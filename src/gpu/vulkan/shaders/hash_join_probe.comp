@@ -1,12 +1,9 @@
 #version 450
 #extension GL_ARB_gpu_shader_fp64 : enable
 
-// tec: pass 2/2 of qe_hash_join. one thread per probe-side (left) row. Hashes its key (same
-// hash function as hash_join_build_count.comp - MUST stay identical or a real match could hash
-// to a different bucket than its build-side counterpart), scans only its own bucket's CSR range,
-// and confirms each candidate with a real value comparison (hash collisions across distinct keys
-// are expected and handled here, not by the hash table structure itself). LEFT JOIN's unmatched
-// row is emitted by the very same thread that already knows it found nothing
+// tec: pass 2/2 of qe_hash_join, one thread per probe-side row. Scans its bucket's CSR range and confirms each candidate with a value comparison
+// the hash function MUST stay identical to hash_join_build_count.comp
+// a LEFT JOIN's unmatched row is emitted by the same thread that found nothing
 //
 // NOTE: binding layout/push-constant slot order MUST stay in sync with qe_hash_join.
 

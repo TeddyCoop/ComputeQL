@@ -232,13 +232,33 @@ struct GDB_Column
   U64 gpu_upload_generation;
   U64 gpu_upload_data_size;
   
-  //- tec: dense device copies kept for qe_aggregate, each is only valid while its generation equals write_generation
+  //- tec: entire col gpu string data/offsets (non dict String8 columns only)
+  U64 gpu_str_upload_generation;
+  U64 gpu_str_upload_data_size;
+  U64 gpu_str_upload_offsets_size;
+  
+  //- tec: dense device copies kept for qe_aggregate
   U64 agg_f64_generation;
   U64 agg_f32_generation;
   U64 agg_narrow_generation;
   B32 agg_narrow;
+  F64 agg_int_bound;
+  U64 agg_fixed_generation;
+  S32 agg_fixed_scale;
+  F64 agg_fixed_max;
+  U64 agg_key_generation;
+  B32 agg_key_whole;
+  S64 agg_key_min;
+  S64 agg_key_max;
   void* agg_f64_buffer;
   void* agg_f32_buffer;
+  
+  // tec: entire col GROUP BY keys for no dict eligble String8
+  Arena* agg_str_arena;
+  U64 agg_str_generation;
+  void* agg_str_data;
+  U64 agg_str_data_size;
+  U64* agg_str_offsets;
   
   //- tec: data storage
   U8 *data;
@@ -473,6 +493,8 @@ internal void gdb_column_add_data_disk_backed(GDB_Column* column, void* data);
 internal void gdb_column_materialize_to_memory(GDB_Column* column);
 internal void gdb_column_add_data(GDB_Column* column, void* data);
 internal void gdb_column_add_data_maybe_null(GDB_Column* column, void* data, B32 is_null);
+internal B32 gdb_column_fill_from_f64(GDB_Column* column, F64* values, U8* is_null, U64 count);
+internal B32 gdb_column_fill_from_strings(GDB_Column* column, String8* values, U8* is_null, U64 count);
 internal void* gdb_column_get_data(GDB_Column* column, U64 index);
 internal void gdb_column_remove_data(GDB_Column* column, U64 row_index);
 internal B32 gdb_column_is_null(GDB_Column* column, U64 row_index);

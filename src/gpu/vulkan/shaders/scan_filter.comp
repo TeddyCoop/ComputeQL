@@ -70,6 +70,10 @@ layout(push_constant) uniform PushConstants
   uint words[16];
 } pc;
 
+// tec: matches are counted per workgroup in shared memory, so the global counter takes one atomic per workgroup instead of one per match
+shared uint s_match_count;
+shared uint s_match_base;
+
 uint
 read_col_word(uint slot, uint word_index)
 {
@@ -321,7 +325,12 @@ main()
 {
   uint row_count = pc.words[0];
   uint row = gl_GlobalInvocationID.x;
-  if (row >= row_count) return;
+  // tec: a row past the end still has to reach the barriers below, it just never matches
+  bool in_range = row < row_count;
+  if (gl_LocalInvocationIndex == 0u)
+  {
+    s_match_count = 0u;
+  }
 
   // tec: pc.words[2]/[4] are the lo words of push-constant slots
 	// score_flags bit0=has_aux_score, bit1=score_is_distance
@@ -340,7 +349,7 @@ main()
   uint bytecode_word_count = bytecode.length();
   uint steps = 0u;
 
-  while (running && ip < bytecode_word_count && steps < bytecode_word_count + 64u)
+  while (in_range && running && ip < bytecode_word_count && steps < bytecode_word_count + 64u)
   {
     steps++;
     uint opcode = bytecode[ip++];
@@ -517,10 +526,22 @@ main()
     }
   }
 
-  bool matched = (sp > 0) && (stack[sp - 1] != 0.0LF);
+  bool matched = in_range && (sp > 0) && (stack[sp - 1] != 0.0LF);
+  barrier();
+  uint local_position = 0u;
   if (matched)
   {
-    uint pos = atomicAdd(out_count[0], 1u);
+    local_position = atomicAdd(s_match_count, 1u);
+  }
+  barrier();
+  if (gl_LocalInvocationIndex == 0u)
+  {
+    s_match_base = (s_match_count > 0u) ? atomicAdd(out_count[0], s_match_count) : 0u;
+  }
+  barrier();
+  if (matched)
+  {
+    uint pos = s_match_base + local_position;
     if (pos < out_indices.length() / 2u)
     {
       out_indices[pos * 2u + 0u] = row;

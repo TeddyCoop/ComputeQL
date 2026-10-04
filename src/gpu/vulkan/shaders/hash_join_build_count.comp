@@ -1,10 +1,8 @@
 #version 450
 #extension GL_ARB_gpu_shader_fp64 : enable
 
-// tec: pass 1/2 of qe_hash_join's build side - hashes each build-side (right table) row's key
-// into a bucket histogram. Unlike qe_aggregate's assign pass, this does not deduplicate by key, every build row is kept (even duplicate keys), because join semantics require every matching
-// pair to appear, not one row per distinct key. Real key equality is confirmed later, in the
-// probe pass, by comparing actual values - hashing here is purely a lookup-narrowing structure.
+// tec: pass 1/2 of qe_hash_join's build side, hashes each build-side row's key into a bucket histogram
+// every build row is kept even with duplicate keys, key equality is confirmed in the probe pass
 //
 // NOTE: binding layout/push-constant slot order MUST stay in sync with qe_hash_join.
 

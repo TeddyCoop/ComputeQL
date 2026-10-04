@@ -463,6 +463,10 @@ global XL_Case g_xl_cases[] =
     "SELECT user_id, COUNT(*), SUM(amount) FROM events GROUP BY user_id;", NULL },
   { "agg: two keys (region, category)",
     "SELECT region_id, category, SUM(amount), COUNT(*) FROM events GROUP BY region_id, category;", NULL },
+  { "agg: group by product, f64 measures",
+    "SELECT product_id, SUM(price), AVG(price), MIN(score), MAX(score) FROM events GROUP BY product_id;", NULL },
+  { "agg: group by status (5), f64 measures",
+    "SELECT status, SUM(price), AVG(score), MIN(score), MAX(score) FROM events GROUP BY status;", NULL },
   { "agg: group by dict string (200)",
     "SELECT country, COUNT(*), SUM(amount) FROM events GROUP BY country;", NULL },
   { "agg: group by session (4M)",
@@ -494,6 +498,26 @@ global XL_Case g_xl_cases[] =
   { "sort: 200k rows",
     "SELECT id, amount FROM events WHERE region_id = 3 ORDER BY amount, id;", NULL },
   
+  // tec: coverage gaps, composite join keys, distinct counts, string group keys and substring filters at mid and high cardinality
+  { "gap: join two keys, count",
+    "SELECT COUNT(*) FROM events JOIN users ON events.user_id = users.user_id AND events.region_id = users.age;", NULL },
+  { "gap: join two keys, group by segment",
+    "SELECT users.segment, COUNT(*), SUM(events.amount) FROM events JOIN users ON events.user_id = users.user_id AND events.region_id = users.age GROUP BY users.segment;", NULL },
+  { "gap: distinct users (1M)",
+    "SELECT COUNT(*) FROM (SELECT user_id FROM events GROUP BY user_id) AS t;", NULL },
+  { "gap: distinct sessions (4M)",
+    "SELECT COUNT(*) FROM (SELECT session FROM events GROUP BY session) AS t;", NULL },
+  { "gap: group by two strings (4000)",
+    "SELECT country, category, COUNT(*), SUM(amount) FROM events GROUP BY country, category;", NULL },
+  { "gap: group by string after join",
+    "SELECT products.brand, COUNT(*), SUM(events.amount) FROM events JOIN products ON events.product_id = products.product_id GROUP BY products.brand;", NULL },
+  { "gap: substring filter, mid card",
+    "SELECT COUNT(*) FROM events WHERE category contains 'at1';",
+    "SELECT COUNT(*) FROM events WHERE category LIKE '%at1%';" },
+  { "gap: substring filter then group",
+    "SELECT country, COUNT(*) FROM events WHERE session contains '77' GROUP BY country;",
+    "SELECT country, COUNT(*) FROM events WHERE session LIKE '%77%' GROUP BY country;" },
+
   { "window: top 3 per region, 1M rows",
     "SELECT COUNT(*) FROM (SELECT id, ROW_NUMBER() OVER (PARTITION BY region_id ORDER BY amount DESC, id) AS rn FROM events WHERE amount > 9000) AS t WHERE rn <= 3;", NULL },
 };
@@ -522,6 +546,7 @@ entry_point(CmdLine* cmdline)
   B32 run_sqlite = !cmd_line_has_flag(cmdline, str8_lit("no_sqlite"));
   B32 run_duckdb = !cmd_line_has_flag(cmdline, str8_lit("no_duckdb"));
   String8 only = cmd_line_string(cmdline, str8_lit("only"));
+  B32 explain = cmd_line_has_flag(cmdline, str8_lit("explain"));
   String8 setting = cmd_line_string(cmdline, str8_lit("setting"));
   if (setting.size > 0)
   {
@@ -602,6 +627,15 @@ entry_point(CmdLine* cmdline)
     U64 gdb_rows = 0, gdb_checksum = 0;
     Bench_Stats gdb_stats = bench_run_gdb_query(database, gdb_sql, &gdb_rows, &gdb_checksum);
     bench_print_table_row(report, label, "gdb", gdb_rows, gdb_checksum, &gdb_stats);
+    
+    if (explain)
+    {
+      Arena* explain_arena = arena_alloc(.reserve_size = GB(1), .commit_size = MB(4));
+      String8 explain_sql = push_str8f(explain_arena, "EXPLAIN ANALYZE %.*s", str8_varg(gdb_sql));
+      APP_QueryResult explain_result = app_execute_query_capture(explain_arena, explain_sql, &database, NULL);
+      printf("%.*s\n", str8_varg(explain_result.output_text));
+      arena_release(explain_arena);
+    }
     
     if (run_sqlite)
     {

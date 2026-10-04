@@ -216,6 +216,112 @@ ch_write_dim_csv(Arena* arena, String8 path, U64 num_groups)
   return ok;
 }
 
+// tec: a second dimension table with several rows per group, so fk_name stays dict-eligible and exercises the dict-coded join key path
+#define CH_DIM2_ROWS_PER_GROUP 3
+
+internal void
+ch_duckdb_create_dim2_schema(duckdb_connection conn)
+{
+  duckdb_result result = {0};
+  if (duckdb_query(conn, "CREATE TABLE dim2 (fk_name VARCHAR, weight INTEGER);", &result) != DuckDBSuccess)
+  {
+    log_error("duckdb_query (CREATE TABLE dim2) failed: %s", duckdb_result_error(&result));
+  }
+  duckdb_destroy_result(&result);
+}
+
+internal void
+ch_duckdb_bulk_insert_dim2(duckdb_connection conn, U64 num_groups)
+{
+  Temp scratch = scratch_begin(0, 0);
+
+  duckdb_appender appender = NULL;
+  if (duckdb_appender_create(conn, NULL, "dim2", &appender) == DuckDBSuccess)
+  {
+    for (U64 g = 0; g < num_groups; g++)
+    {
+      String8 fk_name = push_str8f(scratch.arena, "g%05llu", g);
+      for (U64 r = 0; r < CH_DIM2_ROWS_PER_GROUP; r++)
+      {
+        duckdb_append_varchar_length(appender, (const char*)fk_name.str, fk_name.size);
+        duckdb_append_int32(appender, (S32)(r + 1));
+        duckdb_appender_end_row(appender);
+      }
+    }
+  }
+  duckdb_appender_destroy(&appender);
+
+  scratch_end(scratch);
+}
+
+internal B32
+ch_write_dim2_csv(Arena* arena, String8 path, U64 num_groups)
+{
+  Temp scratch = scratch_begin(&arena, 1);
+
+  String8List lines = {0};
+  str8_list_pushf(scratch.arena, &lines, "fk_name,weight\n");
+  for (U64 g = 0; g < num_groups; g++)
+  {
+    for (U64 r = 0; r < CH_DIM2_ROWS_PER_GROUP; r++)
+    {
+      str8_list_pushf(scratch.arena, &lines, "g%05llu,%llu\n", g, r + 1);
+    }
+  }
+  String8 content = str8_list_join(scratch.arena, &lines, 0);
+
+  B32 ok = 0;
+  OS_Handle file = os_file_open(OS_AccessFlag_Write, path);
+  if (!os_handle_match(file, os_handle_zero()))
+  {
+    os_file_write(file, r1u64(0, content.size), content.str);
+    os_file_close(file);
+    ok = 1;
+  }
+
+  scratch_end(scratch);
+  return ok;
+}
+
+internal void
+ch_sqlite_create_dim2_schema(sqlite3* db)
+{
+  char* err = NULL;
+  if (sqlite3_exec(db, "CREATE TABLE dim2 (fk_name TEXT, weight INTEGER);", NULL, NULL, &err) != SQLITE_OK)
+  {
+    log_error("sqlite3_exec (CREATE TABLE dim2) failed: %s", err ? err : "unknown error");
+    sqlite3_free(err);
+  }
+}
+
+internal void
+ch_sqlite_bulk_insert_dim2(sqlite3* db, U64 num_groups)
+{
+  Temp scratch = scratch_begin(0, 0);
+
+  sqlite3_exec(db, "BEGIN TRANSACTION;", NULL, NULL, NULL);
+
+  sqlite3_stmt* stmt = NULL;
+  sqlite3_prepare_v2(db, "INSERT INTO dim2 (fk_name, weight) VALUES (?, ?);", -1, &stmt, NULL);
+
+  for (U64 g = 0; g < num_groups; g++)
+  {
+    String8 fk_name = push_str8f(scratch.arena, "g%05llu", g);
+    for (U64 r = 0; r < CH_DIM2_ROWS_PER_GROUP; r++)
+    {
+      sqlite3_bind_text(stmt, 1, (const char*)fk_name.str, (int)fk_name.size, SQLITE_TRANSIENT);
+      sqlite3_bind_int64(stmt, 2, (S64)(r + 1));
+      sqlite3_step(stmt);
+      sqlite3_reset(stmt);
+    }
+  }
+
+  sqlite3_finalize(stmt);
+  sqlite3_exec(db, "COMMIT;", NULL, NULL, NULL);
+
+  scratch_end(scratch);
+}
+
 internal void
 ch_sqlite_create_dim_schema(sqlite3* db)
 {
@@ -268,8 +374,10 @@ ch_run_suite(Arena* arena, Bench_Report* report, U64 row_count, char* label)
   }
   String8 fact_csv_path = push_str8f(scratch.arena, "bench_data/chunked_hash_fact_%s.csv", label);
   String8 dim_csv_path = push_str8f(scratch.arena, "bench_data/chunked_hash_dim_%s.csv", label);
+  String8 dim2_csv_path = push_str8f(scratch.arena, "bench_data/chunked_hash_dim2_%s.csv", label);
   ch_write_fact_csv(scratch.arena, fact_csv_path, fact_rows, row_count);
   ch_write_dim_csv(scratch.arena, dim_csv_path, CH_NUM_GROUPS);
+  ch_write_dim2_csv(scratch.arena, dim2_csv_path, CH_NUM_GROUPS);
 
   //- tec: seed compute_ql
   GDB_Database* database = gdb_database_alloc(str8_lit("chunked_hash_db"));
@@ -278,6 +386,8 @@ ch_run_suite(Arena* arena, Bench_Report* report, U64 row_count, char* label)
   gdb_database_add_table(database, fact_table);
   GDB_Table* dim_table = gdb_table_import_csv_streaming(database, str8_lit("dim"), dim_csv_path);
   gdb_database_add_table(database, dim_table);
+  GDB_Table* dim2_table = gdb_table_import_csv_streaming(database, str8_lit("dim2"), dim2_csv_path);
+  gdb_database_add_table(database, dim2_table);
 
   //- tec: seed sqlite with the exact same rows
   sqlite3* sqlite_db = NULL;
@@ -286,6 +396,8 @@ ch_run_suite(Arena* arena, Bench_Report* report, U64 row_count, char* label)
   ch_sqlite_bulk_insert_fact(sqlite_db, fact_rows, row_count);
   ch_sqlite_create_dim_schema(sqlite_db);
   ch_sqlite_bulk_insert_dim(sqlite_db, CH_NUM_GROUPS);
+  ch_sqlite_create_dim2_schema(sqlite_db);
+  ch_sqlite_bulk_insert_dim2(sqlite_db, CH_NUM_GROUPS);
 
   //- tec: seed duckdb with the exact same rows
   duckdb_database duckdb_db = NULL;
@@ -296,8 +408,10 @@ ch_run_suite(Arena* arena, Bench_Report* report, U64 row_count, char* label)
   ch_duckdb_bulk_insert_fact(duckdb_conn, fact_rows, row_count);
   ch_duckdb_create_dim_schema(duckdb_conn);
   ch_duckdb_bulk_insert_dim(duckdb_conn, CH_NUM_GROUPS);
+  ch_duckdb_create_dim2_schema(duckdb_conn);
+  ch_duckdb_bulk_insert_dim2(duckdb_conn, CH_NUM_GROUPS);
 
-  Bench_QueryCase cases[5];
+  Bench_QueryCase cases[7];
   cases[0].label = str8_lit("GROUP BY numeric key");
   cases[0].gdb_sql = str8_lit("SELECT group_key, COUNT(*), SUM(value), AVG(value), MIN(value), MAX(value) FROM fact GROUP BY group_key;");
   cases[0].sqlite_sql = cases[0].gdb_sql;
@@ -322,6 +436,18 @@ ch_run_suite(Arena* arena, Bench_Report* report, U64 row_count, char* label)
   cases[4].gdb_sql = str8_lit("SELECT dim.dim_name, fact.id FROM dim LEFT JOIN fact ON dim.dim_key = fact.group_key;");
   cases[4].sqlite_sql = str8_lit("SELECT dim.dim_name, fact.id FROM dim LEFT JOIN fact ON dim.dim_key = fact.group_key;");
   cases[4].duckdb_sql = cases[4].sqlite_sql;
+
+  // tec: dim2.fk_name and fact.group_name are both dict-eligible, exercises the dict-coded join key path feeding the GROUP BY
+  cases[5].label = str8_lit("JOIN + GROUP BY, string dict key");
+  cases[5].gdb_sql = str8_lit("SELECT dim2.fk_name, COUNT(*), SUM(fact.value) FROM dim2 JOIN fact ON dim2.fk_name = fact.group_name GROUP BY dim2.fk_name;");
+  cases[5].sqlite_sql = str8_lit("SELECT dim2.fk_name, COUNT(*), SUM(fact.value) FROM dim2 INNER JOIN fact ON dim2.fk_name = fact.group_name GROUP BY dim2.fk_name;");
+  cases[5].duckdb_sql = cases[5].sqlite_sql;
+
+  // tec: 10000 groups averages 5 or 200 rows/group at below/past_threshold, forcing the GPU hash-reduce path at below_threshold and the chunked-reduce fallback at past_threshold
+  cases[6].label = str8_lit("GROUP BY numeric key, hash-reduce shape");
+  cases[6].gdb_sql = str8_lit("SELECT group_key, COUNT(*), SUM(id), AVG(id), MIN(id), MAX(id) FROM fact GROUP BY group_key;");
+  cases[6].sqlite_sql = cases[6].gdb_sql;
+  cases[6].duckdb_sql = cases[6].gdb_sql;
 
   bench_print_table_header(report, label);
   for (U64 i = 0; i < ArrayCount(cases); i++)

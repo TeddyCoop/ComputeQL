@@ -1,8 +1,11 @@
 #version 450
 #extension GL_ARB_gpu_shader_fp64 : enable
+#extension GL_EXT_control_flow_attributes : enable
 
 // NOTE: binding layout/push-constant slot order/func codes MUST stay in sync with qe_aggregate
 // NOTE: local_size_x MUST match QE_GPU_WORKGROUP_SIZE - the caller dispatches total_chunks * QE_GPU_WORKGROUP_SIZE threads so that gl_WorkGroupID.x is exactly the chunk index
+//
+// tec: each member row is read once and folded into every expression's accumulator in the same pass
 
 layout(local_size_x = 256) in;
 
@@ -13,6 +16,7 @@ layout(local_size_x = 256) in;
 #define FUNC_MAX                   4u
 #define FUNC_APPROX_COUNT_DISTINCT 5u
 #define FUNC_APPROX_PERCENTILE     6u
+#define MAX_EXPRS                  8u
 
 layout(std430, binding = 0) readonly buffer MembersBuf    { uint group_member_rows[]; };
 layout(std430, binding = 1) readonly buffer ChunkRangeBuf { uint chunk_range[]; };  // tec: [chunk*2+0]=start, [chunk*2+1]=end (indices into group_member_rows)
@@ -29,12 +33,11 @@ layout(std430, binding = 10) readonly buffer Arg5Buf { double arg5[]; };
 layout(std430, binding = 11) readonly buffer Arg6Buf { double arg6[]; };
 layout(std430, binding = 12) readonly buffer Arg7Buf { double arg7[]; };
 
-// tec: one HyperLogLog sketch (hll_words registers) per (group, hll-slot), 
+// tec: one HyperLogLog sketch (hll_words registers) per (group, hll-slot),
 // merged in place via atomicMax. sized by num_groups rather than total_chunks
 layout(std430, binding = 13) buffer SketchBuf { uint sketch[]; };
 
-// tec: one t-digest centroid (mean, weight) per GPU thread per chunk per pct-slot - see
-// qe_aggregate's digest_size comment
+// tec: one t-digest centroid (mean, weight) per GPU thread per chunk per pct-slot
 layout(std430, binding = 14) buffer DigestMeanBuf   { float digest_mean[]; };
 layout(std430, binding = 15) buffer DigestWeightBuf { float digest_weight[]; };
 
@@ -99,9 +102,7 @@ main()
   uint total_chunks  = pc.words[0];
   uint num_exprs     = pc.words[2];
   uint func_codes    = pc.words[4];
-  // tec: no GROUP BY - every row already trivially belongs to the one group, so the CPU skips
-  // the assign/scatter passes entirely (no hashing/CAS/scatter needed for a single group spanning
-  // every row) and group_member_rows is never populated - chunk_range indices ARE row indices
+    // tec: no GROUP BY, so group_member_rows is never populated and chunk_range indices are row indices
   bool identity_mode = pc.words[6] != 0u;
   uint hll_precision  = pc.words[8];
   uint hll_slot_packed = pc.words[10];
@@ -110,8 +111,7 @@ main()
   uint num_pct_exprs  = pc.words[14];
   uint pct_slot_packed = pc.words[15];
 
-  // tec: WorkGroupID is uniform across every invocation in this workgroup, so this
-  // early-out (and every barrier() below) is taken/reached uniformly by the whole group
+    // tec: uniform across the workgroup, so this early-out and every barrier() below are reached uniformly
   uint chunk_id = gl_WorkGroupID.x;
   if (chunk_id >= total_chunks) return;
 
@@ -123,62 +123,77 @@ main()
 
   if (tid == 0u)
   {
-    // tec: every chunk of a group writes the same kind of value here (its own first member) -
-    // benign last-write-wins race across a group's chunks, any member row is a valid representative
+        // tec: benign last-write-wins race, any member row is a valid representative
     representative_row_out[g] = identity_mode ? start : group_member_rows[start];
+  }
+
+  double acc[MAX_EXPRS];
+  double mn[MAX_EXPRS];
+  double mx[MAX_EXPRS];
+  double pct_sample[MAX_EXPRS];
+  [[unroll]] for (uint e = 0u; e < MAX_EXPRS; e++)
+  {
+    acc[e] = 0.0LF;
+    mn[e] = 1.0e300LF;
+    mx[e] = -1.0e300LF;
+    pct_sample[e] = 0.0LF;
+  }
+  uint count = 0u;
+
+    // tec: one read of each member row, folded into every expression's accumulator
+  for (uint m = start + tid; m < end; m += 256u)
+  {
+    uint row = identity_mode ? m : group_member_rows[m];
+    count++;
+
+    [[unroll]] for (uint e = 0u; e < MAX_EXPRS; e++)
+    {
+      if (e >= num_exprs)
+      {
+        continue;
+      }
+      uint func = (func_codes >> (e * 4u)) & 0xfu;
+      if (func == FUNC_SUM || func == FUNC_AVG)
+      {
+        acc[e] += read_arg(e, row);
+      }
+      else if (func == FUNC_MIN)
+      {
+        double v = read_arg(e, row);
+        if (v < mn[e]) mn[e] = v;
+      }
+      else if (func == FUNC_MAX)
+      {
+        double v = read_arg(e, row);
+        if (v > mx[e]) mx[e] = v;
+      }
+      else if (func == FUNC_APPROX_COUNT_DISTINCT)
+      {
+        uint hll_slot = (hll_slot_packed >> (e * 4u)) & 0xfu;
+        hll_add(hll_slot, g, num_hll_exprs, hll_precision, read_arg(e, row));
+      }
+      else if (func == FUNC_APPROX_PERCENTILE && count == 1u)
+      {
+        pct_sample[e] = read_arg(e, row);
+      }
+    }
   }
 
   for (uint e = 0u; e < num_exprs; e++)
   {
     uint func = (func_codes >> (e * 4u)) & 0xfu;
-    uint hll_slot = (hll_slot_packed >> (e * 4u)) & 0xfu;
     uint pct_slot = (pct_slot_packed >> (e * 4u)) & 0xfu;
-
-    double acc = 0.0LF;
-    double mn = 1.0e300LF;
-    double mx = -1.0e300LF;
-    uint count = 0u;
-    double pct_sample = 0.0LF;
-
-    for (uint m = start + tid; m < end; m += 256u)
-    {
-      uint row = identity_mode ? m : group_member_rows[m];
-      count++;
-
-      if (func == FUNC_SUM || func == FUNC_AVG)
-      {
-        acc += read_arg(e, row);
-      }
-      else if (func == FUNC_MIN)
-      {
-        double v = read_arg(e, row);
-        if (v < mn) mn = v;
-      }
-      else if (func == FUNC_MAX)
-      {
-        double v = read_arg(e, row);
-        if (v > mx) mx = v;
-      }
-      else if (func == FUNC_APPROX_COUNT_DISTINCT)
-      {
-        hll_add(hll_slot, g, num_hll_exprs, hll_precision, read_arg(e, row));
-      }
-      else if (func == FUNC_APPROX_PERCENTILE && count == 1u)
-      {
-        pct_sample = read_arg(e, row);
-      }
-    }
 
     if (func == FUNC_APPROX_PERCENTILE)
     {
       uint digest_idx = (chunk_id * num_pct_exprs + pct_slot) * 256u + tid;
-      digest_mean[digest_idx] = float(pct_sample);
+      digest_mean[digest_idx] = float(pct_sample[e]);
       digest_weight[digest_idx] = float(count);
     }
 
-    sh_acc[tid] = acc;
-    sh_mn[tid] = mn;
-    sh_mx[tid] = mx;
+    sh_acc[tid] = acc[e];
+    sh_mn[tid] = mn[e];
+    sh_mx[tid] = mx[e];
     sh_count[tid] = count;
     barrier();
 

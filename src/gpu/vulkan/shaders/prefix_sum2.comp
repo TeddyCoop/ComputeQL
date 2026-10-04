@@ -1,12 +1,13 @@
 #version 450
 
-// tec: exclusive prefix sum of a bucket histogram in three dispatches, so qe_hash_join goes from build to scatter without the counts visiting the CPU
-// offsets holds n + 1 entries, cursor is a copy of the first n that the scatter pass advances with atomics
+// tec: copy of prefix_sum.comp under its own kernel name so qe_window_rank_gpu can run two prefix sums in one GPU_Batch
+// gpu_kernel_alloc caches by name, and rebinding a kernel mid-batch retargets its already recorded dispatches
+// keep identical to prefix_sum.comp
 //   mode 0: one workgroup per block of 256 counts, scans the block in shared memory (Hillis-Steele) and records the block total
 //   mode 1: one workgroup scans the block totals and writes the grand total to offsets[n]
 //   mode 2: adds each block's base to its entries and seeds the cursor
 //
-// NOTE: binding layout MUST stay in sync with qe_hash_join
+// NOTE: binding layout MUST stay in sync with qe_hash_join / qe_window_rank_gpu
 
 layout(local_size_x = 256) in;
 

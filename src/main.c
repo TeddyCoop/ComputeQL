@@ -54,6 +54,22 @@ entry_point(CmdLine* cmdline)
   ProfBeginFunction();
   
   log_alloc();
+  
+  // tec: --log-level=error|warn|info|verbose, info is the default
+  String8 log_level_str = cmd_line_string(cmdline, str8_lit("log-level"));
+  if (log_level_str.size != 0)
+  {
+    LogLevel log_level = LogLevel_Info;
+    if (log_level_from_string(log_level_str, &log_level))
+    {
+      log_set_level(log_level);
+    }
+    else
+    {
+      log_error("--log-level expects error, warn, info or verbose, got '%.*s'", str8_varg(log_level_str));
+    }
+  }
+  
   g_query_exec_mutex = os_mutex_alloc();
   
   String8 query_str = cmd_line_string(cmdline, str8_lit("query"));

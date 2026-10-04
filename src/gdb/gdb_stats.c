@@ -44,7 +44,7 @@ gdb_stats_hll_add(U8* registers, U64 hash)
 {
   U64 register_index = hash >> (64 - GDB_STATS_HLL_PRECISION);
   U64 remaining = (hash << GDB_STATS_HLL_PRECISION) | ((U64)1 << (GDB_STATS_HLL_PRECISION - 1));
-
+  
   U8 rank = 1;
   U64 top_bit = (U64)1 << 63;
   while ((remaining & top_bit) == 0)
@@ -52,7 +52,7 @@ gdb_stats_hll_add(U8* registers, U64 hash)
     rank += 1;
     remaining = remaining << 1;
   }
-
+  
   if (registers[register_index] < rank)
   {
     registers[register_index] = rank;
@@ -64,7 +64,7 @@ gdb_stats_hll_estimate(U8* registers)
 {
   F64 register_count = (F64)GDB_STATS_HLL_REGISTER_COUNT;
   F64 alpha = 0.7213 / (1.0 + 1.079 / register_count);
-
+  
   F64 harmonic_sum = 0.0;
   U64 zero_registers = 0;
   for (U64 i = 0; i < GDB_STATS_HLL_REGISTER_COUNT; i += 1)
@@ -75,15 +75,15 @@ gdb_stats_hll_estimate(U8* registers)
       zero_registers += 1;
     }
   }
-
+  
   F64 estimate = alpha * register_count * register_count / harmonic_sum;
-
+  
   // tec: linear counting corrects the small range
   if (estimate <= 2.5 * register_count && zero_registers > 0)
   {
     estimate = register_count * log(register_count / (F64)zero_registers);
   }
-
+  
   return (U64)(estimate + 0.5);
 }
 
@@ -129,7 +129,7 @@ internal THREAD_POOL_TASK_FUNC(gdb_stats_scan_task)
   GDB_StatsTaskResult* result = &ctx->results[task_id];
   Rng1U64 range = ctx->ranges[task_id];
   GDB_Column* column = ctx->column;
-
+  
   for (U64 row = range.min; row < range.max; row += 1)
   {
     if (gdb_column_is_null(column, row))
@@ -137,7 +137,7 @@ internal THREAD_POOL_TASK_FUNC(gdb_stats_scan_task)
       result->null_count += 1;
       continue;
     }
-
+    
     U64 hash = 0;
     if (ctx->is_string)
     {
@@ -150,7 +150,7 @@ internal THREAD_POOL_TASK_FUNC(gdb_stats_scan_task)
       U64 raw_bits = 0;
       MemoryCopy(&raw_bits, data, Min(column->size, (U64)sizeof(raw_bits)));
       hash = gdb_stats_hash_u64(raw_bits);
-
+      
       F64 value = gdb_numeric_value_as_f64(column->type, data);
       if (!result->has_range)
       {
@@ -170,7 +170,7 @@ internal THREAD_POOL_TASK_FUNC(gdb_stats_scan_task)
         }
       }
     }
-
+    
     gdb_stats_hll_add(result->hll_registers, hash);
     result->non_null_count += 1;
   }
@@ -185,7 +185,7 @@ gdb_stats_build_mcv(GDB_ColumnStats* stats, U64* sorted_keys, U64 key_count)
   stats->mcv_count = 0;
   U64 run_counts[GDB_STATS_MCV_COUNT] = {0};
   U64 distinct_keys = 0;
-
+  
   U64 run_start = 0;
   while (run_start < key_count)
   {
@@ -194,10 +194,10 @@ gdb_stats_build_mcv(GDB_ColumnStats* stats, U64* sorted_keys, U64 key_count)
     {
       run_end += 1;
     }
-
+    
     distinct_keys += 1;
     U64 run_length = run_end - run_start;
-
+    
     if (run_length >= 2)
     {
       U32 insert_at = stats->mcv_count;
@@ -205,7 +205,7 @@ gdb_stats_build_mcv(GDB_ColumnStats* stats, U64* sorted_keys, U64 key_count)
       {
         insert_at -= 1;
       }
-
+      
       if (insert_at < GDB_STATS_MCV_COUNT)
       {
         U32 last = Min(stats->mcv_count, (U32)(GDB_STATS_MCV_COUNT - 1));
@@ -223,10 +223,10 @@ gdb_stats_build_mcv(GDB_ColumnStats* stats, U64* sorted_keys, U64 key_count)
         }
       }
     }
-
+    
     run_start = run_end;
   }
-
+  
   return distinct_keys;
 }
 
@@ -238,7 +238,7 @@ gdb_stats_build_histogram(GDB_ColumnStats* stats, F64* sorted_values, U64 value_
   {
     return;
   }
-
+  
   // tec: bucket b starts at sample b * n / buckets, so a table with as few rows as buckets gets one value per bucket
   U64 bucket_count = Min((U64)GDB_STATS_HISTOGRAM_BUCKETS, value_count);
   for (U64 bucket = 0; bucket <= bucket_count; bucket += 1)
@@ -246,11 +246,94 @@ gdb_stats_build_histogram(GDB_ColumnStats* stats, F64* sorted_values, U64 value_
     U64 sample_index = Min(bucket * value_count / bucket_count, value_count - 1);
     stats->histogram_bounds[bucket] = sorted_values[sample_index];
   }
-
+  
   // tec: the scan saw every row, so the outer bounds are exact even when the sample is not
   stats->histogram_bounds[0] = stats->min_value;
   stats->histogram_bounds[bucket_count] = stats->max_value;
   stats->histogram_bucket_count = (U32)bucket_count;
+}
+
+//~ tec: sorting the sample
+
+// tec: least significant digit first, one byte at a time, a byte that is the same in every key is skipped
+internal void
+gdb_stats_radix_sort_u64(Arena* arena, U64* keys, U64 count)
+{
+  if (count < 2)
+  {
+    return;
+  }
+  
+  Temp scratch = scratch_begin(&arena, 1);
+  U64* buffer = push_array(scratch.arena, U64, count);
+  U64* source = keys;
+  U64* target = buffer;
+  for (U32 pass = 0; pass < 8; pass += 1)
+  {
+    U32 shift = pass * 8;
+    U64 histogram[256] = {0};
+    for (U64 i = 0; i < count; i += 1)
+    {
+      histogram[(source[i] >> shift) & 0xff] += 1;
+    }
+    if (histogram[(source[0] >> shift) & 0xff] == count)
+    {
+      continue;
+    }
+    U64 running = 0;
+    for (U32 digit = 0; digit < 256; digit += 1)
+    {
+      U64 digit_count = histogram[digit];
+      histogram[digit] = running;
+      running += digit_count;
+    }
+    for (U64 i = 0; i < count; i += 1)
+    {
+      target[histogram[(source[i] >> shift) & 0xff]++] = source[i];
+    }
+    U64* swap = source;
+    source = target;
+    target = swap;
+  }
+  if (source != keys)
+  {
+    MemoryCopy(keys, source, count * sizeof(U64));
+  }
+  scratch_end(scratch);
+}
+
+internal U64
+gdb_stats_f64_sort_key(F64 value)
+{
+  U64 bits = 0;
+  MemoryCopy(&bits, &value, sizeof(bits));
+  return (bits >> 63) ? ~bits : (bits | 0x8000000000000000ull);
+}
+
+internal F64
+gdb_stats_f64_from_sort_key(U64 key)
+{
+  U64 bits = (key >> 63) ? (key & 0x7fffffffffffffffull) : ~key;
+  F64 value = 0.0;
+  MemoryCopy(&value, &bits, sizeof(value));
+  return value;
+}
+
+internal void
+gdb_stats_sort_f64(Arena* arena, F64* values, U64 count)
+{
+  Temp scratch = scratch_begin(&arena, 1);
+  U64* keys = push_array(scratch.arena, U64, Max(count, (U64)1));
+  for (U64 i = 0; i < count; i += 1)
+  {
+    keys[i] = gdb_stats_f64_sort_key(values[i]);
+  }
+  gdb_stats_radix_sort_u64(scratch.arena, keys, count);
+  for (U64 i = 0; i < count; i += 1)
+  {
+    values[i] = gdb_stats_f64_from_sort_key(keys[i]);
+  }
+  scratch_end(scratch);
 }
 
 //~ tec: entry points
@@ -266,24 +349,24 @@ internal void
 gdb_column_ensure_stats(GDB_Column* column)
 {
   ProfBeginFunction();
-
+  
   if (gdb_column_stats_is_current(column))
   {
     ProfEnd();
     return;
   }
-
+  
   GDB_ColumnStats* stats = &column->stats;
   MemoryZeroStruct(stats);
   stats->row_count = column->row_count;
-
+  
   B32 is_string = column->type == GDB_ColumnType_String8;
   B32 is_scannable = column->type != GDB_ColumnType_Invalid;
-
+  
   if (column->row_count > 0 && is_scannable)
   {
     Temp scratch = scratch_begin(0, 0);
-
+    
     GDB_StatsScanCtx ctx = {0};
     ctx.column = column;
     ctx.is_string = is_string;
@@ -296,7 +379,7 @@ gdb_column_ensure_stats(GDB_Column* column)
       U64 range_size = 0;
       ctx.base_ptr = gdb_column_get_data_range(scratch.arena, column, r1u64(0, column->row_count), &range_size);
     }
-
+    
     TP_Context* pool = app_thread_pool();
     U64 task_count = Max((U64)1, Min((U64)pool->worker_count, column->row_count));
     ctx.ranges = tp_divide_work(scratch.arena, column->row_count, (U32)task_count);
@@ -305,12 +388,12 @@ gdb_column_ensure_stats(GDB_Column* column)
     {
       ctx.results[task].hll_registers = push_array(scratch.arena, U8, GDB_STATS_HLL_REGISTER_COUNT);
     }
-
+    
     TP_Arena* pool_arena = app_thread_pool_arena();
     TP_Temp temp = tp_temp_begin(pool_arena);
     tp_for_parallel(pool, pool_arena, task_count, gdb_stats_scan_task, &ctx);
     tp_temp_end(temp);
-
+    
     U8* merged_registers = ctx.results[0].hll_registers;
     U64 non_null_count = 0;
     for (U64 task = 0; task < task_count; task += 1)
@@ -318,7 +401,7 @@ gdb_column_ensure_stats(GDB_Column* column)
       GDB_StatsTaskResult* result = &ctx.results[task];
       non_null_count += result->non_null_count;
       stats->null_count += result->null_count;
-
+      
       if (task > 0)
       {
         for (U64 i = 0; i < GDB_STATS_HLL_REGISTER_COUNT; i += 1)
@@ -329,7 +412,7 @@ gdb_column_ensure_stats(GDB_Column* column)
           }
         }
       }
-
+      
       if (result->has_range)
       {
         if (!stats->has_range)
@@ -351,7 +434,7 @@ gdb_column_ensure_stats(GDB_Column* column)
         }
       }
     }
-
+    
     // tec: systematic sample by row position
     U64 stride = Max((U64)1, column->row_count / GDB_STATS_SAMPLE_ROWS);
     U64 sample_capacity = column->row_count / stride + 1;
@@ -366,14 +449,14 @@ gdb_column_ensure_stats(GDB_Column* column)
     {
       numeric_sample = push_array(scratch.arena, F64, sample_capacity);
     }
-
+    
     for (U64 row = 0; row < column->row_count; row += stride)
     {
       if (gdb_column_is_null(column, row))
       {
         continue;
       }
-
+      
       if (is_string)
       {
         String8 value = gdb_dict_row_string(&ctx.string_chunk, row);
@@ -391,18 +474,18 @@ gdb_column_ensure_stats(GDB_Column* column)
         }
       }
     }
-
+    
     U64 sample_distinct_count = 0;
     if (is_string)
     {
-      quick_sort(key_sample, sample_count, sizeof(U64), gdb_stats_compare_u64);
+      gdb_stats_radix_sort_u64(scratch.arena, key_sample, sample_count);
       sample_distinct_count = gdb_stats_build_mcv(stats, key_sample, sample_count);
     }
     else
     {
-      quick_sort(numeric_sample, sample_count, sizeof(F64), gdb_stats_compare_f64);
+      gdb_stats_sort_f64(scratch.arena, numeric_sample, sample_count);
       gdb_stats_build_histogram(stats, numeric_sample, sample_count);
-
+      
       U64* numeric_keys = push_array(scratch.arena, U64, Max(sample_count, (U64)1));
       for (U64 i = 0; i < sample_count; i += 1)
       {
@@ -410,7 +493,7 @@ gdb_column_ensure_stats(GDB_Column* column)
       }
       sample_distinct_count = gdb_stats_build_mcv(stats, numeric_keys, sample_count);
     }
-
+    
     // tec: a sample that holds every row gives an exact count, otherwise fall back to HyperLogLog
     U64 distinct_count = 0;
     if (stride == 1)
@@ -426,7 +509,7 @@ gdb_column_ensure_stats(GDB_Column* column)
     {
       distinct_count = Max(distinct_count, (U64)1);
     }
-
+    
     B32 dict_is_current = column->has_dict && column->dict && column->dict_checked_generation == column->write_generation;
     if (dict_is_current)
     {
@@ -437,18 +520,18 @@ gdb_column_ensure_stats(GDB_Column* column)
       distinct_count = non_null_count;
     }
     stats->distinct_count = distinct_count;
-
+    
     if (is_string)
     {
       gdb_column_close_string_chunk(column);
     }
-
+    
     scratch_end(scratch);
   }
-
+  
   stats->is_computed = 1;
   stats->computed_generation = column->write_generation;
-
+  
   ProfEnd();
 }
 

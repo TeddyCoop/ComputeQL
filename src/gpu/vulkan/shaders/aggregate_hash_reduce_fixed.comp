@@ -1,0 +1,122 @@
+#version 450
+#extension GL_ARB_gpu_shader_fp64 : enable
+
+// tec: exact hash aggregation for F64 arguments that are decimals with a few places, same dispatch as aggregate_hash_reduce_f32.comp
+// each value is scaled by its argument's power of ten into a whole number, SUM is a 64 bit integer held in two 32 bit words with plain atomicAdd
+// MIN and MAX are 32 bit signed atomics, the scaled values are checked on the CPU to fit (qe_values_fixed_point)
+//
+// NOTE: binding layout/push-constant slot order MUST stay in sync with qe_aggregate
+
+layout(local_size_x = 256) in;
+
+#define FUNC_COUNT 0u
+#define FUNC_SUM   1u
+#define FUNC_AVG   2u
+#define FUNC_MIN   3u
+#define FUNC_MAX   4u
+#define EMPTY      0xffffffffu
+
+layout(std430, binding = 0) readonly buffer RowSlotBuf   { uint row_slot[]; };
+layout(std430, binding = 1) readonly buffer SlotGroupBuf { uint slot_group[]; };
+layout(std430, binding = 2) buffer SumBuf                { uint sum_words[]; };  // tec: low word then high word per entry
+layout(std430, binding = 3) buffer CountBuf              { uint count_out[]; };
+layout(std430, binding = 4) buffer MinBuf                { int min_out[]; };
+layout(std430, binding = 5) buffer MaxBuf                { int max_out[]; };
+
+layout(std430, binding = 6)  readonly buffer Arg0Buf { double arg0[]; };
+layout(std430, binding = 7)  readonly buffer Arg1Buf { double arg1[]; };
+layout(std430, binding = 8)  readonly buffer Arg2Buf { double arg2[]; };
+layout(std430, binding = 9)  readonly buffer Arg3Buf { double arg3[]; };
+layout(std430, binding = 10) readonly buffer Arg4Buf { double arg4[]; };
+layout(std430, binding = 11) readonly buffer Arg5Buf { double arg5[]; };
+layout(std430, binding = 12) readonly buffer Arg6Buf { double arg6[]; };
+layout(std430, binding = 13) readonly buffer Arg7Buf { double arg7[]; };
+
+layout(push_constant) uniform PushConstants
+{
+  uint words[16];
+} pc;
+
+const double POW10[7] = double[7](1.0lf, 10.0lf, 100.0lf, 1000.0lf, 10000.0lf, 100000.0lf, 1000000.0lf);
+
+double
+read_arg(uint e, uint row)
+{
+  switch (e)
+  {
+    case 0u: return arg0[row];
+    case 1u: return arg1[row];
+    case 2u: return arg2[row];
+    case 3u: return arg3[row];
+    case 4u: return arg4[row];
+    case 5u: return arg5[row];
+    case 6u: return arg6[row];
+    case 7u: return arg7[row];
+  }
+  return 0.0lf;
+}
+
+void
+main()
+{
+  uint row_count  = pc.words[0];
+  uint num_exprs  = pc.words[2];
+  uint func_codes = pc.words[4];
+  uint scales     = pc.words[6]; // tec: each argument's power of ten exponent in four bits
+
+  uint row = gl_GlobalInvocationID.x;
+  if (row >= row_count)
+  {
+    return;
+  }
+
+  uint slot = row_slot[row];
+  if (slot == EMPTY)
+  {
+    return;
+  }
+  uint g = slot_group[slot];
+  if (g == EMPTY)
+  {
+    return;
+  }
+
+  for (uint e = 0u; e < num_exprs; e++)
+  {
+    uint func = (func_codes >> (e * 4u)) & 0xfu;
+    uint index = g * num_exprs + e;
+
+    // tec: every func needs the row count (COUNT(*) IS this, AVG divides by it on the CPU afterward)
+    atomicAdd(count_out[index], 1u);
+
+    if (func == FUNC_COUNT)
+    {
+      continue;
+    }
+
+    uint exponent = (scales >> (e * 4u)) & 0xfu;
+    double scaled = read_arg(e, row) * POW10[exponent];
+    int q = int(floor(scaled + 0.5lf));
+
+    if (func == FUNC_SUM || func == FUNC_AVG)
+    {
+      uint low = uint(q);
+      uint high = (q < 0) ? 0xffffffffu : 0u;
+      uint before = atomicAdd(sum_words[index * 2u], low);
+      uint carry = (before + low < before) ? 1u : 0u;
+      uint high_add = high + carry;
+      if (high_add != 0u)
+      {
+        atomicAdd(sum_words[index * 2u + 1u], high_add);
+      }
+    }
+    else if (func == FUNC_MIN)
+    {
+      atomicMin(min_out[index], q);
+    }
+    else if (func == FUNC_MAX)
+    {
+      atomicMax(max_out[index], q);
+    }
+  }
+}

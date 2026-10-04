@@ -1,8 +1,7 @@
 #version 450
 
-// tec: reads columns through device rows, so a consumer of a scan or join output never needs the row ids on the host
-// the rows hold one index every stride words (a scan also keeps a score there, a join keeps a pair), row_offset is added to each
-// an index of 0xffffffff is no row, it reads as 0 and stays no row when it is passed on
+// tec: reads columns through device rows so a consumer of a scan or join output never needs the row ids on the host
+// rows hold one index every stride words, row_offset is added to each, 0xffffffff is no row and reads as 0
 //
 // NOTE: binding layout and push constant slots stay in sync with qe_selection_gather_column, qe_selection_rows_for_positions and qe_rows_resolve
 

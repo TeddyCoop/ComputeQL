@@ -677,7 +677,7 @@ gdb_table_save(GDB_Table* table, String8 table_dir)
       meta_size += sizeof(U64) + column->name.size + sizeof(U64) +
         column->zone_map_chunk_count * (sizeof(F64) * 2 + sizeof(U32));
     }
-
+    
     // tec: trailing, optional per column statistics section
     meta_size += sizeof(U64);
     for (U64 i = 0; i < table->column_count; i++)
@@ -689,7 +689,7 @@ gdb_table_save(GDB_Table* table, String8 table_dir)
       }
       meta_size += gdb_column_stats_record_size(column);
     }
-
+    
     U8* meta_buffer = push_array(scratch.arena, U8, meta_size);
     U8* meta_ptr = meta_buffer;
     
@@ -852,7 +852,7 @@ gdb_table_save(GDB_Table* table, String8 table_dir)
         *(U32*)meta_ptr = chunk->has_values; meta_ptr += sizeof(U32);
       }
     }
-
+    
     U64 stats_column_count = 0;
     for (U64 i = 0; i < table->column_count; i++)
     {
@@ -861,7 +861,7 @@ gdb_table_save(GDB_Table* table, String8 table_dir)
         stats_column_count += 1;
       }
     }
-
+    
     *(U64*)meta_ptr = stats_column_count; meta_ptr += sizeof(U64);
     for (U64 i = 0; i < table->column_count; i++)
     {
@@ -872,7 +872,7 @@ gdb_table_save(GDB_Table* table, String8 table_dir)
       }
       meta_ptr = gdb_column_stats_write_record(meta_ptr, column);
     }
-
+    
     os_file_write(meta_file, r1u64(0, meta_size), meta_buffer);
     os_file_close(meta_file);
   }
@@ -1461,7 +1461,7 @@ gdb_table_load(GDB_Database* database, String8 table_dir, String8 meta_path)
       U64 expected_chunk_count = column ? (column->row_count + g_gdb_state->zonemap_chunk_rows - 1) / g_gdb_state->zonemap_chunk_rows : 0;
       if (!column || chunk_count != expected_chunk_count)
       {
-        if (column) log_info("gdb_table_load: zone map chunk count mismatch for column '%.*s' - will rebuild lazily", str8_varg(column_name));
+        if (column) log_debug("gdb_table_load: zone map chunk count mismatch for column '%.*s' - will rebuild lazily", str8_varg(column_name));
         read_ptr += chunks_size;
         continue;
       }
@@ -1479,13 +1479,13 @@ gdb_table_load(GDB_Database* database, String8 table_dir, String8 meta_path)
       column->zonemap_checked_generation = column->write_generation;
     }
   }
-
+  
   //- tec: optional trailing statistics section
   if (read_ptr + sizeof(U64) <= meta_data.str + meta_data.size)
   {
     U8* meta_end = meta_data.str + meta_data.size;
     U64 stats_column_count = *(U64*)read_ptr; read_ptr += sizeof(U64);
-
+    
     for (U64 i = 0; i < stats_column_count; i++)
     {
       String8 column_name = {0};
@@ -1494,20 +1494,20 @@ gdb_table_load(GDB_Database* database, String8 table_dir, String8 meta_path)
       {
         break;
       }
-
+      
       GDB_Column* column = gdb_table_find_column(table, column_name);
       // tec: a row count mismatch means the stats predate the data on disk
       if (!column || loaded_stats.row_count != column->row_count)
       {
         continue;
       }
-
+      
       column->stats = loaded_stats;
       column->stats.is_computed = 1;
       column->stats.computed_generation = column->write_generation;
     }
   }
-
+  
   table->name = push_str8_copy(table->arena, str8_skip_last_slash(table_dir));
   temp_end(scratch);
   
@@ -1640,7 +1640,7 @@ gdb_csv_append_parsed_row(GDB_Table* table, GDB_CSV_ParsedField* row_fields, U64
   table->row_count++;
   if ((table->row_count % 1000000) == 0)
   {
-    log_info("processing row %llu", table->row_count);
+    log_debug("processing row %llu", table->row_count);
   }
   
   for (U64 col_i = 0; col_i < column_count; col_i++)
@@ -1964,8 +1964,8 @@ gdb_table_import_csv_streaming(GDB_Database *db, String8 table_name, String8 pat
   os_file_close(file);
   temp_end(scratch);
   log_info("ending import csv file %.*s", str8_varg(path));
-  log_info("gdb_table_import_csv_streaming: %llu rows, phases (us): type_sample=%llu read=%llu scan=%llu parse=%llu append=%llu total=%llu",
-           table->row_count, t_typesample, t_read, t_scan, t_parse, t_append, os_now_microseconds() - t_fn_start);
+  log_debug("gdb_table_import_csv_streaming: %llu rows, phases (us): type_sample=%llu read=%llu scan=%llu parse=%llu append=%llu total=%llu",
+            table->row_count, t_typesample, t_read, t_scan, t_parse, t_append, os_now_microseconds() - t_fn_start);
   ProfEnd();
   return table;
 }
@@ -2394,6 +2394,10 @@ gdb_column_release(GDB_Column* column)
   {
     arena_release(column->dict->arena);
   }
+  if (column->agg_str_arena)
+  {
+    arena_release(column->agg_str_arena);
+  }
   arena_release(column->arena);
 }
 
@@ -2685,10 +2689,175 @@ gdb_column_add_data(GDB_Column* column, void* data)
   }
 }
 
+internal B32
+gdb_column_fill_from_f64(GDB_Column* column, F64* values, U8* is_null, U64 count)
+{
+  if (column->type == GDB_ColumnType_String8 || column->type == GDB_ColumnType_Invalid || 
+      column->row_count != 0 || column->is_disk_backed)
+  {
+    return 0;
+  }
+  if (count == 0)
+  {
+    return 1;
+  }
+  
+  U8* data = arena_push(column->arena, count * column->size, 8);
+  if (data == 0)
+  {
+    return 0;
+  }
+  
+  switch (column->type)
+  {
+    case GDB_ColumnType_U32:
+    case GDB_ColumnType_Enum:
+    { 
+      U32* out = (U32*)data; 
+      for (U64 i = 0; i < count; i++) 
+      {
+        out[i] = (U32)values[i];
+      }
+    } break;
+    case GDB_ColumnType_U64:
+    { 
+      U64* out = (U64*)data; 
+      for (U64 i = 0; i < count; i++) 
+      {
+        out[i] = (U64)values[i];
+      }
+    } break;
+    case GDB_ColumnType_F32: 
+    { 
+      F32* out = (F32*)data; 
+      for (U64 i = 0; i < count; i++) 
+      {
+        out[i] = (F32)values[i];
+      }
+    } break;
+    case GDB_ColumnType_F64: 
+    { 
+      MemoryCopy(data, values, count * sizeof(F64)); 
+    } break;
+    case GDB_ColumnType_Bool: 
+    { 
+      U8* out = data; 
+      for (U64 i = 0; i < count; i++) 
+      {
+        out[i] = (U8)values[i]; 
+      }
+    } break;
+    case GDB_ColumnType_I32:
+    case GDB_ColumnType_Date: 
+    { 
+      S32* out = (S32*)data; 
+      for (U64 i = 0; i < count; i++) 
+      {
+        out[i] = (S32)values[i]; 
+      }
+    } break;
+    case GDB_ColumnType_I64:
+    case GDB_ColumnType_Timestamp:
+    case GDB_ColumnType_Decimal: 
+    { 
+      S64* out = (S64*)data; 
+      for (U64 i = 0; i < count; i++) 
+      {
+        out[i] = (S64)values[i];
+      }
+    } break;
+    default: return 0;
+  }
+  
+  column->data = data;
+  column->capacity = count;
+  column->row_count = count;
+  column->write_generation++;
+  
+  if (is_null)
+  {
+    B32 any_null = 0;
+    for (U64 i = 0; i < count && !any_null; i++)
+    {
+      any_null = is_null[i] != 0;
+    }
+    if (any_null)
+    {
+      gdb_column_ensure_null_flags_capacity(column, count);
+      MemoryCopy(column->null_flags, is_null, count);
+    }
+  }
+  return 1;
+}
+
+internal B32
+gdb_column_fill_from_strings(GDB_Column* column, String8* values, U8* is_null, U64 count)
+{
+  if (column->type != GDB_ColumnType_String8 || column->row_count != 0 || 
+      column->is_disk_backed || column->offsets != 0)
+  {
+    return 0;
+  }
+  if (count == 0)
+  {
+    return 1;
+  }
+  
+  U64 total_size = 0;
+  for (U64 i = 0; i < count; i++)
+  {
+    total_size += values[i].size;
+  }
+  
+  U64* offsets = push_array_no_zero(column->arena, U64, count);
+  U8* data = push_array_no_zero(column->arena, U8, Max(total_size, 8));
+  if (offsets == 0 || data == 0)
+  {
+    return 0;
+  }
+  
+  U64 cursor = 0;
+  for (U64 i = 0; i < count; i++)
+  {
+    U64 size = values[i].size;
+    if (size > 0)
+    {
+      MemoryCopy(data + cursor, values[i].str, size);
+    }
+    cursor += size;
+    offsets[i] = cursor;
+  }
+  
+  column->data = data;
+  column->offsets = offsets;
+  column->capacity = count;
+  column->variable_capacity = Max(total_size, 8);
+  column->row_count = count;
+  column->write_generation++;
+  
+  if (is_null)
+  {
+    B32 any_null = 0;
+    for (U64 i = 0; i < count && !any_null; i++)
+    {
+      any_null = is_null[i] != 0;
+    }
+    if (any_null)
+    {
+      gdb_column_ensure_null_flags_capacity(column, count);
+      MemoryCopy(column->null_flags, is_null, count);
+    }
+  }
+  return 1;
+}
+
 internal void
 gdb_column_ensure_null_flags_capacity(GDB_Column* column, U64 needed_count)
 {
-  if (needed_count <= column->null_flags_capacity) return;
+  if (needed_count <= column->null_flags_capacity)
+  {
+    return;
+  }
   
   U64 new_capacity = (column->null_flags_capacity > 0) ? column->null_flags_capacity * 2 : g_gdb_state->column_expand_count;
   while (new_capacity < needed_count) new_capacity *= 2;
@@ -3879,7 +4048,7 @@ gdb_database_build_column_catalog(GDB_Database* database)
   gdb_table_add_column(catalog, gdb_column_schema_create(str8_lit("row_count"), GDB_ColumnType_U64));
   gdb_table_add_column(catalog, gdb_column_schema_create(str8_lit("distinct_count"), GDB_ColumnType_U64));
   gdb_table_add_column(catalog, gdb_column_schema_create(str8_lit("null_count"), GDB_ColumnType_U64));
-
+  
   String8 empty = str8_lit("");
   
   for (U64 t = 0; t < database->table_count; t++)
@@ -3911,7 +4080,7 @@ gdb_database_build_column_catalog(GDB_Database* database)
       B32 has_stats = gdb_column_stats_is_current(column);
       U64 distinct_count = column->stats.distinct_count;
       U64 null_count = column->stats.null_count;
-
+      
       void* row_data[18] = {
         &table->name, &column->name, &type_name, &ordinal, &nullable, &is_unique,
         &is_primary_key, &is_foreign_key, &fk_ref_table, &fk_ref_column, &has_check,
@@ -3921,7 +4090,7 @@ gdb_database_build_column_catalog(GDB_Database* database)
       B32 null_flags[18] = {0};
       null_flags[16] = !has_stats;
       null_flags[17] = !has_stats;
-
+      
       gdb_table_add_row(catalog, row_data, null_flags);
     }
   }

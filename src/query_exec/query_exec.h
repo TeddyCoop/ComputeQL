@@ -194,6 +194,7 @@ struct QE_SortTrace
   U64 gpu_time_us;
   B32 used_cpu;
   U64 kept_rows;
+  U32 top_k_tasks;
 };
 
 //~ tec: what the optimizer passes down so an operator can size its buffers and pick a device before it runs, zero means unknown
@@ -202,7 +203,31 @@ struct QE_JoinHints
 {
   U64 output_rows;
   B32 fuse_round_trips;
+  
+  IR_Node* second_key;
+  B32 second_key_applied;
 };
+
+//- tec: packing two whole number join keys into one exact F64
+typedef struct QE_JoinPackTask QE_JoinPackTask;
+struct QE_JoinPackTask
+{
+  Rng1U64* ranges;
+  F64* first;
+  F64* second;
+  F64* task_min_first;
+  F64* task_max_first;
+  F64* task_min_second;
+  F64* task_max_second;
+  F64 min_first;
+  F64 min_second;
+  F64 span_second;
+};
+
+internal THREAD_POOL_TASK_FUNC(qe_join_pack_range_task);
+internal THREAD_POOL_TASK_FUNC(qe_join_pack_compose_task);
+internal B32 qe_join_key_is_whole_number(GDB_Column* column);
+internal B32 qe_join_pack_keys(Arena* arena, F64* build_first, F64* build_second, U64 build_count, F64* probe_first, F64* probe_second, U64 probe_count);
 
 typedef struct QE_AggregateHints QE_AggregateHints;
 struct QE_AggregateHints
@@ -313,7 +338,7 @@ struct QE_DeviceRows
   String8 aliases[QE_DEVICE_ROWS_MAX_TABLES];
 };
 
-internal QE_ScanResult qe_scan_filter_selected(Arena* arena, GDB_Database* database, GDB_Table* table, IR_Node* where_clause, QE_ScanTrace* out_trace, QE_DeviceSelection* out_selection);
+internal QE_ScanResult qe_scan_filter_selected(Arena* arena, GDB_Database* database, GDB_Table* table, IR_Node* where_clause, QE_ScanTrace* out_trace, QE_DeviceSelection* out_selection, U64 expected_rows);
 internal QE_DeviceRows qe_device_rows_from_selection(QE_DeviceSelection* selection, String8 alias);
 internal QE_DeviceSelection* qe_device_view(QE_DeviceRows* device, U64 table_slot);
 internal B32 qe_try_index_scan(Arena* arena, GDB_Table* table, IR_Node* where_clause, QE_ScanResult* out_result);
@@ -408,6 +433,71 @@ struct QE_GatherNumericTask
   F64* values;
 };
 
+//- tec: the span of table rows a row list touches, NULL rows skipped
+typedef struct QE_RowBoundsTask QE_RowBoundsTask;
+struct QE_RowBoundsTask
+{
+  Rng1U64* ranges;
+  U64* table_rows;
+  U64* task_min;
+  U64* task_max;
+};
+
+internal THREAD_POOL_TASK_FUNC(qe_row_bounds_task);
+internal void qe_row_bounds(U64* table_rows, U64 count, U64* out_min, U64* out_max);
+
+//- tec: aggregate output assembly, one entry per group
+typedef struct QE_AggBaseRowsTask QE_AggBaseRowsTask;
+struct QE_AggBaseRowsTask
+{
+  Rng1U64* ranges;
+  U64* representatives;
+  U64* table_rows;
+  U64 input_count;
+  U64* base_rows;
+};
+
+typedef struct QE_AggStringOutTask QE_AggStringOutTask;
+struct QE_AggStringOutTask
+{
+  Rng1U64* ranges;
+  GDB_StringDataChunk chunk;
+  String8* values;
+};
+
+typedef struct QE_AggResultCopyTask QE_AggResultCopyTask;
+struct QE_AggResultCopyTask
+{
+  Rng1U64* ranges;
+  F64* results;
+  U64 stride;
+  U64 expr;
+  F64* values;
+};
+
+//- tec: string gather straight from an in-memory column, offsets[k] is the end of row k
+typedef struct QE_StringGatherTask QE_StringGatherTask;
+struct QE_StringGatherTask
+{
+  Rng1U64* ranges;
+  U64* table_rows;
+  U64* src_offsets;
+  U8* src_data;
+  B32 src_offsets_lead_with_zero;
+  U64* out_offsets;
+  U8* out_data;
+};
+
+internal THREAD_POOL_TASK_FUNC(qe_string_gather_length_task);
+internal THREAD_POOL_TASK_FUNC(qe_string_gather_copy_task);
+
+internal THREAD_POOL_TASK_FUNC(qe_agg_base_rows_task);
+internal THREAD_POOL_TASK_FUNC(qe_agg_string_out_task);
+internal THREAD_POOL_TASK_FUNC(qe_agg_result_copy_task);
+internal Rng1U64* qe_agg_split_work(Arena* arena, U64 count, U64* out_task_count);
+internal void qe_agg_run_tasks(U64 task_count, TP_TaskFunc* task_func, void* task_data);
+internal void qe_agg_copy_results(F64* values, F64* results, U64 stride, U64 expr, U64 num_groups);
+
 internal F64 qe_read_numeric_as_f64(GDB_Column* column, U64 row_index);
 internal THREAD_POOL_TASK_FUNC(qe_gather_numeric_task);
 
@@ -446,6 +536,21 @@ internal THREAD_POOL_TASK_FUNC(qe_dense_dict_codes_task);
 internal F64* qe_dict_codes_to_f64_dense(Arena* arena, U32* codes, U64 count);
 internal F64* qe_dict_codes_from_string_chunk(Arena* arena, GDB_StringDataChunk* chunk, GDB_StringDict* dict);
 
+typedef struct QE_DictRecodeTask QE_DictRecodeTask;
+struct QE_DictRecodeTask
+{
+  Rng1U64* ranges;
+  U32* codes;
+  // tec: from_dict code -> to_dict code, GDB_DICT_NOT_FOUND for a value absent from to_dict
+  U32* lut;      
+  F64* values;
+};
+
+internal U32* qe_dict_recode_lut(Arena* arena, GDB_StringDict* from_dict, GDB_StringDict* to_dict);
+internal THREAD_POOL_TASK_FUNC(qe_dict_recode_task);
+internal F64* qe_dict_codes_recoded_dense(Arena* arena, U32* codes, U64 count, U32* lut);
+internal GPU_Buffer* qe_hash_join_left_key_recoded_full_f64(Arena* arena, GDB_Column* left_column, GDB_StringDict* right_dict);
+
 //- tec: f32 narrowing
 typedef struct QE_NarrowCheckTask QE_NarrowCheckTask;
 struct QE_NarrowCheckTask
@@ -453,7 +558,32 @@ struct QE_NarrowCheckTask
   Rng1U64* ranges;
   F64* values;
   B32* task_narrow;
+  F64* task_int_bound;
 };
+
+#define QE_FIXED_MAX_SCALE 6
+typedef struct QE_FixedPointTask QE_FixedPointTask;
+struct QE_FixedPointTask
+{
+  Rng1U64* ranges;
+  F64* values;
+  S32* task_scale;
+  F64* task_max;
+};
+// tec: true when every value is a whole number after scaling by 10^out_scale, out_max is the largest magnitude
+internal B32 qe_values_fixed_point(F64* values, U64 count, S32* out_scale, F64* out_max);
+
+//- tec: the range of a GROUP BY key, for the dense aggregation that needs no hash table
+typedef struct QE_KeyRangeTask QE_KeyRangeTask;
+struct QE_KeyRangeTask
+{
+  Rng1U64* ranges;
+  F64* values;
+  F64* task_min;
+  F64* task_max;
+  B32* task_whole;
+};
+internal B32 qe_values_whole_range(F64* values, U64 count, S64* out_min, S64* out_max);
 
 typedef struct QE_NarrowConvertTask QE_NarrowConvertTask;
 struct QE_NarrowConvertTask
@@ -463,8 +593,10 @@ struct QE_NarrowConvertTask
   F32* dst;
 };
 
+global F64 g_qe_fixed_pow10[QE_FIXED_MAX_SCALE + 1] = { 1.0, 10.0, 100.0, 1000.0, 10000.0, 100000.0, 1000000.0 };
+
 internal THREAD_POOL_TASK_FUNC(qe_narrow_check_task);
-internal B32 qe_values_round_trip_f32(F64* values, U64 count);
+internal B32 qe_values_round_trip_f32(F64* values, U64 count, F64* out_int_bound);
 internal THREAD_POOL_TASK_FUNC(qe_narrow_convert_task);
 internal F32* qe_values_to_f32(Arena* arena, F64* values, U64 count);
 
@@ -475,10 +607,28 @@ internal F32* qe_values_to_f32(Arena* arena, F64* values, U64 count);
 #define QE_AGG_TILED_SCATTER_MAX_SLOTS 4096
 #define QE_AGG_TILED_SCATTER_TILE_ROWS 4096
 
-//- tec: baked into aggregate_tile_reduce.comp as its 256 threads and SUB_TILE
-#define QE_AGG_TILE_REDUCE_MAX_GROUPS 256
+// tec: aggregate_tile_reduce.comp scans each row segment once per possible group id, so it stops winning against the per-chunk reduce as groups grow
+#define QE_AGG_TILE_REDUCE_MAX_GROUPS 4
+// tec: baked into aggregate_tile_reduce.comp as its 256 threads. not tunable
 #define QE_AGG_TILE_REDUCE_SUB_TILE   256
 #define QE_AGG_TILE_REDUCE_MAX_SLOTS  65536
+
+// tec: aggregate_hash_reduce_f32.comp does one atomic CAS loop op per row, so it only wins with few rows per group
+#define QE_AGG_HASH_REDUCE_MAX_AVG_ROWS_PER_GROUP 8
+// tec: when every SUM and AVG argument is a whole number small enough that F32 sums stay exact, only contention limits the hash reduce
+#define QE_AGG_HASH_REDUCE_EXACT_MAX_AVG_ROWS_PER_GROUP 64
+// tec: F32 holds every whole number up to 2^24
+#define QE_AGG_F32_EXACT_SUM_LIMIT 16777216.0
+// tec: aggregate_hash_reduce_fixed.comp keeps its sums exact with plain atomicAdd, which held up from 5 groups to 4M groups on the 10M row scale suite, so by default there is no cap
+#define QE_AGG_HASH_REDUCE_FIXED_MAX_AVG_ROWS_PER_GROUP (1ull << 40)
+// tec: scaled values must fit a signed 32 bit word for the MIN and MAX atomics
+#define QE_AGG_FIXED_SCALED_LIMIT 2147483648.0
+// tec: aggregate_dense_*.comp keeps its accumulators in 2048 words of shared memory for the counts and sums and 2048 for the min and max
+#define QE_AGG_DENSE_SHARED_WORDS 2048
+#define QE_AGG_DENSE_ROWS_PER_WORKGROUP 16384
+
+// tec: aggregate_compact.comp: past this many hash table slots the table is compacted on the gpu, below it reading it back whole is cheaper than the extra submit
+#define QE_AGG_GPU_COMPACT_MIN_SLOTS (1u << 20)
 
 typedef struct QE_IdentityCheckTask QE_IdentityCheckTask;
 struct QE_IdentityCheckTask
@@ -509,6 +659,73 @@ internal PLAN_RowSet qe_device_representative_rows(Arena* arena, QE_DeviceRows* 
 #define QE_SORT_MAX_KEYS   4
 #define QE_SORT_MAX_TABLES 4
 internal PLAN_RowSet qe_sort_rows(Arena* arena, PLAN_RowSet* rows, IR_Node* order_by_ir, QE_SortHints* hints, QE_SortTrace* out_trace);
+
+internal U32 qe_f32_to_bits(F32 v);
+internal F32 qe_bits_to_f32(U32 bits);
+
+typedef struct QE_WindowRankResult QE_WindowRankResult;
+struct QE_WindowRankResult
+{
+  B32 ok;
+  U64 real_count;
+  U32* orig_index;
+  U32* row_number;
+  U32* rank;
+  U32* dense_rank;
+  U64 gpu_time_us;
+};
+internal QE_WindowRankResult qe_window_rank_gpu(Arena* arena, F64** keys, B32* key_desc, U64 num_keys, U64 partition_key_count, U64 real_count);
+p
+#define QE_WINDOW_COMPOSITE_TILE 1024
+typedef struct QE_WindowKeyRange QE_WindowKeyRange;
+struct QE_WindowKeyRange
+{
+  S32 scale;
+  S64 minimum;
+  S64 maximum;
+  U32 bits;
+  U32 shift;
+};
+
+typedef struct QE_WindowRangeTask QE_WindowRangeTask;
+struct QE_WindowRangeTask
+{
+  Rng1U64* ranges;
+  F64* values;
+  S32* task_scale;
+  F64* task_min;
+  F64* task_max;
+};
+
+typedef struct QE_WindowComposeTask QE_WindowComposeTask;
+struct QE_WindowComposeTask
+{
+  Rng1U64* ranges;
+  F64** keys;
+  B32* descending;
+  QE_WindowKeyRange* key_ranges;
+  U32 num_keys;
+  U64 padded_count;
+  U64 real_count;
+  U32* sort_keys; // tec: low word then high word per row
+  U32* sort_rows;
+};
+
+internal THREAD_POOL_TASK_FUNC(qe_window_range_task);
+internal THREAD_POOL_TASK_FUNC(qe_window_compose_task);
+
+typedef struct QE_CompositeSort QE_CompositeSort;
+struct QE_CompositeSort
+{
+  B32 ok;
+  U32* sorted_keys;
+  U32* sorted_rows;
+  U32 total_bits;
+  U32 key_bits[QE_SORT_MAX_KEYS];
+};
+
+internal QE_CompositeSort qe_sort_composite_gpu(Arena* arena, F64** keys, B32* key_desc, U64 num_keys, U64 count);
+internal QE_WindowRankResult qe_window_rank_gpu_composite(Arena* arena, F64** keys, B32* key_desc, U64 num_keys, U64 partition_key_count, U64 real_count);
 internal PLAN_Materialized qe_sort_materialized(Arena* arena, PLAN_Materialized* m, IR_Node* order_by_ir, QE_SortHints* hints);
 
 //- tec: ordering row positions through a comparison callback, used for the top-K heap and the stable merge
@@ -518,6 +735,8 @@ internal B32 qe_order_before(QE_OrderLessFn* less, void* context, U64 a, U64 b);
 internal void qe_order_merge_sort(U64* order, U64* buffer, U64 count, QE_OrderLessFn* less, void* context);
 internal void qe_order_sift_down(U64* heap, U64 count, U64 root, QE_OrderLessFn* less, void* context);
 internal U64 qe_order_select_top(U64* order, U64* buffer, U64 count, U64 keep, QE_OrderLessFn* less, void* context);
+// tec: same as select_top over the positions [start, end), the caller owns heap and buffer, each needs keep entries
+internal U64 qe_order_select_top_range(U64* heap, U64* buffer, U64 start, U64 end, U64 keep, QE_OrderLessFn* less, void* context);
 internal B32 qe_sort_rows_less(void* context, U64 a, U64 b);
 
 typedef struct QE_MaterializedOrder QE_MaterializedOrder;
@@ -542,7 +761,49 @@ struct QE_SortRowsCtx
 global QE_SortRowsCtx* g_qe_sort_rows_ctx = 0;
 
 internal S32 qe_str8_compare(String8 a, String8 b);
+internal int qe_sort_rows_compare_ctx(QE_SortRowsCtx* ctx, U64 ia, U64 ib);
 internal int qe_sort_rows_compare(const void* a, const void* b);
+
+#define QE_TOP_K_PARALLEL_MIN_ROWS 65536
+#define QE_TOP_K_MIN_ROWS_PER_TASK 32768
+typedef struct QE_TopKTask QE_TopKTask;
+struct QE_TopKTask
+{
+  Rng1U64* ranges;
+  QE_SortRowsCtx* ctx;
+  U64 keep;
+  U64* heaps;   // tec: task_count * keep entries
+  U64* buffers; // tec: task_count * keep entries
+  U64* task_kept;
+};
+
+//- tec: top k over numeric columns read in place, so the scan never gathers a whole column into an array first
+typedef struct QE_TopKKey QE_TopKKey;
+struct QE_TopKKey
+{
+  U64* table_rows;
+  void* base_ptr;
+  U64 min_row;
+  GDB_ColumnType column_type;
+  U64 column_size;
+  B32 descending;
+};
+
+typedef struct QE_TopKNativeTask QE_TopKNativeTask;
+struct QE_TopKNativeTask
+{
+  Rng1U64* ranges;
+  QE_TopKKey keys[QE_SORT_MAX_KEYS];
+  U32 num_keys;
+  U64 keep;
+  U64* heaps; // tec: task_count * keep positions
+  U64* task_kept;
+};
+internal THREAD_POOL_TASK_FUNC(qe_top_k_native_task);
+internal B32 qe_top_k_native_supported(PLAN_RowSet* rows, U32 num_keys, B32* key_is_string, F64** key_fuzzy_scores, U64* key_slots);
+internal U64 qe_sort_rows_top_k_native(Arena* arena, PLAN_RowSet* rows, U32 num_keys, U64* key_slots, GDB_Column** key_columns, B32* key_desc, U64 keep, U64* out_order, U32* out_tasks);
+internal THREAD_POOL_TASK_FUNC(qe_top_k_task);
+internal U64 qe_sort_rows_top_k_parallel(Arena* arena, QE_SortRowsCtx* ctx, U64 count, U64 keep, U64* out_order, U32* out_tasks);
 internal B32 qe_materialized_row_less(PLAN_Materialized* m, IR_Node* order_by_ir, U64 a, U64 b);
 
 //~ tec: aggregate
@@ -582,6 +843,37 @@ internal F64 qe_hll_estimate_cardinality(U32* registers, U64 num_registers);
 internal PLAN_Materialized qe_aggregate(Arena* arena, GDB_Database* database, PLAN_RowSet* input, IR_Node* group_by_ir, IR_Node* column_list_ir, IR_Node* having_ir, QE_AggregateHints* hints, QE_AggregateTrace* out_trace);
 internal PLAN_Materialized qe_aggregate_impl(Arena* arena, GDB_Database* database, PLAN_RowSet* input, IR_Node* group_by_ir, IR_Node* column_list_ir, IR_Node* having_ir, QE_AggregateHints* hints, QE_AggregateTrace* out_trace, QE_DeviceRows* device, B32* out_needs_host_rows);
 internal B32 qe_aggregate_device(Arena* arena, GDB_Database* database, QE_DeviceRows* device, IR_Node* group_by_ir, IR_Node* column_list_ir, IR_Node* having_ir, QE_AggregateHints* hints, QE_AggregateTrace* out_trace, PLAN_Materialized* out_result);
+//- tec: a HAVING made of numeric comparisons against literals, resolved once so the per group check is a compare
+typedef enum QE_HavingNodeKind
+{
+  QE_HavingNodeKind_Compare,
+  QE_HavingNodeKind_And,
+  QE_HavingNodeKind_Or,
+} QE_HavingNodeKind;
+
+typedef enum QE_HavingCompare
+{
+  QE_HavingCompare_Equal,
+  QE_HavingCompare_NotEqual,
+  QE_HavingCompare_Less,
+  QE_HavingCompare_LessEqual,
+  QE_HavingCompare_Greater,
+  QE_HavingCompare_GreaterEqual,
+} QE_HavingCompare;
+
+typedef struct QE_HavingNode QE_HavingNode;
+struct QE_HavingNode
+{
+  QE_HavingNodeKind kind;
+  QE_HavingCompare compare;
+  F64* values;
+  F64 literal;
+  QE_HavingNode* left;
+  QE_HavingNode* right;
+};
+
+internal QE_HavingNode* qe_having_compile(Arena* arena, PLAN_Materialized* m, IR_Node* condition);
+internal B32 qe_having_node_eval(QE_HavingNode* node, U64 row);
 internal PLAN_Materialized qe_apply_having(Arena* arena, PLAN_Materialized* m, IR_Node* having_ir);
 
 typedef struct QE_AggExprInfo QE_AggExprInfo;
@@ -598,6 +890,7 @@ struct QE_AggExprInfo
 
 internal B32 qe_agg_func_code_from_name(String8 name, U32* out_func_code);
 internal B32 qe_aggregate_collect_exprs(Arena* arena, PLAN_RowSet* input, IR_Node* node, QE_AggExprInfo* exprs, U32* num_exprs);
+internal B32 qe_aggregate_hash_allowed(QE_AggExprInfo* exprs, U32 num_exprs, U32* arg_owner, F64* arg_int_bound, U64 row_count, U64 num_groups, U64 max_group_rows, U64 cap, U64 exact_cap, B32 fixed_ok, U64 fixed_cap);
 internal void qe_agg_output_type_for_expr(QE_AggExprInfo* expr, GDB_ColumnType* out_type, U32* out_decimal_scale, GDB_EnumType** out_enum_type);
 internal PLAN_Materialized qe_aggregate_build_output(Arena* arena, PLAN_RowSet* input, IR_Node* column_list_ir, QE_AggExprInfo* exprs, U32 num_exprs, U64 num_groups, U64* representative_readback, F64* results_readback);
 

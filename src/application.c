@@ -1665,12 +1665,12 @@ app_execute_query_capture(Arena* arena, String8 sql_query, GDB_Database** io_dat
               }
             }
             
-            log_info("select column gather total time: %llu microseconds", os_now_microseconds() - gather_start);
+            log_debug("select column gather total time: %llu microseconds", os_now_microseconds() - gather_start);
             U64 format_start = os_now_microseconds();
             
             app_select_format_dispatch(arena, &out, select_output_columns, gathered, column_count,
                                        &result.rows, result_count, capture_structured, out_result_set);
-            log_info("select cell format/emit total time: %llu microseconds", os_now_microseconds() - format_start);
+            log_debug("select cell format/emit total time: %llu microseconds", os_now_microseconds() - format_start);
           }
           
           scratch_end(scratch);

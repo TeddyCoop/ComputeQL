@@ -42,6 +42,20 @@ internal PLAN_ExecResult plan_execute_join(Arena* arena, GDB_Database* database,
 internal PLAN_ExecResult plan_execute_left_device(Arena* arena, GDB_Database* database, PLAN_Node* node, IR_Node* select_ir_node, QE_TraceCtx* trace, QE_DeviceRows* out_left);
 internal B32 plan_aggregate_reads_join(PLAN_Node* aggregate);
 internal PLAN_RowSet plan_make_empty_join_rowset(Arena* arena, PLAN_RowSet* left, GDB_Table* right_table, String8 right_alias);
+//- tec: the identity scan fills its row list across the thread pool
+typedef struct PLAN_IdentityFillTask PLAN_IdentityFillTask;
+struct PLAN_IdentityFillTask
+{
+  Rng1U64* ranges;
+  U64* indices;
+};
+
+global U64* g_plan_identity_rows = 0;
+global U64 g_plan_identity_capacity = 0;
+
+internal THREAD_POOL_TASK_FUNC(plan_identity_fill_task);
+internal U64* plan_shared_identity_rows(U64 count);
+internal B32 plan_rows_are_shared_identity(U64* rows, U64 count);
 internal PLAN_ExecResult plan_execute_identity_scan(Arena* arena, PLAN_Node* scan, QE_ScanTrace* trace);
 internal F64 plan_us_to_ms(U64 us);
 
@@ -93,6 +107,9 @@ struct PLAN_WindowSortCtx
 global PLAN_WindowSortCtx* g_plan_window_sort_ctx = 0;
 
 #define PLAN_WINDOW_MAX_KEYS 8
+
+// tec: below this, a GPU dispatch's fixed overhead isnt worth it over the CPU sort+scan
+#define PLAN_WINDOW_GPU_MIN_ROWS 4096
 
 typedef enum PLAN_WindowFunc
 {

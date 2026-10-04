@@ -13,7 +13,7 @@ gpu_vulkan_debug_callback(VkDebugUtilsMessageSeverityFlagBitsEXT severity, VkDeb
   }
   else
   {
-    log_info("[vulkan validation] %s", data->pMessage);
+    log_debug("[vulkan validation] %s", data->pMessage);
   }
   return VK_FALSE;
 }
@@ -55,7 +55,7 @@ gpu_vulkan_init(void)
   g_vulkan_state = push_array(arena, GPU_VulkanState, 1);
   g_vulkan_state->arena = arena;
   
-  U64 kernel_cache_cap = settings_u64(str8_lit("GPU_VULKAN_MAX_CACHED_KERNELS"), 16);
+  U64 kernel_cache_cap = settings_u64(str8_lit("GPU_VULKAN_MAX_CACHED_KERNELS"), 32);
   if (kernel_cache_cap < 16)
   {
     log_error("settings: GPU_VULKAN_MAX_CACHED_KERNELS (%llu) is below the safe minimum (16) - using the minimum instead", kernel_cache_cap);
@@ -89,7 +89,7 @@ gpu_vulkan_init(void)
     pending_read_cap = 8;
   }
   g_vulkan_state->active_batch.pending_read_cap = (U32)pending_read_cap;
-  g_vulkan_state->active_batch.pending_reads = push_array(arena, GPU_PendingRead, pending_read_cap);
+  `g_vulkan_state->active_batch.pending_reads = push_array(arena, GPU_PendingRead, pending_read_cap);
   
   VkResult res;
   
@@ -275,7 +275,7 @@ gpu_vulkan_init(void)
     
     if (g_vulkan_state->rebar_supported)
     {
-      log_info("Resizable BAR detected (%llu MB host-visible VRAM) - GPU buffer uploads will skip staging where possible", g_vulkan_state->rebar_heap_size / (1024 * 1024));
+      log_debug("Resizable BAR detected (%llu MB host-visible VRAM) - GPU buffer uploads will skip staging where possible", g_vulkan_state->rebar_heap_size / (1024 * 1024));
     }
   }
   
@@ -322,7 +322,7 @@ gpu_vulkan_init(void)
     }
     else
     {
-      log_info("VK_EXT_external_memory_host supported (alignment=%llu) - disk-backed numeric column reads will import mapped file views directly, skipping the upload copy", g_vulkan_state->min_imported_host_pointer_alignment);
+      log_debug("VK_EXT_external_memory_host supported (alignment=%llu) - disk-backed numeric column reads will import mapped file views directly, skipping the upload copy", g_vulkan_state->min_imported_host_pointer_alignment);
     }
   }
   
@@ -719,7 +719,7 @@ gpu_vulkan_end_and_submit_cmd_tagged(VkCommandBuffer cmd, const char* tag)
   }
   
   g_vulkan_state->submit_count += 1;
-  log_info("submit+wait wall time [%s]: %llu microseconds", tag, os_now_microseconds() - t0);
+  log_debug("submit+wait wall time [%s]: %llu microseconds", tag, os_now_microseconds() - t0);
   return 1;
 }
 
@@ -775,7 +775,7 @@ gpu_vulkan_alloc_raw_buffer(U64 size, VkBufferUsageFlags usage, VkMemoryProperty
   }
   
   vkBindBufferMemory(g_vulkan_state->device, *out_buffer, *out_memory, 0);
-  log_info("gpu_vulkan_alloc_raw_buffer (create+alloc+bind) size=%llu: %llu microseconds", size, os_now_microseconds() - raw_alloc_t0);
+  log_debug("gpu_vulkan_alloc_raw_buffer (create+alloc+bind) size=%llu: %llu microseconds", size, os_now_microseconds() - raw_alloc_t0);
   return 1;
 }
 
@@ -797,7 +797,7 @@ gpu_vulkan_alloc_dedicated_memory(GPU_VulkanBuffer* result, VkMemoryRequirements
     log_error("Failed to allocate Vulkan buffer memory.");
     return 0;
   }
-  log_info("gpu_vulkan_alloc_dedicated_memory size=%llu: vkAllocateMemory=%llu microseconds", mem_req->size, os_now_microseconds() - dedicated_t0);
+  log_debug("gpu_vulkan_alloc_dedicated_memory size=%llu: vkAllocateMemory=%llu microseconds", mem_req->size, os_now_microseconds() - dedicated_t0);
   
   vkBindBufferMemory(g_vulkan_state->device, result->buffer, result->memory, 0);
   result->owns_memory = 1;
@@ -853,8 +853,8 @@ gpu_vulkan_find_or_create_mem_block(U32 memory_type_index, B32 wants_mapped, U64
     log_error("gpu_vulkan: failed to allocate %llu byte suballocation block - falling back to a dedicated allocation", g_vulkan_state->mem_block_size);
     return 0;
   }
-  log_info("gpu_vulkan_find_or_create_mem_block: new %llu byte block (type=%u mapped=%d): vkAllocateMemory=%llu microseconds",
-           g_vulkan_state->mem_block_size, memory_type_index, wants_mapped, os_now_microseconds() - block_alloc_t0);
+  log_debug("gpu_vulkan_find_or_create_mem_block: new %llu byte block (type=%u mapped=%d): vkAllocateMemory=%llu microseconds",
+            g_vulkan_state->mem_block_size, memory_type_index, wants_mapped, os_now_microseconds() - block_alloc_t0);
   
   GPU_VulkanMemBlock* block = &g_vulkan_state->mem_blocks[g_vulkan_state->mem_block_count++];
   block->memory = memory;

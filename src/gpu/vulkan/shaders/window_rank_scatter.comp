@@ -1,0 +1,48 @@
+#version 450
+
+// tec: second stage of GPU ROW_NUMBER/RANK/DENSE_RANK, scatters each partition and peer group's first sorted position
+// exactly one row carries each id's flag so no atomics are needed
+//
+// NOTE: binding layout/push-constant slot order MUST stay in sync with qe_window_rank_gpu
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer PartitionFlagBuf { uint partition_flag[]; };
+layout(std430, binding = 1) readonly buffer PeerFlagBuf      { uint peer_flag[]; };
+layout(std430, binding = 2) buffer PartitionIdBuf             { uint partition_id[]; };
+layout(std430, binding = 3) buffer PeerGroupIdBuf              { uint peer_group_id[]; };
+layout(std430, binding = 4) buffer PartitionStartPosBuf      { uint partition_start_pos[]; };
+layout(std430, binding = 5) buffer PartitionBasePeerGroupBuf { uint partition_base_peer_group_id[]; };
+layout(std430, binding = 6) buffer PeerGroupStartPosBuf      { uint peer_group_start_pos[]; };
+
+layout(push_constant) uniform PushConstants
+{
+  uint words[16];
+} pc;
+
+void
+main()
+{
+  uint n = pc.words[0];
+  uint i = gl_GlobalInvocationID.x;
+  if (i >= n)
+  {
+    return;
+  }
+
+    // tec: the exclusive scan is one short of the 0-based id, so add the row's own flag and subtract 1
+  uint pid = partition_id[i] + partition_flag[i] - 1u;
+  uint gid = peer_group_id[i] + peer_flag[i] - 1u;
+  partition_id[i] = pid;
+  peer_group_id[i] = gid;
+
+  if (partition_flag[i] == 1u)
+  {
+    partition_start_pos[pid] = i;
+    partition_base_peer_group_id[pid] = gid;
+  }
+  if (peer_flag[i] == 1u)
+  {
+    peer_group_start_pos[gid] = i;
+  }
+}
