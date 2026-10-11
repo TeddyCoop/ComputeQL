@@ -13,7 +13,7 @@ typedef struct OPT_Relation OPT_Relation;
 struct OPT_Relation
 {
   PLAN_Node* scan;
-  GDB_Table* table;
+  CQL_Table* table;
   String8 alias;
 };
 
@@ -122,13 +122,13 @@ internal B32 optimizer_ir_is_constant_false(IR_Node* root);
 // tec: marks always-true conjuncts dropped, returns true when one is always false
 internal B32 optimizer_fold_constants(OPT_JoinStep* steps, OPT_Conjunct* conjuncts, U32 conjunct_count);
 
-internal B32 optimizer_column_type_is_comparable_number(GDB_ColumnType type);
-internal B32 optimizer_column_operand(OPT_Relation* relations, U32 relation_count, IR_Node* node, U32* out_relation, String8* out_column, GDB_ColumnType* out_type);
+internal B32 optimizer_column_type_is_comparable_number(CQL_ColumnType type);
+internal B32 optimizer_column_operand(OPT_Relation* relations, U32 relation_count, IR_Node* node, U32* out_relation, String8* out_column, CQL_ColumnType* out_type);
 internal String8 optimizer_flip_comparison(String8 op);
 
 internal OPT_ColumnBounds* optimizer_find_bounds(OPT_ColumnBounds* bounds, U32* io_count, U32 relation, String8 column);
 internal B32 optimizer_bounds_are_contradictory(OPT_ColumnBounds* bounds);
-internal B32 optimizer_bounds_apply(OPT_ColumnBounds* bounds, String8 op, IR_Node* literal, GDB_ColumnType type);
+internal B32 optimizer_bounds_apply(OPT_ColumnBounds* bounds, String8 op, IR_Node* literal, CQL_ColumnType type);
 
 // tec: same column pinned to two values, or a range that cannot hold any value
 internal B32 optimizer_detect_contradiction(OPT_Relation* relations, U32 relation_count, OPT_JoinStep* steps, OPT_Conjunct* conjuncts, U32 conjunct_count);
@@ -154,7 +154,7 @@ struct OPT_InlineSource
   IR_Node* table;
   IR_Node* column_list;
   IR_Node* where;
-  GDB_Table* base_table;
+  CQL_Table* base_table;
   B32 is_star;
 };
 
@@ -169,8 +169,8 @@ internal B32 optimizer_is_bare_star(IR_Node* column_list);
 
 //~ tec: deciding whether a source can be inlined
 internal B32 optimizer_list_has_column(IR_Node* column_list, String8 bare_name);
-internal B32 optimizer_inner_columns_belong_to_base(IR_Node* node, GDB_Table* base_table, String8 inner_alias);
-internal B32 optimizer_describe_inline_source(GDB_Database* database, IR_Node* inner_select, OPT_InlineSource* out_source);
+internal B32 optimizer_inner_columns_belong_to_base(IR_Node* node, CQL_Table* base_table, String8 inner_alias);
+internal B32 optimizer_describe_inline_source(CQL_Database* database, IR_Node* inner_select, OPT_InlineSource* out_source);
 internal B32 optimizer_column_reference_blocks(IR_Node* node, OPT_InlineSource* source, String8 exposed_name);
 internal B32 optimizer_outer_blocks_inline(IR_Node* outer_select, OPT_InlineSource* source, String8 exposed_name);
 
@@ -179,12 +179,12 @@ internal IR_Node* optimizer_clone_with_alias(Arena* arena, IR_Node* node, String
 internal void optimizer_merge_where(Arena* arena, IR_Node* outer_select, IR_Node* condition);
 internal void optimizer_inline_source(Arena* arena, IR_Node* outer_select, IR_Node* table_ir, OPT_InlineSource* source, String8 exposed_name, B32 qualify);
 internal B32 optimizer_source_is_in_left_join(IR_Node* outer_select, IR_Node* table_ir);
-internal B32 optimizer_try_inline_reference(Arena* arena, GDB_Database* database, IR_Node* select_ir, IR_Node* table_ir, IR_Node* inner_select, String8 default_name);
+internal B32 optimizer_try_inline_reference(Arena* arena, CQL_Database* database, IR_Node* select_ir, IR_Node* table_ir, IR_Node* inner_select, String8 default_name);
 internal IR_Node* optimizer_find_from_reference(IR_Node* select_ir, String8 name);
 internal B32 optimizer_name_is_cte(IR_Node* cte_list, String8 name);
 
 // tec: drops unreferenced CTEs, inlines single-use CTEs and derived tables where that keeps the query's meaning
-internal void optimizer_inline_sources(Arena* arena, GDB_Database* database, IR_Node* select_ir);
+internal void optimizer_inline_sources(Arena* arena, CQL_Database* database, IR_Node* select_ir);
 
 //~ tec: selectivity and cardinality estimation
 
@@ -199,15 +199,15 @@ internal void optimizer_inline_sources(Arena* arena, GDB_Database* database, IR_
 #define OPT_ESTIMATE_LEAF_CAPACITY 16
 
 //~ tec: statistics lookups
-internal B32 optimizer_stats_available(GDB_Column* column);
+internal B32 optimizer_stats_available(CQL_Column* column);
 internal F64 optimizer_clamp_selectivity(F64 selectivity);
-internal F64 optimizer_non_null_fraction(GDB_Column* column);
-internal F64 optimizer_distinct_count(GDB_Column* column);
+internal F64 optimizer_non_null_fraction(CQL_Column* column);
+internal F64 optimizer_distinct_count(CQL_Column* column);
 
 //~ tec: single predicate selectivity
-internal F64 optimizer_equality_selectivity(GDB_Column* column, B32 is_string, F64 target_numeric, String8 target_string);
-internal F64 optimizer_histogram_fraction_below(GDB_ColumnStats* stats, F64 value);
-internal F64 optimizer_range_selectivity(GDB_Column* column, B32 is_lt, B32 is_le, B32 is_gt, B32 is_ge, F64 target_numeric);
+internal F64 optimizer_equality_selectivity(CQL_Column* column, B32 is_string, F64 target_numeric, String8 target_string);
+internal F64 optimizer_histogram_fraction_below(CQL_ColumnStats* stats, F64 value);
+internal F64 optimizer_range_selectivity(CQL_Column* column, B32 is_lt, B32 is_le, B32 is_gt, B32 is_ge, F64 target_numeric);
 internal IR_Node* optimizer_make_comparison(Arena* arena, String8 op, IR_Node* column_node, IR_Node* literal_node);
 internal F64 optimizer_comparison_selectivity(Arena* arena, OPT_Relation* relations, U32 relation_count, IR_Node* leaf);
 internal F64 optimizer_in_list_selectivity(Arena* arena, OPT_Relation* relations, U32 relation_count, IR_Node* leaf);
@@ -217,7 +217,7 @@ internal F64 optimizer_leaf_selectivity(Arena* arena, OPT_Relation* relations, U
 
 //~ tec: combining predicates
 internal F64 optimizer_combine_and(F64* selectivities, U32 count);
-internal B32 optimizer_range_leaf_info(Arena* arena, OPT_Relation* relations, U32 relation_count, IR_Node* leaf, GDB_Column** out_column, B32* out_is_lower);
+internal B32 optimizer_range_leaf_info(Arena* arena, OPT_Relation* relations, U32 relation_count, IR_Node* leaf, CQL_Column** out_column, B32* out_is_lower);
 internal void optimizer_merge_range_pairs(Arena* arena, OPT_Relation* relations, U32 relation_count, IR_Node** leaves, F64* selectivities, U32 count);
 internal F64 optimizer_condition_selectivity(Arena* arena, OPT_Relation* relations, U32 relation_count, IR_Node* root);
 
@@ -257,6 +257,7 @@ struct OPT_CostModel
   F64 cpu_scan_fixed_us;
   F64 cpu_scan_per_row_us;
   F64 cpu_scan_per_extra_condition_us;
+  F64 cpu_fuzzy_per_row_us;
   F64 cpu_reference_workers;
   
   F64 index_fixed_us;
@@ -313,9 +314,9 @@ internal U64 optimizer_aggregate_cpu_max_rows(OPT_CostModel* model);
 internal B32 optimizer_scan_costing_enabled(void);
 
 //~ tec: what a scan condition reads
-internal void optimizer_collect_condition_columns(GDB_Table* table, IR_Node* node, GDB_Column** out_columns, U32* io_count, U32 capacity, B32* out_unresolved);
-internal B32 optimizer_columns_have_nulls(GDB_Column** columns, U32 count);
-internal U32 optimizer_count_cold_columns(GDB_Column** columns, U32 count);
+internal void optimizer_collect_condition_columns(CQL_Table* table, IR_Node* node, CQL_Column** out_columns, U32* io_count, U32 capacity, B32* out_unresolved);
+internal B32 optimizer_columns_have_nulls(CQL_Column** columns, U32 count);
+internal U32 optimizer_count_cold_columns(CQL_Column** columns, U32 count);
 
 //~ tec: ordering the conditions of a CPU scan
 internal void optimizer_order_conjuncts_for_cpu(Arena* arena, PLAN_Node* filter, IR_Node** leaves, U32 leaf_count);
@@ -338,8 +339,8 @@ struct OPT_JoinEdge
 {
   U32 relation_a;
   U32 relation_b;
-  GDB_Column* column_a;
-  GDB_Column* column_b;
+  CQL_Column* column_a;
+  CQL_Column* column_b;
   String8 name_a;
   String8 name_b;
   B32 is_derived;
@@ -367,7 +368,7 @@ struct OPT_JoinState
 
 //~ tec: building the graph
 internal B32 optimizer_join_enabled(void);
-internal B32 optimizer_join_add_edge(OPT_JoinGraph* graph, U32 relation_a, GDB_Column* column_a, String8 name_a, U32 relation_b, GDB_Column* column_b, String8 name_b, B32 is_derived);
+internal B32 optimizer_join_add_edge(OPT_JoinGraph* graph, U32 relation_a, CQL_Column* column_a, String8 name_a, U32 relation_b, CQL_Column* column_b, String8 name_b, B32 is_derived);
 internal void optimizer_join_collect_edges(OPT_Relation* relations, U32 relation_count, OPT_Conjunct* conjuncts, U32 conjunct_count, U32 group_size, OPT_JoinGraph* graph);
 internal void optimizer_join_add_derived_edges(OPT_JoinGraph* graph);
 internal B32 optimizer_join_has_edge_between(OPT_JoinGraph* graph, U32 relation_a, U32 relation_b, B32 original_only, OPT_JoinEdge** out_edge);
@@ -434,17 +435,17 @@ struct OPT_OrderSource
 {
   PLAN_Node* scan;
   PLAN_Node* filter;
-  GDB_Table* table;
+  CQL_Table* table;
   IR_Node* condition;
 };
 
 internal B32 optimizer_limit_keep_count(PLAN_Node* node, U64* out_keep);
 internal B32 optimizer_find_order_source(PLAN_Node* input, OPT_OrderSource* out_source);
-internal B32 optimizer_order_key(OPT_OrderSource* source, IR_Node* order_by, GDB_Column** out_column, B32* out_descending);
+internal B32 optimizer_order_key(OPT_OrderSource* source, IR_Node* order_by, CQL_Column** out_column, B32* out_descending);
 
 //~ tec: choosing how a Sort, or a Sort under a Limit, gets its order
-internal B32 optimizer_choose_presorted(Arena* arena, PLAN_Node* sort, OPT_OrderSource* source, GDB_Column* key_column, B32 descending);
-internal B32 optimizer_choose_index_walk(Arena* arena, OPT_CostModel* model, PLAN_Node* top_n, OPT_OrderSource* source, GDB_Column* key_column, B32 descending, U64 keep);
+internal B32 optimizer_choose_presorted(Arena* arena, PLAN_Node* sort, OPT_OrderSource* source, CQL_Column* key_column, B32 descending);
+internal B32 optimizer_choose_index_walk(Arena* arena, OPT_CostModel* model, PLAN_Node* top_n, OPT_OrderSource* source, CQL_Column* key_column, B32 descending, U64 keep);
 internal PLAN_Node* optimizer_plan_ordering(Arena* arena, PLAN_Node* root);
 
 //~ tec: semi / anti join extraction (EXISTS, IN over a subquery)
@@ -461,7 +462,7 @@ internal B32 optimizer_semi_join_enabled(void);
 typedef struct OPT_OuterTable OPT_OuterTable;
 struct OPT_OuterTable
 {
-  GDB_Table* table;
+  CQL_Table* table;
   String8 alias;
 };
 
@@ -469,23 +470,23 @@ internal String8 optimizer_outer_table_label(OPT_OuterTable* table);
 
 // tec: how many of the tables a column name resolves in, out_first is the first of them
 internal U32 optimizer_semi_match_tables(OPT_OuterTable* tables, U32 count, String8 name, U32* out_first);
-internal B32 optimizer_collect_outer_tables(GDB_Database* database, IR_Node* select_ir, OPT_OuterTable* out_tables, U32* out_count);
+internal B32 optimizer_collect_outer_tables(CQL_Database* database, IR_Node* select_ir, OPT_OuterTable* out_tables, U32* out_count);
 
 // tec: counts the columns an expression reads from the inner table and from the outer ones, unsupported is set for anything else
 internal void optimizer_semi_classify_columns(IR_Node* node, OPT_OuterTable* inner, OPT_OuterTable* outer, U32 outer_count, U32* io_inner_refs, U32* io_outer_refs, B32* out_unsupported);
 
 //~ tec: building the IR node the planner turns into a semi or anti join
 internal IR_Node* optimizer_make_semi_node(Arena* arena, String8 kind, String8 outer_key, String8 inner_key, String8 table_name, String8 alias, IR_Node* filter);
-internal B32 optimizer_semi_keys_compatible(GDB_Column* outer_key, GDB_Column* inner_key);
+internal B32 optimizer_semi_keys_compatible(CQL_Column* outer_key, CQL_Column* inner_key);
 
 //~ tec: EXISTS with an equality between the inner and outer tables, a correlated subquery the old path had to refuse
-internal B32 optimizer_try_exists_semi(Arena* arena, GDB_Database* database, IR_Node* exists_node, OPT_OuterTable* outer, U32 outer_count, IR_Node** out_semi);
+internal B32 optimizer_try_exists_semi(Arena* arena, CQL_Database* database, IR_Node* exists_node, OPT_OuterTable* outer, U32 outer_count, IR_Node** out_semi);
 
 //~ tec: IN and NOT IN over an uncorrelated subquery, a semi join once the list is too long for a GPU scan
 internal B32 optimizer_semi_pays_off(OPT_CostModel* model, U64 list_count, F64 outer_rows);
-internal B32 optimizer_try_in_semi(Arena* arena, GDB_Database* database, IR_Node* in_node, OPT_OuterTable* outer, U32 outer_count, IR_Node** out_semi, B32* out_failed);
+internal B32 optimizer_try_in_semi(Arena* arena, CQL_Database* database, IR_Node* in_node, OPT_OuterTable* outer, U32 outer_count, IR_Node** out_semi, B32* out_failed);
 
 // tec: may_execute is off for a plain EXPLAIN, which must not run the IN subqueries it would need the size of
-internal B32 optimizer_extract_semi_joins(Arena* arena, GDB_Database* database, IR_Node* select_ir, B32 may_execute);
+internal B32 optimizer_extract_semi_joins(Arena* arena, CQL_Database* database, IR_Node* select_ir, B32 may_execute);
 
 #endif //OPTIMIZER_H

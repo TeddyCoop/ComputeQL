@@ -1,0 +1,383 @@
+#version 450
+#extension GL_ARB_gpu_shader_fp64 : enable
+
+// tec: scan and filter for a condition that is only numeric comparisons joined by and no bytecode interpreter
+// NOTE: the column types, operators and ROWS_PER_THREAD MUST stay in sync with query_exec.h
+
+layout(local_size_x = 256) in;
+
+#define ROWS_PER_THREAD 8u
+
+#define COLTYPE_U32 1
+#define COLTYPE_F32 3
+#define COLTYPE_F64 4
+#define COLTYPE_I32 7
+
+#define CMP_EQ 0u
+#define CMP_LT 1u
+#define CMP_LE 2u
+#define CMP_GT 3u
+#define CMP_GE 4u
+
+layout(std430, binding = 0) readonly buffer LeafBuf       { uint leaf_words[]; };
+layout(std430, binding = 3) buffer OutIndicesBuf          { uint out_indices[]; };
+layout(std430, binding = 4) buffer OutCountBuf            { uint out_count[]; };
+// tec: one bit per zone map chunk, set when the zone map proves no row of the chunk can match
+layout(std430, binding = 5) readonly buffer SkipBuf       { uint skip_bits[]; };
+
+// tec: every column buffer is bound once and seen as 16 byte vectors for the rows a thread reads whole and as words for the end of the column
+layout(std430, binding = 6)  readonly buffer ColBuf6  { uint col_data6[]; };
+layout(std430, binding = 7)  readonly buffer ColBuf7  { uint col_data7[]; };
+layout(std430, binding = 8)  readonly buffer ColBuf8  { uint col_data8[]; };
+layout(std430, binding = 9)  readonly buffer ColBuf9  { uint col_data9[]; };
+layout(std430, binding = 10) readonly buffer ColBuf10 { uint col_data10[]; };
+layout(std430, binding = 11) readonly buffer ColBuf11 { uint col_data11[]; };
+layout(std430, binding = 12) readonly buffer ColBuf12 { uint col_data12[]; };
+layout(std430, binding = 13) readonly buffer ColBuf13 { uint col_data13[]; };
+layout(std430, binding = 14) readonly buffer ColBuf14 { uint col_data14[]; };
+layout(std430, binding = 15) readonly buffer ColBuf15 { uint col_data15[]; };
+
+layout(std430, binding = 6)  readonly buffer VecBuf6  { uvec4 col_vec6[]; };
+layout(std430, binding = 7)  readonly buffer VecBuf7  { uvec4 col_vec7[]; };
+layout(std430, binding = 8)  readonly buffer VecBuf8  { uvec4 col_vec8[]; };
+layout(std430, binding = 9)  readonly buffer VecBuf9  { uvec4 col_vec9[]; };
+layout(std430, binding = 10) readonly buffer VecBuf10 { uvec4 col_vec10[]; };
+layout(std430, binding = 11) readonly buffer VecBuf11 { uvec4 col_vec11[]; };
+layout(std430, binding = 12) readonly buffer VecBuf12 { uvec4 col_vec12[]; };
+layout(std430, binding = 13) readonly buffer VecBuf13 { uvec4 col_vec13[]; };
+layout(std430, binding = 14) readonly buffer VecBuf14 { uvec4 col_vec14[]; };
+layout(std430, binding = 15) readonly buffer VecBuf15 { uvec4 col_vec15[]; };
+
+layout(push_constant) uniform PushConstants
+{
+  uint words[16];
+} pc;
+
+shared uint s_match_count;
+shared uint s_match_base;
+
+uint
+read_col_word(uint slot, uint word_index)
+{
+  switch (slot)
+  {
+    case 0u: return col_data6[word_index];
+    case 1u: return col_data7[word_index];
+    case 2u: return col_data8[word_index];
+    case 3u: return col_data9[word_index];
+    case 4u: return col_data10[word_index];
+    case 5u: return col_data11[word_index];
+    case 6u: return col_data12[word_index];
+    case 7u: return col_data13[word_index];
+    case 8u: return col_data14[word_index];
+    case 9u: return col_data15[word_index];
+  }
+  return 0u;
+}
+
+uvec4
+read_col_vec(uint slot, uint vec_index)
+{
+  switch (slot)
+  {
+    case 0u: return col_vec6[vec_index];
+    case 1u: return col_vec7[vec_index];
+    case 2u: return col_vec8[vec_index];
+    case 3u: return col_vec9[vec_index];
+    case 4u: return col_vec10[vec_index];
+    case 5u: return col_vec11[vec_index];
+    case 6u: return col_vec12[vec_index];
+    case 7u: return col_vec13[vec_index];
+    case 8u: return col_vec14[vec_index];
+    case 9u: return col_vec15[vec_index];
+  }
+  return uvec4(0u);
+}
+
+// tec: the same values scan_filter.comp reads, widened to double so both kernels agree on every row
+double
+widen_word(uint coltype, uint word)
+{
+  if (coltype == COLTYPE_U32)
+  {
+    return double(word);
+  }
+  else if (coltype == COLTYPE_I32)
+  {
+    return double(int(word));
+  }
+  return double(uintBitsToFloat(word));
+}
+
+bool
+compare(uint op, double value, double target)
+{
+  if (op == CMP_EQ)      { return value == target; }
+  else if (op == CMP_LT) { return value < target; }
+  else if (op == CMP_LE) { return value <= target; }
+  else if (op == CMP_GT) { return value > target; }
+  return value >= target;
+}
+
+// tec: the value of row `row` of a narrow column, as the word of its type
+uint
+narrow_value(uint slot, uint row, uint width, uint base)
+{
+  if (width == 1u)
+  {
+    return base + ((read_col_word(slot, row >> 2u) >> ((row & 3u) * 8u)) & 0xffu);
+  }
+  return base + ((read_col_word(slot, row >> 1u) >> ((row & 1u) * 16u)) & 0xffffu);
+}
+
+// tec: the whole number form of compare_rows, see the top of the file. `bias` is 0x80000000 for a whole word I32 column and 0 otherwise
+uint
+compare_rows_int(uint slot, uint width, uint bias, uint lo, uint span, uint first_row, uint valid)
+{
+  uint bits = 0u;
+
+  if (width == 3u)
+  {
+    // tec: a column that is its first value plus the row number is not stored, its code is the chunk's first row (push constant slot 5) plus the row in the chunk
+    uint chunk_start = pc.words[10];
+    for (uint k = 0u; k < valid; k++)
+    {
+      bits |= (chunk_start + first_row + k - lo <= span ? 1u : 0u) << k;
+    }
+    return bits;
+  }
+
+  if (valid == ROWS_PER_THREAD && width == 1u)
+  {
+    uint lo_word = read_col_word(slot, first_row / 4u);
+    uint hi_word = read_col_word(slot, first_row / 4u + 1u);
+    for (uint k = 0u; k < 4u; k++)
+    {
+      bits |= (((lo_word >> (k * 8u)) & 0xffu) - lo <= span ? 1u : 0u) << k;
+      bits |= (((hi_word >> (k * 8u)) & 0xffu) - lo <= span ? 1u : 0u) << (k + 4u);
+    }
+    return bits;
+  }
+
+  if (valid == ROWS_PER_THREAD && width == 2u)
+  {
+    uvec4 words = read_col_vec(slot, first_row / 8u);
+    uint w0 = words.x;
+    uint w1 = words.y;
+    uint w2 = words.z;
+    uint w3 = words.w;
+    bits |= ((w0 & 0xffffu) - lo <= span ? 1u : 0u) << 0u;
+    bits |= ((w0 >> 16u) - lo <= span ? 1u : 0u) << 1u;
+    bits |= ((w1 & 0xffffu) - lo <= span ? 1u : 0u) << 2u;
+    bits |= ((w1 >> 16u) - lo <= span ? 1u : 0u) << 3u;
+    bits |= ((w2 & 0xffffu) - lo <= span ? 1u : 0u) << 4u;
+    bits |= ((w2 >> 16u) - lo <= span ? 1u : 0u) << 5u;
+    bits |= ((w3 & 0xffffu) - lo <= span ? 1u : 0u) << 6u;
+    bits |= ((w3 >> 16u) - lo <= span ? 1u : 0u) << 7u;
+    return bits;
+  }
+
+  if (valid == ROWS_PER_THREAD && width != 1u && width != 2u)
+  {
+    uint base = first_row / 4u;
+    for (uint v = 0u; v < ROWS_PER_THREAD / 4u; v++)
+    {
+      uvec4 words = read_col_vec(slot, base + v);
+      bits |= (((words.x ^ bias) - lo) <= span ? 1u : 0u) << (v * 4u + 0u);
+      bits |= (((words.y ^ bias) - lo) <= span ? 1u : 0u) << (v * 4u + 1u);
+      bits |= (((words.z ^ bias) - lo) <= span ? 1u : 0u) << (v * 4u + 2u);
+      bits |= (((words.w ^ bias) - lo) <= span ? 1u : 0u) << (v * 4u + 3u);
+    }
+    return bits;
+  }
+
+  for (uint k = 0u; k < valid; k++)
+  {
+    uint code;
+    if (width == 1u)
+    {
+      code = (read_col_word(slot, (first_row + k) >> 2u) >> (((first_row + k) & 3u) * 8u)) & 0xffu;
+    }
+    else if (width == 2u)
+    {
+      code = (read_col_word(slot, (first_row + k) >> 1u) >> (((first_row + k) & 1u) * 16u)) & 0xffffu;
+    }
+    else
+    {
+      code = read_col_word(slot, first_row + k) ^ bias;
+    }
+    bits |= (code - lo <= span ? 1u : 0u) << k;
+  }
+  return bits;
+}
+
+// tec: bit k of the result is set when row `first_row + k` passes the comparison. `valid` rows are in the table, the rest are not read
+uint
+compare_rows(uint slot, uint coltype, uint op, double target, uint first_row, uint valid, uint width, uint enc_base)
+{
+  uint bits = 0u;
+
+  if (valid == ROWS_PER_THREAD && width == 1u)
+  {
+    // tec: 8 rows are 8 bytes, two words, first_row is a multiple of 8 so they start on a word boundary
+    uint lo_word = read_col_word(slot, first_row / 4u);
+    uint hi_word = read_col_word(slot, first_row / 4u + 1u);
+    for (uint k = 0u; k < 4u; k++)
+    {
+      uint a = enc_base + ((lo_word >> (k * 8u)) & 0xffu);
+      uint b = enc_base + ((hi_word >> (k * 8u)) & 0xffu);
+      bits |= (compare(op, widen_word(coltype, a), target) ? 1u : 0u) << k;
+      bits |= (compare(op, widen_word(coltype, b), target) ? 1u : 0u) << (k + 4u);
+    }
+    return bits;
+  }
+
+  if (valid == ROWS_PER_THREAD && width == 2u)
+  {
+    // tec: 8 rows are 16 bytes, one vector
+    uvec4 words = read_col_vec(slot, first_row / 8u);
+    for (uint k = 0u; k < 4u; k++)
+    {
+      uint word = (k == 0u) ? words.x : ((k == 1u) ? words.y : ((k == 2u) ? words.z : words.w));
+      uint a = enc_base + (word & 0xffffu);
+      uint b = enc_base + (word >> 16u);
+      bits |= (compare(op, widen_word(coltype, a), target) ? 1u : 0u) << (k * 2u);
+      bits |= (compare(op, widen_word(coltype, b), target) ? 1u : 0u) << (k * 2u + 1u);
+    }
+    return bits;
+  }
+
+  if (valid == ROWS_PER_THREAD)
+  {
+    // tec: a whole group of rows, first_row is a multiple of ROWS_PER_THREAD so it starts on a 16 byte boundary
+    if (coltype == COLTYPE_F64)
+    {
+      // tec: a row is 2 words, so a 16 byte vector holds 2 rows
+      uint base = first_row / 2u;
+      for (uint v = 0u; v < ROWS_PER_THREAD / 2u; v++)
+      {
+        uvec4 words = read_col_vec(slot, base + v);
+        double a = packDouble2x32(uvec2(words.x, words.y));
+        double b = packDouble2x32(uvec2(words.z, words.w));
+        bits |= (compare(op, a, target) ? 1u : 0u) << (v * 2u + 0u);
+        bits |= (compare(op, b, target) ? 1u : 0u) << (v * 2u + 1u);
+      }
+    }
+    else
+    {
+      uint base = first_row / 4u;
+      for (uint v = 0u; v < ROWS_PER_THREAD / 4u; v++)
+      {
+        uvec4 words = read_col_vec(slot, base + v);
+        bits |= (compare(op, widen_word(coltype, words.x), target) ? 1u : 0u) << (v * 4u + 0u);
+        bits |= (compare(op, widen_word(coltype, words.y), target) ? 1u : 0u) << (v * 4u + 1u);
+        bits |= (compare(op, widen_word(coltype, words.z), target) ? 1u : 0u) << (v * 4u + 2u);
+        bits |= (compare(op, widen_word(coltype, words.w), target) ? 1u : 0u) << (v * 4u + 3u);
+      }
+    }
+    return bits;
+  }
+
+  // tec: the last group of a table that is not a whole number of groups
+  for (uint k = 0u; k < valid; k++)
+  {
+    double value;
+    if (width == 1u || width == 2u)
+    {
+      value = widen_word(coltype, narrow_value(slot, first_row + k, width, enc_base));
+    }
+    else if (coltype == COLTYPE_F64)
+    {
+      uint lo = read_col_word(slot, (first_row + k) * 2u + 0u);
+      uint hi = read_col_word(slot, (first_row + k) * 2u + 1u);
+      value = packDouble2x32(uvec2(lo, hi));
+    }
+    else
+    {
+      value = widen_word(coltype, read_col_word(slot, first_row + k));
+    }
+    bits |= (compare(op, value, target) ? 1u : 0u) << k;
+  }
+  return bits;
+}
+
+void
+main()
+{
+  uint row_count = pc.words[0];
+  uint first_row = gl_GlobalInvocationID.x * ROWS_PER_THREAD;
+
+  // tec: rows past the end, or in a skipped zone map chunk, still reach the barriers below, they just never match
+  uint valid = (first_row < row_count) ? min(ROWS_PER_THREAD, row_count - first_row) : 0u;
+  uint live = (valid == 32u) ? 0xffffffffu : ((1u << valid) - 1u);
+
+  // tec: zone map chunks are a multiple of ROWS_PER_THREAD rows, so one bit covers the whole group
+  if (valid != 0u && pc.words[8] != 0u)
+  {
+    uint skip_chunk = first_row >> pc.words[6];
+    if ((skip_bits[skip_chunk >> 5u] & (1u << (skip_chunk & 31u))) != 0u)
+    {
+      live = 0u;
+    }
+  }
+
+  if (gl_LocalInvocationIndex == 0u)
+  {
+    s_match_count = 0u;
+  }
+
+  uint leaf_count = leaf_words[0];
+  for (uint l = 0u; l < leaf_count && live != 0u; l++)
+  {
+    uint base = 1u + l * 6u;
+    uint slot = leaf_words[base + 0u];
+    uint coltype = leaf_words[base + 1u] & 0xffu;
+    uint width = (leaf_words[base + 1u] >> 8u) & 0xffu;
+    uint enc_base = leaf_words[base + 5u];
+    if ((leaf_words[base + 1u] & 0x10000u) != 0u)
+    {
+      if ((leaf_words[base + 1u] & 0x20000u) != 0u)
+      {
+        live = 0u;
+      }
+      else
+      {
+        uint bias = ((leaf_words[base + 1u] & 0x40000u) != 0u) ? 0x80000000u : 0u;
+        live &= compare_rows_int(leaf_words[base + 0u], width, bias, leaf_words[base + 3u], leaf_words[base + 4u], first_row, valid);
+      }
+      continue;
+    }
+    uint op = leaf_words[base + 2u];
+    double target = packDouble2x32(uvec2(leaf_words[base + 3u], leaf_words[base + 4u]));
+    live &= compare_rows(slot, coltype, op, target, first_row, valid, width, enc_base);
+  }
+
+  // tec: matches are counted per workgroup in shared memory, so the global counter takes one atomic per workgroup instead of one per match
+  uint match_count = bitCount(live);
+  barrier();
+  uint local_position = 0u;
+  if (match_count != 0u)
+  {
+    local_position = atomicAdd(s_match_count, match_count);
+  }
+  barrier();
+  if (gl_LocalInvocationIndex == 0u)
+  {
+    s_match_base = (s_match_count > 0u) ? atomicAdd(out_count[0], s_match_count) : 0u;
+  }
+  barrier();
+
+  uint capacity = out_indices.length() / 2u;
+  uint pos = s_match_base + local_position;
+  while (live != 0u)
+  {
+    uint k = uint(findLSB(live));
+    live &= live - 1u;
+    if (pos < capacity)
+    {
+      out_indices[pos * 2u + 0u] = first_row + k;
+      out_indices[pos * 2u + 1u] = 0u;
+    }
+    pos++;
+  }
+}

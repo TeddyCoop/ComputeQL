@@ -8,7 +8,7 @@
 #include "os/os_inc.h"
 #include "thread_pool/thread_pool.h"
 #include "settings/settings.h"
-#include "gdb/gdb_inc.h"
+#include "cql/cql_inc.h"
 #include "ir_gen/ir_gen_inc.h"
 #include "gpu/gpu_inc.h"
 #include "planner/plan_node.h"
@@ -25,7 +25,7 @@
 #include "settings/settings.c"
 #include "gpu/gpu_inc.c"
 #include "ir_gen/ir_gen_inc.c"
-#include "gdb/gdb_inc.c"
+#include "cql/cql_inc.c"
 #include "query_exec/query_exec.c"
 #include "optimizer/optimizer_inc.c"
 #include "planner/planner.c"
@@ -74,25 +74,22 @@ fs_generate_rows(Arena* arena, U64 row_count, U64 rng_seed)
   return rows;
 }
 
-// tec: `value` is an otherwise-unused numeric column - row 0's is left blank in the CSV to give
-// the "forced CPU fallback" table exactly one NULL, tripping gdb_table_may_have_nulls for the
-// whole table (qe_row_condition_eval's fuzzy branch doesn't care, it never touches `value`)
+// tec: appends a row with a NULL text, a NULL in the searched column rules out the GPU
 internal B32
-fs_write_csv(String8 path, FS_Row* rows, U64 row_count, B32 null_first_value)
+fs_write_csv(String8 path, FS_Row* rows, U64 row_count, B32 null_text_row)
 {
   Temp scratch = scratch_begin(0, 0);
   String8List lines = {0};
   str8_list_pushf(scratch.arena, &lines, "id,text,value\n");
   for (U64 i = 0; i < row_count; i++)
   {
-    if (null_first_value && i == 0)
-    {
-      str8_list_pushf(scratch.arena, &lines, "%u,%.*s,\n", rows[i].id, str8_varg(rows[i].text));
-    }
-    else
-    {
-      str8_list_pushf(scratch.arena, &lines, "%u,%.*s,%u\n", rows[i].id, str8_varg(rows[i].text), (U32)i);
-    }
+    str8_list_pushf(scratch.arena, &lines, "%u,%.*s,%u\n", rows[i].id, str8_varg(rows[i].text), (U32)i);
+  }
+  
+  //- tec: the optimizer only looks at the columns a query references, so the NULL goes in the searched column. NULL text never matches
+  if (null_text_row)
+  {
+    str8_list_pushf(scratch.arena, &lines, "%llu,,%u\n", row_count, (U32)row_count);
   }
   String8 content = str8_list_join(scratch.arena, &lines, 0);
   
@@ -109,7 +106,7 @@ fs_write_csv(String8 path, FS_Row* rows, U64 row_count, B32 null_first_value)
 }
 
 internal U32*
-fs_run_and_collect_ids(Arena* arena, GDB_Database* database, String8 sql_text, QE_TraceStrategy* out_strategy, U64* out_count)
+fs_run_and_collect_ids(Arena* arena, CQL_Database* database, String8 sql_text, QE_TraceStrategy* out_strategy, U64* out_count)
 {
   SQL_TokenizeResult tok = sql_tokenize_from_text(arena, sql_text);
   SQL_Node* ast = sql_parse(arena, tok.tokens, tok.count, sql_text);
@@ -136,7 +133,7 @@ fs_run_and_collect_ids(Arena* arena, GDB_Database* database, String8 sql_text, Q
     }
   }
   
-  GDB_Column* id_column = gdb_table_find_column(result.rows.tables[0], str8_lit("id"));
+  CQL_Column* id_column = cql_table_find_column(result.rows.tables[0], str8_lit("id"));
   F64* id_values = qe_gather_numeric_column(arena, &result.rows, 0, id_column);
   
   U64 count = result.rows.count;
@@ -219,18 +216,18 @@ fs_run_suite(Arena* arena, Bench_Report* report, U64 row_count)
   //- tec: GPU path table. without nulls
   String8 gpu_csv_path = str8_lit("bench_data/fuzzy_search_gpu.csv");
   fs_write_csv(gpu_csv_path, rows, row_count, 0);
-  GDB_Database* gpu_db = gdb_database_alloc(str8_lit("fuzzy_gpu_db"));
-  gdb_add_database(gpu_db);
-  GDB_Table* gpu_table = gdb_table_import_csv_streaming(gpu_db, str8_lit("t"), gpu_csv_path);
-  gdb_database_add_table(gpu_db, gpu_table);
+  CQL_Database* gpu_db = cql_database_alloc(str8_lit("fuzzy_gpu_db"));
+  cql_add_database(gpu_db);
+  CQL_Table* gpu_table = cql_table_import_csv_streaming(gpu_db, str8_lit("t"), gpu_csv_path);
+  cql_database_add_table(gpu_db, gpu_table);
   
-  //- tec: CPU fallback table. same rows, but one NULL in an unrelated column forces qe_cpu_scan_filter for the whole table (gdb_table_may_have_nulls)
+  //- tec: CPU fallback table. same rows plus one with a NULL text, which forces qe_cpu_scan_filter
   String8 cpu_csv_path = str8_lit("bench_data/fuzzy_search_cpu.csv");
   fs_write_csv(cpu_csv_path, rows, row_count, 1);
-  GDB_Database* cpu_db = gdb_database_alloc(str8_lit("fuzzy_cpu_db"));
-  gdb_add_database(cpu_db);
-  GDB_Table* cpu_table = gdb_table_import_csv_streaming(cpu_db, str8_lit("t"), cpu_csv_path);
-  gdb_database_add_table(cpu_db, cpu_table);
+  CQL_Database* cpu_db = cql_database_alloc(str8_lit("fuzzy_cpu_db"));
+  cql_add_database(cpu_db);
+  CQL_Table* cpu_table = cql_table_import_csv_streaming(cpu_db, str8_lit("t"), cpu_csv_path);
+  cql_database_add_table(cpu_db, cpu_table);
   
   char* needles[] = { "alpha bravo", "charlie", "zzz not present", g_bench_words[7] /* "hotel" */ };
   F64 sim_thresholds[] = { 0.5, 0.2, 0.1, 0.6 };
@@ -373,10 +370,10 @@ fs_run_ranking_suite(Arena* arena, Bench_Report* report, U64 row_count)
   }
   String8 csv_path = str8_lit("bench_data/fuzzy_search_ranking.csv");
   fs_write_csv(csv_path, rows, row_count, 0);
-  GDB_Database* database = gdb_database_alloc(str8_lit("fuzzy_ranking_db"));
-  gdb_add_database(database);
-  GDB_Table* table = gdb_table_import_csv_streaming(database, str8_lit("t"), csv_path);
-  gdb_database_add_table(database, table);
+  CQL_Database* database = cql_database_alloc(str8_lit("fuzzy_ranking_db"));
+  cql_add_database(database);
+  CQL_Table* table = cql_table_import_csv_streaming(database, str8_lit("t"), csv_path);
+  cql_database_add_table(database, table);
   
   String8 needle = str8_lit("alpha bravo");
   
@@ -494,15 +491,15 @@ entry_point(CmdLine* cmdline)
   log_alloc();
   
   U64 t0 = os_now_microseconds();
-  gdb_init();
+  cql_init();
   gpu_init();
   U64 t1 = os_now_microseconds();
-  printf("engine startup (gdb_init + gpu_init, one-time): %.4f ms\n", (F64)(t1 - t0) / 1000.0);
+  printf("engine startup (cql_init + gpu_init, one-time): %.4f ms\n", (F64)(t1 - t0) / 1000.0);
   
   Arena* arena = arena_alloc(.reserve_size = GB(2), .commit_size = MB(64));
   
   Bench_Report* report = bench_report_alloc(arena, "compute_ql GPU-native fuzzy search (SIMILARITY/EDIT_DISTANCE) correctness");
-  bench_report_text(report, "engine startup (gdb_init + gpu_init, one-time): %.4f ms", (F64)(t1 - t0) / 1000.0);
+  bench_report_text(report, "engine startup (cql_init + gpu_init, one-time): %.4f ms", (F64)(t1 - t0) / 1000.0);
   
   fs_run_suite(arena, report, 4000);
   fs_run_ranking_suite(arena, report, 4000);

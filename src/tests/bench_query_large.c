@@ -9,7 +9,7 @@
 #include "os/os_inc.h"
 #include "thread_pool/thread_pool.h"
 #include "settings/settings.h"
-#include "gdb/gdb_inc.h"
+#include "cql/cql_inc.h"
 #include "ir_gen/ir_gen_inc.h"
 #include "gpu/gpu_inc.h"
 #include "planner/plan_node.h"
@@ -26,7 +26,7 @@
 #include "settings/settings.c"
 #include "gpu/gpu_inc.c"
 #include "ir_gen/ir_gen_inc.c"
-#include "gdb/gdb_inc.c"
+#include "cql/cql_inc.c"
 #include "query_exec/query_exec.c"
 #include "optimizer/optimizer_inc.c"
 #include "planner/planner.c"
@@ -43,15 +43,15 @@ entry_point(CmdLine* cmdline)
   log_alloc();
 
   U64 t0 = os_now_microseconds();
-  gdb_init();
+  cql_init();
   gpu_init();
   U64 t1 = os_now_microseconds();
-  printf("engine startup (gdb_init + gpu_init, one-time): %.4f ms\n", (F64)(t1 - t0) / 1000.0);
+  printf("engine startup (cql_init + gpu_init, one-time): %.4f ms\n", (F64)(t1 - t0) / 1000.0);
 
   Arena* arena = arena_alloc(.reserve_size = GB(1), .commit_size = MB(64));
 
   Bench_Report* report = bench_report_alloc(arena, "compute_ql vs sqlite vs duckdb - large dataset query suite");
-  bench_report_text(report, "engine startup (gdb_init + gpu_init, one-time): %.4f ms", (F64)(t1 - t0) / 1000.0);
+  bench_report_text(report, "engine startup (cql_init + gpu_init, one-time): %.4f ms", (F64)(t1 - t0) / 1000.0);
 
   bench_run_query_suite(arena, report, 100000, "large");
 

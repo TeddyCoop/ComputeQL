@@ -8,7 +8,7 @@
 #include "os/os_inc.h"
 #include "thread_pool/thread_pool.h"
 #include "settings/settings.h"
-#include "gdb/gdb_inc.h"
+#include "cql/cql_inc.h"
 #include "ir_gen/ir_gen_inc.h"
 #include "gpu/gpu_inc.h"
 #include "planner/plan_node.h"
@@ -25,7 +25,7 @@
 #include "settings/settings.c"
 #include "gpu/gpu_inc.c"
 #include "ir_gen/ir_gen_inc.c"
-#include "gdb/gdb_inc.c"
+#include "cql/cql_inc.c"
 #include "query_exec/query_exec.c"
 #include "optimizer/optimizer_inc.c"
 #include "planner/planner.c"
@@ -116,10 +116,10 @@ entry_point(CmdLine* cmdline)
   log_alloc();
 
   U64 t0 = os_now_microseconds();
-  gdb_init();
+  cql_init();
   gpu_init();
   U64 t1 = os_now_microseconds();
-  printf("engine startup (gdb_init + gpu_init, one-time): %.4f ms\n", (F64)(t1 - t0) / 1000.0);
+  printf("engine startup (cql_init + gpu_init, one-time): %.4f ms\n", (F64)(t1 - t0) / 1000.0);
 
   U64 row_count = 100000;
   printf("\n########## csv import: %llu rows ##########\n", row_count);
@@ -127,7 +127,7 @@ entry_point(CmdLine* cmdline)
   Arena* arena = arena_alloc(.reserve_size = GB(1), .commit_size = MB(64));
 
   Bench_Report* report = bench_report_alloc(arena, "compute_ql vs sqlite vs duckdb - csv import");
-  bench_report_text(report, "engine startup (gdb_init + gpu_init, one-time): %.4f ms", (F64)(t1 - t0) / 1000.0);
+  bench_report_text(report, "engine startup (cql_init + gpu_init, one-time): %.4f ms", (F64)(t1 - t0) / 1000.0);
   bench_report_section(report, "csv import: %llu rows", row_count);
 
   Bench_Row* rows = bench_generate_rows(arena, row_count);
@@ -142,36 +142,36 @@ entry_point(CmdLine* cmdline)
   String8 table_name = str8_lit("bench_import");
 
   //- tec: compute_ql import
-  GDB_Database* gdb_import_db = gdb_database_alloc(str8_lit("bench_import_db"));
-  GDB_Table* previous_import_table = NULL;
+  CQL_Database* cql_import_db = cql_database_alloc(str8_lit("bench_import_db"));
+  CQL_Table* previous_import_table = NULL;
 
   for (U64 run = 0; run < IMPORT_WARMUP_RUNS; run++)
   {
-    GDB_Table* table = gdb_table_import_csv_streaming(gdb_import_db, table_name, csv_path);
+    CQL_Table* table = cql_table_import_csv_streaming(cql_import_db, table_name, csv_path);
     previous_import_table = table;
   }
 
-  F64 gdb_samples[IMPORT_TIMED_RUNS];
-  U64 gdb_last_row_count = 0;
+  F64 cql_samples[IMPORT_TIMED_RUNS];
+  U64 cql_last_row_count = 0;
   for (U64 run = 0; run < IMPORT_TIMED_RUNS; run++)
   {
     if (previous_import_table)
     {
       for (U64 c = 0; c < previous_import_table->column_count; c++)
       {
-        gdb_column_close(previous_import_table->columns[c]);
+        cql_column_close(previous_import_table->columns[c]);
       }
     }
 
     U64 s0 = os_now_microseconds();
-    GDB_Table* table = gdb_table_import_csv_streaming(gdb_import_db, table_name, csv_path);
+    CQL_Table* table = cql_table_import_csv_streaming(cql_import_db, table_name, csv_path);
     U64 s1 = os_now_microseconds();
-    gdb_samples[run] = (F64)(s1 - s0) / 1000.0;
-    gdb_last_row_count = table->row_count;
+    cql_samples[run] = (F64)(s1 - s0) / 1000.0;
+    cql_last_row_count = table->row_count;
     previous_import_table = table;
   }
 
-  gdb_database_replace_table(gdb_import_db, previous_import_table);
+  cql_database_replace_table(cql_import_db, previous_import_table);
 
   //- tec: sqlite import
   for (U64 run = 0; run < IMPORT_WARMUP_RUNS; run++)
@@ -248,15 +248,15 @@ entry_point(CmdLine* cmdline)
     duckdb_samples[run] = (F64)(s1 - s0) / 1000.0;
   }
 
-  F64 gdb_min, gdb_med, gdb_avg;
+  F64 cql_min, cql_med, cql_avg;
   F64 sqlite_min, sqlite_med, sqlite_avg;
   F64 duckdb_min, duckdb_med, duckdb_avg;
-  bench_reduce(gdb_samples, IMPORT_TIMED_RUNS, &gdb_min, &gdb_med, &gdb_avg);
+  bench_reduce(cql_samples, IMPORT_TIMED_RUNS, &cql_min, &cql_med, &cql_avg);
   bench_reduce(sqlite_samples, IMPORT_TIMED_RUNS, &sqlite_min, &sqlite_med, &sqlite_avg);
   bench_reduce(duckdb_samples, IMPORT_TIMED_RUNS, &duckdb_min, &duckdb_med, &duckdb_avg);
 
   printf("\n%-10s %10s %10s %10s %10s\n", "engine", "rows", "min(ms)", "median(ms)", "avg(ms)");
-  printf("%-10s %10llu %10.4f %10.4f %10.4f\n", "gdb", gdb_last_row_count, gdb_min, gdb_med, gdb_avg);
+  printf("%-10s %10llu %10.4f %10.4f %10.4f\n", "cql", cql_last_row_count, cql_min, cql_med, cql_avg);
   printf("%-10s %10llu %10.4f %10.4f %10.4f\n", "sqlite", sqlite_last_row_count, sqlite_min, sqlite_med, sqlite_avg);
   printf("%-10s %10llu %10.4f %10.4f %10.4f\n", "duckdb", duckdb_last_row_count, duckdb_min, duckdb_med, duckdb_avg);
 
@@ -269,11 +269,11 @@ entry_point(CmdLine* cmdline)
   bench_report_table_header_end(report);
 
   bench_report_row_begin(report);
-  bench_report_cellf(report, "gdb");
-  bench_report_cellf(report, "%llu", gdb_last_row_count);
-  bench_report_cellf(report, "%.4f", gdb_min);
-  bench_report_cellf(report, "%.4f", gdb_med);
-  bench_report_cellf(report, "%.4f", gdb_avg);
+  bench_report_cellf(report, "cql");
+  bench_report_cellf(report, "%llu", cql_last_row_count);
+  bench_report_cellf(report, "%.4f", cql_min);
+  bench_report_cellf(report, "%.4f", cql_med);
+  bench_report_cellf(report, "%.4f", cql_avg);
   bench_report_row_end(report);
 
   bench_report_row_begin(report);
@@ -292,12 +292,12 @@ entry_point(CmdLine* cmdline)
   bench_report_cellf(report, "%.4f", duckdb_avg);
   bench_report_row_end(report);
 
-  if (gdb_last_row_count != row_count || sqlite_last_row_count != row_count || duckdb_last_row_count != row_count)
+  if (cql_last_row_count != row_count || sqlite_last_row_count != row_count || duckdb_last_row_count != row_count)
   {
-    printf("  !! row count mismatch: expected %llu, gdb imported %llu, sqlite imported %llu, duckdb imported %llu\n",
-           row_count, gdb_last_row_count, sqlite_last_row_count, duckdb_last_row_count);
-    bench_report_warn(report, "row count mismatch: expected %llu, gdb imported %llu, sqlite imported %llu, duckdb imported %llu",
-                       row_count, gdb_last_row_count, sqlite_last_row_count, duckdb_last_row_count);
+    printf("  !! row count mismatch: expected %llu, cql imported %llu, sqlite imported %llu, duckdb imported %llu\n",
+           row_count, cql_last_row_count, sqlite_last_row_count, duckdb_last_row_count);
+    bench_report_warn(report, "row count mismatch: expected %llu, cql imported %llu, sqlite imported %llu, duckdb imported %llu",
+                       row_count, cql_last_row_count, sqlite_last_row_count, duckdb_last_row_count);
   }
 
   printf("(sqlite has no native CSV loader via the C API - this times the idiomatic bulk-load path: one transaction, one prepared INSERT, bind+step+reset per parsed row. duckdb instead uses its native COPY FROM CSV loader, its own idiomatic bulk-load path)\n");

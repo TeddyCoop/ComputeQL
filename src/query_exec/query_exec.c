@@ -65,7 +65,7 @@ qe_find_binding(QE_BytecodeProgram* prog, String8 column_name)
 }
 
 internal QE_ColumnBinding*
-qe_bind_column(QE_BytecodeProgram* prog, GDB_Table* table, String8 column_name)
+qe_bind_column(QE_BytecodeProgram* prog, CQL_Table* table, String8 column_name)
 {
   QE_ColumnBinding* existing = qe_find_binding(prog, column_name);
   if (existing) return existing;
@@ -76,14 +76,14 @@ qe_bind_column(QE_BytecodeProgram* prog, GDB_Table* table, String8 column_name)
     return 0;
   }
   
-  GDB_Column* column = gdb_table_find_column(table, column_name);
+  CQL_Column* column = cql_table_find_column(table, column_name);
   if (!column)
   {
     log_error("qe_bind_column: unknown column '%.*s'", str8_varg(column_name));
     return 0;
   }
   
-  U32 slot_count = (column->type == GDB_ColumnType_String8) ? 2 : 1;
+  U32 slot_count = (column->type == CQL_ColumnType_String8) ? 2 : 1;
   if (prog->next_slot + slot_count > QE_MAX_COLUMN_BINDINGS)
   {
     log_error("qe_bind_column: exceeded available descriptor column slots for '%.*s'", str8_varg(column_name));
@@ -102,7 +102,7 @@ qe_bind_column(QE_BytecodeProgram* prog, GDB_Table* table, String8 column_name)
 }
 
 internal QE_ColumnBinding*
-qe_bind_column_dict_codes(QE_BytecodeProgram* prog, GDB_Table* table, String8 column_name)
+qe_bind_column_dict_codes(QE_BytecodeProgram* prog, CQL_Table* table, String8 column_name)
 {
   String8 synthetic_name = push_str8f(prog->arena, "%.*s$dict", str8_varg(column_name));
   
@@ -115,7 +115,7 @@ qe_bind_column_dict_codes(QE_BytecodeProgram* prog, GDB_Table* table, String8 co
     return 0;
   }
   
-  GDB_Column* column = gdb_table_find_column(table, column_name);
+  CQL_Column* column = cql_table_find_column(table, column_name);
   if (!column || !column->has_dict)
   {
     log_error("qe_bind_column_dict_codes: '%.*s' has no dictionary", str8_varg(column_name));
@@ -131,7 +131,7 @@ qe_bind_column_dict_codes(QE_BytecodeProgram* prog, GDB_Table* table, String8 co
   QE_ColumnBinding* binding = &prog->bindings[prog->binding_count++];
   binding->name = synthetic_name;
   binding->column = column;
-  binding->type = GDB_ColumnType_U32;
+  binding->type = CQL_ColumnType_U32;
   binding->first_slot = prog->next_slot;
   binding->slot_count = 1;
   binding->use_dict_codes = 1;
@@ -174,7 +174,7 @@ qe_opcode_from_comparison_operator(String8 op)
 }
 
 internal void
-qe_compile_load_value(QE_BytecodeProgram* prog, GDB_Table* table, IR_Node* node)
+qe_compile_load_value(QE_BytecodeProgram* prog, CQL_Table* table, IR_Node* node)
 {
   if (node->type == IR_NodeType_Column)
   {
@@ -200,7 +200,7 @@ qe_compile_load_value(QE_BytecodeProgram* prog, GDB_Table* table, IR_Node* node)
 }
 
 internal void
-qe_compile_condition(QE_BytecodeProgram* prog, GDB_Table* table, IR_Node* condition, QE_ScanTrace* out_trace)
+qe_compile_condition(QE_BytecodeProgram* prog, CQL_Table* table, IR_Node* condition, QE_ScanTrace* out_trace)
 {
   if (!condition) return;
   
@@ -314,7 +314,7 @@ qe_compile_condition(QE_BytecodeProgram* prog, GDB_Table* table, IR_Node* condit
     IR_Node* needle_arg = col_arg ? col_arg->next : 0;
     QE_ColumnBinding* binding = (col_arg && col_arg->type == IR_NodeType_Column) ? qe_bind_column(prog, table, col_arg->value) : 0;
     
-    if (!right || !col_arg || !needle_arg || !binding || binding->type != GDB_ColumnType_String8)
+    if (!right || !col_arg || !needle_arg || !binding || binding->type != CQL_ColumnType_String8)
     {
       log_error("qe_compile_condition: %.*s() requires (string column, string literal) and a comparison", str8_varg(left->value));
       qe_bytecode_emit(prog, QE_Opcode_PushTrue);
@@ -362,7 +362,7 @@ qe_compile_condition(QE_BytecodeProgram* prog, GDB_Table* table, IR_Node* condit
     U32 slots_before = prog->next_slot;
     QE_ColumnBinding* binding = qe_bind_column(prog, table, left->value);
     B32 bound_here = prog->binding_count > bindings_before;
-    if (binding && binding->type == GDB_ColumnType_String8)
+    if (binding && binding->type == CQL_ColumnType_String8)
     {
       B32 is_contains = str8_match(op, str8_lit("contains"), StringMatchFlag_CaseInsensitive);
       B32 is_eq = str8_match(op, str8_lit("="), 0) || str8_match(op, str8_lit("=="), 0);
@@ -383,7 +383,7 @@ qe_compile_condition(QE_BytecodeProgram* prog, GDB_Table* table, IR_Node* condit
       // so only equality/inequality can use them, relational ops must always compare the raw bytes
       if (is_eq || is_ne)
       {
-        gdb_column_ensure_string_dict(binding->column);
+        cql_column_ensure_string_dict(binding->column);
         if (binding->column->has_dict)
         {
           if (out_trace)
@@ -393,7 +393,7 @@ qe_compile_condition(QE_BytecodeProgram* prog, GDB_Table* table, IR_Node* condit
           }
           
           U32 code = 0;
-          if (!gdb_string_dict_code_from_value(binding->column->dict, right->value, &code))
+          if (!cql_string_dict_code_from_value(binding->column->dict, right->value, &code))
           {
             if (out_trace) out_trace->dict_hit = 0;
             if (bound_here)
@@ -453,7 +453,7 @@ qe_compile_condition(QE_BytecodeProgram* prog, GDB_Table* table, IR_Node* condit
     }
     
     // tec: DATE/TIMESTAMP comparison
-    if (binding && (binding->type == GDB_ColumnType_Date || binding->type == GDB_ColumnType_Timestamp))
+    if (binding && (binding->type == CQL_ColumnType_Date || binding->type == CQL_ColumnType_Timestamp))
     {
       F64 value = 0.0;
       if (!qe_resolve_date_literal_value(binding->type, right, &value))
@@ -472,7 +472,7 @@ qe_compile_condition(QE_BytecodeProgram* prog, GDB_Table* table, IR_Node* condit
     }
     
     // tec: ENUM comparisons
-    if (binding && binding->type == GDB_ColumnType_Enum)
+    if (binding && binding->type == CQL_ColumnType_Enum)
     {
       F64 value = 0.0;
       if (!qe_resolve_enum_literal_value(binding->column, right, &value))
@@ -495,7 +495,7 @@ qe_compile_condition(QE_BytecodeProgram* prog, GDB_Table* table, IR_Node* condit
   if (left->type == IR_NodeType_Column && right->type == IR_NodeType_Numeric)
   {
     QE_ColumnBinding* binding = qe_bind_column(prog, table, left->value);
-    if (binding && binding->type == GDB_ColumnType_Decimal)
+    if (binding && binding->type == CQL_ColumnType_Decimal)
     {
       F64 value = 0.0;
       if (!qe_resolve_decimal_literal_value(binding->column, right, &value))
@@ -521,7 +521,7 @@ qe_compile_condition(QE_BytecodeProgram* prog, GDB_Table* table, IR_Node* condit
 }
 
 internal void
-qe_bytecode_program_build(Arena* arena, QE_BytecodeProgram* prog, GDB_Database* database, GDB_Table* table, IR_Node* root_node, IR_Node* where_clause, QE_ScanTrace* out_trace)
+qe_bytecode_program_build(Arena* arena, QE_BytecodeProgram* prog, CQL_Database* database, CQL_Table* table, IR_Node* root_node, IR_Node* where_clause, QE_ScanTrace* out_trace)
 {
   MemoryZeroStruct(prog);
   prog->arena = arena;
@@ -620,7 +620,7 @@ qe_bytecode_program_max_stack_depth(QE_BytecodeProgram* prog)
 /*
   abackground thread loads the next chunk from disk while the main thread uploads, dispatches, and reads back the current chunk, overlapping disk IO with GPU work
 
-the worker only performs gdb_column_* reads into host memory. all GPU work remains on the
+the worker only performs cql_column_* reads into host memory. all GPU work remains on the
 main thread because the dispatch path uses shared sync stuff
 
 the next chunk is not prefetched until the current chunk has finished uploading and any mapped string data has been closed
@@ -639,14 +639,14 @@ qe_prefetch_read_slot(QE_PrefetchSlot* slot, QE_BytecodeProgram* prog, Rng1U64 r
     MemoryZeroStruct(out);
     
     B32 is_whole_column = (range.min == 0 && range.max == binding->column->row_count);
-    if (binding->type != GDB_ColumnType_String8 && is_whole_column &&
+    if (binding->type != CQL_ColumnType_String8 && is_whole_column &&
         binding->column->gpu_upload_generation == binding->column->write_generation)
     {
       out->valid = 1;
       out->cached = 1;
     }
     // tec: non dict string column already resident from a prior whole col upload. skip the chunk read entirely
-    else if (binding->type == GDB_ColumnType_String8 && !binding->use_dict_codes && is_whole_column &&
+    else if (binding->type == CQL_ColumnType_String8 && !binding->use_dict_codes && is_whole_column &&
              binding->column->gpu_str_upload_generation == binding->column->write_generation)
     {
       out->is_string = 1;
@@ -659,15 +659,15 @@ qe_prefetch_read_slot(QE_PrefetchSlot* slot, QE_BytecodeProgram* prog, Rng1U64 r
       out->size = (range.max - range.min) * sizeof(U32);
       out->valid = (binding->column->dict_codes != 0);
     }
-    else if (binding->type == GDB_ColumnType_String8)
+    else if (binding->type == CQL_ColumnType_String8)
     {
       out->is_string = 1;
-      out->str_chunk = gdb_column_get_string_chunk(slot->arena, binding->column, range);
+      out->str_chunk = cql_column_get_string_chunk(slot->arena, binding->column, range);
       out->valid = (out->str_chunk.data != 0 && out->str_chunk.offsets != 0);
     }
     else
     {
-      out->data_ptr = gdb_column_get_data_range(slot->arena, binding->column, range, &out->size);
+      out->data_ptr = cql_column_get_data_range(slot->arena, binding->column, range, &out->size);
       out->valid = (out->data_ptr != 0);
     }
   }
@@ -781,20 +781,1409 @@ qe_trace_find(QE_TraceCtx* trace, PLAN_Node* plan_node)
 }
 
 internal QE_ScanResult
-qe_scan_filter(Arena* arena, GDB_Database* database, GDB_Table* table, IR_Node* where_clause, QE_ScanTrace* out_trace)
+qe_scan_filter(Arena* arena, CQL_Database* database, CQL_Table* table, IR_Node* where_clause, QE_ScanTrace* out_trace)
 {
   return qe_scan_filter_selected(arena, database, table, where_clause, out_trace, 0, 0);
 }
 
-// tec: when out_selection is given and the scan is a single dispatch, the selected rows stay on the GPU and result.indices stays empty
-internal QE_ScanResult
-qe_scan_filter_selected(Arena* arena, GDB_Database* database, GDB_Table* table, IR_Node* where_clause, QE_ScanTrace* out_trace, QE_DeviceSelection* out_selection, U64 expected_rows)
+//~ tec: chunked scans on the CPU
+// tec: chunked tables would re-upload every run, so numeric comparisons joined by AND on NULL free columns scan on the CPU
+// tec: pass 1 sets a bit per matching row, pass 2 counts the bits per slice and writes row ids at each slice's offset
+
+#define QE_CPU_SCAN_MAX_LEAVES 8
+
+// tec: scan_simple.comp reads its comparisons from a buffer of this many
+#define QE_SIMPLE_SCAN_MAX_LEAVES 4
+
+// tec: rows one thread of scan_simple.comp takes, must match its ROWS_PER_THREAD. it reads them with 16 byte loads
+#define QE_SIMPLE_SCAN_ROWS_PER_THREAD 8
+
+#define QE_CPU_OP_EQ 0
+#define QE_CPU_OP_LT 1
+#define QE_CPU_OP_LE 2
+#define QE_CPU_OP_GT 3
+#define QE_CPU_OP_GE 4
+
+typedef struct QE_CpuScanLeaf QE_CpuScanLeaf;
+struct QE_CpuScanLeaf
+{
+  CQL_Column* column;
+  U32 op;
+  F64 target;
+};
+
+typedef struct QE_CpuScanBitsTask QE_CpuScanBitsTask;
+struct QE_CpuScanBitsTask
+{
+  Rng1U64* group_ranges;
+  U64 group_base;
+  U64 range_min;
+  U64 range_max;
+  QE_CpuScanLeaf* leaves;
+  U32 leaf_count;
+  U8** windows;
+  U64* bits;
+};
+
+typedef struct QE_CpuScanIdsTask QE_CpuScanIdsTask;
+struct QE_CpuScanIdsTask
+{
+  Rng1U64* word_ranges;
+  U64* bits;
+  U64* slice_counts;
+  U64* slice_offsets;
+  U64* out_indices;
+  U64 word_base;
+};
+
+internal U32 qe_collect_and_leaves(IR_Node* condition, IR_Node** out_leaves, U32 count, U32 max_leaves);
+internal B32 qe_chunk_reduce_type_supported(CQL_ColumnType type);
+
+#define QE_CPU_LEAF_LOOP(T)                                                                              \
+{                                                                                                        \
+  T* values = (T*)task->windows[l] + (row0 - task->range_min);                                           \
+  switch (leaf->op)                                                                                      \
+  {                                                                                                      \
+    case QE_CPU_OP_EQ: for (U64 k = 0; k < n; k++) { hit |= (U64)((F64)values[k] == target) << k; } break; \
+    case QE_CPU_OP_LT: for (U64 k = 0; k < n; k++) { hit |= (U64)((F64)values[k] <  target) << k; } break; \
+    case QE_CPU_OP_LE: for (U64 k = 0; k < n; k++) { hit |= (U64)((F64)values[k] <= target) << k; } break; \
+    case QE_CPU_OP_GT: for (U64 k = 0; k < n; k++) { hit |= (U64)((F64)values[k] >  target) << k; } break; \
+    case QE_CPU_OP_GE: for (U64 k = 0; k < n; k++) { hit |= (U64)((F64)values[k] >= target) << k; } break; \
+  }                                                                                                      \
+}
+
+internal THREAD_POOL_TASK_FUNC(qe_cpu_scan_bits_task)
+{
+  QE_CpuScanBitsTask* task = (QE_CpuScanBitsTask*)raw_task;
+  Rng1U64 groups = task->group_ranges[task_id];
+  for (U64 g = task->group_base + groups.min; g < task->group_base + groups.max; g++)
+  {
+    // tec: a group of 64 rows can start before or end after the range, the rows outside it are not read and never match
+    U64 row0 = Max(g * 64, task->range_min);
+    U64 row1 = Min(g * 64 + 64, task->range_max);
+    if (row1 <= row0)
+    {
+      continue;
+    }
+    U64 n = row1 - row0;
+    U64 shift = row0 - g * 64;
+    U64 word = (n == 64) ? max_U64 : (((U64)1 << n) - 1);
+
+    for (U32 l = 0; l < task->leaf_count && word != 0; l++)
+    {
+      QE_CpuScanLeaf* leaf = &task->leaves[l];
+      F64 target = leaf->target;
+      U64 hit = 0;
+      switch (leaf->column->type)
+      {
+        case CQL_ColumnType_U32: QE_CPU_LEAF_LOOP(U32) break;
+        case CQL_ColumnType_I32: QE_CPU_LEAF_LOOP(S32) break;
+        case CQL_ColumnType_U64: QE_CPU_LEAF_LOOP(U64) break;
+        case CQL_ColumnType_I64: QE_CPU_LEAF_LOOP(S64) break;
+        case CQL_ColumnType_F32: QE_CPU_LEAF_LOOP(F32) break;
+        case CQL_ColumnType_F64: QE_CPU_LEAF_LOOP(F64) break;
+        default: break;
+      }
+      word &= hit;
+    }
+    task->bits[g] |= word << shift;
+  }
+}
+
+internal THREAD_POOL_TASK_FUNC(qe_cpu_scan_count_task)
+{
+  QE_CpuScanIdsTask* task = (QE_CpuScanIdsTask*)raw_task;
+  Rng1U64 words = task->word_ranges[task_id];
+  U64 count = 0;
+  for (U64 w = words.min; w < words.max; w++)
+  {
+    count += count_bits_set64(task->bits[w]);
+  }
+  task->slice_counts[task_id] = count;
+}
+
+internal THREAD_POOL_TASK_FUNC(qe_cpu_scan_ids_task)
+{
+  QE_CpuScanIdsTask* task = (QE_CpuScanIdsTask*)raw_task;
+  Rng1U64 words = task->word_ranges[task_id];
+  U64 out = task->slice_offsets[task_id];
+  for (U64 w = words.min; w < words.max; w++)
+  {
+    U64 word = task->bits[w];
+    while (word != 0)
+    {
+      unsigned long bit = 0;
+      _BitScanForward64(&bit, word);
+      task->out_indices[out++] = (task->word_base + w) * 64 + bit;
+      word &= word - 1;
+    }
+  }
+}
+
+internal B32
+qe_cpu_scan_collect_leaves(CQL_Table* table, IR_Node* where_clause, QE_CpuScanLeaf* leaves, U32* out_count)
+{
+  IR_Node* root = (where_clause && where_clause->first) ? where_clause->first : NULL;
+  if (!root)
+  {
+    return 0;
+  }
+
+  IR_Node* nodes[QE_CPU_SCAN_MAX_LEAVES + 1] = {0};
+  U32 count = qe_collect_and_leaves(root, nodes, 0, QE_CPU_SCAN_MAX_LEAVES + 1);
+  if (count == 0 || count > QE_CPU_SCAN_MAX_LEAVES)
+  {
+    return 0;
+  }
+
+  for (U32 i = 0; i < count; i++)
+  {
+    CQL_Column* column = 0;
+    B32 is_eq = 0, is_lt = 0, is_le = 0, is_gt = 0, is_ge = 0, is_string = 0;
+    F64 target = 0.0;
+    String8 target_string = {0};
+    if (!qe_resolve_leaf_comparison(table, nodes[i], &column, &is_eq, &is_lt, &is_le, &is_gt, &is_ge, &is_string, &target, &target_string))
+    {
+      return 0;
+    }
+    if (is_string || !column || !qe_chunk_reduce_type_supported(column->type) || column->null_flags || column->row_count != table->row_count)
+    {
+      return 0;
+    }
+
+    U32 op = 0;
+    if (is_eq)      { op = QE_CPU_OP_EQ; }
+    else if (is_lt) { op = QE_CPU_OP_LT; }
+    else if (is_le) { op = QE_CPU_OP_LE; }
+    else if (is_gt) { op = QE_CPU_OP_GT; }
+    else if (is_ge) { op = QE_CPU_OP_GE; }
+    else
+    {
+      return 0;
+    }
+    leaves[i].column = column;
+    leaves[i].op = op;
+    leaves[i].target = target;
+  }
+  *out_count = count;
+  return 1;
+}
+
+// tec: returns 0 with nothing built when the condition is not a numeric AND scan
+// tec: count_only skips the row ids, out_result holds just the count
+internal B32
+qe_scan_filter_chunked_cpu(Arena* arena, CQL_Table* table, IR_Node* where_clause, Rng1U64* ranges, U64 range_count, B32 count_only, QE_ScanResult* out_result)
+{
+  QE_CpuScanLeaf leaves[QE_CPU_SCAN_MAX_LEAVES] = {0};
+  U32 leaf_count = 0;
+  if (!qe_cpu_scan_collect_leaves(table, where_clause, leaves, &leaf_count))
+  {
+    return 0;
+  }
+
+  TP_Context* pool = app_thread_pool();
+  TP_Arena* pool_arena = app_thread_pool_arena();
+
+  U64* range_first_group = push_array(arena, U64, Max(range_count, (U64)1));
+  U64* range_group_count = push_array(arena, U64, Max(range_count, (U64)1));
+  U64** range_bits = push_array(arena, U64*, Max(range_count, (U64)1));
+  U64* range_totals = push_array(arena, U64, Max(range_count, (U64)1));
+
+  //- tec: pass 1, one bit per matching row
+  for (U64 r = 0; r < range_count; r++)
+  {
+    Temp scratch = scratch_begin(&arena, 1);
+
+    U8** windows = push_array(scratch.arena, U8*, leaf_count);
+    for (U32 l = 0; l < leaf_count; l++)
+    {
+      U64 window_size = 0;
+      windows[l] = (U8*)cql_column_get_data_range(scratch.arena, leaves[l].column, ranges[r], &window_size);
+      if (!windows[l])
+      {
+        scratch_end(scratch);
+        return 0;
+      }
+    }
+
+    range_first_group[r] = ranges[r].min / 64;
+    range_group_count[r] = (ranges[r].max + 63) / 64 - range_first_group[r];
+    range_bits[r] = push_array(arena, U64, Max(range_group_count[r], (U64)1));
+
+    U64 task_count = Max((U64)1, Min((U64)pool->worker_count * 4, range_group_count[r] / 1024));
+
+    QE_CpuScanBitsTask task = {0};
+    task.group_ranges = tp_divide_work(scratch.arena, range_group_count[r], (U32)task_count);
+    task.group_base = range_first_group[r];
+    task.range_min = ranges[r].min;
+    task.range_max = ranges[r].max;
+    task.leaves = leaves;
+    task.leaf_count = leaf_count;
+    task.windows = windows;
+    task.bits = range_bits[r] - range_first_group[r];
+
+    TP_Temp temp = tp_temp_begin(pool_arena);
+    tp_for_parallel(pool, pool_arena, task_count, qe_cpu_scan_bits_task, &task);
+    tp_temp_end(temp);
+
+    scratch_end(scratch);
+  }
+
+  //- tec: pass 2, count the bits of every range, then write the row ids at their offsets
+  U64 total = 0;
+  for (U64 r = 0; r < range_count; r++)
+  {
+    Temp scratch = scratch_begin(&arena, 1);
+    U64 slice_count = Max((U64)1, Min((U64)pool->worker_count * 4, range_group_count[r] / 4096));
+
+    QE_CpuScanIdsTask ids = {0};
+    ids.word_ranges = tp_divide_work(scratch.arena, range_group_count[r], (U32)slice_count);
+    ids.bits = range_bits[r];
+    ids.slice_counts = push_array(scratch.arena, U64, slice_count);
+
+    TP_Temp temp = tp_temp_begin(pool_arena);
+    tp_for_parallel(pool, pool_arena, slice_count, qe_cpu_scan_count_task, &ids);
+    tp_temp_end(temp);
+
+    for (U64 t = 0; t < slice_count; t++)
+    {
+      range_totals[r] += ids.slice_counts[t];
+    }
+    total += range_totals[r];
+    scratch_end(scratch);
+  }
+
+  if (count_only)
+  {
+    out_result->indices = 0;
+    out_result->count = total;
+    return 1;
+  }
+
+  U64* out_indices = push_array(arena, U64, Max(total, (U64)1));
+  U64 range_offset = 0;
+  for (U64 r = 0; r < range_count; r++)
+  {
+    if (range_totals[r] > 0)
+    {
+      Temp scratch = scratch_begin(&arena, 1);
+      U64 slice_count = Max((U64)1, Min((U64)pool->worker_count * 4, range_group_count[r] / 4096));
+
+      QE_CpuScanIdsTask ids = {0};
+      ids.word_ranges = tp_divide_work(scratch.arena, range_group_count[r], (U32)slice_count);
+      ids.bits = range_bits[r];
+      ids.word_base = range_first_group[r];
+      ids.slice_counts = push_array(scratch.arena, U64, slice_count);
+      ids.slice_offsets = push_array(scratch.arena, U64, slice_count);
+      ids.out_indices = out_indices;
+
+      TP_Temp count_temp = tp_temp_begin(pool_arena);
+      tp_for_parallel(pool, pool_arena, slice_count, qe_cpu_scan_count_task, &ids);
+      tp_temp_end(count_temp);
+
+      U64 offset = range_offset;
+      for (U64 t = 0; t < slice_count; t++)
+      {
+        ids.slice_offsets[t] = offset;
+        offset += ids.slice_counts[t];
+      }
+
+      TP_Temp ids_temp = tp_temp_begin(pool_arena);
+      tp_for_parallel(pool, pool_arena, slice_count, qe_cpu_scan_ids_task, &ids);
+      tp_temp_end(ids_temp);
+      scratch_end(scratch);
+    }
+    range_offset += range_totals[r];
+  }
+
+  out_result->indices = out_indices;
+  out_result->count = total;
+  return 1;
+}
+
+//~ tec: whole number comparisons for the simple scan kernel
+// tec: value op target on a 32 bit column is code - lo <= span in unsigned arithmetic, no widening to double
+
+#define QE_SCAN_INT_FLAG        0x10000u
+#define QE_SCAN_INT_NEVER       0x20000u
+#define QE_SCAN_INT_BIAS        0x40000u
+
+// tec: code_offset is 0 for a U32 column, -2^31 for an I32 column (top bit flipped), the base for a narrow column. returns 0 when no code passes
+internal B32
+qe_scan_int_interval(U32 op, F64 target, F64 code_offset, F64 max_code, U32* out_lo, U32* out_span)
+{
+  if (target != target)
+  {
+    return 0;
+  }
+  F64 low = -1e18;
+  F64 high = 1e18;
+  switch (op)
+  {
+    case 0: { if (floor(target) != target) { return 0; } low = target; high = target; } break;
+    case 1: { high = ceil(target) - 1.0; } break;
+    case 2: { high = floor(target); } break;
+    case 3: { low = floor(target) + 1.0; } break;
+    case 4: { low = ceil(target); } break;
+    default: { return 0; }
+  }
+  low = Max(low - code_offset, 0.0);
+  high = Min(high - code_offset, max_code);
+  if (low > high)
+  {
+    return 0;
+  }
+  *out_lo = (U32)low;
+  *out_span = (U32)(high - low);
+  return 1;
+}
+
+// tec: writes a comparison as 6 words, for a whole column (width 0) or a narrow one with the given base
+internal void
+qe_scan_int_leaf_words(U32* words, CQL_ColumnType type, U32 op, F64 target, U32 width, U32 base)
+{
+  F64 code_offset = 0.0;
+  F64 max_code = 4294967295.0;
+  U32 flags = QE_SCAN_INT_FLAG;
+  if (width == 3)
+  {
+    // tec: the code of a row of a sequence is its row number, the value minus the first value
+    code_offset = type == CQL_ColumnType_I32 ? (F64)(S32)base : (F64)base;
+  }
+  else if (width == 1 || width == 2)
+  {
+    max_code = width == 1 ? 255.0 : 65535.0;
+    code_offset = type == CQL_ColumnType_I32 ? (F64)(S32)base : (F64)base;
+  }
+  else if (type == CQL_ColumnType_I32)
+  {
+    code_offset = -2147483648.0;
+    flags |= QE_SCAN_INT_BIAS;
+  }
+  U32 lo = 0;
+  U32 span = 0;
+  if (!qe_scan_int_interval(op, target, code_offset, max_code, &lo, &span))
+  {
+    flags |= QE_SCAN_INT_NEVER;
+  }
+  words[1] = (U32)type | (width << 8) | flags;
+  words[3] = lo;
+  words[4] = span;
+  words[5] = 0;
+}
+
+//~ tec: narrow columns
+// tec: a U32/I32 column with a small zone map range is held on the GPU as 1 or 2 byte offsets from its minimum, kernels add the base back
+
+internal B32 qe_column_range_from_zone_map(CQL_Column* column, F64* out_min, F64* out_max);
+
+typedef struct QE_ColumnEncoding QE_ColumnEncoding;
+struct QE_ColumnEncoding
+{
+  // tec: bytes per value as stored: 1 or 2 for a narrow column, the column's own size for one that is not
+  U32 width;
+  U32 base;
+  // tec: the column is base + row number for every row, so nothing of it is stored on the GPU. width is the column's own size so no code takes it for narrow
+  B32 sequence;
+};
+
+typedef struct QE_SequenceEntry QE_SequenceEntry;
+struct QE_SequenceEntry
+{
+  U64 column_uid;
+  U64 generation;
+  B32 is_sequence;
+};
+global QE_SequenceEntry g_qe_sequence_cache[32];
+global U32 g_qe_sequence_next = 0;
+
+typedef struct QE_SequenceTask QE_SequenceTask;
+struct QE_SequenceTask
+{
+  U32* values;
+  U32 base;
+  Rng1U64* ranges;
+  B32* ok;
+};
+
+internal THREAD_POOL_TASK_FUNC(qe_sequence_task)
+{
+  QE_SequenceTask* task = (QE_SequenceTask*)raw_task;
+  Rng1U64 range = task->ranges[task_id];
+  B32 ok = 1;
+  for (U64 row = range.min; row < range.max && ok; row++)
+  {
+    ok = task->values[row] == task->base + (U32)row;
+  }
+  task->ok[task_id] = ok;
+}
+
+// tec: true when every value is the first value plus its row number, cached until the column is written
+internal B32
+qe_column_is_sequence(CQL_Column* column)
+{
+  for (U32 index = 0; index < 32; index++)
+  {
+    if (g_qe_sequence_cache[index].column_uid == column->uid && g_qe_sequence_cache[index].generation == column->write_generation)
+    {
+      return g_qe_sequence_cache[index].is_sequence;
+    }
+  }
+
+  U32* values = (U32*)column->data;
+  B32 is_sequence = column->row_count > 0;
+  if (is_sequence)
+  {
+    U64 last_value = column->type == CQL_ColumnType_I32 ? (U64)(S64)((S64)(S32)values[0] + (S64)column->row_count - 1) : (U64)values[0] + column->row_count - 1;
+    is_sequence = column->type == CQL_ColumnType_I32 ? ((S64)last_value <= 2147483647ll) : (last_value <= 4294967295ull);
+  }
+  if (is_sequence)
+  {
+    TP_Context* pool = app_thread_pool();
+    TP_Arena* pool_arena = app_thread_pool_arena();
+    Temp scratch = scratch_begin(0, 0);
+    U64 task_count = Max((U64)1, Min((U64)pool->worker_count, column->row_count / 65536));
+    B32* task_ok = push_array(scratch.arena, B32, task_count);
+    QE_SequenceTask task = {0};
+    task.values = values;
+    task.base = values[0];
+    task.ranges = tp_divide_work(scratch.arena, column->row_count, (U32)task_count);
+    task.ok = task_ok;
+    TP_Temp temp = tp_temp_begin(pool_arena);
+    tp_for_parallel(pool, pool_arena, task_count, qe_sequence_task, &task);
+    tp_temp_end(temp);
+    for (U64 index = 0; index < task_count; index++)
+    {
+      is_sequence = is_sequence && task_ok[index];
+    }
+    scratch_end(scratch);
+  }
+
+  QE_SequenceEntry* entry = &g_qe_sequence_cache[g_qe_sequence_next % 32];
+  g_qe_sequence_next += 1;
+  entry->column_uid = column->uid;
+  entry->generation = column->write_generation;
+  entry->is_sequence = is_sequence;
+  return is_sequence;
+}
+
+// tec: allow_sequence is for the operators whose kernels can compute a value from its row number
+internal QE_ColumnEncoding
+qe_column_encoding(CQL_Column* column, B32 allow_sequence)
+{
+  QE_ColumnEncoding encoding = { (U32)column->size, 0, 0 };
+  if (settings_u64(str8_lit("QE_ENCODE"), 1) == 0 || column->row_count == 0 || !(column->type == CQL_ColumnType_U32 || column->type == CQL_ColumnType_I32) ||
+      column->is_disk_backed || column->null_flags)
+  {
+    return encoding;
+  }
+  if (allow_sequence && settings_u64(str8_lit("QE_ENCODE_SEQUENCE"), 1) != 0 && column->data && qe_column_is_sequence(column))
+  {
+    encoding.sequence = 1;
+    encoding.base = *(U32*)column->data;
+    return encoding;
+  }
+  F64 low = 0.0;
+  F64 high = 0.0;
+  if (!qe_column_range_from_zone_map(column, &low, &high))
+  {
+    return encoding;
+  }
+  if (high - low < 256.0)
+  {
+    encoding.width = 1;
+  }
+  else if (high - low < 65536.0)
+  {
+    encoding.width = 2;
+  }
+  else
+  {
+    return encoding;
+  }
+  encoding.base = (U32)(S64)low;
+  return encoding;
+}
+
+// tec: the width a kernel is told, 0 for a column that is stored as it is
+internal U32
+qe_encoding_shader_width(CQL_Column* column, QE_ColumnEncoding encoding)
+{
+  if (encoding.sequence)
+  {
+    return 3;
+  }
+  return encoding.width < column->size ? encoding.width : 0;
+}
+
+// tec: bytes of a chunk, a narrow chunk is rounded up to whole 16 byte vectors
+internal U64
+qe_chunk_bytes(CQL_Column* column, U32 width, U64 rows)
+{
+  if (width >= column->size)
+  {
+    return rows * column->size;
+  }
+  return AlignPow2(rows * width, 16);
+}
+
+typedef struct QE_EncodeTask QE_EncodeTask;
+struct QE_EncodeTask
+{
+  U32* source;
+  U8* destination;
+  U32 width;
+  U32 base;
+  Rng1U64* ranges;
+};
+
+internal THREAD_POOL_TASK_FUNC(qe_encode_task)
+{
+  QE_EncodeTask* task = (QE_EncodeTask*)raw_task;
+  Rng1U64 range = task->ranges[task_id];
+  if (task->width == 1)
+  {
+    for (U64 row = range.min; row < range.max; row++)
+    {
+      task->destination[row] = (U8)(task->source[row] - task->base);
+    }
+  }
+  else
+  {
+    U16* destination = (U16*)task->destination;
+    for (U64 row = range.min; row < range.max; row++)
+    {
+      destination[row] = (U16)(task->source[row] - task->base);
+    }
+  }
+}
+
+// tec: writes rows [start, start + rows) of a narrow column into `destination`, which has qe_chunk_bytes of room
+internal void
+qe_encode_chunk(CQL_Column* column, QE_ColumnEncoding encoding, U64 start, U64 rows, U8* destination)
 {
   ProfBeginFunction();
-  
+  TP_Context* pool = app_thread_pool();
+  TP_Arena* pool_arena = app_thread_pool_arena();
+  Temp scratch = scratch_begin(0, 0);
+  U64 task_count = Max((U64)1, Min((U64)pool->worker_count, rows / 65536));
+
+  QE_EncodeTask task = {0};
+  task.source = (U32*)(column->data + start * column->size);
+  task.destination = destination;
+  task.width = encoding.width;
+  task.base = encoding.base;
+  task.ranges = tp_divide_work(scratch.arena, rows, (U32)task_count);
+  TP_Temp temp = tp_temp_begin(pool_arena);
+  tp_for_parallel(pool, pool_arena, task_count, qe_encode_task, &task);
+  tp_temp_end(temp);
+  scratch_end(scratch);
+
+  U64 used = rows * encoding.width;
+  U64 padded = qe_chunk_bytes(column, encoding.width, rows);
+  for (U64 byte = used; byte < padded; byte++)
+  {
+    destination[byte] = 0;
+  }
+  ProfEnd();
+}
+
+//~ tec: GPU resident column chunks
+// tec: keyed by column id, write generation and row range, so a write makes all chunks of a column stale
+// tec: two queues, probation (read once) and protected (read again). room comes from probation first, most recent first, so a column bigger than the budget keeps its first chunks
+// tec: a chunk an in flight dispatch uses is pinned and never evicted
+
+#define QE_RESIDENT_MAX_ENTRIES 4096
+
+typedef struct QE_ResidentChunk QE_ResidentChunk;
+struct QE_ResidentChunk
+{
+  B32 used;
+  // tec: set once the copy into the buffer has completed, until then the entry can not be found
+  B32 ready;
+  U64 column_uid;
+  U64 generation;
+  U64 row_start;
+  U64 rows;
+  GPU_Buffer* buffer;
+  U64 bytes;
+  // tec: bytes per row as stored in the buffer, the column's own size or less when it is held narrow
+  U32 width;
+  U64 last_use;
+  U32 uses;
+  U32 pins;
+};
+
+typedef struct QE_ResidentStats QE_ResidentStats;
+struct QE_ResidentStats
+{
+  U64 hit_bytes;
+  U64 miss_bytes;
+  U64 evicted_bytes;
+  U64 bytes_in_use;
+  U64 entries;
+  U64 budget_bytes;
+};
+
+typedef struct QE_ResidentCache QE_ResidentCache;
+struct QE_ResidentCache
+{
+  QE_ResidentChunk entries[QE_RESIDENT_MAX_ENTRIES];
+  U64 tick;
+  U64 bytes_in_use;
+  U64 entry_count;
+  U64 hit_bytes;
+  U64 miss_bytes;
+  U64 evicted_bytes;
+  B32 evicting;
+};
+
+global QE_ResidentCache g_qe_resident = {0};
+
+internal U64
+qe_resident_budget(void)
+{
+  U64 percent = Min(settings_u64(str8_lit("QE_RESIDENT_BUDGET_PERCENT"), 70), (U64)100);
+  U64 budget = gpu_device_total_memory() / 100 * percent;
+  U64 override_bytes = settings_u64(str8_lit("QE_RESIDENT_BUDGET_BYTES"), 0);
+  if (override_bytes != 0)
+  {
+    budget = Min(budget, override_bytes);
+  }
+  // tec: other buffers, the driver and other processes use device memory too, so the cache never takes more than what the driver says is left
+  U64 reserve = MB(512);
+  U64 reachable = g_qe_resident.bytes_in_use + gpu_device_free_memory();
+  reachable = reachable > reserve ? reachable - reserve : 0;
+  return Min(budget, reachable);
+}
+
+internal QE_ResidentStats
+qe_resident_stats(void)
+{
+  QE_ResidentStats stats = {0};
+  stats.hit_bytes = g_qe_resident.hit_bytes;
+  stats.miss_bytes = g_qe_resident.miss_bytes;
+  stats.evicted_bytes = g_qe_resident.evicted_bytes;
+  stats.bytes_in_use = g_qe_resident.bytes_in_use;
+  stats.entries = g_qe_resident.entry_count;
+  stats.budget_bytes = qe_resident_budget();
+  return stats;
+}
+
+internal void
+qe_resident_free_entry(QE_ResidentChunk* entry)
+{
+  gpu_buffer_release(entry->buffer);
+  g_qe_resident.bytes_in_use -= Min(entry->bytes, g_qe_resident.bytes_in_use);
+  g_qe_resident.entry_count -= 1;
+  MemoryZeroStruct(entry);
+}
+
+internal QE_ResidentChunk*
+qe_resident_pick_victim(void)
+{
+  QE_ResidentChunk* probation = 0;
+  QE_ResidentChunk* protected_lru = 0;
+  for (U64 index = 0; index < QE_RESIDENT_MAX_ENTRIES; index++)
+  {
+    QE_ResidentChunk* entry = &g_qe_resident.entries[index];
+    if (!entry->used || entry->pins > 0)
+    {
+      continue;
+    }
+    if (entry->uses <= 1)
+    {
+      if (!probation || entry->last_use > probation->last_use)
+      {
+        probation = entry;
+      }
+    }
+    else if (!protected_lru || entry->last_use < protected_lru->last_use)
+    {
+      protected_lru = entry;
+    }
+  }
+  return probation ? probation : protected_lru;
+}
+
+// tec: frees chunks until `bytes_wanted` have been freed or none can be. returns the bytes freed
+internal U64
+qe_resident_evict(U64 bytes_wanted)
+{
+  if (g_qe_resident.evicting)
+  {
+    return 0;
+  }
+  g_qe_resident.evicting = 1;
+  U64 freed = 0;
+  while (freed < bytes_wanted)
+  {
+    QE_ResidentChunk* victim = qe_resident_pick_victim();
+    if (!victim)
+    {
+      break;
+    }
+    freed += victim->bytes;
+    g_qe_resident.evicted_bytes += victim->bytes;
+    qe_resident_free_entry(victim);
+  }
+  g_qe_resident.evicting = 0;
+  return freed;
+}
+
+// tec: the GPU layer calls this when an allocation does not fit, before it gives up
+internal U64
+qe_resident_evict_hook(U64 bytes_wanted)
+{
+  return qe_resident_evict(bytes_wanted);
+}
+
+internal void
+qe_resident_clear(void)
+{
+  for (U64 index = 0; index < QE_RESIDENT_MAX_ENTRIES; index++)
+  {
+    QE_ResidentChunk* entry = &g_qe_resident.entries[index];
+    if (entry->used && entry->pins == 0)
+    {
+      qe_resident_free_entry(entry);
+    }
+  }
+}
+
+// tec: returns the pinned buffer for a chunk and whether the caller must still copy the rows in. 0 when the chunk can not be held, the caller then streams
+// through its own buffer. every non zero return has to be given back with qe_resident_unpin
+internal GPU_Buffer*
+qe_resident_acquire(CQL_Column* column, U64 row_start, U64 rows, U32 width, B32* out_needs_copy, QE_ResidentChunk** out_entry)
+{
+  *out_needs_copy = 0;
+  *out_entry = 0;
+  if (settings_u64(str8_lit("QE_RESIDENT"), 1) == 0)
+  {
+    return 0;
+  }
+  g_gpu_evict_hook = qe_resident_evict_hook;
+  U64 bytes = qe_chunk_bytes(column, width, rows);
+
+  QE_ResidentChunk* free_slot = 0;
+  for (U64 index = 0; index < QE_RESIDENT_MAX_ENTRIES; index++)
+  {
+    QE_ResidentChunk* entry = &g_qe_resident.entries[index];
+    if (!entry->used)
+    {
+      if (!free_slot)
+      {
+        free_slot = entry;
+      }
+      continue;
+    }
+    if (entry->column_uid != column->uid)
+    {
+      continue;
+    }
+    if (entry->generation != column->write_generation)
+    {
+      // tec: the column has been written since, nothing in this entry can be used again
+      if (entry->pins == 0)
+      {
+        qe_resident_free_entry(entry);
+        if (!free_slot)
+        {
+          free_slot = entry;
+        }
+      }
+      continue;
+    }
+    if (entry->ready && entry->row_start == row_start && entry->rows == rows && entry->width == width)
+    {
+      g_qe_resident.tick += 1;
+      entry->last_use = g_qe_resident.tick;
+      entry->uses += 1;
+      entry->pins += 1;
+      g_qe_resident.hit_bytes += bytes;
+      *out_entry = entry;
+      return entry->buffer;
+    }
+  }
+
+  if (!free_slot || bytes == 0)
+  {
+    return 0;
+  }
+  U64 budget = qe_resident_budget();
+  if (bytes > budget)
+  {
+    return 0;
+  }
+  if (g_qe_resident.bytes_in_use + bytes > budget)
+  {
+    U64 over = g_qe_resident.bytes_in_use + bytes - budget;
+    if (qe_resident_evict(over) < over)
+    {
+      return 0;
+    }
+  }
+
+  GPU_Buffer* buffer = gpu_buffer_alloc(bytes, GPU_BufferFlag_Write | GPU_BufferFlag_Shared, 0);
+  if (!buffer)
+  {
+    return 0;
+  }
+  // tec: the allocation can have evicted entries through the hook, free_slot may be taken by none of them but it is looked up again to be sure
+  if (free_slot->used)
+  {
+    free_slot = 0;
+    for (U64 index = 0; index < QE_RESIDENT_MAX_ENTRIES && !free_slot; index++)
+    {
+      free_slot = g_qe_resident.entries[index].used ? 0 : &g_qe_resident.entries[index];
+    }
+    if (!free_slot)
+    {
+      gpu_buffer_release(buffer);
+      return 0;
+    }
+  }
+
+  g_qe_resident.tick += 1;
+  free_slot->used = 1;
+  free_slot->ready = 0;
+  free_slot->column_uid = column->uid;
+  free_slot->generation = column->write_generation;
+  free_slot->row_start = row_start;
+  free_slot->rows = rows;
+  free_slot->buffer = buffer;
+  free_slot->bytes = bytes;
+  free_slot->width = width;
+  free_slot->last_use = g_qe_resident.tick;
+  free_slot->uses = 1;
+  free_slot->pins = 1;
+  g_qe_resident.bytes_in_use += bytes;
+  g_qe_resident.entry_count += 1;
+  g_qe_resident.miss_bytes += bytes;
+  *out_needs_copy = 1;
+  *out_entry = free_slot;
+  return buffer;
+}
+
+// tec: completed says the rows are in the buffer. an entry that was never filled is freed instead of being left to be found
+internal void
+qe_resident_unpin(QE_ResidentChunk* entry, B32 completed)
+{
+  if (!entry || !entry->used)
+  {
+    return;
+  }
+  entry->pins -= Min(entry->pins, (U32)1);
+  if (completed)
+  {
+    entry->ready = 1;
+  }
+  else if (!entry->ready && entry->pins == 0)
+  {
+    qe_resident_free_entry(entry);
+  }
+}
+
+// tec: returns the buffer a chunk is read from and whether rows still need copying. a narrow column is encoded into the slot's host buffer first.
+// returns 0 if no buffer could be had
+internal GPU_Buffer*
+qe_stream_prepare_column(CQL_Column* column, QE_ColumnEncoding encoding, GPU_Buffer* sequence_filler, U64 start, U64 rows, U64 chunk_rows_max, GPU_Buffer** transient,
+                         QE_ResidentChunk** held, U8** encoded, B32* out_needs_copy, void** out_source, U64* out_bytes)
+{
+  // tec: nothing is held or copied, the kernel is bound to a buffer it does not read
+  if (encoding.sequence)
+  {
+    *out_needs_copy = 0;
+    return sequence_filler;
+  }
+  B32 narrow = encoding.width < column->size;
+  U64 bytes = qe_chunk_bytes(column, encoding.width, rows);
+  GPU_Buffer* buffer = qe_resident_acquire(column, start, rows, encoding.width, out_needs_copy, held);
+  if (!buffer)
+  {
+    if (!*transient)
+    {
+      *transient = gpu_buffer_alloc(qe_chunk_bytes(column, encoding.width, chunk_rows_max), GPU_BufferFlag_Write | GPU_BufferFlag_Shared, 0);
+    }
+    buffer = *transient;
+    *out_needs_copy = 1;
+  }
+  if (buffer && *out_needs_copy)
+  {
+    if (narrow)
+    {
+      if (!*encoded)
+      {
+        U64 capacity = qe_chunk_bytes(column, encoding.width, chunk_rows_max);
+        *encoded = (U8*)os_reserve(capacity);
+        if (!*encoded || !os_commit(*encoded, capacity))
+        {
+          return 0;
+        }
+      }
+      qe_encode_chunk(column, encoding, start, rows, *encoded);
+      *out_source = *encoded;
+    }
+    else
+    {
+      *out_source = column->data + start * column->size;
+    }
+    *out_bytes = bytes;
+  }
+  return buffer;
+}
+
+//~ tec: streamed scan for columns too big for one GPU buffer
+// tec: chunks sit on a fixed grid of QE_SCAN_STREAM_CHUNK_ROWS so queries share them, spread over QE_SCAN_STREAM_SLOTS slots
+// tec: copies overlap the kernel of the previous slot, a slot is reused after read back and results are collected in chunk order
+
+#define QE_STREAM_READBACK_PAD 64
+
+typedef struct QE_StreamSlot QE_StreamSlot;
+struct QE_StreamSlot
+{
+  // tec: the buffer each column of the chunk is read from. a resident chunk, or the slot's own transient buffer when the cache could not hold it
+  GPU_Buffer* columns[QE_MAX_COLUMN_BINDINGS];
+  GPU_Buffer* transient[QE_MAX_COLUMN_BINDINGS];
+  QE_ResidentChunk* held[QE_MAX_COLUMN_BINDINGS];
+  U8* encoded[QE_MAX_COLUMN_BINDINGS];
+  GPU_Buffer* output;
+  GPU_Buffer* counter;
+  U64 output_cap_rows;
+
+  // tec: the chunk this slot is working on, max_U64 when it is idle
+  U64 chunk_index;
+  Rng1U64 chunk_range;
+  U32 counter_words[2];
+  U32* speculative_indices;
+  U64 speculative_rows;
+};
+
+typedef struct QE_StreamedScanParams QE_StreamedScanParams;
+struct QE_StreamedScanParams
+{
+  QE_BytecodeProgram* prog;
+  GPU_Kernel* kernel;
+  GPU_Buffer* filler_buffer;
+  B32 use_simple;
+  // tec: the comparisons of a scan_simple condition, as uploaded, and how many words they are. their column types can take the narrow encoding
+  U32* simple_words;
+  U64 simple_word_count;
+  // tec: the comparisons the words were made from, in the same order
+  QE_CpuScanLeaf* simple_leaves;
+  B32 count_only;
+  Rng1U64* ranges;
+  U64 range_count;
+  U64 expected_rows;
+};
+
+typedef struct QE_StreamedScanOutput QE_StreamedScanOutput;
+struct QE_StreamedScanOutput
+{
+  QE_ResultChunk* chunks;
+  U64 total_count;
+  U64 chunk_count;
+  U32 slot_count;
+  U64 bytes_copied;
+  U64 imports_created;
+  U64 import_microseconds;
+  U64 staged_bytes;
+  B32 separate_copy_queue;
+  U64 wall_microseconds;
+  U64 resident_hit_bytes;
+  U64 resident_miss_bytes;
+};
+
+internal U64
+qe_stream_chunk_rows(void)
+{
+  return Max(settings_u64(str8_lit("QE_SCAN_STREAM_CHUNK_ROWS"), 16777216) & ~(U64)4095, (U64)4096);
+}
+
+internal B32
+qe_stream_scan_eligible(QE_BytecodeProgram* prog)
+{
+  if (prog->has_score_output || prog->binding_count == 0)
+  {
+    return 0;
+  }
+  for (U32 index = 0; index < prog->binding_count; index++)
+  {
+    QE_ColumnBinding* binding = &prog->bindings[index];
+    if (binding->type == CQL_ColumnType_String8 || binding->use_dict_codes || binding->column->is_disk_backed || binding->column->data == 0)
+    {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+internal void
+qe_stream_slot_unpin(QE_StreamSlot* slot, U32 binding_count, B32 completed)
+{
+  for (U32 index = 0; index < binding_count; index++)
+  {
+    qe_resident_unpin(slot->held[index], completed);
+    slot->held[index] = 0;
+  }
+}
+
+internal void
+qe_stream_slot_bind(QE_StreamSlot* slot, QE_StreamedScanParams* params, U64 chunk_rows)
+{
+  QE_BytecodeProgram* prog = params->prog;
+  B32 column_slot_used[QE_MAX_COLUMN_BINDINGS] = {0};
+  for (U32 index = 0; index < prog->binding_count; index++)
+  {
+    QE_ColumnBinding* binding = &prog->bindings[index];
+    gpu_kernel_set_arg_buffer(params->kernel, QE_BINDING_COLUMN_BASE + binding->first_slot, slot->columns[index]);
+    column_slot_used[binding->first_slot] = 1;
+  }
+  for (U32 column_slot = 0; column_slot < QE_MAX_COLUMN_BINDINGS; column_slot++)
+  {
+    if (!column_slot_used[column_slot])
+    {
+      gpu_kernel_set_arg_buffer(params->kernel, QE_BINDING_COLUMN_BASE + column_slot, params->filler_buffer);
+    }
+  }
+  gpu_kernel_set_arg_buffer(params->kernel, QE_BINDING_OUT_INDICES, slot->output);
+  gpu_kernel_set_arg_buffer(params->kernel, QE_BINDING_OUT_COUNT, slot->counter);
+  gpu_kernel_set_arg_u64(params->kernel, QE_PUSH_CONSTANT_ROW_COUNT, chunk_rows);
+  // tec: a column held as base + row number is read from the chunk's first row
+  gpu_kernel_set_arg_u64(params->kernel, QE_PUSH_CONSTANT_CHUNK_START, slot->chunk_range.min);
+}
+
+internal void
+qe_stream_slot_dispatch(GPU_Stream* stream, U32 slot_index, QE_StreamSlot* slot, QE_StreamedScanParams* params, U64 chunk_rows)
+{
+  qe_stream_slot_bind(slot, params, chunk_rows);
+  gpu_stream_zero(stream, slot_index, slot->counter, 2 * sizeof(U32));
+  U64 threads = params->use_simple ? (chunk_rows + QE_SIMPLE_SCAN_ROWS_PER_THREAD - 1) / QE_SIMPLE_SCAN_ROWS_PER_THREAD : chunk_rows;
+  gpu_stream_dispatch(stream, slot_index, params->kernel, (U32)threads, QE_GPU_WORKGROUP_SIZE);
+  gpu_stream_read(stream, slot_index, slot->counter, slot->counter_words, sizeof(slot->counter_words));
+  if (slot->speculative_rows > 0)
+  {
+    gpu_stream_read(stream, slot_index, slot->output, slot->speculative_indices, slot->speculative_rows * 2 * sizeof(U32));
+  }
+}
+
+// tec: waits for the slot's chunk and turns its matches into a result chunk. returns 0 if the chunk could not be completed
+internal B32
+qe_stream_slot_retire(Arena* arena, GPU_Stream* stream, U32 slot_index, QE_StreamSlot* slot, QE_StreamedScanParams* params, QE_StreamedScanOutput* output, QE_ResultChunk*** tail)
+{
+  if (slot->chunk_index == max_U64)
+  {
+    return 1;
+  }
+  U32 binding_count = params->prog->binding_count;
+  U64 chunk_rows = slot->chunk_range.max - slot->chunk_range.min;
+  if (!gpu_stream_wait(stream, slot_index))
+  {
+    return 0;
+  }
+  U64 count = slot->counter_words[0];
+
+  if (params->count_only)
+  {
+    output->total_count += count;
+    qe_stream_slot_unpin(slot, binding_count, 1);
+    slot->chunk_index = max_U64;
+    return 1;
+  }
+
+  // tec: the chunk's columns are still in the slot, so a result that did not fit is a second dispatch and no second copy
+  if (count > slot->output_cap_rows)
+  {
+    gpu_buffer_release(slot->output);
+    slot->output_cap_rows = count;
+    slot->output = gpu_buffer_alloc(slot->output_cap_rows * 2 * sizeof(U32), GPU_BufferFlag_Read, 0);
+    if (!slot->output)
+    {
+      return 0;
+    }
+    slot->speculative_rows = Min(slot->speculative_rows, slot->output_cap_rows);
+    if (!gpu_stream_slot_begin(stream, slot_index, 0, QE_STREAM_READBACK_PAD + sizeof(slot->counter_words) + slot->speculative_rows * 2 * sizeof(U32)))
+    {
+      return 0;
+    }
+    qe_stream_slot_dispatch(stream, slot_index, slot, params, chunk_rows);
+    if (!gpu_stream_submit(stream, slot_index) || !gpu_stream_wait(stream, slot_index))
+    {
+      return 0;
+    }
+    count = slot->counter_words[0];
+  }
+
+  if (count != 0)
+  {
+    U32* raw_indices = slot->speculative_indices;
+    if (count > slot->speculative_rows)
+    {
+      raw_indices = push_array(arena, U32, count * 2);
+      gpu_buffer_read(slot->output, raw_indices, count * 2 * sizeof(U32));
+    }
+    U64* indices = push_array(arena, U64, count);
+    for (U64 index = 0; index < count; index++)
+    {
+      indices[index] = slot->chunk_range.min + raw_indices[index * 2];
+    }
+    QE_ResultChunk* result_chunk = push_array(arena, QE_ResultChunk, 1);
+    result_chunk->indices = indices;
+    result_chunk->count = count;
+    **tail = result_chunk;
+    *tail = &result_chunk->next;
+    output->total_count += count;
+  }
+  qe_stream_slot_unpin(slot, binding_count, 1);
+  slot->chunk_index = max_U64;
+  return 1;
+}
+
+// tec: returns 0 without touching the output chunks if the scan cannot be streamed, or a GPU allocation failed. the caller then scans on the CPU
+internal B32
+qe_scan_filter_streamed(Arena* arena, QE_StreamedScanParams* params, QE_StreamedScanOutput* output)
+{
+  ProfBeginFunction();
+  QE_BytecodeProgram* prog = params->prog;
+  MemoryZeroStruct(output);
+  if (!qe_stream_scan_eligible(prog))
+  {
+    ProfEnd();
+    return 0;
+  }
+
+  U64 slot_count = Clamp(2, settings_u64(str8_lit("QE_SCAN_STREAM_SLOTS"), 3), 8);
+  U64 chunk_rows_max = qe_stream_chunk_rows();
+
+  // tec: ranges are cut at the grid, so a range that covers whole cells yields chunks that line up with the cache
+  U64 chunk_count = 0;
+  for (U64 range_index = 0; range_index < params->range_count; range_index++)
+  {
+    Rng1U64 range = params->ranges[range_index];
+    for (U64 start = range.min; start < range.max; start = (start / chunk_rows_max + 1) * chunk_rows_max)
+    {
+      chunk_count += 1;
+    }
+  }
+  Rng1U64* chunks = push_array(arena, Rng1U64, Max(chunk_count, (U64)1));
+  {
+    U64 next = 0;
+    for (U64 range_index = 0; range_index < params->range_count; range_index++)
+    {
+      Rng1U64 range = params->ranges[range_index];
+      for (U64 start = range.min; start < range.max; start = (start / chunk_rows_max + 1) * chunk_rows_max)
+      {
+        chunks[next++] = r1u64(start, Min((start / chunk_rows_max + 1) * chunk_rows_max, range.max));
+      }
+    }
+  }
+  slot_count = Min(slot_count, Max(chunk_count, (U64)1));
+
+  U64 default_cap_rows = params->count_only ? 1 : Max(settings_u64(str8_lit("QE_SCAN_OUTPUT_DEFAULT_CAP_ROWS"), 65536), chunk_rows_max / 32);
+  U64 output_cap_rows = Max(Min(chunk_rows_max, default_cap_rows), (U64)1);
+  U64 speculative_rows = params->count_only ? 0 : Min(settings_u64(str8_lit("QE_SCAN_SPECULATIVE_ROWS"), 4096), output_cap_rows);
+
+  // tec: which columns are held narrow. only the scan_simple kernel reads them, and it is told in the comparisons it was uploaded with
+  QE_ColumnEncoding encodings[QE_MAX_COLUMN_BINDINGS];
+  B32 any_narrow = 0;
+  for (U32 index = 0; index < prog->binding_count; index++)
+  {
+    CQL_Column* column = prog->bindings[index].column;
+    encodings[index] = params->use_simple && params->simple_words ? qe_column_encoding(column, 1) : (QE_ColumnEncoding){ (U32)column->size, 0, 0 };
+    any_narrow = any_narrow || encodings[index].width < column->size || encodings[index].sequence;
+  }
+  U32* encoded_words = 0;
+  if (any_narrow)
+  {
+    encoded_words = push_array(arena, U32, params->simple_word_count);
+    MemoryCopy(encoded_words, params->simple_words, params->simple_word_count * sizeof(U32));
+    for (U32 leaf = 0; leaf < params->simple_words[0]; leaf++)
+    {
+      for (U32 index = 0; index < prog->binding_count; index++)
+      {
+        CQL_Column* column = prog->bindings[index].column;
+        if (prog->bindings[index].first_slot == params->simple_words[1 + leaf * 6] && (encodings[index].width < column->size || encodings[index].sequence))
+        {
+          if (encodings[index].sequence && !(params->simple_words[1 + leaf * 6 + 1] & QE_SCAN_INT_FLAG))
+          {
+            continue;
+          }
+          if (params->simple_words[1 + leaf * 6 + 1] & QE_SCAN_INT_FLAG)
+          {
+            qe_scan_int_leaf_words(&encoded_words[1 + leaf * 6], column->type, params->simple_leaves[leaf].op, params->simple_leaves[leaf].target,
+                                   qe_encoding_shader_width(column, encodings[index]), encodings[index].base);
+          }
+          else
+          {
+            encoded_words[1 + leaf * 6 + 1] |= qe_encoding_shader_width(column, encodings[index]) << 8;
+            encoded_words[1 + leaf * 6 + 5] = encodings[index].base;
+          }
+        }
+      }
+    }
+    gpu_buffer_write(params->filler_buffer, encoded_words, params->simple_word_count * sizeof(U32));
+  }
+
+  QE_ResidentStats resident_before = qe_resident_stats();
+  GPU_Stream* stream = gpu_stream_alloc((U32)slot_count);
+  QE_StreamSlot* slots = push_array(arena, QE_StreamSlot, slot_count);
+  B32 ok = stream != 0;
+  for (U64 slot_index = 0; slot_index < slot_count && ok; slot_index++)
+  {
+    QE_StreamSlot* slot = &slots[slot_index];
+    slot->chunk_index = max_U64;
+    slot->output_cap_rows = output_cap_rows;
+    slot->speculative_rows = speculative_rows;
+    slot->speculative_indices = push_array(arena, U32, Max(speculative_rows, (U64)1) * 2);
+    slot->output = gpu_buffer_alloc(output_cap_rows * 2 * sizeof(U32), GPU_BufferFlag_Read, 0);
+    slot->counter = gpu_buffer_alloc(2 * sizeof(U32), GPU_BufferFlag_ReadWrite, 0);
+    ok = slot->output != 0 && slot->counter != 0;
+  }
+
+  QE_ResultChunk* result_chunks = 0;
+  QE_ResultChunk** tail = &result_chunks;
+  U32 deferred_slot = max_U32;
+  U64 start_time = os_now_microseconds();
+
+  for (U64 chunk_index = 0; chunk_index < chunk_count && ok; chunk_index++)
+  {
+    U32 slot_index = (U32)(chunk_index % slot_count);
+    QE_StreamSlot* slot = &slots[slot_index];
+    Rng1U64 range = chunks[chunk_index];
+    U64 chunk_rows = range.max - range.min;
+
+    ok = qe_stream_slot_retire(arena, stream, slot_index, slot, params, output, &tail);
+    if (!ok)
+    {
+      break;
+    }
+
+    // tec: a column of the chunk is either resident already, or put in a resident buffer by a copy, or copied into a buffer of the slot's own
+    B32 needs_copy[QE_MAX_COLUMN_BINDINGS] = {0};
+    void* source[QE_MAX_COLUMN_BINDINGS] = {0};
+    U64 source_bytes[QE_MAX_COLUMN_BINDINGS] = {0};
+    U64 upload_bytes = 0;
+    for (U32 index = 0; index < prog->binding_count && ok; index++)
+    {
+      CQL_Column* column = prog->bindings[index].column;
+      slot->columns[index] = qe_stream_prepare_column(column, encodings[index], params->filler_buffer, range.min, chunk_rows, chunk_rows_max, &slot->transient[index], &slot->held[index],
+                                                       &slot->encoded[index], &needs_copy[index], &source[index], &source_bytes[index]);
+      ok = slot->columns[index] != 0;
+      if (ok && needs_copy[index])
+      {
+        upload_bytes += source_bytes[index];
+      }
+    }
+    if (!ok)
+    {
+      break;
+    }
+
+    ok = gpu_stream_slot_begin(stream, slot_index, upload_bytes, QE_STREAM_READBACK_PAD + sizeof(slot->counter_words) + slot->speculative_rows * 2 * sizeof(U32));
+    for (U32 index = 0; index < prog->binding_count && ok; index++)
+    {
+      if (needs_copy[index])
+      {
+        ok = gpu_stream_copy(stream, slot_index, slot->columns[index], source[index], source_bytes[index]);
+      }
+    }
+    if (!ok)
+    {
+      break;
+    }
+
+    slot->chunk_index = chunk_index;
+    slot->chunk_range = range;
+    qe_stream_slot_dispatch(stream, slot_index, slot, params, chunk_rows);
+
+// tec: submitting one chunk late lets this chunk's imports run while the previous one is on the GPU
+    if (deferred_slot != max_U32)
+    {
+      ok = gpu_stream_submit(stream, deferred_slot);
+    }
+    deferred_slot = slot_index;
+  }
+  if (deferred_slot != max_U32 && ok)
+  {
+    ok = gpu_stream_submit(stream, deferred_slot);
+  }
+
+  // tec: the slots finish in chunk order, starting with the one that was submitted longest ago
+  for (U64 offset = 0; offset < slot_count; offset++)
+  {
+    U32 slot_index = (U32)((chunk_count + offset) % slot_count);
+    if (ok)
+    {
+      ok = qe_stream_slot_retire(arena, stream, slot_index, &slots[slot_index], params, output, &tail);
+    }
+    else
+    {
+      gpu_stream_wait(stream, slot_index);
+    }
+  }
+  output->wall_microseconds = os_now_microseconds() - start_time;
+
+  if (stream)
+  {
+    GPU_StreamStats stats = gpu_stream_get_stats(stream);
+    output->bytes_copied = stats.bytes_copied;
+    output->imports_created = stats.imports_created;
+    output->import_microseconds = stats.import_microseconds;
+    output->staged_bytes = stats.staged_bytes;
+    output->separate_copy_queue = stats.separate_copy_queue;
+    gpu_stream_release(stream);
+  }
+  for (U64 slot_index = 0; slot_index < slot_count; slot_index++)
+  {
+    // tec: anything still held here belongs to a chunk that did not complete
+    qe_stream_slot_unpin(&slots[slot_index], prog->binding_count, 0);
+    for (U32 index = 0; index < prog->binding_count; index++)
+    {
+      gpu_buffer_release(slots[slot_index].transient[index]);
+      if (slots[slot_index].encoded[index])
+      {
+        os_release(slots[slot_index].encoded[index], qe_chunk_bytes(prog->bindings[index].column, encodings[index].width, chunk_rows_max));
+      }
+    }
+    gpu_buffer_release(slots[slot_index].output);
+    gpu_buffer_release(slots[slot_index].counter);
+  }
+
+  // tec: whatever runs next on this program, the fallback scan after a failure, reads the comparisons as they were
+  if (any_narrow)
+  {
+    gpu_buffer_write(params->filler_buffer, params->simple_words, params->simple_word_count * sizeof(U32));
+  }
+
+  QE_ResidentStats resident_after = qe_resident_stats();
+  output->resident_hit_bytes = resident_after.hit_bytes - resident_before.hit_bytes;
+  output->resident_miss_bytes = resident_after.miss_bytes - resident_before.miss_bytes;
+
+  if (!ok)
+  {
+    log_error("qe_scan_filter_streamed: the streamed scan failed, the scan will run on the CPU instead");
+    MemoryZeroStruct(output);
+    ProfEnd();
+    return 0;
+  }
+  output->chunks = result_chunks;
+  output->chunk_count = chunk_count;
+  output->slot_count = (U32)slot_count;
+  ProfEnd();
+  return 1;
+}
+
+// tec: when out_selection is given and the scan is a single dispatch, the selected rows stay on the GPU and result.indices stays empty
+internal QE_ScanResult
+qe_scan_filter_selected(Arena* arena, CQL_Database* database, CQL_Table* table, IR_Node* where_clause, QE_ScanTrace* out_trace, QE_DeviceSelection* out_selection, U64 expected_rows)
+{
+  ProfBeginFunction();
+
+  B32 count_only = out_selection && out_selection->count_only_requested;
   if (out_selection)
   {
     MemoryZeroStruct(out_selection);
+    out_selection->count_only_requested = count_only;
   }
   QE_ScanResult result = {0};
   
@@ -829,26 +2218,86 @@ qe_scan_filter_selected(Arena* arena, GDB_Database* database, GDB_Table* table, 
     return qe_cpu_scan_filter(arena, table, where_clause, out_trace);
   }
   
-  GPU_Kernel* kernel = gpu_kernel_alloc(str8_lit("scan_filter"));
+// tec: numeric comparisons joined by AND run on scan_simple.comp, they go where the bytecode would, 6 words each behind a count
+  U32 simple_words[1 + QE_SIMPLE_SCAN_MAX_LEAVES * 6] = {0};
+  QE_CpuScanLeaf simple_leaves[QE_CPU_SCAN_MAX_LEAVES] = {0};
+  B32 use_simple = 0;
+  if (!prog->has_score_output && settings_u64(str8_lit("QE_SCAN_SIMPLE_KERNEL"), 1) != 0)
+  {
+    U32 simple_count = 0;
+    if (qe_cpu_scan_collect_leaves(table, where_clause, simple_leaves, &simple_count) && simple_count <= QE_SIMPLE_SCAN_MAX_LEAVES)
+    {
+      use_simple = 1;
+      simple_words[0] = simple_count;
+      for (U32 l = 0; l < simple_count && use_simple; l++)
+      {
+        QE_CpuScanLeaf* leaf = &simple_leaves[l];
+        CQL_ColumnType type = leaf->column->type;
+        B32 shader_type = type == CQL_ColumnType_U32 || type == CQL_ColumnType_I32 || type == CQL_ColumnType_F32 || type == CQL_ColumnType_F64;
+
+        QE_ColumnBinding* binding = 0;
+        for (U32 b = 0; b < prog->binding_count; b++)
+        {
+          if (prog->bindings[b].column == leaf->column)
+          {
+            binding = &prog->bindings[b];
+            break;
+          }
+        }
+        if (!shader_type || !binding || binding->use_dict_codes || binding->type != type || leaf->column->is_disk_backed ||
+            g_cql_state->zonemap_chunk_rows < QE_SIMPLE_SCAN_ROWS_PER_THREAD)
+        {
+          use_simple = 0;
+          break;
+        }
+
+        U64 target_bits = 0;
+        MemoryCopy(&target_bits, &leaf->target, sizeof(target_bits));
+        simple_words[1 + l * 6 + 0] = binding->first_slot;
+        simple_words[1 + l * 6 + 1] = (U32)type;
+        simple_words[1 + l * 6 + 2] = leaf->op;
+        simple_words[1 + l * 6 + 3] = (U32)(target_bits & 0xffffffffull);
+        simple_words[1 + l * 6 + 4] = (U32)(target_bits >> 32);
+        if ((type == CQL_ColumnType_U32 || type == CQL_ColumnType_I32) && settings_u64(str8_lit("QE_SCAN_INT_COMPARE"), 1) != 0)
+        {
+          qe_scan_int_leaf_words(&simple_words[1 + l * 6], type, leaf->op, leaf->target, 0, 0);
+        }
+      }
+    }
+  }
+
+  GPU_Kernel* kernel = use_simple ? gpu_kernel_alloc(str8_lit("scan_simple")) : 0;
+  if (!kernel)
+  {
+    use_simple = 0;
+    kernel = gpu_kernel_alloc(str8_lit("scan_filter"));
+  }
   if (!kernel)
   {
     log_error("qe_scan_filter: failed to alloc 'scan_filter' kernel");
     ProfEnd();
     return result;
   }
+  if (out_trace && use_simple)
+  {
+    out_trace->strategy_reason = str8_lit("numeric comparisons only, scan_simple kernel");
+  }
+
+  U32* program_words = use_simple ? simple_words : prog->words;
+  U64 program_word_count = use_simple ? (1 + (U64)simple_words[0] * 6) : prog->word_count;
   
   //- tec: upload the (query invariant) bytecode + constant pool buffers
-  GPU_Buffer* bytecode_buffer = gpu_buffer_alloc_pooled(str8_lit("scan_filter_bytecode"), Max(prog->word_count, 1) * sizeof(U32), GPU_BufferFlag_Write, 0);
+  GPU_Buffer* bytecode_buffer = gpu_buffer_alloc_pooled(str8_lit("scan_filter_bytecode"), Max(program_word_count, (U64)1) * sizeof(U32), GPU_BufferFlag_Write, 0);
   GPU_Buffer* num_consts_buffer = gpu_buffer_alloc_pooled(str8_lit("scan_filter_num_consts"), Max(prog->const_count * 2, 1) * sizeof(U32), GPU_BufferFlag_Write, 0);
   GPU_Buffer* str_consts_buffer = gpu_buffer_alloc_pooled(str8_lit("scan_filter_str_consts"), Max(prog->str_const_pool_size, 4), GPU_BufferFlag_Write, 0);
   
   {
-    U64 word_bytes = prog->word_count * sizeof(U32);
+    U64 word_bytes = program_word_count * sizeof(U32);
     U64 num_consts_bytes = prog->const_count * 2 * sizeof(U32);
     U64 str_bytes = prog->str_const_pool_size;
     
     GPU_Batch* prog_batch = gpu_batch_begin(word_bytes + num_consts_bytes + str_bytes, 0);
-    gpu_batch_buffer_write(prog_batch, bytecode_buffer, prog->words, word_bytes);
+    gpu_batch_buffer_write(prog_batch, bytecode_buffer, program_words, word_bytes);
     if (prog->const_count > 0)
     {
       gpu_batch_buffer_write(prog_batch, num_consts_buffer, prog->consts, num_consts_bytes);
@@ -875,7 +2324,7 @@ qe_scan_filter_selected(Arena* arena, GDB_Database* database, GDB_Table* table, 
   U64 largest_column_size = 0;
   for (U32 i = 0; i < prog->binding_count; i++)
   {
-    largest_column_size = Max(gdb_column_get_total_size(prog->bindings[i].column), largest_column_size);
+    largest_column_size = Max(cql_column_get_total_size(prog->bindings[i].column), largest_column_size);
   }
   
   U64 gpu_kernel_execution_time = 0;
@@ -896,7 +2345,7 @@ qe_scan_filter_selected(Arena* arena, GDB_Database* database, GDB_Table* table, 
     U64 row_size = 0;
     for (U32 i = 0; i < prog->binding_count; i++)
     {
-      row_size += table->row_count ? (gdb_column_get_total_size(prog->bindings[i].column) / table->row_count) : 0;
+      row_size += table->row_count ? (cql_column_get_total_size(prog->bindings[i].column) / table->row_count) : 0;
     }
     if (row_size == 0) row_size = 1;
     
@@ -905,12 +2354,26 @@ qe_scan_filter_selected(Arena* arena, GDB_Database* database, GDB_Table* table, 
   }
   if (rows_per_chunk == 0) rows_per_chunk = 1; // tec: table->row_count == 0 case
   
-  // tec: zone map pruning may skip some of these ranges' wroth of rows completely and merge the rest into
-  // fewer, differently sized dispatches. fall back to chunk_index*rows_per_chunk if no leaf of the where clause is prunable
+// tec: zone map pruning can skip ranges and merge the rest into fewer dispatches, otherwise chunk_index * rows_per_chunk
   U64 chunk_count = 0;
   U64 pruned_rows = 0;
   String8 pruned_column_name = {0};
-  Rng1U64* dispatch_ranges = qe_scan_build_dispatch_ranges(arena, table, where_clause, rows_per_chunk, &chunk_count, &pruned_rows, &pruned_column_name);
+  U32* skip_bits = 0;
+  Rng1U64* dispatch_ranges = qe_scan_build_dispatch_ranges(arena, table, where_clause, rows_per_chunk, &chunk_count, &pruned_rows, &pruned_column_name, &skip_bits);
+  
+  // tec: the kernel always has something bound at the skip binding, the bitmap only counts when push constant slot 4 is set
+  GPU_Buffer* skip_buffer = bytecode_buffer;
+  if (skip_bits)
+  {
+    U64 skip_words = (((table->row_count + g_cql_state->zonemap_chunk_rows - 1) >> g_cql_state->zonemap_chunk_rows_log2) + 31) / 32;
+    skip_buffer = gpu_buffer_alloc_pooled(str8_lit("scan_filter_skip"), Max(skip_words, (U64)1) * sizeof(U32), GPU_BufferFlag_Write, 0);
+    GPU_Batch* skip_batch = gpu_batch_begin(skip_words * sizeof(U32), 0);
+    gpu_batch_buffer_write(skip_batch, skip_buffer, skip_bits, skip_words * sizeof(U32));
+    gpu_batch_end(skip_batch);
+  }
+  gpu_kernel_set_arg_buffer(kernel, QE_BINDING_SKIP, skip_buffer);
+  gpu_kernel_set_arg_u64(kernel, QE_PUSH_CONSTANT_SKIP_SHIFT, g_cql_state->zonemap_chunk_rows_log2);
+  gpu_kernel_set_arg_u64(kernel, QE_PUSH_CONSTANT_SKIP_ENABLED, skip_bits ? 1 : 0);
   if (pruned_rows > 0)
   {
     log_debug("qe_scan_filter: zone-map pruning skipped %llu of %llu rows, %llu dispatch range(s) remain",
@@ -926,11 +2389,96 @@ qe_scan_filter_selected(Arena* arena, GDB_Database* database, GDB_Table* table, 
   }
   
   B32 keep_on_device = out_selection && chunk_count == 1 && !prog->has_score_output;
+
+  // tec: columns too big for one GPU buffer are streamed through a few slots, the copy of one chunk overlapping the kernel on the one before it
+  B32 streamed = 0;
+  QE_StreamedScanOutput streamed_output = {0};
+  if (needs_chunking && !keep_on_device && settings_u64(str8_lit("QE_SCAN_STREAM"), 1) != 0)
+  {
+    // tec: the zone map bitmap is indexed from the start of the table and a streamed chunk starts at its own row 0, pruning is done by the ranges only
+    gpu_kernel_set_arg_u64(kernel, QE_PUSH_CONSTANT_SKIP_ENABLED, 0);
+    QE_StreamedScanParams stream_params = {0};
+    stream_params.prog = prog;
+    stream_params.kernel = kernel;
+    stream_params.filler_buffer = bytecode_buffer;
+    stream_params.use_simple = use_simple;
+    stream_params.simple_words = use_simple ? simple_words : 0;
+    stream_params.simple_leaves = simple_leaves;
+    stream_params.simple_word_count = 1 + (U64)simple_words[0] * 6;
+    stream_params.count_only = count_only;
+    stream_params.ranges = dispatch_ranges;
+    stream_params.range_count = chunk_count;
+    stream_params.expected_rows = expected_rows;
+    streamed = qe_scan_filter_streamed(arena, &stream_params, &streamed_output);
+    if (streamed)
+    {
+      result_chunks = streamed_output.chunks;
+      if (out_trace)
+      {
+        out_trace->strategy = QE_TraceStrategy_GpuScan;
+        out_trace->strategy_reason = push_str8f(arena, "columns too big for one GPU buffer, streamed in %llu chunks through %u slots%s",
+                                                streamed_output.chunk_count, streamed_output.slot_count,
+                                                streamed_output.separate_copy_queue ? " with a separate copy queue" : "");
+        out_trace->chunk_count = streamed_output.chunk_count;
+        out_trace->submit_wait_time_us = streamed_output.wall_microseconds;
+        out_trace->stream_slot_count = streamed_output.slot_count;
+        out_trace->stream_bytes_copied = streamed_output.bytes_copied;
+        out_trace->stream_staged_bytes = streamed_output.staged_bytes;
+        out_trace->stream_imports = streamed_output.imports_created;
+        out_trace->stream_import_time_us = streamed_output.import_microseconds;
+        out_trace->stream_separate_copy_queue = streamed_output.separate_copy_queue;
+        out_trace->stream_resident_hit_bytes = streamed_output.resident_hit_bytes;
+        out_trace->stream_resident_miss_bytes = streamed_output.resident_miss_bytes;
+        out_trace->rows_after = streamed_output.total_count;
+      }
+      log_debug("qe_scan_filter: streamed %llu chunks, %llu MB copied (%llu staged), %llu imports in %llu microseconds, wall %llu microseconds",
+                streamed_output.chunk_count, streamed_output.bytes_copied / MB(1), streamed_output.staged_bytes, streamed_output.imports_created,
+                streamed_output.import_microseconds, streamed_output.wall_microseconds);
+      if (count_only)
+      {
+        gpu_kernel_release(kernel);
+        out_selection->count = streamed_output.total_count;
+        out_selection->count_only_done = 1;
+        QE_ScanResult counted = {0};
+        counted.count = streamed_output.total_count;
+        ProfEnd();
+        return counted;
+      }
+    }
+    else
+    {
+      gpu_kernel_set_arg_u64(kernel, QE_PUSH_CONSTANT_SKIP_ENABLED, skip_bits ? 1 : 0);
+    }
+  }
+
+  // tec: columns too big for one GPU buffer would be uploaded again on every run, a simple condition is cheaper to scan on the CPU
+  if (!streamed && needs_chunking && !prog->has_score_output && settings_u64(str8_lit("QE_SCAN_CHUNKED_CPU"), 1) != 0)
+  {
+    QE_ScanResult cpu_result = {0};
+    if (qe_scan_filter_chunked_cpu(arena, table, where_clause, dispatch_ranges, chunk_count, count_only, &cpu_result))
+    {
+      gpu_kernel_release(kernel);
+      if (count_only)
+      {
+        out_selection->count = cpu_result.count;
+        out_selection->count_only_done = 1;
+      }
+      if (out_trace)
+      {
+        out_trace->strategy = QE_TraceStrategy_CpuScan;
+        out_trace->strategy_reason = str8_lit("columns too big for one GPU buffer, scanned in chunks on the CPU");
+        out_trace->rows_after = cpu_result.count;
+      }
+      ProfEnd();
+      return cpu_result;
+    }
+  }
+
   
   // tec: only worth a background thread + two extra arenas when there's a next chunk to hide IO for the common single-chunk case
-  QE_PrefetchCtx* prefetch = (chunk_count > 1) ? qe_prefetch_start(arena, prog) : 0;
+  QE_PrefetchCtx* prefetch = (!streamed && chunk_count > 1) ? qe_prefetch_start(arena, prog) : 0;
   
-  for (U64 chunk_index = 0; chunk_index < chunk_count; chunk_index++)
+  for (U64 chunk_index = 0; !streamed && chunk_index < chunk_count; chunk_index++)
   {
     Temp fallback_arena = {0};
     B32 using_prefetch = (prefetch != 0);
@@ -956,8 +2504,7 @@ qe_scan_filter_selected(Arena* arena, GDB_Database* database, GDB_Table* table, 
       }
       else
       {
-        // tec: this chunk's read was kicked off during the previous chunk's dispatch below
-        // usually already done by now, so this should stall near zero if IO is well hidden
+// tec: this chunk's read was started during the previous chunk's dispatch
         U64 wait_start = os_now_microseconds();
         slot = qe_prefetch_wait(prefetch, (U32)(chunk_index % 2));
         prefetch_stall_time += os_now_microseconds() - wait_start;
@@ -1023,7 +2570,7 @@ qe_scan_filter_selected(Arena* arena, GDB_Database* database, GDB_Table* table, 
           log_error("qe_scan_filter: failed to load dictionary codes for column '%.*s'", str8_varg(binding->name));
         }
       }
-      else if (binding->type == GDB_ColumnType_String8)
+      else if (binding->type == CQL_ColumnType_String8)
       {
         if (in->cached)
         {
@@ -1071,7 +2618,7 @@ qe_scan_filter_selected(Arena* arena, GDB_Database* database, GDB_Table* table, 
           }
           
           // tec: safe to close now, the data's already been copied into the GPU buffer above
-          gdb_column_close_string_chunk(binding->column);
+          cql_column_close_string_chunk(binding->column);
         }
         else
         {
@@ -1122,8 +2669,9 @@ qe_scan_filter_selected(Arena* arena, GDB_Database* database, GDB_Table* table, 
       }
     }
     
-    // tec: sized to a default cap rather than chunk_rows
-    U64 output_cap_rows = Max(Min(chunk_rows, settings_u64(str8_lit("QE_SCAN_OUTPUT_DEFAULT_CAP_ROWS"), 65536)), 1);
+// tec: sized to a default cap, at least a share of the chunk's rows so a result up to 3% of them needs no second scan
+    U64 default_cap_rows = Max(settings_u64(str8_lit("QE_SCAN_OUTPUT_DEFAULT_CAP_ROWS"), 65536), chunk_rows / Max(settings_u64(str8_lit("QE_SCAN_OUTPUT_CAP_DIVISOR"), 32), (U64)1));
+    U64 output_cap_rows = Max(Min(chunk_rows, default_cap_rows), 1);
     // tec: a result the optimizer expects to be large gets its buffer up front, saving the second dispatch
     if (expected_rows > output_cap_rows)
     {
@@ -1138,8 +2686,7 @@ qe_scan_filter_selected(Arena* arena, GDB_Database* database, GDB_Table* table, 
     gpu_kernel_set_arg_buffer(kernel, QE_BINDING_OUT_COUNT, result_counter_buffer);
     gpu_kernel_set_arg_u64(kernel, QE_PUSH_CONSTANT_ROW_COUNT, chunk_rows);
     
-    // tec: this chunk's columns are now fully read+uploaded+closed
-    // so its safe to kick off the next chunk's read in the background
+// tec: the chunk's columns are uploaded and closed, start reading the next chunk
     if (using_prefetch && chunk_index + 1 < chunk_count)
     {
       Rng1U64 next_range = dispatch_ranges[chunk_index + 1];
@@ -1166,7 +2713,8 @@ qe_scan_filter_selected(Arena* arena, GDB_Database* database, GDB_Table* table, 
       U64 submit_wait_start = os_now_microseconds();
       GPU_Batch* dispatch_batch = gpu_batch_begin(0, sizeof(result_count32) + speculative_rows * 2 * sizeof(U32));
       gpu_batch_buffer_zero(dispatch_batch, result_counter_buffer, 2 * sizeof(U32));
-      gpu_batch_kernel_execute(dispatch_batch, kernel, (U32)chunk_rows, QE_GPU_WORKGROUP_SIZE);
+      U64 dispatch_threads = use_simple ? (chunk_rows + QE_SIMPLE_SCAN_ROWS_PER_THREAD - 1) / QE_SIMPLE_SCAN_ROWS_PER_THREAD : chunk_rows;
+      gpu_batch_kernel_execute(dispatch_batch, kernel, (U32)dispatch_threads, QE_GPU_WORKGROUP_SIZE);
       gpu_batch_buffer_read(dispatch_batch, result_counter_buffer, result_count32, sizeof(result_count32));
       if (speculative_rows > 0)
       {
@@ -1356,7 +2904,7 @@ qe_column_list_item_display_name(Arena* arena, IR_Node* item)
 
 //~ tec: multi-table column qualifier resolution
 
-internal GDB_Table*
+internal CQL_Table*
 qe_resolve_column_table(PLAN_RowSet* rows, String8 column_name, String8* out_bare_name, U64* out_slot)
 {
   String8 qualifier = {0};
@@ -1400,11 +2948,11 @@ qe_resolve_column_table(PLAN_RowSet* rows, String8 column_name, String8* out_bar
     return NULL;
   }
   
-  GDB_Table* found = NULL;
+  CQL_Table* found = NULL;
   U64 found_slot = max_U64;
   for (U64 t = 0; t < rows->table_count; t++)
   {
-    if (gdb_table_find_column(rows->tables[t], bare_name))
+    if (cql_table_find_column(rows->tables[t], bare_name))
     {
       if (found)
       {
@@ -1429,17 +2977,17 @@ qe_resolve_column_table(PLAN_RowSet* rows, String8 column_name, String8* out_bar
 
 //~ tec: dense per-output-row column gather 
 internal F64
-qe_read_numeric_as_f64(GDB_Column* column, U64 row_index)
+qe_read_numeric_as_f64(CQL_Column* column, U64 row_index)
 {
-  void* data = gdb_column_get_data(column, row_index);
+  void* data = cql_column_get_data(column, row_index);
   if (!data) return 0.0;
-  return gdb_numeric_value_as_f64(column->type, data);
+  return cql_numeric_value_as_f64(column->type, data);
 }
 
 internal B32
-qe_resolve_date_literal_value(GDB_ColumnType col_type, IR_Node* literal_node, F64* out_value)
+qe_resolve_date_literal_value(CQL_ColumnType col_type, IR_Node* literal_node, F64* out_value)
 {
-  if (col_type == GDB_ColumnType_Date)
+  if (col_type == CQL_ColumnType_Date)
   {
     S32 days = 0;
     if (!parse_iso_date(literal_node->value, &days))
@@ -1450,7 +2998,7 @@ qe_resolve_date_literal_value(GDB_ColumnType col_type, IR_Node* literal_node, F6
     *out_value = (F64)days;
     return 1;
   }
-  if (col_type == GDB_ColumnType_Timestamp)
+  if (col_type == CQL_ColumnType_Timestamp)
   {
     S64 seconds = 0;
     if (!parse_iso_timestamp(literal_node->value, &seconds))
@@ -1465,9 +3013,9 @@ qe_resolve_date_literal_value(GDB_ColumnType col_type, IR_Node* literal_node, F6
 }
 
 internal B32
-qe_resolve_decimal_literal_value(GDB_Column* column, IR_Node* literal_node, F64* out_value)
+qe_resolve_decimal_literal_value(CQL_Column* column, IR_Node* literal_node, F64* out_value)
 {
-  if (column->type != GDB_ColumnType_Decimal)
+  if (column->type != CQL_ColumnType_Decimal)
   {
     return 0;
   }
@@ -1483,15 +3031,15 @@ qe_resolve_decimal_literal_value(GDB_Column* column, IR_Node* literal_node, F64*
 }
 
 internal B32
-qe_resolve_enum_literal_value(GDB_Column* column, IR_Node* literal_node, F64* out_value)
+qe_resolve_enum_literal_value(CQL_Column* column, IR_Node* literal_node, F64* out_value)
 {
-  if (column->type != GDB_ColumnType_Enum || !column->enum_type)
+  if (column->type != CQL_ColumnType_Enum || !column->enum_type)
   {
     return 0;
   }
   
   U32 code = 0;
-  if (!gdb_enum_type_code_from_label(column->enum_type, literal_node->value, &code))
+  if (!cql_enum_type_code_from_label(column->enum_type, literal_node->value, &code))
   {
     log_error("'%.*s' is not a valid label for enum type '%.*s'",
               str8_varg(literal_node->value), str8_varg(column->enum_type->name));
@@ -1502,7 +3050,7 @@ qe_resolve_enum_literal_value(GDB_Column* column, IR_Node* literal_node, F64* ou
 }
 
 internal U64
-qe_rowset_table_slot(PLAN_RowSet* rows, GDB_Table* table)
+qe_rowset_table_slot(PLAN_RowSet* rows, CQL_Table* table)
 {
   for (U64 t = 0; t < rows->table_count; t++)
   {
@@ -1529,17 +3077,17 @@ internal THREAD_POOL_TASK_FUNC(qe_gather_numeric_task)
     void* data = (U8*)task->base_ptr + (row - task->min_row) * task->column_size;
     switch (task->column_type)
     {
-      case GDB_ColumnType_U32: task->values[i] = (F64)(*(U32*)data); break;
-      case GDB_ColumnType_U64: task->values[i] = (F64)(*(U64*)data); break;
-      case GDB_ColumnType_F32: task->values[i] = (F64)(*(F32*)data); break;
-      case GDB_ColumnType_F64: task->values[i] = *(F64*)data; break;
-      case GDB_ColumnType_Bool: task->values[i] = (F64)(*(U8*)data); break;
-      case GDB_ColumnType_I32: task->values[i] = (F64)(*(S32*)data); break;
-      case GDB_ColumnType_I64: task->values[i] = (F64)(*(S64*)data); break;
-      case GDB_ColumnType_Date: task->values[i] = (F64)(*(S32*)data); break;
-      case GDB_ColumnType_Timestamp: task->values[i] = (F64)(*(S64*)data); break;
-      case GDB_ColumnType_Decimal: task->values[i] = (F64)(*(S64*)data); break;
-      case GDB_ColumnType_Enum: task->values[i] = (F64)(*(U32*)data); break;
+      case CQL_ColumnType_U32: task->values[i] = (F64)(*(U32*)data); break;
+      case CQL_ColumnType_U64: task->values[i] = (F64)(*(U64*)data); break;
+      case CQL_ColumnType_F32: task->values[i] = (F64)(*(F32*)data); break;
+      case CQL_ColumnType_F64: task->values[i] = *(F64*)data; break;
+      case CQL_ColumnType_Bool: task->values[i] = (F64)(*(U8*)data); break;
+      case CQL_ColumnType_I32: task->values[i] = (F64)(*(S32*)data); break;
+      case CQL_ColumnType_I64: task->values[i] = (F64)(*(S64*)data); break;
+      case CQL_ColumnType_Date: task->values[i] = (F64)(*(S32*)data); break;
+      case CQL_ColumnType_Timestamp: task->values[i] = (F64)(*(S64*)data); break;
+      case CQL_ColumnType_Decimal: task->values[i] = (F64)(*(S64*)data); break;
+      case CQL_ColumnType_Enum: task->values[i] = (F64)(*(U32*)data); break;
       default: task->values[i] = 0.0; break;
     }
   }
@@ -1613,14 +3161,14 @@ qe_row_bounds(U64* table_rows, U64 count, U64* out_min, U64* out_max)
     if (task.task_max[t] > *out_max) 
     {
       *out_max = task.task_max[t];
-      s}
+    }
   }
   
   scratch_end(scratch);
 }
 
 internal F64*
-qe_gather_numeric_column(Arena* arena, PLAN_RowSet* rows, U64 table_slot, GDB_Column* column)
+qe_gather_numeric_column(Arena* arena, PLAN_RowSet* rows, U64 table_slot, CQL_Column* column)
 {
   ProfBeginFunction();
   
@@ -1645,7 +3193,7 @@ qe_gather_numeric_column(Arena* arena, PLAN_RowSet* rows, U64 table_slot, GDB_Co
   if (min_row != max_U64)
   {
     U64 range_size = 0;
-    base_ptr = gdb_column_get_data_range(arena, column, r1u64(min_row, max_row + 1), &range_size);
+    base_ptr = cql_column_get_data_range(arena, column, r1u64(min_row, max_row + 1), &range_size);
   }
   
   Temp scratch = scratch_begin(&arena, 1);
@@ -1685,7 +3233,7 @@ internal THREAD_POOL_TASK_FUNC(qe_gather_dict_codes_task)
 }
 
 internal F64*
-qe_gather_string_dict_codes(Arena* arena, PLAN_RowSet* rows, U64 table_slot, GDB_Column* column)
+qe_gather_string_dict_codes(Arena* arena, PLAN_RowSet* rows, U64 table_slot, CQL_Column* column)
 {
   ProfBeginFunction();
   
@@ -1729,7 +3277,7 @@ internal THREAD_POOL_TASK_FUNC(qe_dict_lookup_task)
     U64 start = task->chunk.offsets[i];
     U64 len = task->chunk.offsets[i + 1] - start;
     String8 s = str8((U8*)task->chunk.data + start, len);
-    task->values[i] = (F64)gdb_string_dict_code_or_sentinel(task->dict, s);
+    task->values[i] = (F64)cql_string_dict_code_or_sentinel(task->dict, s);
   }
 }
 
@@ -1766,7 +3314,7 @@ qe_dict_codes_to_f64_dense(Arena* arena, U32* codes, U64 count)
 
 // tec: cross-column lookup
 internal F64*
-qe_dict_codes_from_string_chunk(Arena* arena, GDB_StringDataChunk* chunk, GDB_StringDict* dict)
+qe_dict_codes_from_string_chunk(Arena* arena, CQL_StringDataChunk* chunk, CQL_StringDict* dict)
 {
   ProfBeginFunction();
   
@@ -1795,12 +3343,12 @@ qe_dict_codes_from_string_chunk(Arena* arena, GDB_StringDataChunk* chunk, GDB_St
 
 // tec: from_dict's codes mean nothing against to_dict, so map each distinct value of from_dict to its to_dict code once
 internal U32*
-qe_dict_recode_lut(Arena* arena, GDB_StringDict* from_dict, GDB_StringDict* to_dict)
+qe_dict_recode_lut(Arena* arena, CQL_StringDict* from_dict, CQL_StringDict* to_dict)
 {
   U32* lut = push_array(arena, U32, Max(from_dict->value_count, (U32)1));
   for (U32 code = 0; code < from_dict->value_count; code++)
   {
-    lut[code] = gdb_string_dict_code_or_sentinel(to_dict, from_dict->values[code]);
+    lut[code] = cql_string_dict_code_or_sentinel(to_dict, from_dict->values[code]);
   }
   return lut;
 }
@@ -1840,10 +3388,9 @@ qe_dict_codes_recoded_dense(Arena* arena, U32* codes, U64 count, U32* lut)
   return values;
 }
 
-// tec: left_column's dict codes recoded into right_dict's code space for a device-resident dict-key hash join
-// not cached across queries since it depends on which right dict the join targets
+// tec: left_column's dict codes recoded into right_dict's code space for a device resident dict key join, not cached
 internal GPU_Buffer*
-qe_hash_join_left_key_recoded_full_f64(Arena* arena, GDB_Column* left_column, GDB_StringDict* right_dict)
+qe_hash_join_left_key_recoded_full_f64(Arena* arena, CQL_Column* left_column, CQL_StringDict* right_dict)
 {
   if (!left_column->has_dict)
   {
@@ -2191,7 +3738,7 @@ qe_rowset_slot_is_identity(PLAN_RowSet* rows, U64 table_slot)
 }
 
 internal B32
-qe_aggregate_column_can_be_resident(PLAN_RowSet* rows, U64 table_slot, GDB_Column* column, B32* identity_known, B32* identity_value)
+qe_aggregate_column_can_be_resident(PLAN_RowSet* rows, U64 table_slot, CQL_Column* column, B32* identity_known, B32* identity_value)
 {
   if (!column->parent_table || column->parent_table->is_ephemeral)
   {
@@ -2215,13 +3762,13 @@ qe_aggregate_column_can_be_resident(PLAN_RowSet* rows, U64 table_slot, GDB_Colum
 
 // tec: keyed by the column object, so two tables that share a name cant hand each other a buffer
 internal String8
-qe_aggregate_resident_key(GDB_Column* column, B32 as_f32)
+qe_aggregate_resident_key(CQL_Column* column, B32 as_f32)
 {
   return push_str8f(gpu_scratch_arena(), "agg_resident_%s:%p", as_f32 ? "f32" : "f64", (void*)column);
 }
 
 internal GPU_Buffer*
-qe_aggregate_resident_lookup(GDB_Column* column, B32 as_f32, U64 row_count)
+qe_aggregate_resident_lookup(CQL_Column* column, B32 as_f32, U64 row_count)
 {
   U64 generation = as_f32 ? column->agg_f32_generation : column->agg_f64_generation;
   void* known_buffer = as_f32 ? column->agg_f32_buffer : column->agg_f64_buffer;
@@ -2249,7 +3796,7 @@ qe_aggregate_resident_lookup(GDB_Column* column, B32 as_f32, U64 row_count)
 }
 
 internal GPU_Buffer*
-qe_aggregate_resident_store(GDB_Column* column, B32 as_f32, void* data, U64 row_count)
+qe_aggregate_resident_store(CQL_Column* column, B32 as_f32, void* data, U64 row_count)
 {
   U64 element_size = as_f32 ? sizeof(F32) : sizeof(F64);
   GPU_Buffer* buffer = gpu_buffer_alloc_pooled(qe_aggregate_resident_key(column, as_f32), row_count * element_size, GPU_BufferFlag_Write, data);
@@ -2275,7 +3822,7 @@ qe_aggregate_resident_store(GDB_Column* column, B32 as_f32, void* data, U64 row_
 // a column that is read through a selection is kept whole on the GPU, so it does not depend on which rows a query selected
 
 internal F64*
-qe_column_dense_f64(Arena* arena, GDB_Column* column)
+qe_column_dense_f64(Arena* arena, CQL_Column* column)
 {
   ProfBeginFunction();
   
@@ -2288,7 +3835,7 @@ qe_column_dense_f64(Arena* arena, GDB_Column* column)
   }
   
   U64 range_size = 0;
-  void* base_ptr = gdb_column_get_data_range(arena, column, r1u64(0, count), &range_size);
+  void* base_ptr = cql_column_get_data_range(arena, column, r1u64(0, count), &range_size);
   
   Temp scratch = scratch_begin(&arena, 1);
   TP_Context* pool = app_thread_pool();
@@ -2315,9 +3862,9 @@ qe_column_dense_f64(Arena* arena, GDB_Column* column)
 }
 
 internal GPU_Buffer*
-qe_aggregate_full_column_f64(Arena* arena, GDB_Column* column, B32 dict_codes, B32* out_narrow)
+qe_aggregate_full_column_f64(Arena* arena, CQL_Column* column, B32 dict_codes, B32* out_narrow)
 {
-  if (!column->parent_table || column->parent_table->is_ephemeral || column->type == GDB_ColumnType_Invalid)
+  if (!column->parent_table || column->parent_table->is_ephemeral || column->type == CQL_ColumnType_Invalid)
   {
     return 0;
   }
@@ -2367,7 +3914,7 @@ qe_aggregate_full_column_f64(Arena* arena, GDB_Column* column, B32 dict_codes, B
 
 // tec: only for a column whose values all fit in F32, qe_aggregate_full_column_f64 says which
 internal GPU_Buffer*
-qe_aggregate_full_column_f32(Arena* arena, GDB_Column* column, B32 dict_codes)
+qe_aggregate_full_column_f32(Arena* arena, CQL_Column* column, B32 dict_codes)
 {
   U64 rows = column->row_count;
   GPU_Buffer* buffer = qe_aggregate_resident_lookup(column, 1, rows);
@@ -2495,8 +4042,7 @@ qe_selection_rows_for_positions(QE_DeviceSelection* selection, U32* positions, U
   return ok;
 }
 
-// tec: dest[i] is the table row that entry i of index_buffer names, looked up through map_buffer when there is one
-// the join pairs are the index buffer, and the map is the row list of a filtered side or of an earlier join
+// tec: dest[i] is the table row of index_buffer entry i, looked up through map_buffer when there is one
 internal GPU_Buffer*
 qe_rows_resolve(GPU_Buffer* index_buffer, U32 index_stride, U32 index_word, GPU_Buffer* map_buffer, U32 map_stride, U64 offset, U64 count, String8 dest_key)
 {
@@ -2552,8 +4098,7 @@ qe_device_view(QE_DeviceRows* device, U64 table_slot)
   return &device->views[table_slot];
 }
 
-// tec: a stand in row set holding just the group representatives' table rows, for qe_aggregate_build_output
-// representatives are rewritten to index into it and a max_U64 (no row) stays as it is
+// tec: stand in row set of just the group representatives' table rows, representatives are rewritten to index into it and max_U64 stays
 internal PLAN_RowSet
 qe_device_representative_rows(Arena* arena, QE_DeviceRows* device, PLAN_RowSet* input, U64* representatives, U64 num_groups)
 {
@@ -2599,7 +4144,7 @@ qe_device_rows_to_rowset(Arena* arena, QE_DeviceRows* device)
 {
   PLAN_RowSet rows = {0};
   rows.table_count = device->table_count;
-  rows.tables = push_array(arena, GDB_Table*, Max(device->table_count, (U32)1));
+  rows.tables = push_array(arena, CQL_Table*, Max(device->table_count, (U32)1));
   rows.aliases = push_array(arena, String8, Max(device->table_count, (U32)1));
   rows.row_indices = push_array(arena, U64*, Max(device->table_count, (U32)1));
   rows.count = device->count;
@@ -2637,7 +4182,7 @@ qe_device_rows_to_rowset(Arena* arena, QE_DeviceRows* device)
 }
 
 internal B32
-qe_aggregate_device(Arena* arena, GDB_Database* database, QE_DeviceRows* device, IR_Node* group_by_ir, IR_Node* column_list_ir, IR_Node* having_ir, QE_AggregateHints* hints, QE_AggregateTrace* out_trace, PLAN_Materialized* out_result)
+qe_aggregate_device(Arena* arena, CQL_Database* database, QE_DeviceRows* device, IR_Node* group_by_ir, IR_Node* column_list_ir, IR_Node* having_ir, QE_AggregateHints* hints, QE_AggregateTrace* out_trace, PLAN_Materialized* out_result)
 {
   // tec: nothing to gain below the size where the aggregate runs on the CPU, and an empty input has its own answers
   if (device->count == 0 || (hints && hints->cpu_max_rows > 0 && device->count <= hints->cpu_max_rows))
@@ -2647,7 +4192,7 @@ qe_aggregate_device(Arena* arena, GDB_Database* database, QE_DeviceRows* device,
   
   PLAN_RowSet stub = {0};
   stub.table_count = device->table_count;
-  stub.tables = push_array(arena, GDB_Table*, device->table_count);
+  stub.tables = push_array(arena, CQL_Table*, device->table_count);
   stub.aliases = push_array(arena, String8, device->table_count);
   stub.row_indices = push_array(arena, U64*, device->table_count);
   stub.count = device->count;
@@ -2702,12 +4247,12 @@ internal THREAD_POOL_TASK_FUNC(qe_string_gather_copy_task)
   }
 }
 
-internal GDB_StringDataChunk
-qe_gather_string_column(Arena* arena, PLAN_RowSet* rows, U64 table_slot, GDB_Column* column)
+internal CQL_StringDataChunk
+qe_gather_string_column(Arena* arena, PLAN_RowSet* rows, U64 table_slot, CQL_Column* column)
 {
   ProfBeginFunction();
   
-  GDB_StringDataChunk chunk = {0};
+  CQL_StringDataChunk chunk = {0};
   chunk.row_count = rows->count;
   
   if (table_slot >= rows->table_count)
@@ -2736,6 +4281,7 @@ qe_gather_string_column(Arena* arena, PLAN_RowSet* rows, U64 table_slot, GDB_Col
   }
   else if (column->is_disk_backed && rows->count > 0)
   {
+    cql_column_flush_pending(column);
     OS_Handle file = column->file;
     B32 opened_file = 0;
     if (os_handle_match(os_handle_zero(), file))
@@ -2818,10 +4364,10 @@ qe_gather_string_column(Arena* arena, PLAN_RowSet* rows, U64 table_slot, GDB_Col
   
   Temp scratch = scratch_begin(&arena, 1);
   
-  GDB_StringDataChunk src = {0};
+  CQL_StringDataChunk src = {0};
   if (min_row != max_U64)
   {
-    src = gdb_column_get_string_chunk(scratch.arena, column, r1u64(min_row, max_row + 1));
+    src = cql_column_get_string_chunk(scratch.arena, column, r1u64(min_row, max_row + 1));
   }
   
   // tec: rows are pulled in whatever order a prior GPU pass, so this needs a per row reorder
@@ -2859,7 +4405,7 @@ qe_gather_string_column(Arena* arena, PLAN_RowSet* rows, U64 table_slot, GDB_Col
   
   if (src.data)
   {
-    gdb_column_close_string_chunk(column);
+    cql_column_close_string_chunk(column);
   }
   
   scratch_end(scratch);
@@ -2889,7 +4435,7 @@ qe_sort_rows_compare_ctx(QE_SortRowsCtx* ctx, U64 ia, U64 ib)
     
     if (ctx->key_is_string[k])
     {
-      GDB_StringDataChunk* chunk = &ctx->string_keys[k];
+      CQL_StringDataChunk* chunk = &ctx->string_keys[k];
       String8 sa = str8((U8*)chunk->data + chunk->offsets[ia], chunk->offsets[ia + 1] - chunk->offsets[ia]);
       String8 sb = str8((U8*)chunk->data + chunk->offsets[ib], chunk->offsets[ib + 1] - chunk->offsets[ib]);
       cmp = qe_str8_compare(sa, sb);
@@ -3157,21 +4703,21 @@ qe_sort_rows_top_k_parallel(Arena* arena, QE_SortRowsCtx* ctx, U64 count, U64 ke
 //~ tec: top k over numeric columns, read in place
 
 internal F64
-qe_native_numeric_value(GDB_ColumnType type, void* data)
+qe_native_numeric_value(CQL_ColumnType type, void* data)
 {
   switch (type)
   {
-    case GDB_ColumnType_U32: return (F64)(*(U32*)data);
-    case GDB_ColumnType_U64: return (F64)(*(U64*)data);
-    case GDB_ColumnType_F32: return (F64)(*(F32*)data);
-    case GDB_ColumnType_F64: return *(F64*)data;
-    case GDB_ColumnType_Bool: return (F64)(*(U8*)data);
-    case GDB_ColumnType_I32: return (F64)(*(S32*)data);
-    case GDB_ColumnType_I64: return (F64)(*(S64*)data);
-    case GDB_ColumnType_Date: return (F64)(*(S32*)data);
-    case GDB_ColumnType_Timestamp: return (F64)(*(S64*)data);
-    case GDB_ColumnType_Decimal: return (F64)(*(S64*)data);
-    case GDB_ColumnType_Enum: return (F64)(*(U32*)data);
+    case CQL_ColumnType_U32: return (F64)(*(U32*)data);
+    case CQL_ColumnType_U64: return (F64)(*(U64*)data);
+    case CQL_ColumnType_F32: return (F64)(*(F32*)data);
+    case CQL_ColumnType_F64: return *(F64*)data;
+    case CQL_ColumnType_Bool: return (F64)(*(U8*)data);
+    case CQL_ColumnType_I32: return (F64)(*(S32*)data);
+    case CQL_ColumnType_I64: return (F64)(*(S64*)data);
+    case CQL_ColumnType_Date: return (F64)(*(S32*)data);
+    case CQL_ColumnType_Timestamp: return (F64)(*(S64*)data);
+    case CQL_ColumnType_Decimal: return (F64)(*(S64*)data);
+    case CQL_ColumnType_Enum: return (F64)(*(U32*)data);
     default: return 0.0;
   }
 }
@@ -3325,7 +4871,7 @@ qe_top_k_native_supported(PLAN_RowSet* rows, U32 num_keys, B32* key_is_string, F
 }
 
 internal U64
-qe_sort_rows_top_k_native(Arena* arena, PLAN_RowSet* rows, U32 num_keys, U64* key_slots, GDB_Column** key_columns, B32* key_desc, U64 keep, U64* out_order, U32* out_tasks)
+qe_sort_rows_top_k_native(Arena* arena, PLAN_RowSet* rows, U32 num_keys, U64* key_slots, CQL_Column** key_columns, B32* key_desc, U64 keep, U64* out_order, U32* out_tasks)
 {
   U64 count = rows->count;
   Temp scratch = scratch_begin(&arena, 1);
@@ -3348,7 +4894,7 @@ qe_sort_rows_top_k_native(Arena* arena, PLAN_RowSet* rows, U32 num_keys, U64* ke
     if (min_row != max_U64)
     {
       U64 range_size = 0;
-      key->base_ptr = gdb_column_get_data_range(scratch.arena, key_columns[k], r1u64(min_row, max_row + 1), &range_size);
+      key->base_ptr = cql_column_get_data_range(scratch.arena, key_columns[k], r1u64(min_row, max_row + 1), &range_size);
     }
   }
   
@@ -3417,7 +4963,7 @@ qe_sort_rows(Arena* arena, PLAN_RowSet* rows, IR_Node* order_by_ir, QE_SortHints
     return result;
   }
   
-  GDB_Column* key_columns[QE_SORT_MAX_KEYS];
+  CQL_Column* key_columns[QE_SORT_MAX_KEYS];
   U64 key_slots[QE_SORT_MAX_KEYS];
   B32 key_desc[QE_SORT_MAX_KEYS];
   B32 key_is_string[QE_SORT_MAX_KEYS];
@@ -3473,14 +5019,14 @@ qe_sort_rows(Arena* arena, PLAN_RowSet* rows, IR_Node* order_by_ir, QE_SortHints
     
     String8 bare_name = {0};
     U64 slot = max_U64;
-    GDB_Table* table = qe_resolve_column_table(rows, col_node->value, &bare_name, &slot);
+    CQL_Table* table = qe_resolve_column_table(rows, col_node->value, &bare_name, &slot);
     if (!table) continue; // tec: already logged by qe_resolve_column_table
     
-    GDB_Column* column = gdb_table_find_column(table, bare_name);
+    CQL_Column* column = cql_table_find_column(table, bare_name);
     if (!column) continue;
     
     B32 desc = (col_node->first && col_node->first->type == IR_NodeType_Descending);
-    B32 is_string = (column->type == GDB_ColumnType_String8);
+    B32 is_string = (column->type == CQL_ColumnType_String8);
     any_string_key |= is_string;
     
     key_slots[num_keys] = slot;
@@ -4370,7 +5916,7 @@ qe_materialized_row_less(PLAN_Materialized* m, IR_Node* order_by_ir, U64 a, U64 
     
     B32 desc = (col_node->first && col_node->first->type == IR_NodeType_Descending);
     
-    if (col->type == GDB_ColumnType_String8)
+    if (col->type == CQL_ColumnType_String8)
     {
       S32 cmp = qe_str8_compare(col->string_values[a], col->string_values[b]);
       if (cmp == 0) continue;
@@ -4438,7 +5984,7 @@ qe_sort_materialized(Arena* arena, PLAN_Materialized* m, IR_Node* order_by_ir, Q
     dst->decimal_scale = src->decimal_scale;
     dst->enum_type = src->enum_type;
     
-    if (src->type == GDB_ColumnType_String8)
+    if (src->type == CQL_ColumnType_String8)
     {
       dst->string_values = push_array(arena, String8, out_count);
       for (U64 i = 0; i < out_count; i++)
@@ -4551,8 +6097,7 @@ qe_tdigest_centroid_compare(const void* a, const void* b)
   return (ma > mb) - (ma < mb);
 }
 
-// tec: standard t-digest quantile query 
-// sort centroids by mean, then linearly interpolate between consecutive centroids' cumulative weight midpoints to find the target rank
+// tec: t-digest quantile, interpolates between the cumulative weight midpoints of the sorted centroids
 internal F64
 qe_tdigest_estimate_percentile(QE_TDigestCentroid* centroids, U64 count, F64 fraction)
 {
@@ -4579,8 +6124,7 @@ qe_tdigest_estimate_percentile(QE_TDigestCentroid* centroids, U64 count, F64 fra
     F64 pos = cumulative + (F64)centroids[i].weight * 0.5;
     if (target <= pos)
     {
-      // tec: target falls before the first centroid's own cumulative-weight midpoint
-      // no lower centroid to interpolate from, so just report this one
+// tec: target is before the first midpoint, report the first centroid
       if (prev_pos < 0.0) 
       {
         return (F64)centroids[i].mean;
@@ -4641,10 +6185,10 @@ qe_aggregate_collect_exprs(Arena* arena, PLAN_RowSet* input, IR_Node* node, QE_A
           {
             String8 bare_name = {0};
             U64 slot = max_U64;
-            GDB_Table* table = qe_resolve_column_table(input, arg->value, &bare_name, &slot);
+            CQL_Table* table = qe_resolve_column_table(input, arg->value, &bare_name, &slot);
             info->arg_table = table;
             info->arg_slot = slot;
-            info->arg_column = table ? gdb_table_find_column(table, bare_name) : NULL;
+            info->arg_column = table ? cql_table_find_column(table, bare_name) : NULL;
           }
           
           if (info->func_code == QE_AGG_FUNC_APPROX_PERCENTILE)
@@ -4678,8 +6222,48 @@ qe_aggregate_collect_exprs(Arena* arena, PLAN_RowSet* input, IR_Node* node, QE_A
   return 1;
 }
 
+// tec: no GROUP BY and nothing in the select list but COUNTs, so the answer is the number of rows and no row has to be read
+internal B32
+qe_aggregate_is_global_count(IR_Node* group_by_ir, IR_Node* column_list_ir)
+{
+  if ((group_by_ir && group_by_ir->first) || !column_list_ir)
+  {
+    return 0;
+  }
+
+  B32 found = 0;
+  for (IR_Node* item = column_list_ir->first; item != NULL; item = item->next)
+  {
+    U32 func_code = 0;
+    if (item->type != IR_NodeType_AggregateCall || !qe_agg_func_code_from_name(item->value, &func_code) ||
+        func_code != QE_AGG_FUNC_COUNT || ir_node_find_child(item, IR_NodeType_Window))
+    {
+      return 0;
+    }
+    found = 1;
+  }
+  return found;
+}
+
+// tec: the output of a select list of COUNTs over row_count rows, the same one the count only shortcut of qe_aggregate_impl builds
+internal PLAN_Materialized
+qe_aggregate_count_rows(Arena* arena, PLAN_RowSet* input, IR_Node* column_list_ir, U64 row_count)
+{
+  QE_AggExprInfo exprs[QE_AGG_MAX_EXPRS] = {0};
+  U32 num_exprs = 0;
+  qe_aggregate_collect_exprs(arena, input, column_list_ir ? column_list_ir->first : NULL, exprs, &num_exprs);
+
+  F64* results = push_array(arena, F64, Max((U64)num_exprs, (U64)1));
+  for (U32 e = 0; e < num_exprs; e++)
+  {
+    results[e] = (F64)row_count;
+  }
+  U64 representative = max_U64;
+  return qe_aggregate_build_output(arena, input, column_list_ir, exprs, num_exprs, 1, &representative, results);
+}
+
 internal void
-qe_agg_output_type_for_expr(QE_AggExprInfo* expr, GDB_ColumnType* out_type, U32* out_decimal_scale, GDB_EnumType** out_enum_type)
+qe_agg_output_type_for_expr(QE_AggExprInfo* expr, CQL_ColumnType* out_type, U32* out_decimal_scale, CQL_EnumType** out_enum_type)
 {
   *out_type = qe_agg_func_policy[expr->func_code].output_type;
   *out_decimal_scale = 0;
@@ -4697,11 +6281,11 @@ qe_agg_output_type_for_expr(QE_AggExprInfo* expr, GDB_ColumnType* out_type, U32*
   {
     switch (expr->arg_column->type)
     {
-      case GDB_ColumnType_U32: case GDB_ColumnType_U64: case GDB_ColumnType_Bool:
-      *out_type = GDB_ColumnType_U64;
+      case CQL_ColumnType_U32: case CQL_ColumnType_U64: case CQL_ColumnType_Bool:
+      *out_type = CQL_ColumnType_U64;
       break;
-      case GDB_ColumnType_I32: case GDB_ColumnType_I64:
-      *out_type = GDB_ColumnType_I64;
+      case CQL_ColumnType_I32: case CQL_ColumnType_I64:
+      *out_type = CQL_ColumnType_I64;
       break;
       default: break;
     }
@@ -4823,8 +6407,8 @@ qe_aggregate_build_output(Arena* arena, PLAN_RowSet* input, IR_Node* column_list
     {
       String8 bare_name = {0};
       U64 table_slot = max_U64;
-      GDB_Table* table = qe_resolve_column_table(input, item->value, &bare_name, &table_slot);
-      GDB_Column* column = table ? gdb_table_find_column(table, bare_name) : NULL;
+      CQL_Table* table = qe_resolve_column_table(input, item->value, &bare_name, &table_slot);
+      CQL_Column* column = table ? cql_table_find_column(table, bare_name) : NULL;
       if (!column) continue;
       
       dst->name = name;
@@ -4832,8 +6416,7 @@ qe_aggregate_build_output(Arena* arena, PLAN_RowSet* input, IR_Node* column_list
       dst->decimal_scale = column->decimal_scale;
       dst->enum_type = column->enum_type;
       
-      // tec: representative rows are scattered across the whole input,
-      // so translate them to table rows in parallel, bound the touched range and pull it in one bulk read
+// tec: representative rows are scattered, translate them in parallel and pull the touched range in one bulk read
       Temp column_scratch = scratch_begin(&arena, 1);
       U64* base_rows = push_array_no_zero(column_scratch.arena, U64, Max(num_groups, 1));
       U64 task_count = 1;
@@ -4849,7 +6432,7 @@ qe_aggregate_build_output(Arena* arena, PLAN_RowSet* input, IR_Node* column_list
           qe_agg_run_tasks(task_count, qe_agg_base_rows_task, &rows_task);
         }
       }
-      if (column->type == GDB_ColumnType_String8)
+      if (column->type == CQL_ColumnType_String8)
       {
         dst->string_values = push_array_no_zero(arena, String8, Max(num_groups, 1));
         
@@ -4878,7 +6461,7 @@ qe_aggregate_build_output(Arena* arena, PLAN_RowSet* input, IR_Node* column_list
         
         void* base_ptr = 0;
         U64 range_size = 0;
-        if (min_row != max_U64) base_ptr = gdb_column_get_data_range(arena, column, r1u64(min_row, max_row + 1), &range_size);
+        if (min_row != max_U64) base_ptr = cql_column_get_data_range(arena, column, r1u64(min_row, max_row + 1), &range_size);
         
         QE_GatherNumericTask gather = {0};
         gather.ranges = qe_agg_split_work(column_scratch.arena, num_groups, &task_count);
@@ -4942,7 +6525,7 @@ qe_aggregate_hash_key(QE_AggregateKeys* keys, U64 row)
   {
     if (keys->string_mask & (1u << column))
     {
-      GDB_StringDataChunk* chunk = &keys->strings[column];
+      CQL_StringDataChunk* chunk = &keys->strings[column];
       U8* bytes = (U8*)chunk->data + chunk->offsets[row];
       U64 size = chunk->offsets[row + 1] - chunk->offsets[row];
       for (U64 index = 0; index < size; index += 1)
@@ -4977,7 +6560,7 @@ qe_aggregate_keys_equal(QE_AggregateKeys* keys, U64 a, U64 b)
   {
     if (keys->string_mask & (1u << column))
     {
-      GDB_StringDataChunk* chunk = &keys->strings[column];
+      CQL_StringDataChunk* chunk = &keys->strings[column];
       U64 size_a = chunk->offsets[a + 1] - chunk->offsets[a];
       U64 size_b = chunk->offsets[b + 1] - chunk->offsets[b];
       if (size_a != size_b)
@@ -5136,13 +6719,12 @@ qe_aggregate_cpu_reduce(Arena* arena, U64 row_count, QE_AggregateKeys* keys, QE_
 }
 
 internal PLAN_Materialized
-qe_aggregate(Arena* arena, GDB_Database* database, PLAN_RowSet* input, IR_Node* group_by_ir, IR_Node* column_list_ir, IR_Node* having_ir, QE_AggregateHints* hints, QE_AggregateTrace* out_trace)
+qe_aggregate(Arena* arena, CQL_Database* database, PLAN_RowSet* input, IR_Node* group_by_ir, IR_Node* column_list_ir, IR_Node* having_ir, QE_AggregateHints* hints, QE_AggregateTrace* out_trace)
 {
   return qe_aggregate_impl(arena, database, input, group_by_ir, column_list_ir, having_ir, hints, out_trace, 0, 0);
 }
 
-// tec: the hash reduce accumulates in F32, it is allowed with few rows per group, or with more when every SUM and AVG
-// argument is a whole number whose largest possible group sum stays inside what F32 holds exactly
+// tec: the F32 hash reduce is allowed with few rows per group, or when every SUM and AVG argument is a whole number whose largest group sum is exact in F32
 internal B32
 qe_aggregate_hash_allowed(QE_AggExprInfo* exprs, U32 num_exprs, U32* arg_owner, F64* arg_int_bound, U64 row_count, U64 num_groups, U64 max_group_rows, U64 cap, U64 exact_cap, B32 fixed_ok, U64 fixed_cap)
 {
@@ -5206,10 +6788,1974 @@ qe_aggregate_slot_table(Arena* arena, U32* count_readback, U64 num_slots, B32 gr
   }
 }
 
+//~ tec: ungrouped aggregates over a table too big for the GPU, read in place and in chunks
+// tec: columns are read in place in chunks split over the pool, slice partials are combined in slice order so the result is deterministic
+
+#define QE_F64_MAX 1.7976931348623157e308
+
+#define QE_CHUNK_REDUCE_LOOP(T)                \
+{                                              \
+  T* values = (T*)task->base_ptr;              \
+  for (U64 i = range.min; i < range.max; i++)  \
+  {                                            \
+    F64 v = (F64)values[i];                    \
+    sum += v;                                  \
+    if (v < min_value) min_value = v;          \
+    if (v > max_value) max_value = v;          \
+  }                                            \
+}
+
+internal THREAD_POOL_TASK_FUNC(qe_chunk_reduce_task)
+{
+  QE_ChunkReduceTask* task = (QE_ChunkReduceTask*)raw_task;
+  Rng1U64 range = task->ranges[task_id];
+  F64 sum = 0.0;
+  F64 min_value = QE_F64_MAX;
+  F64 max_value = -QE_F64_MAX;
+  switch (task->column_type)
+  {
+    case CQL_ColumnType_U32: QE_CHUNK_REDUCE_LOOP(U32) break;
+    case CQL_ColumnType_I32: QE_CHUNK_REDUCE_LOOP(S32) break;
+    case CQL_ColumnType_U64: QE_CHUNK_REDUCE_LOOP(U64) break;
+    case CQL_ColumnType_I64: QE_CHUNK_REDUCE_LOOP(S64) break;
+    case CQL_ColumnType_F32: QE_CHUNK_REDUCE_LOOP(F32) break;
+    case CQL_ColumnType_F64: QE_CHUNK_REDUCE_LOOP(F64) break;
+    default: break;
+  }
+  task->task_sum[task_id] = sum;
+  task->task_min[task_id] = min_value;
+  task->task_max[task_id] = max_value;
+}
+
+internal B32
+qe_chunk_reduce_type_supported(CQL_ColumnType type)
+{
+  return type == CQL_ColumnType_U32 || type == CQL_ColumnType_I32 || type == CQL_ColumnType_U64 ||
+         type == CQL_ColumnType_I64 || type == CQL_ColumnType_F32 || type == CQL_ColumnType_F64;
+}
+
+//~ tec: dense GROUP BY of a whole table on the GPU, streamed
+// tec: GROUP BY a whole number column with a small range, the group is the key minus the smallest key, no hash table
+// tec: chunks stream through the slots, each leaves group arrays (count, sums, mins, maxes, smallest row) folded into the totals in chunk order
+
+#define QE_DENSE_STREAM_MAX_ARGS 4
+#define QE_DENSE_STREAM_MAX_GROUPS 65536
+#define QE_DENSE_STREAM_MAX_TILES 256
+#define QE_DENSE_STREAM_ACC_WORDS 2048
+#define QE_DENSE_STREAM_MM_WORDS 1024
+#define QE_DENSE_STREAM_READBACK_PAD 128
+
+// tec: the smallest and largest value of a column from its zone map, 0 when the column has none
+internal B32
+qe_column_range_from_zone_map(CQL_Column* column, F64* out_min, F64* out_max)
+{
+  if (!cql_column_type_is_zone_map_eligible(column->type))
+  {
+    return 0;
+  }
+  cql_column_ensure_zone_map(column);
+  if (!column->has_zone_map || column->zone_map_chunk_count == 0)
+  {
+    return 0;
+  }
+  B32 any = 0;
+  F64 low = 0.0;
+  F64 high = 0.0;
+  for (U64 chunk = 0; chunk < column->zone_map_chunk_count; chunk++)
+  {
+    CQL_ZoneMapChunk* zone = &column->zone_map[chunk];
+    if (!zone->has_values)
+    {
+      continue;
+    }
+    low = any ? Min(low, zone->min) : zone->min;
+    high = any ? Max(high, zone->max) : zone->max;
+    any = 1;
+  }
+  *out_min = low;
+  *out_max = high;
+  return any;
+}
+
+typedef struct QE_DenseStreamSlot QE_DenseStreamSlot;
+struct QE_DenseStreamSlot
+{
+  GPU_Buffer* columns[1 + QE_DENSE_STREAM_MAX_ARGS];
+  GPU_Buffer* transient[1 + QE_DENSE_STREAM_MAX_ARGS];
+  QE_ResidentChunk* held[1 + QE_DENSE_STREAM_MAX_ARGS];
+  U8* encoded[1 + QE_DENSE_STREAM_MAX_ARGS];
+  GPU_Buffer* info_buffer;
+  GPU_Buffer* sum_buffer;
+  GPU_Buffer* min_buffer;
+  GPU_Buffer* max_buffer;
+  U32* info;
+  U32* sums;
+  U32* mins;
+  U32* maxs;
+  U64 first_row;
+  B32 in_flight;
+};
+
+typedef struct QE_DenseStreamTotals QE_DenseStreamTotals;
+struct QE_DenseStreamTotals
+{
+  U64 group_count;
+  U32 expr_count;
+  U64* counts;
+  U64* owners;
+  S64* sums;
+  S64* mins;
+  S64* maxs;
+};
+
+internal void
+qe_dense_stream_unpin(QE_DenseStreamSlot* slot, B32 completed)
+{
+  for (U32 index = 0; index < 1 + QE_DENSE_STREAM_MAX_ARGS; index++)
+  {
+    qe_resident_unpin(slot->held[index], completed);
+    slot->held[index] = 0;
+  }
+}
+
+internal B32
+qe_dense_stream_retire(GPU_Stream* stream, U32 slot_index, QE_DenseStreamSlot* slot, QE_DenseStreamTotals* totals)
+{
+  if (!slot->in_flight)
+  {
+    return 1;
+  }
+  slot->in_flight = 0;
+  if (!gpu_stream_wait(stream, slot_index))
+  {
+    return 0;
+  }
+  for (U64 group = 0; group < totals->group_count; group++)
+  {
+    U64 count = slot->info[group * 2 + 1];
+    if (count == 0)
+    {
+      continue;
+    }
+    totals->counts[group] += count;
+    for (U32 e = 0; e < totals->expr_count; e++)
+    {
+      U64 index = group * totals->expr_count + e;
+      totals->sums[index] += (S64)(((U64)slot->sums[index * 2 + 1] << 32) | (U64)slot->sums[index * 2]);
+      totals->mins[index] = Min(totals->mins[index], (S64)(S32)slot->mins[index]);
+      totals->maxs[index] = Max(totals->maxs[index], (S64)(S32)slot->maxs[index]);
+    }
+  }
+  qe_dense_stream_unpin(slot, 1);
+  return 1;
+}
+
+// tec: counts rows per key and sums, mins and maxes of the argument columns, func i applies to column i (a COUNT has none).
+// returns 0 with nothing built when the key or a column is not handled or the GPU work did not complete
+internal B32
+qe_dense_stream_core(Arena* arena, CQL_Column* key_column, U64 row_count, U32 num_exprs, U32* funcs, CQL_Column** arg_cols, QE_DenseStreamTotals* out_totals, S64* out_min_key)
+{
+  ProfBeginFunction();
+
+  //- tec: the key must be a whole number column with a small range, found without reading the column
+  F64 key_low = 0.0;
+  F64 key_high = 0.0;
+  if (!(key_column->type == CQL_ColumnType_U32 || key_column->type == CQL_ColumnType_I32) || key_column->row_count != row_count || key_column->null_flags ||
+      key_column->is_disk_backed || key_column->data == 0 || !qe_column_range_from_zone_map(key_column, &key_low, &key_high) ||
+      key_low < -2147483648.0 || key_high > 2147483647.0 || key_high - key_low + 1.0 > (F64)QE_DENSE_STREAM_MAX_GROUPS)
+  {
+    ProfEnd();
+    return 0;
+  }
+  S64 min_key = (S64)key_low;
+  U64 group_count = (U64)((S64)key_high - min_key) + 1;
+
+  //- tec: and the aggregates plain ones over columns of the same kind
+  CQL_Column* arg_columns[QE_DENSE_STREAM_MAX_ARGS] = {0};
+  U32 arg_count = 0;
+  U32 func_codes = 0;
+  U32 arg_index_codes = 0;
+  U32 arg_signed_bits = 0;
+  B32 narrow_sums = 1;
+  F64 largest_sum_arg = 0.0;
+  if (num_exprs == 0 || num_exprs > QE_AGG_MAX_EXPRS)
+  {
+    ProfEnd();
+    return 0;
+  }
+  for (U32 e = 0; e < num_exprs; e++)
+  {
+    U32 func = funcs[e];
+    CQL_Column* column = arg_cols[e];
+    if (func != QE_AGG_FUNC_COUNT && func != QE_AGG_FUNC_SUM && func != QE_AGG_FUNC_AVG && func != QE_AGG_FUNC_MIN && func != QE_AGG_FUNC_MAX)
+    {
+      ProfEnd();
+      return 0;
+    }
+    func_codes |= (func & 0xfu) << (e * 4u);
+    if (func == QE_AGG_FUNC_COUNT)
+    {
+      if (column && (column->row_count != row_count || column->null_flags))
+      {
+        ProfEnd();
+        return 0;
+      }
+      continue;
+    }
+    F64 arg_low = 0.0;
+    F64 arg_high = 0.0;
+    if (!column || !(column->type == CQL_ColumnType_U32 || column->type == CQL_ColumnType_I32) || column->row_count != row_count || column->null_flags ||
+        column->is_disk_backed || column->data == 0)
+    {
+      ProfEnd();
+      return 0;
+    }
+    // tec: MIN and MAX are signed 32 bit atomics, so the values have to fit
+    B32 have_range = qe_column_range_from_zone_map(column, &arg_low, &arg_high);
+    if ((func == QE_AGG_FUNC_MIN || func == QE_AGG_FUNC_MAX) && (!have_range || arg_low < -2147483648.0 || arg_high > 2147483647.0))
+    {
+      ProfEnd();
+      return 0;
+    }
+    // tec: the largest value a SUM adds, see the choice of rows per workgroup below
+    if (func == QE_AGG_FUNC_SUM || func == QE_AGG_FUNC_AVG)
+    {
+      largest_sum_arg = Max(largest_sum_arg, have_range ? Max(arg_high, -arg_low) : 4294967296.0);
+    }
+    U32 index = 0;
+    while (index < arg_count && arg_columns[index] != column)
+    {
+      index++;
+    }
+    if (index == arg_count)
+    {
+      if (arg_count == QE_DENSE_STREAM_MAX_ARGS)
+      {
+        ProfEnd();
+        return 0;
+      }
+      arg_columns[arg_count++] = column;
+    }
+    arg_index_codes |= (index & 0xfu) << (e * 4u);
+    if (column->type == CQL_ColumnType_I32)
+    {
+      arg_signed_bits |= 1u << index;
+    }
+  }
+
+//- tec: a workgroup adds the counts of a slice of rows to the global arrays, a sum of a slice has to fit 31 bits for the one word form
+  U64 slice_rows = 16384;
+  narrow_sums = largest_sum_arg * (F64)slice_rows < 1073741824.0;
+
+  //- tec: groups that fit shared memory at once are counted in one pass, more are counted in tiles
+  U64 acc_stride = 1 + (narrow_sums ? 1 : 2) * (U64)num_exprs;
+  // tec: the minimum and maximum arrays take shared memory only when a MIN or MAX is asked for
+  B32 has_min_max = 0;
+  for (U32 e = 0; e < num_exprs; e++)
+  {
+    has_min_max = has_min_max || funcs[e] == QE_AGG_FUNC_MIN || funcs[e] == QE_AGG_FUNC_MAX;
+  }
+  U64 mm_stride = has_min_max ? 2 * (U64)num_exprs : 0;
+  // tec: the kernel makes the strides odd, see its header
+  acc_stride |= 1;
+  mm_stride |= mm_stride ? 1 : 0;
+  U64 tile_groups = Min((U64)QE_DENSE_STREAM_ACC_WORDS / acc_stride, mm_stride ? (U64)QE_DENSE_STREAM_MM_WORDS / mm_stride : max_U64);
+  tile_groups = Min(tile_groups, group_count);
+  U64 tile_count = (group_count + tile_groups - 1) / tile_groups;
+  if (tile_count > QE_DENSE_STREAM_MAX_TILES)
+  {
+    ProfEnd();
+    return 0;
+  }
+
+  GPU_Kernel* kernel = gpu_kernel_alloc(str8_lit("aggregate_dense_native"));
+  if (!kernel)
+  {
+    ProfEnd();
+    return 0;
+  }
+
+  QE_DenseStreamTotals totals = {0};
+  totals.group_count = group_count;
+  totals.expr_count = num_exprs;
+  totals.counts = push_array(arena, U64, group_count);
+  totals.owners = push_array(arena, U64, group_count);
+  totals.sums = push_array(arena, S64, group_count * num_exprs);
+  totals.mins = push_array(arena, S64, group_count * num_exprs);
+  totals.maxs = push_array(arena, S64, group_count * num_exprs);
+  for (U64 index = 0; index < group_count * num_exprs; index++)
+  {
+    totals.mins[index] = 2147483647;
+    totals.maxs[index] = -2147483648ll;
+  }
+
+  U32 column_count = 1 + arg_count;
+  CQL_Column* columns[1 + QE_DENSE_STREAM_MAX_ARGS] = {0};
+  columns[0] = key_column;
+  for (U32 index = 0; index < arg_count; index++)
+  {
+    columns[1 + index] = arg_columns[index];
+  }
+
+  U64 slot_count = Clamp(2, settings_u64(str8_lit("QE_SCAN_STREAM_SLOTS"), 3), 8);
+  U64 chunk_rows_max = qe_stream_chunk_rows();
+  U64 chunk_count = (row_count + chunk_rows_max - 1) / chunk_rows_max;
+  slot_count = Min(slot_count, Max(chunk_count, (U64)1));
+
+  // tec: the key's base is the smallest key, which is also what the kernel subtracts to get the group
+  QE_ColumnEncoding encodings[1 + QE_DENSE_STREAM_MAX_ARGS];
+  for (U32 c = 0; c < column_count; c++)
+  {
+    // tec: an argument can be a sequence, the key can not (its range would not be small)
+    encodings[c] = qe_column_encoding(columns[c], c > 0);
+  }
+  GPU_Buffer* sequence_filler = gpu_buffer_alloc(256, GPU_BufferFlag_Write, 0);
+  if (encodings[0].width < key_column->size && encodings[0].base != (U32)(S32)min_key)
+  {
+    encodings[0] = (QE_ColumnEncoding){ (U32)key_column->size, 0, 0 };
+  }
+  U64 shader_widths = qe_encoding_shader_width(columns[0], encodings[0]);
+  U32 arg_bases[QE_DENSE_STREAM_MAX_ARGS] = {0};
+  for (U32 index = 0; index < arg_count; index++)
+  {
+    shader_widths |= (U64)qe_encoding_shader_width(columns[1 + index], encodings[1 + index]) << (4 + 4 * index);
+    arg_bases[index] = encodings[1 + index].base;
+  }
+
+  U64 info_bytes = group_count * 2 * sizeof(U32);
+  U64 sum_bytes = group_count * num_exprs * 2 * sizeof(U32);
+  U64 mm_bytes = group_count * num_exprs * sizeof(U32);
+  U64 readback_bytes = QE_DENSE_STREAM_READBACK_PAD + info_bytes + sum_bytes + 2 * mm_bytes + 4 * 16;
+
+  GPU_Stream* stream = gpu_stream_alloc((U32)slot_count);
+  QE_DenseStreamSlot* slots = push_array(arena, QE_DenseStreamSlot, slot_count);
+  B32 ok = stream != 0;
+  for (U64 slot_index = 0; slot_index < slot_count && ok; slot_index++)
+  {
+    QE_DenseStreamSlot* slot = &slots[slot_index];
+    slot->info_buffer = gpu_buffer_alloc(info_bytes, GPU_BufferFlag_ReadWrite, 0);
+    slot->sum_buffer = gpu_buffer_alloc(sum_bytes, GPU_BufferFlag_ReadWrite, 0);
+    slot->min_buffer = gpu_buffer_alloc(mm_bytes, GPU_BufferFlag_ReadWrite, 0);
+    slot->max_buffer = gpu_buffer_alloc(mm_bytes, GPU_BufferFlag_ReadWrite, 0);
+    slot->info = push_array(arena, U32, group_count * 2);
+    slot->sums = push_array(arena, U32, group_count * num_exprs * 2);
+    slot->mins = push_array(arena, U32, group_count * num_exprs);
+    slot->maxs = push_array(arena, U32, group_count * num_exprs);
+    ok = slot->info_buffer && slot->sum_buffer && slot->min_buffer && slot->max_buffer;
+  }
+
+  U32 deferred_slot = max_U32;
+  for (U64 chunk_index = 0; chunk_index < chunk_count && ok; chunk_index++)
+  {
+    U32 slot_index = (U32)(chunk_index % slot_count);
+    QE_DenseStreamSlot* slot = &slots[slot_index];
+    U64 start = chunk_index * chunk_rows_max;
+    U64 rows = Min(chunk_rows_max, row_count - start);
+
+    ok = qe_dense_stream_retire(stream, slot_index, slot, &totals);
+    if (!ok)
+    {
+      break;
+    }
+
+    B32 needs_copy[1 + QE_DENSE_STREAM_MAX_ARGS] = {0};
+    void* source[1 + QE_DENSE_STREAM_MAX_ARGS] = {0};
+    U64 source_bytes[1 + QE_DENSE_STREAM_MAX_ARGS] = {0};
+    U64 upload_bytes = 0;
+    for (U32 c = 0; c < column_count && ok; c++)
+    {
+      slot->columns[c] = qe_stream_prepare_column(columns[c], encodings[c], sequence_filler, start, rows, chunk_rows_max, &slot->transient[c], &slot->held[c], &slot->encoded[c],
+                                                   &needs_copy[c], &source[c], &source_bytes[c]);
+      ok = slot->columns[c] != 0;
+      if (ok && needs_copy[c])
+      {
+        upload_bytes += source_bytes[c];
+      }
+    }
+    if (!ok)
+    {
+      break;
+    }
+
+    ok = gpu_stream_slot_begin(stream, slot_index, upload_bytes, readback_bytes);
+    for (U32 c = 0; c < column_count && ok; c++)
+    {
+      if (needs_copy[c])
+      {
+        ok = gpu_stream_copy(stream, slot_index, slot->columns[c], source[c], source_bytes[c]);
+      }
+    }
+    if (!ok)
+    {
+      break;
+    }
+
+    gpu_stream_fill(stream, slot_index, slot->info_buffer, info_bytes, 0);
+    gpu_stream_fill(stream, slot_index, slot->sum_buffer, sum_bytes, 0);
+    gpu_stream_fill(stream, slot_index, slot->min_buffer, mm_bytes, 0x7fffffffu);
+    gpu_stream_fill(stream, slot_index, slot->max_buffer, mm_bytes, 0x80000000u);
+
+    gpu_kernel_set_arg_buffer(kernel, 0, slot->columns[0]);
+    for (U32 binding = 0; binding < QE_DENSE_STREAM_MAX_ARGS; binding++)
+    {
+      gpu_kernel_set_arg_buffer(kernel, 1 + binding, slot->columns[binding < arg_count ? 1 + binding : 0]);
+    }
+    gpu_kernel_set_arg_buffer(kernel, 5, slot->info_buffer);
+    gpu_kernel_set_arg_buffer(kernel, 6, slot->sum_buffer);
+    gpu_kernel_set_arg_buffer(kernel, 7, slot->min_buffer);
+    gpu_kernel_set_arg_buffer(kernel, 8, slot->max_buffer);
+    gpu_kernel_set_arg_u64(kernel, 0, rows | (shader_widths << 32));
+    gpu_kernel_set_arg_u64(kernel, 1, (U64)num_exprs | ((U64)arg_bases[0] << 32));
+    gpu_kernel_set_arg_u64(kernel, 2, (U64)func_codes | ((U64)arg_bases[1] << 32));
+    gpu_kernel_set_arg_u64(kernel, 3, (U64)arg_index_codes | ((U64)(arg_signed_bits | (narrow_sums ? 0x80000000u : 0u)) << 32));
+    gpu_kernel_set_arg_u64(kernel, 4, group_count | ((U64)arg_bases[2] << 32));
+    gpu_kernel_set_arg_u64(kernel, 5, (U64)(U32)(S32)min_key | ((U64)arg_bases[3] << 32));
+    gpu_kernel_set_arg_u64(kernel, 6, tile_groups | (slice_rows << 32));
+    gpu_kernel_set_arg_u64(kernel, 7, tile_count | (start << 32));
+    U64 workgroups = (rows + slice_rows - 1) / slice_rows;
+    gpu_stream_dispatch(stream, slot_index, kernel, (U32)(workgroups * QE_GPU_WORKGROUP_SIZE), QE_GPU_WORKGROUP_SIZE);
+    gpu_stream_read(stream, slot_index, slot->info_buffer, slot->info, info_bytes);
+    gpu_stream_read(stream, slot_index, slot->sum_buffer, slot->sums, sum_bytes);
+    gpu_stream_read(stream, slot_index, slot->min_buffer, slot->mins, mm_bytes);
+    gpu_stream_read(stream, slot_index, slot->max_buffer, slot->maxs, mm_bytes);
+    slot->first_row = start;
+    slot->in_flight = 1;
+
+    // tec: submitted one chunk late, see qe_scan_filter_streamed
+    if (deferred_slot != max_U32)
+    {
+      ok = gpu_stream_submit(stream, deferred_slot);
+    }
+    deferred_slot = slot_index;
+  }
+  if (ok && deferred_slot != max_U32)
+  {
+    ok = gpu_stream_submit(stream, deferred_slot);
+  }
+
+  for (U64 offset = 0; offset < slot_count; offset++)
+  {
+    U32 slot_index = (U32)((chunk_count + offset) % slot_count);
+    if (ok)
+    {
+      ok = qe_dense_stream_retire(stream, slot_index, &slots[slot_index], &totals);
+    }
+    else
+    {
+      gpu_stream_wait(stream, slot_index);
+    }
+  }
+
+  if (stream)
+  {
+    gpu_stream_release(stream);
+  }
+  for (U64 slot_index = 0; slot_index < slot_count; slot_index++)
+  {
+    qe_dense_stream_unpin(&slots[slot_index], 0);
+    for (U32 c = 0; c < column_count; c++)
+    {
+      gpu_buffer_release(slots[slot_index].transient[c]);
+      if (slots[slot_index].encoded[c])
+      {
+        os_release(slots[slot_index].encoded[c], qe_chunk_bytes(columns[c], encodings[c].width, chunk_rows_max));
+      }
+    }
+    gpu_buffer_release(slots[slot_index].info_buffer);
+    gpu_buffer_release(slots[slot_index].sum_buffer);
+    gpu_buffer_release(slots[slot_index].min_buffer);
+    gpu_buffer_release(slots[slot_index].max_buffer);
+  }
+  gpu_kernel_release(kernel);
+  gpu_buffer_release(sequence_filler);
+
+  if (!ok)
+  {
+    log_error("qe_aggregate_dense_streamed: the streamed group by failed");
+    ProfEnd();
+    return 0;
+  }
+
+// tec: a row of each group for reading key values back, the key column is read from the start until every group has been seen
+  {
+    U64 missing = 0;
+    for (U64 group = 0; group < group_count; group++)
+    {
+      totals.owners[group] = max_U64;
+      missing += totals.counts[group] != 0;
+    }
+    U32* key_words = (U32*)key_column->data;
+    B32 key_signed = key_column->type == CQL_ColumnType_I32;
+    for (U64 row = 0; row < row_count && missing > 0; row++)
+    {
+      S64 id = (key_signed ? (S64)(S32)key_words[row] : (S64)key_words[row]) - min_key;
+      if (id >= 0 && (U64)id < group_count && totals.counts[id] != 0 && totals.owners[id] == max_U64)
+      {
+        totals.owners[id] = row;
+        missing -= 1;
+      }
+    }
+  }
+  
+  *out_totals = totals;
+  *out_min_key = min_key;
+  ProfEnd();
+  return 1;
+}
+
+// tec: GROUP BY one small range whole number column with plain aggregates over whole number columns. returns 0 with nothing built otherwise
+internal B32
+qe_aggregate_dense_streamed(Arena* arena, QE_DeviceRows* device, PLAN_RowSet* input, IR_Node* column_list_ir, QE_AggExprInfo* exprs, U32 num_exprs,
+                            CQL_Column* key_column, U64 row_count, PLAN_Materialized* out_result)
+{
+  if (num_exprs == 0 || num_exprs > QE_AGG_MAX_EXPRS)
+  {
+    return 0;
+  }
+  U32 funcs[QE_AGG_MAX_EXPRS] = {0};
+  CQL_Column* arg_cols[QE_AGG_MAX_EXPRS] = {0};
+  for (U32 e = 0; e < num_exprs; e++)
+  {
+    funcs[e] = exprs[e].func_code;
+    arg_cols[e] = exprs[e].arg_column;
+  }
+  QE_DenseStreamTotals totals = {0};
+  S64 min_key = 0;
+  if (!qe_dense_stream_core(arena, key_column, row_count, num_exprs, funcs, arg_cols, &totals, &min_key))
+  {
+    return 0;
+  }
+  U64 group_count = totals.group_count;
+
+  //- tec: the groups that have rows, in key order
+  U64 present = 0;
+  for (U64 group = 0; group < group_count; group++)
+  {
+    present += totals.counts[group] != 0;
+  }
+  F64* results = push_array(arena, F64, Max(present * num_exprs, (U64)1));
+  U64* representatives = push_array(arena, U64, Max(present, (U64)1));
+  U64 out_group = 0;
+  for (U64 group = 0; group < group_count; group++)
+  {
+    U64 count = totals.counts[group];
+    if (count == 0)
+    {
+      continue;
+    }
+    representatives[out_group] = totals.owners[group];
+    for (U32 e = 0; e < num_exprs; e++)
+    {
+      U64 index = group * num_exprs + e;
+      F64 value = 0.0;
+      switch (exprs[e].func_code)
+      {
+        case QE_AGG_FUNC_COUNT: { value = (F64)count; } break;
+        case QE_AGG_FUNC_SUM:   { value = (F64)totals.sums[index]; } break;
+        case QE_AGG_FUNC_AVG:   { value = (F64)totals.sums[index] / (F64)count; } break;
+        case QE_AGG_FUNC_MIN:   { value = (F64)totals.mins[index]; } break;
+        case QE_AGG_FUNC_MAX:   { value = (F64)totals.maxs[index]; } break;
+        default: break;
+      }
+      results[out_group * num_exprs + e] = value;
+    }
+    out_group += 1;
+  }
+
+  PLAN_RowSet output_rows = *input;
+  if (device)
+  {
+    output_rows = qe_device_representative_rows(arena, device, input, representatives, present);
+  }
+  *out_result = qe_aggregate_build_output(arena, &output_rows, column_list_ir, exprs, num_exprs, present, representatives, results);
+  ProfEnd();
+  return 1;
+}
+
+//~ tec: hash join probe of a big table, fused with the aggregates, streamed
+// tec: dim keys go in a VRAM hash table once, join_probe_native.comp adds each big table row to the totals of the dim row it matched
+// tec: the totals are global arrays added to by every chunk, indexed by dim row, for keys without a small range
+
+#define QE_PROBE_STREAM_MAX_ARGS 4
+#define QE_PROBE_STREAM_MAX_DIM_ROWS 4194304
+
+typedef struct QE_ProbeStreamSlot QE_ProbeStreamSlot;
+struct QE_ProbeStreamSlot
+{
+  GPU_Buffer* columns[1 + QE_PROBE_STREAM_MAX_ARGS];
+  GPU_Buffer* transient[1 + QE_PROBE_STREAM_MAX_ARGS];
+  QE_ResidentChunk* held[1 + QE_PROBE_STREAM_MAX_ARGS];
+  U8* encoded[1 + QE_PROBE_STREAM_MAX_ARGS];
+  B32 in_flight;
+};
+
+internal void
+qe_probe_stream_unpin(QE_ProbeStreamSlot* slot, B32 completed)
+{
+  for (U32 index = 0; index < 1 + QE_PROBE_STREAM_MAX_ARGS; index++)
+  {
+    qe_resident_unpin(slot->held[index], completed);
+    slot->held[index] = 0;
+  }
+}
+
+// tec: dim_rows lists the dim rows that take part, 0 for all. returns 0 with nothing built when a dim key repeats, a column is not handled or the GPU work did not complete
+internal B32
+qe_join_probe_stream_core(Arena* arena, CQL_Column* fact_key, U64 row_count, CQL_Column* dim_key, U64* dim_rows, U64 dim_count, U32 num_exprs, U32* funcs,
+                          CQL_Column** arg_cols, QE_DenseStreamTotals* out_totals)
+{
+  ProfBeginFunction();
+  CQL_Table* dim_table = dim_key->parent_table;
+  U64 dim_table_rows = dim_key->row_count;
+  if (!(fact_key->type == CQL_ColumnType_U32 || fact_key->type == CQL_ColumnType_I32) || fact_key->type != dim_key->type || fact_key->row_count != row_count ||
+      fact_key->null_flags || dim_key->null_flags || fact_key->is_disk_backed || dim_key->is_disk_backed || fact_key->data == 0 || dim_key->data == 0 ||
+      dim_table_rows == 0 || dim_table_rows > QE_PROBE_STREAM_MAX_DIM_ROWS || num_exprs == 0 || num_exprs > QE_AGG_MAX_EXPRS || !dim_table)
+  {
+    ProfEnd();
+    return 0;
+  }
+
+  //- tec: the same checks of the aggregates as the dense group by
+  CQL_Column* arg_columns[QE_PROBE_STREAM_MAX_ARGS] = {0};
+  U32 arg_count = 0;
+  U32 func_codes = 0;
+  U32 arg_index_codes = 0;
+  U32 arg_signed_bits = 0;
+  for (U32 e = 0; e < num_exprs; e++)
+  {
+    U32 func = funcs[e];
+    CQL_Column* column = arg_cols[e];
+    if (func != QE_AGG_FUNC_COUNT && func != QE_AGG_FUNC_SUM && func != QE_AGG_FUNC_AVG && func != QE_AGG_FUNC_MIN && func != QE_AGG_FUNC_MAX)
+    {
+      ProfEnd();
+      return 0;
+    }
+    func_codes |= (func & 0xfu) << (e * 4u);
+    if (func == QE_AGG_FUNC_COUNT)
+    {
+      continue;
+    }
+    F64 arg_low = 0.0;
+    F64 arg_high = 0.0;
+    if (!column || !(column->type == CQL_ColumnType_U32 || column->type == CQL_ColumnType_I32) || column->row_count != row_count || column->null_flags ||
+        column->is_disk_backed || column->data == 0)
+    {
+      ProfEnd();
+      return 0;
+    }
+    if ((func == QE_AGG_FUNC_MIN || func == QE_AGG_FUNC_MAX) &&
+        (!qe_column_range_from_zone_map(column, &arg_low, &arg_high) || arg_low < -2147483648.0 || arg_high > 2147483647.0))
+    {
+      ProfEnd();
+      return 0;
+    }
+    U32 index = 0;
+    while (index < arg_count && arg_columns[index] != column)
+    {
+      index++;
+    }
+    if (index == arg_count)
+    {
+      if (arg_count == QE_PROBE_STREAM_MAX_ARGS)
+      {
+        ProfEnd();
+        return 0;
+      }
+      arg_columns[arg_count++] = column;
+    }
+    arg_index_codes |= (index & 0xfu) << (e * 4u);
+    if (column->type == CQL_ColumnType_I32)
+    {
+      arg_signed_bits |= 1u << index;
+    }
+  }
+
+  //- tec: the hash table, built here. a key that is in the dim table twice would make a row match two entries, which the totals per dim row can not say
+  U64 table_rows = dim_rows ? dim_count : dim_table_rows;
+  U32 log2_size = 4;
+  while (((U64)1 << log2_size) < table_rows * 2)
+  {
+    log2_size += 1;
+  }
+  U64 table_size = (U64)1 << log2_size;
+  U32* table_keys = push_array(arena, U32, table_size);
+  U32* table_row_words = push_array(arena, U32, table_size);
+  U32* dim_words = (U32*)dim_key->data;
+  for (U64 visit = 0; visit < table_rows; visit++)
+  {
+    U64 dim_row = dim_rows ? dim_rows[visit] : visit;
+    U32 key = dim_words[dim_row];
+    U64 slot_index = (U64)((U32)(key * 0x9E3779B1u) >> (32 - log2_size));
+    while (table_row_words[slot_index] != 0)
+    {
+      if (table_keys[slot_index] == key)
+      {
+        ProfEnd();
+        return 0;
+      }
+      slot_index = (slot_index + 1) & (table_size - 1);
+    }
+    table_keys[slot_index] = key;
+    table_row_words[slot_index] = (U32)dim_row + 1;
+  }
+
+  // tec: 16 bits per key, a key sets two of the 32 bits of one word
+  U32 bloom_log2 = 4;
+  while (((U64)1 << bloom_log2) * 2 < table_rows)
+  {
+    bloom_log2 += 1;
+  }
+  U32* bloom_words = push_array(arena, U32, (U64)1 << bloom_log2);
+  for (U64 visit = 0; visit < table_rows; visit++)
+  {
+    U32 key = dim_words[dim_rows ? dim_rows[visit] : visit];
+    U32 h = key * 0x9E3779B1u;
+    U32 h2 = key * 0x85EBCA6Bu;
+    bloom_words[h >> (32 - bloom_log2)] |= (1u << ((h2 >> 27) & 31)) | (1u << ((h2 >> 22) & 31));
+  }
+  
+  QE_DenseStreamTotals totals = {0};
+  totals.group_count = dim_table_rows;
+  totals.expr_count = num_exprs;
+  totals.counts = push_array(arena, U64, dim_table_rows);
+  totals.sums = push_array(arena, S64, dim_table_rows * num_exprs);
+  totals.mins = push_array(arena, S64, dim_table_rows * num_exprs);
+  totals.maxs = push_array(arena, S64, dim_table_rows * num_exprs);
+  totals.owners = push_array(arena, U64, dim_table_rows);
+
+  U32 column_count = 1 + arg_count;
+  CQL_Column* columns[1 + QE_PROBE_STREAM_MAX_ARGS] = {0};
+  columns[0] = fact_key;
+  for (U32 index = 0; index < arg_count; index++)
+  {
+    columns[1 + index] = arg_columns[index];
+  }
+  QE_ColumnEncoding encodings[1 + QE_PROBE_STREAM_MAX_ARGS];
+  for (U32 c = 0; c < column_count; c++)
+  {
+    encodings[c] = qe_column_encoding(columns[c], 0);
+  }
+  U64 shader_widths = qe_encoding_shader_width(columns[0], encodings[0]);
+  U32 arg_bases[QE_PROBE_STREAM_MAX_ARGS] = {0};
+  for (U32 index = 0; index < arg_count; index++)
+  {
+    shader_widths |= (U64)qe_encoding_shader_width(columns[1 + index], encodings[1 + index]) << (4 + 4 * index);
+    arg_bases[index] = encodings[1 + index].base;
+  }
+
+  //- tec: the hash table and the totals, on the GPU, the totals cleared
+  U64 count_bytes = dim_table_rows * sizeof(U32);
+  U64 sum_bytes = dim_table_rows * num_exprs * 2 * sizeof(U32);
+  U64 mm_bytes = dim_table_rows * num_exprs * sizeof(U32);
+  GPU_Buffer* table_key_buffer = gpu_buffer_alloc(table_size * sizeof(U32), GPU_BufferFlag_Write, table_keys);
+  GPU_Buffer* table_row_buffer = gpu_buffer_alloc(table_size * sizeof(U32), GPU_BufferFlag_Write, table_row_words);
+  GPU_Buffer* count_buffer = gpu_buffer_alloc(count_bytes, GPU_BufferFlag_ReadWrite, 0);
+  GPU_Buffer* sum_buffer = gpu_buffer_alloc(sum_bytes, GPU_BufferFlag_ReadWrite, 0);
+  GPU_Buffer* min_buffer = gpu_buffer_alloc(mm_bytes, GPU_BufferFlag_ReadWrite, 0);
+  GPU_Buffer* max_buffer = gpu_buffer_alloc(mm_bytes, GPU_BufferFlag_ReadWrite, 0);
+  GPU_Buffer* bloom_buffer = gpu_buffer_alloc(((U64)1 << bloom_log2) * sizeof(U32), GPU_BufferFlag_Write, bloom_words);
+  GPU_Buffer* sequence_filler = gpu_buffer_alloc(256, GPU_BufferFlag_Write, 0);
+  GPU_Kernel* kernel = gpu_kernel_alloc(str8_lit("join_probe_native"));
+  B32 ok = bloom_buffer && table_key_buffer && table_row_buffer && count_buffer && sum_buffer && min_buffer && max_buffer && sequence_filler && kernel;
+  if (ok)
+  {
+    GPU_Batch* clear = gpu_batch_begin(0, 0);
+    gpu_batch_buffer_zero(clear, count_buffer, count_bytes);
+    gpu_batch_buffer_zero(clear, sum_buffer, sum_bytes);
+    gpu_batch_buffer_fill(clear, min_buffer, mm_bytes, 0x7fffffffu);
+    gpu_batch_buffer_fill(clear, max_buffer, mm_bytes, 0x80000000u);
+    ok = gpu_batch_end(clear);
+  }
+
+  U64 slot_count = Clamp(2, settings_u64(str8_lit("QE_SCAN_STREAM_SLOTS"), 3), 8);
+  U64 chunk_rows_max = qe_stream_chunk_rows();
+  U64 chunk_count = (row_count + chunk_rows_max - 1) / chunk_rows_max;
+  slot_count = Min(slot_count, Max(chunk_count, (U64)1));
+
+  GPU_Stream* stream = ok ? gpu_stream_alloc((U32)slot_count) : 0;
+  QE_ProbeStreamSlot* slots = push_array(arena, QE_ProbeStreamSlot, slot_count);
+  ok = ok && stream != 0;
+
+  U32 deferred_slot = max_U32;
+  for (U64 chunk_index = 0; chunk_index < chunk_count && ok; chunk_index++)
+  {
+    U32 slot_index = (U32)(chunk_index % slot_count);
+    QE_ProbeStreamSlot* slot = &slots[slot_index];
+    U64 start = chunk_index * chunk_rows_max;
+    U64 rows = Min(chunk_rows_max, row_count - start);
+
+    if (slot->in_flight)
+    {
+      slot->in_flight = 0;
+      ok = gpu_stream_wait(stream, slot_index);
+      qe_probe_stream_unpin(slot, 1);
+      if (!ok)
+      {
+        break;
+      }
+    }
+
+    B32 needs_copy[1 + QE_PROBE_STREAM_MAX_ARGS] = {0};
+    void* source[1 + QE_PROBE_STREAM_MAX_ARGS] = {0};
+    U64 source_bytes[1 + QE_PROBE_STREAM_MAX_ARGS] = {0};
+    U64 upload_bytes = 0;
+    for (U32 c = 0; c < column_count && ok; c++)
+    {
+      slot->columns[c] = qe_stream_prepare_column(columns[c], encodings[c], sequence_filler, start, rows, chunk_rows_max, &slot->transient[c], &slot->held[c], &slot->encoded[c],
+                                                   &needs_copy[c], &source[c], &source_bytes[c]);
+      ok = slot->columns[c] != 0;
+      if (ok && needs_copy[c])
+      {
+        upload_bytes += source_bytes[c];
+      }
+    }
+    if (!ok)
+    {
+      break;
+    }
+
+    ok = gpu_stream_slot_begin(stream, slot_index, upload_bytes, 0);
+    for (U32 c = 0; c < column_count && ok; c++)
+    {
+      if (needs_copy[c])
+      {
+        ok = gpu_stream_copy(stream, slot_index, slot->columns[c], source[c], source_bytes[c]);
+      }
+    }
+    if (!ok)
+    {
+      break;
+    }
+
+    gpu_kernel_set_arg_buffer(kernel, 0, slot->columns[0]);
+    for (U32 binding = 0; binding < QE_PROBE_STREAM_MAX_ARGS; binding++)
+    {
+      gpu_kernel_set_arg_buffer(kernel, 1 + binding, slot->columns[binding < arg_count ? 1 + binding : 0]);
+    }
+    gpu_kernel_set_arg_buffer(kernel, 5, table_key_buffer);
+    gpu_kernel_set_arg_buffer(kernel, 6, table_row_buffer);
+    gpu_kernel_set_arg_buffer(kernel, 7, count_buffer);
+    gpu_kernel_set_arg_buffer(kernel, 8, sum_buffer);
+    gpu_kernel_set_arg_buffer(kernel, 9, min_buffer);
+    gpu_kernel_set_arg_buffer(kernel, 10, max_buffer);
+    gpu_kernel_set_arg_buffer(kernel, 11, bloom_buffer);
+    gpu_kernel_set_arg_u64(kernel, 0, rows | (shader_widths << 32));
+    gpu_kernel_set_arg_u64(kernel, 1, (U64)num_exprs | ((U64)arg_bases[0] << 32));
+    gpu_kernel_set_arg_u64(kernel, 2, (U64)func_codes | ((U64)arg_bases[1] << 32));
+    gpu_kernel_set_arg_u64(kernel, 3, (U64)arg_index_codes | ((U64)arg_signed_bits << 32));
+    gpu_kernel_set_arg_u64(kernel, 4, (table_size - 1) | ((U64)arg_bases[2] << 32));
+    gpu_kernel_set_arg_u64(kernel, 5, (U64)encodings[0].base | ((U64)arg_bases[3] << 32));
+    gpu_kernel_set_arg_u64(kernel, 6, (U64)log2_size | ((U64)bloom_log2 << 32));
+    U64 workgroups = (rows + 8191) / 8192;
+    gpu_stream_dispatch(stream, slot_index, kernel, (U32)(workgroups * QE_GPU_WORKGROUP_SIZE), QE_GPU_WORKGROUP_SIZE);
+    slot->in_flight = 1;
+
+    if (deferred_slot != max_U32)
+    {
+      ok = gpu_stream_submit(stream, deferred_slot);
+    }
+    deferred_slot = slot_index;
+  }
+  if (ok && deferred_slot != max_U32)
+  {
+    ok = gpu_stream_submit(stream, deferred_slot);
+  }
+  for (U64 offset = 0; offset < slot_count; offset++)
+  {
+    U32 slot_index = (U32)((chunk_count + offset) % slot_count);
+    QE_ProbeStreamSlot* slot = &slots[slot_index];
+    if (slot->in_flight)
+    {
+      slot->in_flight = 0;
+      B32 waited = gpu_stream_wait(stream, slot_index);
+      qe_probe_stream_unpin(slot, ok && waited);
+      ok = ok && waited;
+    }
+  }
+  if (stream)
+  {
+    gpu_stream_release(stream);
+  }
+
+  //- tec: the totals come back once
+  if (ok)
+  {
+    U32* count_words = push_array(arena, U32, dim_table_rows);
+    U32* sum_words = push_array(arena, U32, dim_table_rows * num_exprs * 2);
+    U32* min_words = push_array(arena, U32, dim_table_rows * num_exprs);
+    U32* max_words = push_array(arena, U32, dim_table_rows * num_exprs);
+    gpu_buffer_read(count_buffer, count_words, count_bytes);
+    gpu_buffer_read(sum_buffer, sum_words, sum_bytes);
+    gpu_buffer_read(min_buffer, min_words, mm_bytes);
+    gpu_buffer_read(max_buffer, max_words, mm_bytes);
+    for (U64 row = 0; row < dim_table_rows; row++)
+    {
+      totals.counts[row] = count_words[row];
+      for (U32 e = 0; e < num_exprs; e++)
+      {
+        U64 index = row * num_exprs + e;
+        totals.sums[index] = (S64)(((U64)sum_words[index * 2 + 1] << 32) | (U64)sum_words[index * 2]);
+        totals.mins[index] = (S64)(S32)min_words[index];
+        totals.maxs[index] = (S64)(S32)max_words[index];
+      }
+    }
+  }
+
+  for (U64 slot_index = 0; slot_index < slot_count; slot_index++)
+  {
+    qe_probe_stream_unpin(&slots[slot_index], 0);
+    for (U32 c = 0; c < column_count; c++)
+    {
+      gpu_buffer_release(slots[slot_index].transient[c]);
+      if (slots[slot_index].encoded[c])
+      {
+        os_release(slots[slot_index].encoded[c], qe_chunk_bytes(columns[c], encodings[c].width, chunk_rows_max));
+      }
+    }
+  }
+  gpu_buffer_release(table_key_buffer);
+  gpu_buffer_release(table_row_buffer);
+  gpu_buffer_release(count_buffer);
+  gpu_buffer_release(sum_buffer);
+  gpu_buffer_release(min_buffer);
+  gpu_buffer_release(max_buffer);
+  gpu_buffer_release(bloom_buffer);
+  gpu_buffer_release(sequence_filler);
+  if (kernel)
+  {
+    gpu_kernel_release(kernel);
+  }
+
+  if (!ok)
+  {
+    log_error("qe_join_probe_stream_core: the streamed join probe failed");
+    ProfEnd();
+    return 0;
+  }
+  *out_totals = totals;
+  ProfEnd();
+  return 1;
+}
+
+//~ tec: aggregate over a join, computed per join key
+// tec: SELECT aggregates FROM fact JOIN dim ON fact.k = dim.k [WHERE on dim] [GROUP BY dim columns]
+// tec: fact rows with one key join the same dim rows, so the fact table is reduced to one entry per key by qe_dense_stream_core and combined with the dim rows
+// tec: needs a small range whole number fact key and whole number fact aggregates, returns 0 with nothing built otherwise
+
+#define QE_JOIN_PUSH_MAX_FACT_FUNCS 8
+
+typedef struct QE_JoinPushAccumulator QE_JoinPushAccumulator;
+struct QE_JoinPushAccumulator
+{
+  F64 sum;
+  F64 min_value;
+  F64 max_value;
+  U64 count;
+  B32 seen;
+};
+
+internal B32
+qe_aggregate_join_pushdown(Arena* arena, PLAN_RowSet* fact_rows, CQL_Table* dim_table, String8 dim_alias, U64* dim_rows, U64 dim_count, IR_Node* equi_condition,
+                           IR_Node* group_by_ir, IR_Node* column_list_ir, PLAN_Materialized* out_result)
+{
+  ProfBeginFunction();
+  if (!equi_condition || fact_rows->table_count != 1 || settings_u64(str8_lit("QE_JOIN_PUSHDOWN"), 1) == 0 || settings_u64(str8_lit("QE_AGG_STREAM"), 1) == 0)
+  {
+    ProfEnd();
+    return 0;
+  }
+  CQL_Table* fact_table = fact_rows->tables[0];
+  U64 row_count = fact_table->row_count;
+  if (row_count * sizeof(F64) <= settings_u64(str8_lit("GPU_MAX_BUFFER_SIZE"), GPU_MAX_BUFFER_SIZE))
+  {
+    ProfEnd();
+    return 0;
+  }
+
+  //- tec: the two key columns
+  IR_Node* left_node = equi_condition->first;
+  IR_Node* right_node = left_node ? left_node->next : 0;
+  if (!left_node || !right_node)
+  {
+    ProfEnd();
+    return 0;
+  }
+  B32 left_is_dim = qe_column_belongs_to_table(dim_table, dim_alias, left_node->value);
+  IR_Node* fact_key_node = left_is_dim ? right_node : left_node;
+  IR_Node* dim_key_node = left_is_dim ? left_node : right_node;
+
+  String8 fact_bare = {0};
+  U64 fact_slot = max_U64;
+  CQL_Table* resolved_fact = qe_resolve_column_table(fact_rows, fact_key_node->value, &fact_bare, &fact_slot);
+  CQL_Column* fact_key = resolved_fact ? cql_table_find_column(resolved_fact, fact_bare) : 0;
+
+  String8 dim_bare = dim_key_node->value;
+  for (U64 i = 0; i < dim_key_node->value.size; i++)
+  {
+    if (dim_key_node->value.str[i] == '.')
+    {
+      dim_bare = str8_skip(dim_key_node->value, i + 1);
+      break;
+    }
+  }
+  CQL_Column* dim_key = cql_table_find_column(dim_table, dim_bare);
+  if (!fact_key || !dim_key || resolved_fact != fact_table || dim_key->null_flags || dim_key->is_disk_backed)
+  {
+    ProfEnd();
+    return 0;
+  }
+
+  //- tec: the aggregates and group columns, resolved against both tables
+  CQL_Table* joined_tables[2] = { fact_table, dim_table };
+  String8 joined_aliases[2] = { fact_rows->aliases ? fact_rows->aliases[0] : (String8){0}, dim_alias };
+  U64* joined_indices[2] = {0};
+  PLAN_RowSet joined_stub = {0};
+  joined_stub.tables = joined_tables;
+  joined_stub.aliases = joined_aliases;
+  joined_stub.table_count = 2;
+  joined_stub.row_indices = joined_indices;
+
+  QE_AggExprInfo exprs[QE_AGG_MAX_EXPRS];
+  U32 num_exprs = 0;
+  if (!qe_aggregate_collect_exprs(arena, &joined_stub, column_list_ir ? column_list_ir->first : NULL, exprs, &num_exprs) || num_exprs == 0)
+  {
+    ProfEnd();
+    return 0;
+  }
+
+  // tec: which fact side values the totals per key have to carry. an expr over a dim column needs only the count
+  U32 core_funcs[QE_JOIN_PUSH_MAX_FACT_FUNCS] = {0};
+  CQL_Column* core_cols[QE_JOIN_PUSH_MAX_FACT_FUNCS] = {0};
+  U32 core_count = 0;
+  U32 core_index_of_expr[QE_AGG_MAX_EXPRS] = {0};
+  B32 expr_on_dim[QE_AGG_MAX_EXPRS] = {0};
+  F64* dim_arg_values[QE_AGG_MAX_EXPRS] = {0};
+  for (U32 e = 0; e < num_exprs; e++)
+  {
+    U32 func = exprs[e].func_code;
+    CQL_Column* column = exprs[e].arg_column;
+    if (func != QE_AGG_FUNC_COUNT && func != QE_AGG_FUNC_SUM && func != QE_AGG_FUNC_AVG && func != QE_AGG_FUNC_MIN && func != QE_AGG_FUNC_MAX)
+    {
+      ProfEnd();
+      return 0;
+    }
+    if (!column)
+    {
+      if (func != QE_AGG_FUNC_COUNT)
+      {
+        ProfEnd();
+        return 0;
+      }
+      continue;
+    }
+    if (column->null_flags)
+    {
+      ProfEnd();
+      return 0;
+    }
+    if (func == QE_AGG_FUNC_COUNT)
+    {
+      continue;
+    }
+    if (exprs[e].arg_table == dim_table && column->parent_table == dim_table)
+    {
+      expr_on_dim[e] = 1;
+      if (column->type == CQL_ColumnType_String8 || column->is_disk_backed)
+      {
+        ProfEnd();
+        return 0;
+      }
+      dim_arg_values[e] = qe_column_dense_f64(arena, column);
+      continue;
+    }
+    if (exprs[e].arg_table != fact_table)
+    {
+      ProfEnd();
+      return 0;
+    }
+    // tec: AVG is a sum and the count
+    U32 core_func = func == QE_AGG_FUNC_AVG ? QE_AGG_FUNC_SUM : func;
+    U32 index = 0;
+    while (index < core_count && !(core_funcs[index] == core_func && core_cols[index] == column))
+    {
+      index++;
+    }
+    if (index == core_count)
+    {
+      if (core_count == QE_JOIN_PUSH_MAX_FACT_FUNCS)
+      {
+        ProfEnd();
+        return 0;
+      }
+      core_funcs[core_count] = core_func;
+      core_cols[core_count] = column;
+      core_count += 1;
+    }
+    core_index_of_expr[e] = index;
+  }
+  if (core_count == 0)
+  {
+    core_funcs[0] = QE_AGG_FUNC_COUNT;
+    core_count = 1;
+  }
+
+  U32 group_col_count = 0;
+  CQL_Column* group_cols[QE_AGG_MAX_GROUP_COLS] = {0};
+  F64* group_values[QE_AGG_MAX_GROUP_COLS] = {0};
+  for (IR_Node* node = group_by_ir ? group_by_ir->first : NULL; node; node = node->next)
+  {
+    String8 bare = {0};
+    U64 slot = max_U64;
+    CQL_Table* table = qe_resolve_column_table(&joined_stub, node->value, &bare, &slot);
+    CQL_Column* column = table ? cql_table_find_column(table, bare) : 0;
+    if (!column || table != dim_table || group_col_count == QE_AGG_MAX_GROUP_COLS || column->type == CQL_ColumnType_String8 || column->null_flags ||
+        column->is_disk_backed)
+    {
+      ProfEnd();
+      return 0;
+    }
+    group_cols[group_col_count] = column;
+    group_values[group_col_count] = qe_column_dense_f64(arena, column);
+    group_col_count += 1;
+  }
+
+  //- tec: the fact table, reduced to one entry per key
+// tec: a small range key is reduced densely per key value, any other key through a hash table of the dim keys, with totals per dim row
+  QE_DenseStreamTotals totals = {0};
+  S64 min_key = 0;
+  B32 by_dim_row = 0;
+  if (!qe_dense_stream_core(arena, fact_key, row_count, core_count, core_funcs, core_cols, &totals, &min_key))
+  {
+    by_dim_row = 1;
+    if (settings_u64(str8_lit("QE_JOIN_PROBE"), 1) == 0 || !qe_join_probe_stream_core(arena, fact_key, row_count, dim_key, dim_rows, dim_count, core_count, core_funcs, core_cols, &totals))
+    {
+      ProfEnd();
+      return 0;
+    }
+  }
+
+  //- tec: each dim row meets the entry of its key
+  F64* dim_key_values = qe_column_dense_f64(arena, dim_key);
+  U64 rows_to_visit = dim_rows ? dim_count : dim_table->row_count;
+
+  // tec: a group is a distinct combination of the group column values of the dim rows that matched, found with a small open addressing table
+  U64 slot_capacity = 64;
+  while (slot_capacity < rows_to_visit * 2 + 2)
+  {
+    slot_capacity *= 2;
+  }
+  U32* hash_slots = push_array(arena, U32, slot_capacity);
+  U64 group_capacity = Max(rows_to_visit, (U64)1);
+  U64* group_representative = push_array(arena, U64, group_capacity);
+  QE_JoinPushAccumulator* accumulators = push_array(arena, QE_JoinPushAccumulator, group_capacity * num_exprs);
+  U64 group_matched_rows = 0;
+  U64 groups = 0;
+
+  for (U64 visit = 0; visit < rows_to_visit; visit++)
+  {
+    U64 dim_row = dim_rows ? dim_rows[visit] : visit;
+    F64 key_value = dim_key_values[dim_row];
+    S64 key_id = by_dim_row ? (S64)dim_row : (S64)key_value - min_key;
+    if ((!by_dim_row && (F64)(S64)key_value != key_value) || key_id < 0 || (U64)key_id >= totals.group_count || totals.counts[key_id] == 0)
+    {
+      continue;
+    }
+    U64 matches = totals.counts[key_id];
+
+    U64 group = 0;
+    if (group_col_count == 0)
+    {
+      group = 0;
+      groups = Max(groups, (U64)1);
+      group_representative[0] = dim_row;
+    }
+    else
+    {
+      U64 hash = 1469598103934665603ull;
+      for (U32 c = 0; c < group_col_count; c++)
+      {
+        U64 bits = 0;
+        MemoryCopy(&bits, &group_values[c][dim_row], sizeof(bits));
+        hash = (hash ^ bits) * 1099511628211ull;
+        hash ^= hash >> 29;
+      }
+      U64 position = hash & (slot_capacity - 1);
+      for (;;)
+      {
+        U32 stored = hash_slots[position];
+        if (stored == 0)
+        {
+          group = groups;
+          groups += 1;
+          hash_slots[position] = (U32)group + 1;
+          group_representative[group] = dim_row;
+          break;
+        }
+        U64 candidate = group_representative[stored - 1];
+        B32 same = 1;
+        for (U32 c = 0; c < group_col_count && same; c++)
+        {
+          same = group_values[c][candidate] == group_values[c][dim_row];
+        }
+        if (same)
+        {
+          group = stored - 1;
+          break;
+        }
+        position = (position + 1) & (slot_capacity - 1);
+      }
+    }
+    group_matched_rows += 1;
+
+    for (U32 e = 0; e < num_exprs; e++)
+    {
+      QE_JoinPushAccumulator* acc = &accumulators[group * num_exprs + e];
+      U32 func = exprs[e].func_code;
+      U64 core_slot = key_id * core_count + core_index_of_expr[e];
+      acc->count += matches;
+      if (func == QE_AGG_FUNC_COUNT)
+      {
+        continue;
+      }
+      if (expr_on_dim[e])
+      {
+        F64 value = dim_arg_values[e][dim_row];
+        acc->sum += value * (F64)matches;
+        acc->min_value = acc->seen ? Min(acc->min_value, value) : value;
+        acc->max_value = acc->seen ? Max(acc->max_value, value) : value;
+      }
+      else
+      {
+        acc->sum += (F64)totals.sums[core_slot];
+        acc->min_value = acc->seen ? Min(acc->min_value, (F64)totals.mins[core_slot]) : (F64)totals.mins[core_slot];
+        acc->max_value = acc->seen ? Max(acc->max_value, (F64)totals.maxs[core_slot]) : (F64)totals.maxs[core_slot];
+      }
+      acc->seen = 1;
+    }
+  }
+
+  // tec: no group by means one row of totals, an empty join then has nothing to say that the general path would not say better
+  if (groups == 0)
+  {
+    ProfEnd();
+    return 0;
+  }
+
+  F64* results = push_array(arena, F64, groups * num_exprs);
+  for (U64 group = 0; group < groups; group++)
+  {
+    for (U32 e = 0; e < num_exprs; e++)
+    {
+      QE_JoinPushAccumulator* acc = &accumulators[group * num_exprs + e];
+      F64 value = 0.0;
+      switch (exprs[e].func_code)
+      {
+        case QE_AGG_FUNC_COUNT: { value = (F64)acc->count; } break;
+        case QE_AGG_FUNC_SUM:   { value = acc->sum; } break;
+        case QE_AGG_FUNC_AVG:   { value = acc->count ? acc->sum / (F64)acc->count : 0.0; } break;
+        case QE_AGG_FUNC_MIN:   { value = acc->min_value; } break;
+        case QE_AGG_FUNC_MAX:   { value = acc->max_value; } break;
+        default: break;
+      }
+      results[group * num_exprs + e] = value;
+    }
+  }
+
+  //- tec: the group columns are read from the first dim row of each group
+  PLAN_RowSet output_rows = {0};
+  output_rows.tables = joined_tables;
+  output_rows.aliases = joined_aliases;
+  output_rows.table_count = 2;
+  output_rows.row_indices = push_array(arena, U64*, 2);
+  output_rows.row_indices[0] = push_array(arena, U64, groups);
+  output_rows.row_indices[1] = push_array(arena, U64, groups);
+  output_rows.count = groups;
+  U64* representatives = push_array(arena, U64, groups);
+  for (U64 group = 0; group < groups; group++)
+  {
+    output_rows.row_indices[0][group] = PLAN_NULL_ROW;
+    output_rows.row_indices[1][group] = group_representative[group];
+    representatives[group] = group;
+  }
+  CQL_Table** kept_tables = push_array(arena, CQL_Table*, 2);
+  String8* kept_aliases = push_array(arena, String8, 2);
+  MemoryCopy(kept_tables, joined_tables, sizeof(joined_tables));
+  MemoryCopy(kept_aliases, joined_aliases, sizeof(joined_aliases));
+  output_rows.tables = kept_tables;
+  output_rows.aliases = kept_aliases;
+
+  *out_result = qe_aggregate_build_output(arena, &output_rows, column_list_ir, exprs, num_exprs, groups, representatives, results);
+  (void)group_matched_rows;
+  ProfEnd();
+  return 1;
+}
+
+//~ tec: COUNT, SUM, AVG, MIN and MAX of whole columns on the GPU, streamed
+// tec: same slot pipeline and resident chunks as qe_scan_filter_streamed, aggregate_global_native.comp leaves doubles per workgroup and column
+// tec: partials are folded in chunk then workgroup order so the result does not depend on scheduling
+
+#define QE_AGG_STREAM_MAX_COLUMNS 4
+#define QE_AGG_STREAM_DEFAULT_GROUPS 2048
+#define QE_AGG_STREAM_READBACK_PAD 64
+
+typedef struct QE_AggStreamSlot QE_AggStreamSlot;
+struct QE_AggStreamSlot
+{
+  GPU_Buffer* columns[QE_AGG_STREAM_MAX_COLUMNS];
+  GPU_Buffer* transient[QE_AGG_STREAM_MAX_COLUMNS];
+  QE_ResidentChunk* held[QE_AGG_STREAM_MAX_COLUMNS];
+  U8* encoded[QE_AGG_STREAM_MAX_COLUMNS];
+  GPU_Buffer* partials_buffer;
+  F64* partials;
+  B32 in_flight;
+};
+
+internal B32
+qe_agg_stream_type_supported(CQL_ColumnType type)
+{
+  return type == CQL_ColumnType_U32 || type == CQL_ColumnType_I32 || type == CQL_ColumnType_F32 || type == CQL_ColumnType_F64;
+}
+
+internal void
+qe_agg_stream_unpin(QE_AggStreamSlot* slot, B32 completed)
+{
+  for (U32 index = 0; index < QE_AGG_STREAM_MAX_COLUMNS; index++)
+  {
+    qe_resident_unpin(slot->held[index], completed);
+    slot->held[index] = 0;
+  }
+}
+
+// tec: waits for the slot and folds its partials into the column totals
+internal B32
+qe_agg_stream_retire(GPU_Stream* stream, U32 slot_index, QE_AggStreamSlot* slot, U32 column_count, U64 group_count, F64* column_sum, F64* column_min, F64* column_max)
+{
+  if (!slot->in_flight)
+  {
+    return 1;
+  }
+  slot->in_flight = 0;
+  if (!gpu_stream_wait(stream, slot_index))
+  {
+    return 0;
+  }
+  for (U64 group = 0; group < group_count; group++)
+  {
+    for (U32 c = 0; c < column_count; c++)
+    {
+      F64* triple = &slot->partials[(group * column_count + c) * 3];
+      column_sum[c] += triple[0];
+      column_min[c] = Min(column_min[c], triple[1]);
+      column_max[c] = Max(column_max[c], triple[2]);
+    }
+  }
+  qe_agg_stream_unpin(slot, 1);
+  return 1;
+}
+
+// tec: returns 0, with nothing built, when the select list or a column is not one this handles or the GPU work did not complete
+internal B32
+qe_aggregate_global_streamed(Arena* arena, PLAN_RowSet* input, IR_Node* column_list_ir, QE_AggExprInfo* exprs, U32 num_exprs, U64 row_count, PLAN_Materialized* out_result)
+{
+  ProfBeginFunction();
+  CQL_Column* columns[QE_AGG_STREAM_MAX_COLUMNS] = {0};
+  U32 column_count = 0;
+  U32 column_of_expr[QE_AGG_MAX_EXPRS] = {0};
+
+  for (U32 e = 0; e < num_exprs; e++)
+  {
+    U32 func = exprs[e].func_code;
+    if (func != QE_AGG_FUNC_COUNT && func != QE_AGG_FUNC_SUM && func != QE_AGG_FUNC_AVG && func != QE_AGG_FUNC_MIN && func != QE_AGG_FUNC_MAX)
+    {
+      ProfEnd();
+      return 0;
+    }
+    CQL_Column* column = exprs[e].arg_column;
+    if (!column)
+    {
+      if (func != QE_AGG_FUNC_COUNT)
+      {
+        ProfEnd();
+        return 0;
+      }
+      continue;
+    }
+    if (column->row_count != row_count || column->null_flags || column->is_disk_backed || column->data == 0 || !qe_agg_stream_type_supported(column->type))
+    {
+      ProfEnd();
+      return 0;
+    }
+    U32 index = 0;
+    while (index < column_count && columns[index] != column)
+    {
+      index++;
+    }
+    if (index == column_count)
+    {
+      if (column_count == QE_AGG_STREAM_MAX_COLUMNS)
+      {
+        ProfEnd();
+        return 0;
+      }
+      columns[column_count++] = column;
+    }
+    column_of_expr[e] = index;
+  }
+
+  F64 column_sum[QE_AGG_STREAM_MAX_COLUMNS] = {0};
+  F64 column_min[QE_AGG_STREAM_MAX_COLUMNS] = {0};
+  F64 column_max[QE_AGG_STREAM_MAX_COLUMNS] = {0};
+  for (U32 c = 0; c < column_count; c++)
+  {
+    column_min[c] = QE_F64_MAX;
+    column_max[c] = -QE_F64_MAX;
+  }
+
+  // tec: a column that is base + row number is summed, and its smallest and largest found, without reading it. the others go to the GPU
+  QE_ColumnEncoding encodings[QE_AGG_STREAM_MAX_COLUMNS];
+  CQL_Column* gpu_columns[QE_AGG_STREAM_MAX_COLUMNS] = {0};
+  U32 gpu_to_column[QE_AGG_STREAM_MAX_COLUMNS] = {0};
+  U32 gpu_count = 0;
+  for (U32 c = 0; c < column_count; c++)
+  {
+    QE_ColumnEncoding encoding = qe_column_encoding(columns[c], 1);
+    if (encoding.sequence)
+    {
+      F64 first = columns[c]->type == CQL_ColumnType_I32 ? (F64)(S32)encoding.base : (F64)encoding.base;
+      S64 first_value = columns[c]->type == CQL_ColumnType_I32 ? (S64)(S32)encoding.base : (S64)encoding.base;
+      U64 n = row_count;
+      // tec: n * first + n * (n - 1) / 2, in 64 bit whole numbers up to the sizes a table can have, rounded to a double once
+      S64 total = first_value * (S64)n + (S64)(n * (n - 1) / 2);
+      column_sum[c] = (F64)total;
+      column_min[c] = first;
+      column_max[c] = first + (F64)(n - 1);
+    }
+    else
+    {
+      encodings[gpu_count] = encoding;
+      gpu_columns[gpu_count] = columns[c];
+      gpu_to_column[gpu_count] = c;
+      gpu_count += 1;
+    }
+  }
+  F64 gpu_sum[QE_AGG_STREAM_MAX_COLUMNS] = {0};
+  F64 gpu_min[QE_AGG_STREAM_MAX_COLUMNS] = {0};
+  F64 gpu_max[QE_AGG_STREAM_MAX_COLUMNS] = {0};
+  for (U32 c = 0; c < gpu_count; c++)
+  {
+    gpu_min[c] = QE_F64_MAX;
+    gpu_max[c] = -QE_F64_MAX;
+  }
+
+  B32 ok = 1;
+  if (gpu_count > 0)
+  {
+    GPU_Kernel* kernel = gpu_kernel_alloc(str8_lit("aggregate_global_native"));
+    if (!kernel)
+    {
+      ProfEnd();
+      return 0;
+    }
+
+    U64 slot_count = Clamp(2, settings_u64(str8_lit("QE_SCAN_STREAM_SLOTS"), 3), 8);
+    U64 chunk_rows_max = qe_stream_chunk_rows();
+    U64 chunk_count = (row_count + chunk_rows_max - 1) / chunk_rows_max;
+    slot_count = Min(slot_count, Max(chunk_count, (U64)1));
+
+    U64 group_count = Max(Min(chunk_rows_max / 4 / 1024, settings_u64(str8_lit("QE_AGG_GLOBAL_GROUPS"), QE_AGG_STREAM_DEFAULT_GROUPS)), (U64)1);
+    U64 partial_count = group_count * gpu_count * 3;
+
+    GPU_Buffer* sequence_filler = gpu_buffer_alloc(256, GPU_BufferFlag_Write, 0);
+    GPU_Stream* stream = gpu_stream_alloc((U32)slot_count);
+    QE_AggStreamSlot* slots = push_array(arena, QE_AggStreamSlot, slot_count);
+    ok = stream != 0;
+    for (U64 slot_index = 0; slot_index < slot_count && ok; slot_index++)
+    {
+      QE_AggStreamSlot* slot = &slots[slot_index];
+      slot->partials_buffer = gpu_buffer_alloc(partial_count * sizeof(F64), GPU_BufferFlag_Read, 0);
+      slot->partials = push_array(arena, F64, partial_count);
+      ok = slot->partials_buffer != 0;
+    }
+
+    U32 deferred_slot = max_U32;
+    for (U64 chunk_index = 0; chunk_index < chunk_count && ok; chunk_index++)
+    {
+      U32 slot_index = (U32)(chunk_index % slot_count);
+      QE_AggStreamSlot* slot = &slots[slot_index];
+      U64 start = chunk_index * chunk_rows_max;
+      U64 rows = Min(chunk_rows_max, row_count - start);
+
+      ok = qe_agg_stream_retire(stream, slot_index, slot, gpu_count, group_count, gpu_sum, gpu_min, gpu_max);
+      if (!ok)
+      {
+        break;
+      }
+
+      B32 needs_copy[QE_AGG_STREAM_MAX_COLUMNS] = {0};
+      void* source[QE_AGG_STREAM_MAX_COLUMNS] = {0};
+      U64 source_bytes[QE_AGG_STREAM_MAX_COLUMNS] = {0};
+      U64 upload_bytes = 0;
+      for (U32 c = 0; c < gpu_count && ok; c++)
+      {
+        slot->columns[c] = qe_stream_prepare_column(gpu_columns[c], encodings[c], sequence_filler, start, rows, chunk_rows_max, &slot->transient[c], &slot->held[c], &slot->encoded[c],
+                                                     &needs_copy[c], &source[c], &source_bytes[c]);
+        ok = slot->columns[c] != 0;
+        if (ok && needs_copy[c])
+        {
+          upload_bytes += source_bytes[c];
+        }
+      }
+      if (!ok)
+      {
+        break;
+      }
+
+      ok = gpu_stream_slot_begin(stream, slot_index, upload_bytes, QE_AGG_STREAM_READBACK_PAD + partial_count * sizeof(F64));
+      for (U32 c = 0; c < gpu_count && ok; c++)
+      {
+        if (needs_copy[c])
+        {
+          ok = gpu_stream_copy(stream, slot_index, slot->columns[c], source[c], source_bytes[c]);
+        }
+      }
+      if (!ok)
+      {
+        break;
+      }
+
+      // tec: a slot with no column behind it is bound to the first column, the kernel never reads it
+      for (U32 binding = 0; binding < QE_AGG_STREAM_MAX_COLUMNS; binding++)
+      {
+        gpu_kernel_set_arg_buffer(kernel, binding, slot->columns[binding < gpu_count ? binding : 0]);
+      }
+      gpu_kernel_set_arg_buffer(kernel, QE_AGG_STREAM_MAX_COLUMNS, slot->partials_buffer);
+      gpu_kernel_set_arg_u64(kernel, 0, rows);
+      gpu_kernel_set_arg_u64(kernel, 1, gpu_count);
+      gpu_kernel_set_arg_u64(kernel, 2, group_count);
+      for (U32 c = 0; c < QE_AGG_STREAM_MAX_COLUMNS; c++)
+      {
+        U64 type_word = 0;
+        if (c < gpu_count)
+        {
+          type_word = (U64)gpu_columns[c]->type | ((U64)qe_encoding_shader_width(gpu_columns[c], encodings[c]) << 8) | ((U64)encodings[c].base << 32);
+        }
+        gpu_kernel_set_arg_u64(kernel, 3 + c, type_word);
+      }
+      gpu_stream_dispatch(stream, slot_index, kernel, (U32)(group_count * QE_GPU_WORKGROUP_SIZE), QE_GPU_WORKGROUP_SIZE);
+      gpu_stream_read(stream, slot_index, slot->partials_buffer, slot->partials, partial_count * sizeof(F64));
+      slot->in_flight = 1;
+
+      // tec: submitted one chunk late, see qe_scan_filter_streamed
+      if (deferred_slot != max_U32)
+      {
+        ok = gpu_stream_submit(stream, deferred_slot);
+      }
+      deferred_slot = slot_index;
+    }
+    if (ok && deferred_slot != max_U32)
+    {
+      ok = gpu_stream_submit(stream, deferred_slot);
+    }
+
+    // tec: the slots finish in chunk order, starting with the one submitted longest ago
+    for (U64 offset = 0; offset < slot_count; offset++)
+    {
+      U32 slot_index = (U32)((chunk_count + offset) % slot_count);
+      if (ok)
+      {
+        ok = qe_agg_stream_retire(stream, slot_index, &slots[slot_index], gpu_count, group_count, gpu_sum, gpu_min, gpu_max);
+      }
+      else
+      {
+        gpu_stream_wait(stream, slot_index);
+      }
+    }
+
+    if (stream)
+    {
+      gpu_stream_release(stream);
+    }
+    for (U64 slot_index = 0; slot_index < slot_count; slot_index++)
+    {
+      // tec: anything still held here belongs to a chunk that did not complete
+      qe_agg_stream_unpin(&slots[slot_index], 0);
+      for (U32 c = 0; c < gpu_count; c++)
+      {
+        gpu_buffer_release(slots[slot_index].transient[c]);
+        if (slots[slot_index].encoded[c])
+        {
+          os_release(slots[slot_index].encoded[c], qe_chunk_bytes(gpu_columns[c], encodings[c].width, chunk_rows_max));
+        }
+      }
+      gpu_buffer_release(slots[slot_index].partials_buffer);
+    }
+    gpu_kernel_release(kernel);
+    gpu_buffer_release(sequence_filler);
+    for (U32 c = 0; c < gpu_count; c++)
+    {
+      column_sum[gpu_to_column[c]] = gpu_sum[c];
+      column_min[gpu_to_column[c]] = gpu_min[c];
+      column_max[gpu_to_column[c]] = gpu_max[c];
+    }
+  }
+
+  if (!ok)
+  {
+    log_error("qe_aggregate_global_streamed: the streamed aggregate failed, it will run on the CPU instead");
+    ProfEnd();
+    return 0;
+  }
+
+  F64* results = push_array(arena, F64, Max((U64)num_exprs, (U64)1));
+  for (U32 e = 0; e < num_exprs; e++)
+  {
+    U32 c = column_of_expr[e];
+    switch (exprs[e].func_code)
+    {
+      case QE_AGG_FUNC_COUNT: { results[e] = (F64)row_count; } break;
+      case QE_AGG_FUNC_SUM:   { results[e] = column_sum[c]; } break;
+      case QE_AGG_FUNC_AVG:   { results[e] = column_sum[c] / (F64)row_count; } break;
+      case QE_AGG_FUNC_MIN:   { results[e] = column_min[c]; } break;
+      case QE_AGG_FUNC_MAX:   { results[e] = column_max[c]; } break;
+    }
+  }
+  U64 representative = max_U64;
+  *out_result = qe_aggregate_build_output(arena, input, column_list_ir, exprs, num_exprs, 1, &representative, results);
+  ProfEnd();
+  return 1;
+}
+
+// tec: COUNT, SUM, AVG, MIN and MAX over whole numeric columns without NULLs. returns 0 when anything else is asked for, nothing is built then
+internal B32
+qe_aggregate_global_chunked(Arena* arena, PLAN_RowSet* input, IR_Node* column_list_ir, QE_AggExprInfo* exprs, U32 num_exprs, U64 row_count, PLAN_Materialized* out_result)
+{
+  CQL_Column* columns[QE_AGG_MAX_EXPRS] = {0};
+  U32 column_count = 0;
+  U32 column_of_expr[QE_AGG_MAX_EXPRS] = {0};
+
+  for (U32 e = 0; e < num_exprs; e++)
+  {
+    U32 func = exprs[e].func_code;
+    if (func != QE_AGG_FUNC_COUNT && func != QE_AGG_FUNC_SUM && func != QE_AGG_FUNC_AVG && func != QE_AGG_FUNC_MIN && func != QE_AGG_FUNC_MAX)
+    {
+      return 0;
+    }
+    CQL_Column* column = exprs[e].arg_column;
+    if (!column)
+    {
+      if (func != QE_AGG_FUNC_COUNT)
+      {
+        return 0;
+      }
+      continue;
+    }
+    if (column->row_count != row_count || column->null_flags || !qe_chunk_reduce_type_supported(column->type))
+    {
+      return 0;
+    }
+
+    U32 index = 0;
+    while (index < column_count && columns[index] != column)
+    {
+      index++;
+    }
+    if (index == column_count)
+    {
+      columns[column_count++] = column;
+    }
+    column_of_expr[e] = index;
+  }
+
+  F64 column_sum[QE_AGG_MAX_EXPRS] = {0};
+  F64 column_min[QE_AGG_MAX_EXPRS] = {0};
+  F64 column_max[QE_AGG_MAX_EXPRS] = {0};
+  for (U32 c = 0; c < column_count; c++)
+  {
+    column_min[c] = QE_F64_MAX;
+    column_max[c] = -QE_F64_MAX;
+  }
+
+  U64 chunk_rows = Max(settings_u64(str8_lit("QE_AGG_CHUNK_ROWS"), 67108864), (U64)65536);
+  TP_Context* pool = app_thread_pool();
+  TP_Arena* pool_arena = app_thread_pool_arena();
+
+  for (U64 chunk_start = 0; chunk_start < row_count; chunk_start += chunk_rows)
+  {
+    U64 chunk_end = Min(chunk_start + chunk_rows, row_count);
+    U64 rows = chunk_end - chunk_start;
+    U64 task_count = Max((U64)1, Min((U64)pool->worker_count, rows / 65536));
+
+    for (U32 c = 0; c < column_count; c++)
+    {
+      Temp scratch = scratch_begin(&arena, 1);
+
+      U64 window_size = 0;
+      void* window = cql_column_get_data_range(scratch.arena, columns[c], r1u64(chunk_start, chunk_end), &window_size);
+      if (!window)
+      {
+        scratch_end(scratch);
+        return 0;
+      }
+
+      QE_ChunkReduceTask task = {0};
+      task.ranges = tp_divide_work(scratch.arena, rows, (U32)task_count);
+      task.base_ptr = (U8*)window;
+      task.column_type = columns[c]->type;
+      task.task_sum = push_array(scratch.arena, F64, task_count);
+      task.task_min = push_array(scratch.arena, F64, task_count);
+      task.task_max = push_array(scratch.arena, F64, task_count);
+
+      TP_Temp temp = tp_temp_begin(pool_arena);
+      tp_for_parallel(pool, pool_arena, task_count, qe_chunk_reduce_task, &task);
+      tp_temp_end(temp);
+
+      for (U64 t = 0; t < task_count; t++)
+      {
+        column_sum[c] += task.task_sum[t];
+        if (task.task_min[t] < column_min[c])
+        {
+          column_min[c] = task.task_min[t];
+        }
+        if (task.task_max[t] > column_max[c])
+        {
+          column_max[c] = task.task_max[t];
+        }
+      }
+      scratch_end(scratch);
+    }
+  }
+
+  F64* results = push_array(arena, F64, num_exprs);
+  for (U32 e = 0; e < num_exprs; e++)
+  {
+    U32 c = column_of_expr[e];
+    switch (exprs[e].func_code)
+    {
+      case QE_AGG_FUNC_COUNT: { results[e] = (F64)row_count; } break;
+      case QE_AGG_FUNC_SUM:   { results[e] = column_sum[c]; } break;
+      case QE_AGG_FUNC_AVG:   { results[e] = column_sum[c] / (F64)row_count; } break;
+      case QE_AGG_FUNC_MIN:   { results[e] = column_min[c]; } break;
+      case QE_AGG_FUNC_MAX:   { results[e] = column_max[c]; } break;
+    }
+  }
+  U64 representative = max_U64;
+  *out_result = qe_aggregate_build_output(arena, input, column_list_ir, exprs, num_exprs, 1, &representative, results);
+  return 1;
+}
+
+//~ tec: SUM, MIN, MAX and COUNT of whole columns on the GPU with no GROUP BY
+// tec: the generic reduce works in 4096 row chunks per expression, aggregate_global_f32.comp reads each column once for a whole table with plain aggregates over F32 exact columns
+
+#define QE_AGG_GLOBAL_MAX_COLUMNS 4
+#define QE_AGG_GLOBAL_DEFAULT_GROUPS 2048
+#define QE_AGG_GLOBAL_FIT_CACHE 16
+
+typedef struct QE_F32FitEntry QE_F32FitEntry;
+struct QE_F32FitEntry
+{
+  CQL_Column* column;
+  U64 generation;
+  B32 fits;
+};
+
+global QE_F32FitEntry g_qe_f32_fit_cache[QE_AGG_GLOBAL_FIT_CACHE];
+global U32 g_qe_f32_fit_next = 0;
+
+// tec: true when every value of the column is exact in F32, cached per column until it is written
+internal B32
+qe_column_fits_f32(CQL_Column* column)
+{
+  for (U32 i = 0; i < QE_AGG_GLOBAL_FIT_CACHE; i++)
+  {
+    if (g_qe_f32_fit_cache[i].column == column && g_qe_f32_fit_cache[i].generation == column->write_generation)
+    {
+      return g_qe_f32_fit_cache[i].fits;
+    }
+  }
+
+  B32 fits = 1;
+  Temp scratch = scratch_begin(0, 0);
+  U64 window_size = 0;
+  void* window = cql_column_get_data_range(scratch.arena, column, r1u64(0, column->row_count), &window_size);
+  if (!window)
+  {
+    fits = 0;
+  }
+
+  // tec: whole numbers up to 2^24 are exact in F32
+  F64 limit = 16777216.0;
+  for (U64 i = 0; i < column->row_count && fits; i++)
+  {
+    F64 v = 0.0;
+    switch (column->type)
+    {
+      case CQL_ColumnType_U32: { v = (F64)((U32*)window)[i]; } break;
+      case CQL_ColumnType_I32: { v = (F64)((S32*)window)[i]; } break;
+      case CQL_ColumnType_U64: { v = (F64)((U64*)window)[i]; } break;
+      case CQL_ColumnType_I64: { v = (F64)((S64*)window)[i]; } break;
+      case CQL_ColumnType_F32: { v = (F64)((F32*)window)[i]; } break;
+      case CQL_ColumnType_F64: { v = ((F64*)window)[i]; } break;
+      default: { fits = 0; } break;
+    }
+    if (column->type == CQL_ColumnType_F32)
+    {
+      continue;
+    }
+    if (column->type == CQL_ColumnType_F64)
+    {
+      fits = ((F64)(F32)v == v);
+    }
+    else if (v > limit || v < -limit)
+    {
+      fits = 0;
+    }
+  }
+  scratch_end(scratch);
+
+  QE_F32FitEntry* entry = &g_qe_f32_fit_cache[g_qe_f32_fit_next % QE_AGG_GLOBAL_FIT_CACHE];
+  g_qe_f32_fit_next += 1;
+  entry->column = column;
+  entry->generation = column->write_generation;
+  entry->fits = fits;
+  return fits;
+}
+
+// tec: returns 0 when the select list or a column is not one this handles, or the GPU work did not complete, nothing is built then
+internal B32
+qe_aggregate_global_gpu(Arena* arena, PLAN_RowSet* input, IR_Node* column_list_ir, QE_AggExprInfo* exprs, U32 num_exprs, U64 row_count, PLAN_Materialized* out_result)
+{
+  CQL_Column* columns[QE_AGG_GLOBAL_MAX_COLUMNS] = {0};
+  U32 column_count = 0;
+  U32 column_of_expr[QE_AGG_MAX_EXPRS] = {0};
+
+  for (U32 e = 0; e < num_exprs; e++)
+  {
+    U32 func = exprs[e].func_code;
+    if (func != QE_AGG_FUNC_COUNT && func != QE_AGG_FUNC_SUM && func != QE_AGG_FUNC_AVG && func != QE_AGG_FUNC_MIN && func != QE_AGG_FUNC_MAX)
+    {
+      return 0;
+    }
+    CQL_Column* column = exprs[e].arg_column;
+    if (!column)
+    {
+      if (func != QE_AGG_FUNC_COUNT)
+      {
+        return 0;
+      }
+      continue;
+    }
+    if (column->row_count != row_count || column->null_flags || column->is_disk_backed || !qe_chunk_reduce_type_supported(column->type))
+    {
+      return 0;
+    }
+
+    U32 index = 0;
+    while (index < column_count && columns[index] != column)
+    {
+      index++;
+    }
+    if (index == column_count)
+    {
+      if (column_count == QE_AGG_GLOBAL_MAX_COLUMNS || !qe_column_fits_f32(column))
+      {
+        return 0;
+      }
+      columns[column_count++] = column;
+    }
+    column_of_expr[e] = index;
+  }
+
+  F64 column_sum[QE_AGG_GLOBAL_MAX_COLUMNS] = {0};
+  F64 column_min[QE_AGG_GLOBAL_MAX_COLUMNS] = {0};
+  F64 column_max[QE_AGG_GLOBAL_MAX_COLUMNS] = {0};
+
+  if (column_count > 0)
+  {
+    GPU_Buffer* buffers[QE_AGG_GLOBAL_MAX_COLUMNS] = {0};
+    for (U32 c = 0; c < column_count; c++)
+    {
+      buffers[c] = qe_aggregate_full_column_f32(arena, columns[c], 0);
+      if (!buffers[c])
+      {
+        return 0;
+      }
+    }
+
+    GPU_Kernel* kernel = gpu_kernel_alloc(str8_lit("aggregate_global_f32"));
+    if (!kernel)
+    {
+      return 0;
+    }
+
+    U64 vec_count = row_count / 4;
+    U64 max_groups = Max(settings_u64(str8_lit("QE_AGG_GLOBAL_GROUPS"), QE_AGG_GLOBAL_DEFAULT_GROUPS), (U64)1);
+    U64 group_count = Max(Min(vec_count / 1024, max_groups), (U64)1);
+    U64 partial_count = group_count * column_count * 3;
+    GPU_Buffer* partials_buffer = gpu_buffer_alloc_pooled(str8_lit("agg_global_partials"), partial_count * sizeof(F64), GPU_BufferFlag_ReadWrite, 0);
+    if (!partials_buffer)
+    {
+      gpu_kernel_release(kernel);
+      return 0;
+    }
+
+    // tec: a slot with no column behind it is bound to the first column, the kernel never reads it
+    for (U32 slot = 0; slot < QE_AGG_GLOBAL_MAX_COLUMNS; slot++)
+    {
+      gpu_kernel_set_arg_buffer(kernel, slot, buffers[slot < column_count ? slot : 0]);
+    }
+    gpu_kernel_set_arg_buffer(kernel, QE_AGG_GLOBAL_MAX_COLUMNS, partials_buffer);
+    gpu_kernel_set_arg_u64(kernel, 0, row_count);
+    gpu_kernel_set_arg_u64(kernel, 1, column_count);
+    gpu_kernel_set_arg_u64(kernel, 2, group_count);
+
+    F64* partials = push_array(arena, F64, partial_count);
+    GPU_Batch* batch = gpu_batch_begin(0, partial_count * sizeof(F64));
+    gpu_batch_kernel_execute(batch, kernel, (U32)(group_count * QE_GPU_WORKGROUP_SIZE), QE_GPU_WORKGROUP_SIZE);
+    gpu_batch_buffer_read(batch, partials_buffer, partials, partial_count * sizeof(F64));
+    B32 completed = gpu_batch_end(batch);
+    gpu_kernel_release(kernel);
+    if (!completed)
+    {
+      return 0;
+    }
+
+    // tec: combined in workgroup order, so the result does not depend on how the GPU scheduled them
+    for (U32 c = 0; c < column_count; c++)
+    {
+      column_min[c] = QE_F64_MAX;
+      column_max[c] = -QE_F64_MAX;
+      for (U64 g = 0; g < group_count; g++)
+      {
+        F64* triple = &partials[(g * column_count + c) * 3];
+        column_sum[c] += triple[0];
+        column_min[c] = Min(column_min[c], triple[1]);
+        column_max[c] = Max(column_max[c], triple[2]);
+      }
+    }
+  }
+
+  F64* results = push_array(arena, F64, Max((U64)num_exprs, (U64)1));
+  for (U32 e = 0; e < num_exprs; e++)
+  {
+    U32 c = column_of_expr[e];
+    switch (exprs[e].func_code)
+    {
+      case QE_AGG_FUNC_COUNT: { results[e] = (F64)row_count; } break;
+      case QE_AGG_FUNC_SUM:   { results[e] = column_sum[c]; } break;
+      case QE_AGG_FUNC_AVG:   { results[e] = column_sum[c] / (F64)row_count; } break;
+      case QE_AGG_FUNC_MIN:   { results[e] = column_min[c]; } break;
+      case QE_AGG_FUNC_MAX:   { results[e] = column_max[c]; } break;
+    }
+  }
+  U64 representative = max_U64;
+  *out_result = qe_aggregate_build_output(arena, input, column_list_ir, exprs, num_exprs, 1, &representative, results);
+  return 1;
+}
+
 // tec: with a device selection, input only stands in for the table and the row count, the rows themselves stay on the GPU.
 // out_needs_host_rows is set, before any result exists, when the query has to run on host row ids instead
 internal PLAN_Materialized
-qe_aggregate_impl(Arena* arena, GDB_Database* database, PLAN_RowSet* input, IR_Node* group_by_ir, IR_Node* column_list_ir, IR_Node* having_ir, QE_AggregateHints* hints, QE_AggregateTrace* out_trace, QE_DeviceRows* device, B32* out_needs_host_rows)
+qe_aggregate_impl(Arena* arena, CQL_Database* database, PLAN_RowSet* input, IR_Node* group_by_ir, IR_Node* column_list_ir, IR_Node* having_ir, QE_AggregateHints* hints, QE_AggregateTrace* out_trace, QE_DeviceRows* device, B32* out_needs_host_rows)
 {
   ProfBeginFunction();
   
@@ -5230,7 +8776,7 @@ qe_aggregate_impl(Arena* arena, GDB_Database* database, PLAN_RowSet* input, IR_N
   
   //- tec: resolve GROUP BY key columns (0 means one global group)
   U64 group_slots[QE_AGG_MAX_GROUP_COLS];
-  GDB_Column* group_columns[QE_AGG_MAX_GROUP_COLS];
+  CQL_Column* group_columns[QE_AGG_MAX_GROUP_COLS];
   U32 num_group_cols = 0;
   
   for (IR_Node* col_node = group_by_ir ? group_by_ir->first : NULL; col_node != NULL; col_node = col_node->next)
@@ -5243,9 +8789,9 @@ qe_aggregate_impl(Arena* arena, GDB_Database* database, PLAN_RowSet* input, IR_N
     
     String8 bare_name = {0};
     U64 slot = max_U64;
-    GDB_Table* table = qe_resolve_column_table(input, col_node->value, &bare_name, &slot);
+    CQL_Table* table = qe_resolve_column_table(input, col_node->value, &bare_name, &slot);
     if (!table) continue;
-    GDB_Column* column = gdb_table_find_column(table, bare_name);
+    CQL_Column* column = cql_table_find_column(table, bare_name);
     if (!column) continue;
     
     group_slots[num_group_cols] = slot;
@@ -5263,29 +8809,27 @@ qe_aggregate_impl(Arena* arena, GDB_Database* database, PLAN_RowSet* input, IR_N
     return result;
   }
   
-  // tec: GROUP BY/aggregate kernels dont know about NULL yet, so a NULL cell is grouped/summed using its placeholder value instead of being excluded
+  // tec: GROUP BY/aggregate kernels dont know about NULL yet, so refuse instead of returning a wrong answer
+  for (U32 c = 0; c < num_group_cols; c++)
   {
-    B32 warned = 0;
-    for (U32 c = 0; c < num_group_cols && !warned; c++)
+    if (group_columns[c]->null_flags)
     {
-      if (group_columns[c]->null_flags)
-      {
-        log_error("qe_aggregate: GROUP BY column '%.*s' has NULLs - they are not excluded/grouped per standard SQL semantics yet",
-                  str8_varg(group_columns[c]->name));
-        warned = 1;
-      }
-    }
-    for (U32 e = 0; e < num_exprs && !warned; e++)
-    {
-      if (exprs[e].arg_column && exprs[e].arg_column->null_flags)
-      {
-        log_error("qe_aggregate: aggregate argument column '%.*s' has NULLs - they are not excluded from SUM/AVG/MIN/MAX/COUNT yet",
-                  str8_varg(exprs[e].arg_column->name));
-        warned = 1;
-      }
+      log_error("qe_aggregate: GROUP BY column '%.*s' has NULLs, NULL aware aggregation is not supported",
+                str8_varg(group_columns[c]->name));
+      ProfEnd();
+      return result;
     }
   }
-  
+  for (U32 e = 0; e < num_exprs; e++)
+  {
+    if (exprs[e].arg_column && exprs[e].arg_column->null_flags)
+    {
+      log_error("qe_aggregate: aggregate argument column '%.*s' has NULLs, NULL aware aggregation is not supported",
+                str8_varg(exprs[e].arg_column->name));
+      ProfEnd();
+      return result;
+    }
+  }
   
   //- tec: no point spinning up a GPU dispatch for zero rows.
   if (row_count == 0)
@@ -5331,6 +8875,76 @@ qe_aggregate_impl(Arena* arena, GDB_Database* database, PLAN_RowSet* input, IR_N
     }
   }
   
+  // tec: a whole table too big for one GPU buffer, grouped by one small range whole number column, is counted in dense groups chunk by chunk
+  if (device && num_group_cols == 1 && !having_ir && settings_u64(str8_lit("QE_AGG_STREAM"), 1) != 0 &&
+      (row_count * sizeof(F64) > settings_u64(str8_lit("GPU_MAX_BUFFER_SIZE"), GPU_MAX_BUFFER_SIZE) || row_count >= settings_u64(str8_lit("QE_AGG_STREAM_MIN_ROWS"), 1000000)))
+  {
+    B32 whole_table = device->table_count == 1 && !device->views[0].rows && device->views[0].row_offset == 0 &&
+                      device->views[0].table && device->views[0].table->row_count == row_count;
+    if (whole_table && qe_aggregate_dense_streamed(arena, device, input, column_list_ir, exprs, num_exprs, group_columns[0], row_count, &result))
+    {
+      if (out_trace)
+      {
+        out_trace->input_row_count = row_count;
+        out_trace->group_count = result.count;
+      }
+      ProfEnd();
+      return result;
+    }
+  }
+
+  // tec: a whole table with no GROUP BY and plain aggregates is reduced by one kernel that reads each column once
+  if (device && num_group_cols == 0 && num_exprs > 0 && settings_u64(str8_lit("QE_AGG_GLOBAL_KERNEL"), 1) != 0 &&
+      row_count * sizeof(F32) <= settings_u64(str8_lit("GPU_MAX_BUFFER_SIZE"), GPU_MAX_BUFFER_SIZE))
+  {
+    B32 whole_table = device->table_count == 1 && !device->views[0].rows && device->views[0].row_offset == 0 &&
+                      device->views[0].table && device->views[0].table->row_count == row_count;
+    if (whole_table && qe_aggregate_global_gpu(arena, input, column_list_ir, exprs, num_exprs, row_count, &result))
+    {
+      if (out_trace)
+      {
+        out_trace->input_row_count = row_count;
+        out_trace->group_count = 1;
+      }
+      ProfEnd();
+      return result;
+    }
+  }
+
+  // tec: a device selection reads whole columns as F64 buffers on the GPU, a table too big for that is aggregated in chunks on the CPU
+  // when it is a whole table with no GROUP BY, anything else takes the host rows path
+  if (device && row_count * sizeof(F64) > settings_u64(str8_lit("GPU_MAX_BUFFER_SIZE"), GPU_MAX_BUFFER_SIZE))
+  {
+    B32 whole_table = device->table_count == 1 && !device->views[0].rows && device->views[0].row_offset == 0 &&
+                      device->views[0].table && device->views[0].table->row_count == row_count;
+    // tec: on the GPU, streamed through slots, unless that is switched off or the columns are not ones it reads
+    if (whole_table && num_group_cols == 0 && settings_u64(str8_lit("QE_AGG_STREAM"), 1) != 0 &&
+        qe_aggregate_global_streamed(arena, input, column_list_ir, exprs, num_exprs, row_count, &result))
+    {
+      if (out_trace)
+      {
+        out_trace->input_row_count = row_count;
+        out_trace->group_count = 1;
+      }
+      ProfEnd();
+      return result;
+    }
+    if (whole_table && num_group_cols == 0 && qe_aggregate_global_chunked(arena, input, column_list_ir, exprs, num_exprs, row_count, &result))
+    {
+      if (out_trace)
+      {
+        out_trace->input_row_count = row_count;
+        out_trace->group_count = 1;
+        out_trace->used_cpu = 1;
+      }
+      ProfEnd();
+      return result;
+    }
+    *out_needs_host_rows = 1;
+    ProfEnd();
+    return result;
+  }
+  
   //- tec: an aggregate small enough for the CPU never touches the GPU, so it gathers everything on the host
   B32 use_cpu = !device && hints && hints->cpu_max_rows > 0 && row_count <= hints->cpu_max_rows && qe_aggregate_cpu_supported(exprs, num_exprs);
   
@@ -5344,17 +8958,17 @@ qe_aggregate_impl(Arena* arena, GDB_Database* database, PLAN_RowSet* input, IR_N
   B32 key_whole[QE_AGG_MAX_GROUP_COLS] = {0};
   S64 key_min[QE_AGG_MAX_GROUP_COLS] = {0};
   S64 key_max[QE_AGG_MAX_GROUP_COLS] = {0};
-  GDB_StringDataChunk group_string[QE_AGG_MAX_GROUP_COLS];
+  CQL_StringDataChunk group_string[QE_AGG_MAX_GROUP_COLS];
   MemoryZeroArray(group_string);
   U32 group_string_mask = 0;
   
   for (U32 c = 0; c < num_group_cols; c++)
   {
-    GDB_Column* key_column = group_columns[c];
+    CQL_Column* key_column = group_columns[c];
     B32 is_dict_key = 0;
-    if (key_column->type == GDB_ColumnType_String8)
+    if (key_column->type == CQL_ColumnType_String8)
     {
-      gdb_column_ensure_string_dict(key_column);
+      cql_column_ensure_string_dict(key_column);
       if (!key_column->has_dict)
       {
         if (device)
@@ -5381,7 +8995,7 @@ qe_aggregate_impl(Arena* arena, GDB_Database* database, PLAN_RowSet* input, IR_N
             arena_release(key_column->agg_str_arena);
           }
           key_column->agg_str_arena = arena_alloc();
-          GDB_StringDataChunk fresh = qe_gather_string_column(key_column->agg_str_arena, input, group_slots[c], key_column);
+          CQL_StringDataChunk fresh = qe_gather_string_column(key_column->agg_str_arena, input, group_slots[c], key_column);
           key_column->agg_str_data = fresh.data;
           key_column->agg_str_offsets = fresh.offsets;
           key_column->agg_str_data_size = fresh.size;
@@ -5494,12 +9108,12 @@ qe_aggregate_impl(Arena* arena, GDB_Database* database, PLAN_RowSet* input, IR_N
     {
       continue;
     }
-    GDB_Column* arg_column = exprs[e].arg_column;
+    CQL_Column* arg_column = exprs[e].arg_column;
     if (device)
     {
       B32 arg_column_narrow = 0;
       GPU_Buffer* full_arg = 0;
-      if (arg_column->type != GDB_ColumnType_String8)
+      if (arg_column->type != CQL_ColumnType_String8)
       {
         full_arg = qe_aggregate_full_column_f64(arena, arg_column, 0, &arg_column_narrow);
       }
@@ -5625,7 +9239,7 @@ qe_aggregate_impl(Arena* arena, GDB_Database* database, PLAN_RowSet* input, IR_N
     {
       continue;
     }
-    GDB_Column* arg_column = exprs[e].arg_column;
+    CQL_Column* arg_column = exprs[e].arg_column;
     if (device)
     {
       GPU_Buffer* selection_source = arg_narrow ? qe_aggregate_full_column_f32(arena, arg_column, 0) : arg_full_f64[e];
@@ -7247,7 +10861,7 @@ qe_having_load_value(PLAN_Materialized* m, IR_Node* node, U64 row, B32* out_is_s
     {
       log_error("HAVING: column '%.*s' not found in aggregate result", str8_varg(name));
     }
-    else if (col->type == GDB_ColumnType_String8)
+    else if (col->type == CQL_ColumnType_String8)
     {
       *out_is_string = 1;
       *out_string = col->string_values[row];
@@ -7349,7 +10963,7 @@ qe_having_eval(PLAN_Materialized* m, IR_Node* condition, U64 row)
       }
       
       if (right->type == IR_NodeType_Literal &&
-          (m->columns[c].type == GDB_ColumnType_Date || m->columns[c].type == GDB_ColumnType_Timestamp))
+          (m->columns[c].type == CQL_ColumnType_Date || m->columns[c].type == CQL_ColumnType_Timestamp))
       {
         right_resolved = 1;
         if (!qe_resolve_date_literal_value(m->columns[c].type, right, &rv)) 
@@ -7358,18 +10972,18 @@ qe_having_eval(PLAN_Materialized* m, IR_Node* condition, U64 row)
           return 0; 
         }
       }
-      else if (right->type == IR_NodeType_Literal && m->columns[c].type == GDB_ColumnType_Enum)
+      else if (right->type == IR_NodeType_Literal && m->columns[c].type == CQL_ColumnType_Enum)
       {
         right_resolved = 1;
         U32 code = 0;
-        if (!m->columns[c].enum_type || !gdb_enum_type_code_from_label(m->columns[c].enum_type, right->value, &code)) 
+        if (!m->columns[c].enum_type || !cql_enum_type_code_from_label(m->columns[c].enum_type, right->value, &code)) 
         { 
           scratch_end(scratch);
           return 0; 
         }
         rv = (F64)code;
       }
-      else if (right->type == IR_NodeType_Numeric && m->columns[c].type == GDB_ColumnType_Decimal)
+      else if (right->type == IR_NodeType_Numeric && m->columns[c].type == CQL_ColumnType_Decimal)
       {
         right_resolved = 1;
         S64 raw = 0;
@@ -7476,13 +11090,13 @@ qe_having_compile(Arena* arena, PLAN_Materialized* m, IR_Node* condition)
     }
   }
   scratch_end(scratch);
-  if (!column || column->type == GDB_ColumnType_String8)
+  if (!column || column->type == CQL_ColumnType_String8)
   {
     return 0;
   }
   
   F64 literal = 0.0;
-  if (column->type == GDB_ColumnType_Decimal)
+  if (column->type == CQL_ColumnType_Decimal)
   {
     S64 raw = 0;
     if (!decimal_from_str8(right->value, column->decimal_scale, &raw))
@@ -7559,7 +11173,7 @@ qe_apply_having(Arena* arena, PLAN_Materialized* m, IR_Node* having_ir)
     dst->decimal_scale = src->decimal_scale;
     dst->enum_type = src->enum_type;
     
-    if (src->type == GDB_ColumnType_String8)
+    if (src->type == CQL_ColumnType_String8)
     {
       dst->string_values = push_array(arena, String8, Max(keep_count, 1));
       for (U64 i = 0; i < keep_count; i++) dst->string_values[i] = src->string_values[keep[i]];
@@ -7596,11 +11210,11 @@ qe_bare_column_name(String8 name)
 //~ tec: index scan
 
 internal S32
-qe_index_row_cmp_target(Arena* arena, GDB_Column* column, B32 is_string, U64 row, F64 target_numeric, String8 target_string)
+qe_index_row_cmp_target(Arena* arena, CQL_Column* column, B32 is_string, U64 row, F64 target_numeric, String8 target_string)
 {
   if (is_string)
   {
-    String8 sv = gdb_column_get_string(arena, column, row);
+    String8 sv = cql_column_get_string(arena, column, row);
     return qe_str8_compare(sv, target_string);
   }
   F64 v = qe_read_numeric_as_f64(column, row);
@@ -7609,7 +11223,7 @@ qe_index_row_cmp_target(Arena* arena, GDB_Column* column, B32 is_string, U64 row
 
 // tec: first index i in order[lo..count) such that order[i]'s key >= target (standard lower_bound)
 internal U64
-qe_index_lower_bound(Arena* arena, GDB_Column* column, B32 is_string, U64* order, U64 count, F64 target_numeric, String8 target_string)
+qe_index_lower_bound(Arena* arena, CQL_Column* column, B32 is_string, U64* order, U64 count, F64 target_numeric, String8 target_string)
 {
   U64 lo = 0, hi = count;
   while (lo < hi)
@@ -7623,7 +11237,7 @@ qe_index_lower_bound(Arena* arena, GDB_Column* column, B32 is_string, U64* order
 
 // tec: first index i such that order[i]'s key > target (standard upper_bound)
 internal U64
-qe_index_upper_bound(Arena* arena, GDB_Column* column, B32 is_string, U64* order, U64 count, F64 target_numeric, String8 target_string)
+qe_index_upper_bound(Arena* arena, CQL_Column* column, B32 is_string, U64* order, U64 count, F64 target_numeric, String8 target_string)
 {
   U64 lo = 0, hi = count;
   while (lo < hi)
@@ -7636,8 +11250,8 @@ qe_index_upper_bound(Arena* arena, GDB_Column* column, B32 is_string, U64* order
 }
 
 internal B32
-qe_resolve_leaf_comparison(GDB_Table* table, IR_Node* condition,
-                           GDB_Column** out_column,
+qe_resolve_leaf_comparison(CQL_Table* table, IR_Node* condition,
+                           CQL_Column** out_column,
                            B32* out_is_eq, B32* out_is_lt, B32* out_is_le, B32* out_is_gt, B32* out_is_ge,
                            B32* out_is_string, F64* out_target_numeric, String8* out_target_string)
 {
@@ -7665,12 +11279,12 @@ qe_resolve_leaf_comparison(GDB_Table* table, IR_Node* condition,
     return 0;
   }
   
-  GDB_Column* column = gdb_table_find_column(table, qe_bare_column_name(left->value));
+  CQL_Column* column = cql_table_find_column(table, qe_bare_column_name(left->value));
   if (!column) return 0;
   
-  B32 is_string_key = (column->type == GDB_ColumnType_String8);
-  B32 is_date_key = (column->type == GDB_ColumnType_Date || column->type == GDB_ColumnType_Timestamp);
-  B32 is_enum_key = (column->type == GDB_ColumnType_Enum);
+  B32 is_string_key = (column->type == CQL_ColumnType_String8);
+  B32 is_date_key = (column->type == CQL_ColumnType_Date || column->type == CQL_ColumnType_Timestamp);
+  B32 is_enum_key = (column->type == CQL_ColumnType_Enum);
   B32 literal_given = (right->type == IR_NodeType_Literal);
   
   if (is_date_key || is_enum_key)
@@ -7704,7 +11318,7 @@ qe_resolve_leaf_comparison(GDB_Table* table, IR_Node* condition,
       return 0;
     }
   }
-  else if (column->type == GDB_ColumnType_Decimal)
+  else if (column->type == CQL_ColumnType_Decimal)
   {
     // unparsable literal, cant use
     if (!qe_resolve_decimal_literal_value(column, right, &target_numeric))
@@ -7731,9 +11345,9 @@ qe_resolve_leaf_comparison(GDB_Table* table, IR_Node* condition,
 
 // tec: finds the slice of the index order that satisfies one comparison, without touching any rows
 internal B32
-qe_index_leaf_range(Arena* arena, GDB_Table* table, IR_Node* condition, GDB_Index** out_index, U64* out_range_lo, U64* out_range_hi)
+qe_index_leaf_range(Arena* arena, CQL_Table* table, IR_Node* condition, CQL_Index** out_index, U64* out_range_lo, U64* out_range_hi)
 {
-  GDB_Column* column = 0;
+  CQL_Column* column = 0;
   B32 is_eq = 0, is_lt = 0, is_le = 0, is_gt = 0, is_ge = 0, is_string_key = 0;
   F64 target_numeric = 0.0;
   String8 target_string = {0};
@@ -7747,7 +11361,7 @@ qe_index_leaf_range(Arena* arena, GDB_Table* table, IR_Node* condition, GDB_Inde
   // so fall back rather than risk treating a NULL as its placeholder value
   if (column->null_flags) return 0;
   
-  GDB_Index* index = gdb_table_find_index_on_column(table, column);
+  CQL_Index* index = cql_table_find_index_on_column(table, column);
   if (!index) return 0;
   
   U64 row_count = table->row_count;
@@ -7762,7 +11376,7 @@ qe_index_leaf_range(Arena* arena, GDB_Table* table, IR_Node* condition, GDB_Inde
   // tec: recreate index if needed
   if (index->order_count != row_count)
   {
-    gdb_index_build_order(index);
+    cql_index_build_order(index);
   }
   
   Temp scratch = scratch_begin(&arena, 1);
@@ -7802,9 +11416,9 @@ qe_index_leaf_range(Arena* arena, GDB_Table* table, IR_Node* condition, GDB_Inde
 
 // tec: how many rows an index would return for this comparison, exact and without reading any of them
 internal B32
-qe_index_leaf_match_count(Arena* arena, GDB_Table* table, IR_Node* condition, U64* out_match_count)
+qe_index_leaf_match_count(Arena* arena, CQL_Table* table, IR_Node* condition, U64* out_match_count)
 {
-  GDB_Index* index = 0;
+  CQL_Index* index = 0;
   U64 range_lo = 0;
   U64 range_hi = 0;
   if (!qe_index_leaf_range(arena, table, condition, &index, &range_lo, &range_hi))
@@ -7816,9 +11430,9 @@ qe_index_leaf_match_count(Arena* arena, GDB_Table* table, IR_Node* condition, U6
 }
 
 internal B32
-qe_index_range_for_leaf(Arena* arena, GDB_Table* table, IR_Node* condition, QE_ScanResult* out_result)
+qe_index_range_for_leaf(Arena* arena, CQL_Table* table, IR_Node* condition, QE_ScanResult* out_result)
 {
-  GDB_Index* index = 0;
+  CQL_Index* index = 0;
   U64 range_lo = 0;
   U64 range_hi = 0;
   if (!qe_index_leaf_range(arena, table, condition, &index, &range_lo, &range_hi))
@@ -7855,7 +11469,7 @@ qe_collect_and_leaves(IR_Node* condition, IR_Node** out_leaves, U32 count, U32 m
 
 // tec: narrows by one indexable leaf, then applies the whole condition to the rows that are left
 internal B32
-qe_index_narrow_and_filter(Arena* arena, GDB_Table* table, IR_Node* root, IR_Node* leaf, QE_ScanResult* out_result)
+qe_index_narrow_and_filter(Arena* arena, CQL_Table* table, IR_Node* root, IR_Node* leaf, QE_ScanResult* out_result)
 {
   QE_ScanResult narrowed = {0};
   if (!qe_index_range_for_leaf(arena, table, leaf, &narrowed))
@@ -7880,7 +11494,7 @@ qe_index_narrow_and_filter(Arena* arena, GDB_Table* table, IR_Node* root, IR_Nod
 
 // tec: the optimizer picked this leaf, so it is used whether or not it is the first indexable one
 internal B32
-qe_index_scan_with_leaf(Arena* arena, GDB_Table* table, IR_Node* where_clause, IR_Node* leaf, QE_ScanResult* out_result)
+qe_index_scan_with_leaf(Arena* arena, CQL_Table* table, IR_Node* where_clause, IR_Node* leaf, QE_ScanResult* out_result)
 {
   if (!where_clause || !where_clause->first || !leaf)
   {
@@ -7896,12 +11510,12 @@ qe_index_scan_with_leaf(Arena* arena, GDB_Table* table, IR_Node* where_clause, I
 
 // tec: walks the index in key order in growing chunks and stops once enough rows pass the condition, condition is the root expression or NULL
 internal void
-qe_index_ordered_scan(Arena* arena, GDB_Table* table, String8 alias, GDB_Index* index, IR_Node* condition, B32 descending, U64 wanted, QE_ScanResult* out_result)
+qe_index_ordered_scan(Arena* arena, CQL_Table* table, String8 alias, CQL_Index* index, IR_Node* condition, B32 descending, U64 wanted, QE_ScanResult* out_result)
 {
   U64 row_count = table->row_count;
   if (index->order_count != row_count)
   {
-    gdb_index_build_order(index);
+    cql_index_build_order(index);
   }
   
   out_result->indices = push_array(arena, U64, Max(wanted, (U64)1));
@@ -7952,7 +11566,7 @@ qe_index_ordered_scan(Arena* arena, GDB_Table* table, String8 alias, GDB_Index* 
 }
 
 internal B32
-qe_try_index_scan(Arena* arena, GDB_Table* table, IR_Node* where_clause, QE_ScanResult* out_result)
+qe_try_index_scan(Arena* arena, CQL_Table* table, IR_Node* where_clause, QE_ScanResult* out_result)
 {
   if (!where_clause || !where_clause->first) return 0;
   IR_Node* root = where_clause->first;
@@ -7984,7 +11598,7 @@ qe_try_index_scan(Arena* arena, GDB_Table* table, IR_Node* where_clause, QE_Scan
 
 // tec: does column's [min,max] over a chunk provably rule out every row satisfying `leaf`?
 internal B32
-qe_zonemap_chunk_is_prunable(QE_ZonemapLeaf* leaf, GDB_ZoneMapChunk* chunk)
+qe_zonemap_chunk_is_prunable(QE_ZonemapLeaf* leaf, CQL_ZoneMapChunk* chunk)
 {
   if (!chunk->has_values) return 0; // tec: an all NULL (so far) chunk can never be proven empty
   
@@ -7997,16 +11611,17 @@ qe_zonemap_chunk_is_prunable(QE_ZonemapLeaf* leaf, GDB_ZoneMapChunk* chunk)
 }
 
 internal Rng1U64*
-qe_scan_build_dispatch_ranges(Arena* arena, GDB_Table* table, IR_Node* where_clause,
+qe_scan_build_dispatch_ranges(Arena* arena, CQL_Table* table, IR_Node* where_clause,
                               U64 rows_per_chunk, U64* out_range_count, U64* out_pruned_rows,
-                              String8* out_pruned_column_name)
+                              String8* out_pruned_column_name, U32** out_skip_bits)
 {
   *out_pruned_rows = 0;
   *out_pruned_column_name = (String8){0};
+  *out_skip_bits = 0;
   
   U64 uniform_range_count = (table->row_count == 0) ? 0 : (table->row_count + rows_per_chunk - 1) / rows_per_chunk;
   
-  if (g_gdb_state->zonemap_chunk_rows > rows_per_chunk)
+  if (g_cql_state->zonemap_chunk_rows > rows_per_chunk)
   {
     Rng1U64* ranges = push_array(arena, Rng1U64, Max(uniform_range_count, 1));
     for (U64 i = 0; i < uniform_range_count; i++)
@@ -8045,7 +11660,7 @@ qe_scan_build_dispatch_ranges(Arena* arena, GDB_Table* table, IR_Node* where_cla
   
   for (U32 i = 0; i < leaf_count; i++)
   {
-    GDB_Column* column = 0;
+    CQL_Column* column = 0;
     B32 is_eq = 0, is_lt = 0, is_le = 0, is_gt = 0, is_ge = 0, is_string = 0;
     F64 target_numeric = 0.0;
     String8 target_string = {0};
@@ -8054,7 +11669,7 @@ qe_scan_build_dispatch_ranges(Arena* arena, GDB_Table* table, IR_Node* where_cla
     {
       continue;
     }
-    if (is_string || !gdb_column_type_is_zone_map_eligible(column->type)) 
+    if (is_string || !cql_column_type_is_zone_map_eligible(column->type)) 
     {
       continue;
     }
@@ -8064,7 +11679,7 @@ qe_scan_build_dispatch_ranges(Arena* arena, GDB_Table* table, IR_Node* where_cla
       continue;
     }
     
-    gdb_column_ensure_zone_map(column);
+    cql_column_ensure_zone_map(column);
     if (!column->has_zone_map) 
     {
       continue;
@@ -8105,7 +11720,7 @@ qe_scan_build_dispatch_ranges(Arena* arena, GDB_Table* table, IR_Node* where_cla
   {
     for (U32 i = 0; i < zonemap_leaf_count; i++)
     {
-      GDB_ZoneMapChunk* chunk = &zonemap_leaves[i].column->zone_map[z];
+      CQL_ZoneMapChunk* chunk = &zonemap_leaves[i].column->zone_map[z];
       if (qe_zonemap_chunk_is_prunable(&zonemap_leaves[i], chunk))
       {
         chunk_prunable[z] = 1;
@@ -8115,8 +11730,57 @@ qe_scan_build_dispatch_ranges(Arena* arena, GDB_Table* table, IR_Node* where_cla
     }
   }
   
+  U64 zonemap_chunk_rows = g_cql_state->zonemap_chunk_rows;
+  
+//- tec: a short run of prunable chunks between two scanned ones is scanned too, a dispatch costs more than a few chunks
+  {
+    U64 min_gap_rows = settings_u64(str8_lit("QE_SCAN_MIN_PRUNE_GAP_ROWS"), 1048576);
+    U64 min_gap_chunks = Max(min_gap_rows / zonemap_chunk_rows, (U64)1);
+    U64 gz = 0;
+    while (gz < zone_map_chunk_count)
+    {
+      if (!chunk_prunable[gz])
+      {
+        gz++;
+        continue;
+      }
+      U64 gap_start = gz;
+      while (gz < zone_map_chunk_count && chunk_prunable[gz])
+      {
+        gz++;
+      }
+      B32 interior = gap_start > 0 && gz < zone_map_chunk_count;
+      if (interior && (gz - gap_start) < min_gap_chunks)
+      {
+        for (U64 k = gap_start; k < gz; k++)
+        {
+          chunk_prunable[k] = 0;
+        }
+      }
+    }
+  }
+  
+  U64 prunable_rows = 0;
+  for (U64 z = 0; z < zone_map_chunk_count; z++)
+  {
+    if (chunk_prunable[z])
+    {
+      U64 start = z * zonemap_chunk_rows;
+      prunable_rows += Min(start + zonemap_chunk_rows, table->row_count) - start;
+    }
+  }
+  
+  //- tec: with several dispatches anyway, pruning only pays when it removes a real share of the table
+  {
+    U64 min_percent = settings_u64(str8_lit("QE_SCAN_MIN_PRUNE_PERCENT"), 10);
+    if (prunable_rows * 100 < table->row_count * min_percent)
+    {
+      MemoryZero(chunk_prunable, zone_map_chunk_count * sizeof(B32));
+      first_pruned_column_name = (String8){0};
+    }
+  }
+  
   //- tec: combine consecutive unprunable chunks into rows_per_chunk-capped dispatch ranges
-  U64 zonemap_chunk_rows = g_gdb_state->zonemap_chunk_rows;
   U64 range_cap = rows_per_chunk;
   
   Rng1U64* ranges = push_array(arena, Rng1U64, zone_map_chunk_count + 1);
@@ -8153,6 +11817,29 @@ qe_scan_build_dispatch_ranges(Arena* arena, GDB_Table* table, IR_Node* where_cla
     ranges[range_count++] = r1u64(run_start, run_end);
   }
   
+// tec: a table in one GPU buffer can skip pruned chunks inside one dispatch, which only wins when the ranges' cost (about QE_SCAN_RANGE_COST_ROWS rows each) outweighs launching the whole table
+  U64 range_cost_rows = settings_u64(str8_lit("QE_SCAN_RANGE_COST_ROWS"), 4194304);
+  if (uniform_range_count == 1 && range_count > 1 && range_count * range_cost_rows > table->row_count)
+  {
+    U64 word_count = (zone_map_chunk_count + 31) / 32;
+    U32* skip_bits = push_array(arena, U32, Max(word_count, (U64)1));
+    for (U64 zb = 0; zb < zone_map_chunk_count; zb++)
+    {
+      if (chunk_prunable[zb])
+      {
+        skip_bits[zb >> 5] |= (U32)1 << (zb & 31);
+      }
+    }
+    Rng1U64* whole = push_array(arena, Rng1U64, 1);
+    whole[0] = r1u64(0, table->row_count);
+    *out_range_count = 1;
+    *out_pruned_rows = pruned_rows;
+    *out_pruned_column_name = first_pruned_column_name;
+    *out_skip_bits = skip_bits;
+    scratch_end(scratch);
+    return whole;
+  }
+  
   *out_range_count = range_count;
   *out_pruned_rows = pruned_rows;
   *out_pruned_column_name = first_pruned_column_name;
@@ -8161,7 +11848,7 @@ qe_scan_build_dispatch_ranges(Arena* arena, GDB_Table* table, IR_Node* where_cla
 }
 
 internal B32
-qe_column_belongs_to_table(GDB_Table* table, String8 alias, String8 column_name)
+qe_column_belongs_to_table(CQL_Table* table, String8 alias, String8 column_name)
 {
   String8 bare = column_name;
   
@@ -8177,7 +11864,7 @@ qe_column_belongs_to_table(GDB_Table* table, String8 alias, String8 column_name)
     }
   }
   
-  return gdb_table_find_column(table, bare) != NULL;
+  return cql_table_find_column(table, bare) != NULL;
 }
 
 internal B32
@@ -8192,7 +11879,7 @@ qe_column_belongs_to_rowset(PLAN_RowSet* rows, String8 column_name)
 }
 
 internal IR_Node*
-qe_validate_equi_condition(PLAN_RowSet* left_rows, GDB_Table* right_table, String8 right_alias, IR_Node* condition)
+qe_validate_equi_condition(PLAN_RowSet* left_rows, CQL_Table* right_table, String8 right_alias, IR_Node* condition)
 {
   if (!condition || condition->type != IR_NodeType_Operator) 
   {
@@ -8223,7 +11910,7 @@ qe_validate_equi_condition(PLAN_RowSet* left_rows, GDB_Table* right_table, Strin
 }
 
 internal IR_Node*
-qe_find_equi_condition(PLAN_RowSet* left_rows, GDB_Table* right_table, String8 right_alias, IR_Node* condition)
+qe_find_equi_condition(PLAN_RowSet* left_rows, CQL_Table* right_table, String8 right_alias, IR_Node* condition)
 {
   if (!condition) 
   {
@@ -8256,7 +11943,7 @@ qe_row_load_value(Arena* arena, PLAN_RowSet* rows, IR_Node* node, U64 output_row
   {
     String8 bare = {0};
     U64 slot = max_U64;
-    GDB_Table* table = qe_resolve_column_table(rows, node->value, &bare, &slot);
+    CQL_Table* table = qe_resolve_column_table(rows, node->value, &bare, &slot);
     if (!table) 
     {
       return 0.0;
@@ -8269,22 +11956,22 @@ qe_row_load_value(Arena* arena, PLAN_RowSet* rows, IR_Node* node, U64 output_row
       return 0.0; 
     }
     
-    GDB_Column* column = gdb_table_find_column(table, bare);
+    CQL_Column* column = cql_table_find_column(table, bare);
     if (!column) 
     {
       return 0.0;
     }
     
-    if (gdb_column_is_null(column, row)) 
+    if (cql_column_is_null(column, row)) 
     { 
       *out_is_null = 1; 
       return 0.0; 
     }
     
-    if (column->type == GDB_ColumnType_String8)
+    if (column->type == CQL_ColumnType_String8)
     {
       *out_is_string = 1;
-      *out_string = gdb_column_get_string(arena, column, row);
+      *out_string = cql_column_get_string(arena, column, row);
       return 0.0;
     }
     return qe_read_numeric_as_f64(column, row);
@@ -8336,29 +12023,29 @@ qe_str8_compare_for_sort(const void* a, const void* b)
 }
 
 internal B32
-qe_in_item_resolve(GDB_Column* column, IR_Node* item, B32* out_is_string, F64* out_num, String8* out_str)
+qe_in_item_resolve(CQL_Column* column, IR_Node* item, B32* out_is_string, F64* out_num, String8* out_str)
 {
   *out_is_string = 0;
   *out_num = 0.0;
   *out_str = (String8){0};
   
-  GDB_ColumnType type = column ? column->type : GDB_ColumnType_Invalid;
+  CQL_ColumnType type = column ? column->type : CQL_ColumnType_Invalid;
   
-  if (type == GDB_ColumnType_String8 || (!column && item->type == IR_NodeType_Literal))
+  if (type == CQL_ColumnType_String8 || (!column && item->type == IR_NodeType_Literal))
   {
     *out_is_string = 1;
     *out_str = item->value;
     return 1;
   }
-  if (type == GDB_ColumnType_Date || type == GDB_ColumnType_Timestamp)
+  if (type == CQL_ColumnType_Date || type == CQL_ColumnType_Timestamp)
   {
     return item->type == IR_NodeType_Literal && qe_resolve_date_literal_value(type, item, out_num);
   }
-  if (type == GDB_ColumnType_Enum)
+  if (type == CQL_ColumnType_Enum)
   {
     return item->type == IR_NodeType_Literal && qe_resolve_enum_literal_value(column, item, out_num);
   }
-  if (type == GDB_ColumnType_Decimal)
+  if (type == CQL_ColumnType_Decimal)
   {
     return qe_resolve_decimal_literal_value(column, item, out_num);
   }
@@ -8367,7 +12054,7 @@ qe_in_item_resolve(GDB_Column* column, IR_Node* item, B32* out_is_string, F64* o
   return 1;
 }
 
-internal GDB_Column*
+internal CQL_Column*
 qe_in_left_column(PLAN_RowSet* rows, IR_Node* left)
 {
   if (!left || left->type != IR_NodeType_Column) 
@@ -8376,8 +12063,8 @@ qe_in_left_column(PLAN_RowSet* rows, IR_Node* left)
   }
   String8 bare = {0};
   U64 slot = max_U64;
-  GDB_Table* table = qe_resolve_column_table(rows, left->value, &bare, &slot);
-  return table ? gdb_table_find_column(table, bare) : NULL;
+  CQL_Table* table = qe_resolve_column_table(rows, left->value, &bare, &slot);
+  return table ? cql_table_find_column(table, bare) : NULL;
 }
 
 internal void
@@ -8407,7 +12094,7 @@ qe_in_sets_register(Arena* arena, PLAN_RowSet* rows, IR_Node* condition)
   U64 item_count = 0;
   for (IR_Node* item = right->first; item != NULL; item = item->next) item_count++;
   
-  GDB_Column* column = qe_in_left_column(rows, left);
+  CQL_Column* column = qe_in_left_column(rows, left);
   QE_InSet* set = push_array(arena, QE_InSet, 1);
   set->list_node = right;
   set->nums = push_array(arena, F64, Max(item_count, 1));
@@ -8475,7 +12162,7 @@ qe_in_list_contains(PLAN_RowSet* rows, IR_Node* left, IR_Node* list_node, B32 ls
   }
   
   // tec: not registered, walk the list
-  GDB_Column* column = rows ? qe_in_left_column(rows, left) : NULL;
+  CQL_Column* column = rows ? qe_in_left_column(rows, left) : NULL;
   for (IR_Node* item = list_node->first; item != NULL; item = item->next)
   {
     B32 is_string = 0;
@@ -8598,10 +12285,10 @@ qe_row_condition_eval(Arena* arena, PLAN_RowSet* rows, IR_Node* condition, U64 o
   {
     String8 bare = {0};
     U64 slot = max_U64;
-    GDB_Table* col_table = qe_resolve_column_table(rows, left->value, &bare, &slot);
-    GDB_Column* column = col_table ? gdb_table_find_column(col_table, bare) : NULL;
+    CQL_Table* col_table = qe_resolve_column_table(rows, left->value, &bare, &slot);
+    CQL_Column* column = col_table ? cql_table_find_column(col_table, bare) : NULL;
     if (column && right->type == IR_NodeType_Literal &&
-        (column->type == GDB_ColumnType_Date || column->type == GDB_ColumnType_Timestamp))
+        (column->type == CQL_ColumnType_Date || column->type == CQL_ColumnType_Timestamp))
     {
       right_resolved = 1;
       if (!qe_resolve_date_literal_value(column->type, right, &rv)) 
@@ -8610,7 +12297,7 @@ qe_row_condition_eval(Arena* arena, PLAN_RowSet* rows, IR_Node* condition, U64 o
         return 0;
       }
     }
-    else if (column && right->type == IR_NodeType_Literal && column->type == GDB_ColumnType_Enum)
+    else if (column && right->type == IR_NodeType_Literal && column->type == CQL_ColumnType_Enum)
     {
       right_resolved = 1;
       if (!qe_resolve_enum_literal_value(column, right, &rv))
@@ -8619,7 +12306,7 @@ qe_row_condition_eval(Arena* arena, PLAN_RowSet* rows, IR_Node* condition, U64 o
         return 0;
       }
     }
-    else if (column && right->type == IR_NodeType_Numeric && column->type == GDB_ColumnType_Decimal)
+    else if (column && right->type == IR_NodeType_Numeric && column->type == CQL_ColumnType_Decimal)
     {
       right_resolved = 1;
       if (!qe_resolve_decimal_literal_value(column, right, &rv))
@@ -8679,7 +12366,7 @@ internal THREAD_POOL_TASK_FUNC(qe_cpu_scan_filter_task)
 }
 
 internal QE_ScanResult
-qe_cpu_scan_filter(Arena* arena, GDB_Table* table, IR_Node* where_clause, QE_ScanTrace* out_trace)
+qe_cpu_scan_filter(Arena* arena, CQL_Table* table, IR_Node* where_clause, QE_ScanTrace* out_trace)
 {
   QE_ScanResult result = {0};
   U64 row_count = table->row_count;
@@ -8687,7 +12374,7 @@ qe_cpu_scan_filter(Arena* arena, GDB_Table* table, IR_Node* where_clause, QE_Sca
   
   Temp scratch = scratch_begin(&arena, 1);
   
-  GDB_Table* tables_arr[1] = { table };
+  CQL_Table* tables_arr[1] = { table };
   U64* all_rows = push_array(scratch.arena, U64, Max(row_count, 1));
   for (U64 i = 0; i < row_count; i++) all_rows[i] = i;
   U64* row_indices_arr[1] = { all_rows };
@@ -8842,10 +12529,10 @@ internal THREAD_POOL_TASK_FUNC(qe_join_pack_compose_task)
 }
 
 internal B32
-qe_join_key_is_whole_number(GDB_Column* column)
+qe_join_key_is_whole_number(CQL_Column* column)
 {
-  GDB_ColumnType type = column->type;
-  return type == GDB_ColumnType_U32 || type == GDB_ColumnType_U64 || type == GDB_ColumnType_I32 || type == GDB_ColumnType_I64;
+  CQL_ColumnType type = column->type;
+  return type == CQL_ColumnType_U32 || type == CQL_ColumnType_U64 || type == CQL_ColumnType_I32 || type == CQL_ColumnType_I64;
 }
 
 // tec: false when the pair does not fit in 53 bits, the arrays are untouched then
@@ -8907,6 +12594,81 @@ qe_join_pack_keys(Arena* arena, F64* build_first, F64* build_second, U64 build_c
   return 1;
 }
 
+// tec: the spans of the build side are enough to pack both sides, the probe side reads the same spans and maps anything outside them to no match
+// false when the pair does not fit in 53 bits, the arrays are untouched then
+internal B32
+qe_join_pack_build_keys(F64* first, F64* second, U64 count, QE_JoinPackSpan* out_span)
+{
+  if (count == 0)
+  {
+    return 0;
+  }
+
+  F64 min_first = first[0], max_first = first[0], min_second = second[0], max_second = second[0];
+  for (U64 i = 1; i < count; i++)
+  {
+    min_first = Min(min_first, first[i]);
+    max_first = Max(max_first, first[i]);
+    min_second = Min(min_second, second[i]);
+    max_second = Max(max_second, second[i]);
+  }
+
+  F64 span_first = max_first - min_first + 1.0;
+  F64 span_second = max_second - min_second + 1.0;
+  if (span_first * span_second >= 9.0e15)
+  {
+    return 0;
+  }
+
+  for (U64 i = 0; i < count; i++)
+  {
+    first[i] = (first[i] - min_first) * span_second + (second[i] - min_second);
+  }
+
+  out_span->min_first = min_first;
+  out_span->min_second = min_second;
+  out_span->span_first = span_first;
+  out_span->span_second = span_second;
+  return 1;
+}
+
+// tec: dest[i] = packed key of first[i] and second[i], a separate buffer since the sources can be the resident column buffers
+internal GPU_Buffer*
+qe_join_pack_probe_keys_gpu(GPU_Buffer* first, GPU_Buffer* second, U64 count, QE_JoinPackSpan* span, String8 dest_key)
+{
+  GPU_Buffer* dest = gpu_buffer_alloc_pooled(dest_key, Max(count, (U64)1) * sizeof(F64), GPU_BufferFlag_ReadWrite, 0);
+  GPU_Kernel* kernel = gpu_kernel_alloc(str8_lit("join_pack_key"));
+  if (!dest || !first || !second || !kernel)
+  {
+    if (kernel)
+    {
+      gpu_kernel_release(kernel);
+    }
+    return 0;
+  }
+
+  U64 bits[4] = {0};
+  MemoryCopy(&bits[0], &span->min_first, sizeof(F64));
+  MemoryCopy(&bits[1], &span->min_second, sizeof(F64));
+  MemoryCopy(&bits[2], &span->span_first, sizeof(F64));
+  MemoryCopy(&bits[3], &span->span_second, sizeof(F64));
+
+  gpu_kernel_set_arg_buffer(kernel, 0, first);
+  gpu_kernel_set_arg_buffer(kernel, 1, second);
+  gpu_kernel_set_arg_buffer(kernel, 2, dest);
+  gpu_kernel_set_arg_u64(kernel, 0, count);
+  gpu_kernel_set_arg_u64(kernel, 1, bits[0]);
+  gpu_kernel_set_arg_u64(kernel, 2, bits[1]);
+  gpu_kernel_set_arg_u64(kernel, 3, bits[2]);
+  gpu_kernel_set_arg_u64(kernel, 4, bits[3]);
+
+  GPU_Batch* batch = gpu_batch_begin(0, 0);
+  gpu_batch_kernel_execute(batch, kernel, (U32)count, QE_GPU_WORKGROUP_SIZE);
+  B32 ok = gpu_batch_end(batch);
+  gpu_kernel_release(kernel);
+  return ok ? dest : 0;
+}
+
 // tec: the default guess assumes a mostly one to one join, a hint that says the join fans out replaces it so the probe does not run twice
 internal U64
 qe_join_output_capacity(U64 probe_rows, U64 build_rows, QE_JoinHints* hints, U64 hard_max_capacity)
@@ -8933,13 +12695,13 @@ qe_join_type_is_filter(String8 join_type)
 
 // tec: FNV-1a over the bytes of a string cell, a multiply and shift mix over the bits of a numeric one
 internal U64
-qe_key_hash(GDB_Column* column, U64 row)
+qe_key_hash(CQL_Column* column, U64 row)
 {
   U64 hash = 14695981039346656037ull;
-  if (column->type == GDB_ColumnType_String8)
+  if (column->type == CQL_ColumnType_String8)
   {
     Temp scratch = scratch_begin(0, 0);
-    String8 text = gdb_column_get_string(scratch.arena, column, row);
+    String8 text = cql_column_get_string(scratch.arena, column, row);
     for (U64 index = 0; index < text.size; index += 1)
     {
       hash ^= text.str[index];
@@ -8949,7 +12711,7 @@ qe_key_hash(GDB_Column* column, U64 row)
     return hash;
   }
   
-  F64 value = gdb_index_numeric_value(column, row);
+  F64 value = cql_index_numeric_value(column, row);
   if (value == 0.0)
   {
     value = 0.0;
@@ -8963,23 +12725,23 @@ qe_key_hash(GDB_Column* column, U64 row)
 }
 
 internal B32
-qe_key_equal(GDB_Column* column, U64 row_a, U64 row_b)
+qe_key_equal(CQL_Column* column, U64 row_a, U64 row_b)
 {
-  if (column->type == GDB_ColumnType_String8)
+  if (column->type == CQL_ColumnType_String8)
   {
     Temp scratch = scratch_begin(0, 0);
-    String8 text_a = gdb_column_get_string(scratch.arena, column, row_a);
-    String8 text_b = gdb_column_get_string(scratch.arena, column, row_b);
+    String8 text_a = cql_column_get_string(scratch.arena, column, row_a);
+    String8 text_b = cql_column_get_string(scratch.arena, column, row_b);
     B32 equal = str8_match(text_a, text_b, 0);
     scratch_end(scratch);
     return equal;
   }
-  return gdb_index_numeric_value(column, row_a) == gdb_index_numeric_value(column, row_b);
+  return cql_index_numeric_value(column, row_a) == cql_index_numeric_value(column, row_b);
 }
 
 // tec: a match only has to be found once, so duplicate keys on the build side are dropped and a semi join cannot fan out. rows NULL means every row
 internal U64*
-qe_distinct_key_rows(Arena* arena, GDB_Column* key_column, U64* rows, U64 row_count, U64* out_count)
+qe_distinct_key_rows(Arena* arena, CQL_Column* key_column, U64* rows, U64 row_count, U64* out_count)
 {
   Temp scratch = scratch_begin(&arena, 1);
   
@@ -9072,7 +12834,7 @@ qe_join_filter_left_rows(Arena* arena, PLAN_RowSet* left, U32* pairs, U64 pair_c
 }
 
 internal PLAN_RowSet
-qe_hash_join(Arena* arena, PLAN_RowSet* left, GDB_Table* right_table, String8 right_alias, U64* right_rows, U64 right_count, String8 join_type, IR_Node* condition, QE_JoinHints* hints, QE_JoinTrace* out_trace)
+qe_hash_join(Arena* arena, PLAN_RowSet* left, CQL_Table* right_table, String8 right_alias, U64* right_rows, U64 right_count, String8 join_type, IR_Node* condition, QE_JoinHints* hints, QE_JoinTrace* out_trace)
 {
   return qe_hash_join_impl(arena, left, right_table, right_alias, right_rows, right_count, join_type, condition, hints, out_trace, 0, 0);
 }
@@ -9081,7 +12843,7 @@ qe_hash_join(Arena* arena, PLAN_RowSet* left, GDB_Table* right_table, String8 ri
 // with out_device the joined rows stay on the GPU too, as one dense row list per table, and the returned row set holds no row ids.
 // a join that cannot run that way sets out_device->declined before doing any work
 internal PLAN_RowSet
-qe_hash_join_impl(Arena* arena, PLAN_RowSet* left, GDB_Table* right_table, String8 right_alias, U64* right_rows, U64 right_count, String8 join_type, IR_Node* condition, QE_JoinHints* hints, QE_JoinTrace* out_trace, QE_DeviceRows* device_left, QE_DeviceRows* out_device)
+qe_hash_join_impl(Arena* arena, PLAN_RowSet* left, CQL_Table* right_table, String8 right_alias, U64* right_rows, U64 right_count, String8 join_type, IR_Node* condition, QE_JoinHints* hints, QE_JoinTrace* out_trace, QE_DeviceRows* device_left, QE_DeviceRows* out_device)
 {
   ProfBeginFunction();
   PLAN_RowSet result = {0};
@@ -9111,11 +12873,11 @@ qe_hash_join_impl(Arena* arena, PLAN_RowSet* left, GDB_Table* right_table, Strin
   IR_Node* right_key_node = left_side_is_right_table ? cond_left : cond_right;
   IR_Node* left_key_node = left_side_is_right_table ? cond_right : cond_left;
   
-  GDB_Column* right_key_column = gdb_table_find_column(right_table, qe_bare_column_name(right_key_node->value));
+  CQL_Column* right_key_column = cql_table_find_column(right_table, qe_bare_column_name(right_key_node->value));
   String8 left_bare = {0};
   U64 left_key_slot = max_U64;
-  GDB_Table* left_key_table = qe_resolve_column_table(left, left_key_node->value, &left_bare, &left_key_slot);
-  GDB_Column* left_key_column = left_key_table ? gdb_table_find_column(left_key_table, left_bare) : NULL;
+  CQL_Table* left_key_table = qe_resolve_column_table(left, left_key_node->value, &left_bare, &left_key_slot);
+  CQL_Column* left_key_column = left_key_table ? cql_table_find_column(left_key_table, left_bare) : NULL;
   
   if (!right_key_column || !left_key_column)
   {
@@ -9124,8 +12886,8 @@ qe_hash_join_impl(Arena* arena, PLAN_RowSet* left, GDB_Table* right_table, Strin
     return result;
   }
   
-  B32 is_string_key = (right_key_column->type == GDB_ColumnType_String8);
-  if (is_string_key != (left_key_column->type == GDB_ColumnType_String8))
+  B32 is_string_key = (right_key_column->type == CQL_ColumnType_String8);
+  if (is_string_key != (left_key_column->type == CQL_ColumnType_String8))
   {
     log_error("qe_hash_join: join key type mismatch (one side numeric, other string)");
     ProfEnd();
@@ -9134,10 +12896,10 @@ qe_hash_join_impl(Arena* arena, PLAN_RowSet* left, GDB_Table* right_table, Strin
   
   // tec: dictionary codes are only comparable within the column that produced them
   B32 dict_key = 0;
-  GDB_StringDict* join_dict = 0;
+  CQL_StringDict* join_dict = 0;
   if (is_string_key)
   {
-    gdb_column_ensure_string_dict(right_key_column);
+    cql_column_ensure_string_dict(right_key_column);
     if (right_key_column->has_dict)
     {
       dict_key = 1;
@@ -9153,7 +12915,7 @@ qe_hash_join_impl(Arena* arena, PLAN_RowSet* left, GDB_Table* right_table, Strin
   B32 device_join = device_left && out_device && !is_string_key && !is_filter_join && left->table_count + 1 <= QE_DEVICE_ROWS_MAX_TABLES;
   if (device_join && dict_key)
   {
-    gdb_column_ensure_string_dict(left_key_column);
+    cql_column_ensure_string_dict(left_key_column);
     if (!left_key_column->has_dict)
     {
       // tec: no dict on the left column means recoding would need a per row string lookup, which needs the host row list this path doesn't have
@@ -9234,14 +12996,14 @@ qe_hash_join_impl(Arena* arena, PLAN_RowSet* left, GDB_Table* right_table, Strin
   }
   else if (is_string_key)
   {
-    GDB_StringDataChunk chunk = {0};
+    CQL_StringDataChunk chunk = {0};
     if (right_rows)
     {
       chunk = qe_gather_string_column(scratch.arena, &right_subset, 0, right_key_column);
     }
     else
     {
-      chunk = gdb_column_get_string_chunk(scratch.arena, right_key_column, r1u64(0, build_row_count));
+      chunk = cql_column_get_string_chunk(scratch.arena, right_key_column, r1u64(0, build_row_count));
     }
     build_data = chunk.data;
     build_offsets = chunk.offsets;
@@ -9257,23 +13019,23 @@ qe_hash_join_impl(Arena* arena, PLAN_RowSet* left, GDB_Table* right_table, Strin
     // tec: bulk range read
     F64* values = push_array(scratch.arena, F64, Max(build_row_count, 1));
     U64 range_size = 0;
-    void* base_ptr = (build_row_count > 0) ? gdb_column_get_data_range(scratch.arena, right_key_column, r1u64(0, build_row_count), &range_size) : 0;
+    void* base_ptr = (build_row_count > 0) ? cql_column_get_data_range(scratch.arena, right_key_column, r1u64(0, build_row_count), &range_size) : 0;
     for (U64 i = 0; i < build_row_count; i++)
     {
       void* data = base_ptr ? (U8*)base_ptr + i * right_key_column->size : 0;
-      switch (data ? right_key_column->type : GDB_ColumnType_U32)
+      switch (data ? right_key_column->type : CQL_ColumnType_U32)
       {
-        case GDB_ColumnType_U32: values[i] = (F64)(*(U32*)data); break;
-        case GDB_ColumnType_U64: values[i] = (F64)(*(U64*)data); break;
-        case GDB_ColumnType_F32: values[i] = (F64)(*(F32*)data); break;
-        case GDB_ColumnType_F64: values[i] = *(F64*)data; break;
-        case GDB_ColumnType_Bool: values[i] = (F64)(*(U8*)data); break;
-        case GDB_ColumnType_I32: values[i] = (F64)(*(S32*)data); break;
-        case GDB_ColumnType_I64: values[i] = (F64)(*(S64*)data); break;
-        case GDB_ColumnType_Date: values[i] = (F64)(*(S32*)data); break;
-        case GDB_ColumnType_Timestamp: values[i] = (F64)(*(S64*)data); break;
-        case GDB_ColumnType_Decimal: values[i] = (F64)(*(S64*)data); break;
-        case GDB_ColumnType_Enum: values[i] = (F64)(*(U32*)data); break;
+        case CQL_ColumnType_U32: values[i] = (F64)(*(U32*)data); break;
+        case CQL_ColumnType_U64: values[i] = (F64)(*(U64*)data); break;
+        case CQL_ColumnType_F32: values[i] = (F64)(*(F32*)data); break;
+        case CQL_ColumnType_F64: values[i] = *(F64*)data; break;
+        case CQL_ColumnType_Bool: values[i] = (F64)(*(U8*)data); break;
+        case CQL_ColumnType_I32: values[i] = (F64)(*(S32*)data); break;
+        case CQL_ColumnType_I64: values[i] = (F64)(*(S64*)data); break;
+        case CQL_ColumnType_Date: values[i] = (F64)(*(S32*)data); break;
+        case CQL_ColumnType_Timestamp: values[i] = (F64)(*(S64*)data); break;
+        case CQL_ColumnType_Decimal: values[i] = (F64)(*(S64*)data); break;
+        case CQL_ColumnType_Enum: values[i] = (F64)(*(U32*)data); break;
         default: values[i] = 0.0; break;
       }
     }
@@ -9318,13 +13080,13 @@ qe_hash_join_impl(Arena* arena, PLAN_RowSet* left, GDB_Table* right_table, Strin
   }
   else if (dict_key)
   {
-    GDB_StringDataChunk chunk = qe_gather_string_column(scratch.arena, left, left_key_slot, left_key_column);
+    CQL_StringDataChunk chunk = qe_gather_string_column(scratch.arena, left, left_key_slot, left_key_column);
     probe_data = qe_dict_codes_from_string_chunk(scratch.arena, &chunk, join_dict);
     probe_data_size = Max(probe_row_count, 1) * sizeof(F64);
   }
   else if (is_string_key)
   {
-    GDB_StringDataChunk chunk = qe_gather_string_column(scratch.arena, left, left_key_slot, left_key_column);
+    CQL_StringDataChunk chunk = qe_gather_string_column(scratch.arena, left, left_key_slot, left_key_column);
     probe_data = chunk.data;
     probe_offsets = chunk.offsets;
     probe_data_size = Max(chunk.size, 4);
@@ -9336,50 +13098,83 @@ qe_hash_join_impl(Arena* arena, PLAN_RowSet* left, GDB_Table* right_table, Strin
   }
   
   //- tec: a second whole number equality folds into the key, so the join emits only the rows matching both
-  if (hints && hints->second_key && !device_join && !is_string_key && !dict_key && !is_filter_join && !is_left_join &&
-      qe_join_key_is_whole_number(right_key_column) && qe_join_key_is_whole_number(left_key_column))
+  if (hints && hints->second_key)
   {
-    IR_Node* second_a = hints->second_key->first;
-    IR_Node* second_b = second_a ? second_a->next : NULL;
-    if (second_a && second_b)
+    if (!is_string_key && !dict_key && !is_filter_join && !is_left_join &&
+        qe_join_key_is_whole_number(right_key_column) && qe_join_key_is_whole_number(left_key_column))
     {
-      B32 a_is_right = qe_column_belongs_to_table(right_table, right_alias, second_a->value);
-      IR_Node* second_right = a_is_right ? second_a : second_b;
-      IR_Node* second_left = a_is_right ? second_b : second_a;
-      
-      GDB_Column* right_second_column = gdb_table_find_column(right_table, qe_bare_column_name(second_right->value));
-      String8 second_left_bare = {0};
-      U64 second_left_slot = max_U64;
-      GDB_Table* second_left_table = qe_resolve_column_table(left, second_left->value, &second_left_bare, &second_left_slot);
-      GDB_Column* left_second_column = second_left_table ? gdb_table_find_column(second_left_table, second_left_bare) : NULL;
-      
-      if (right_second_column && left_second_column && qe_join_key_is_whole_number(right_second_column) &&
-          qe_join_key_is_whole_number(left_second_column))
+      IR_Node* second_a = hints->second_key->first;
+      IR_Node* second_b = second_a ? second_a->next : NULL;
+      if (second_a && second_b)
       {
-        PLAN_RowSet build_rows = right_subset;
-        if (!right_rows)
+        B32 a_is_right = qe_column_belongs_to_table(right_table, right_alias, second_a->value);
+        IR_Node* second_right = a_is_right ? second_a : second_b;
+        IR_Node* second_left = a_is_right ? second_b : second_a;
+
+        CQL_Column* right_second_column = cql_table_find_column(right_table, qe_bare_column_name(second_right->value));
+        String8 second_left_bare = {0};
+        U64 second_left_slot = max_U64;
+        CQL_Table* second_left_table = qe_resolve_column_table(left, second_left->value, &second_left_bare, &second_left_slot);
+        CQL_Column* left_second_column = second_left_table ? cql_table_find_column(second_left_table, second_left_bare) : NULL;
+
+        if (right_second_column && left_second_column && qe_join_key_is_whole_number(right_second_column) &&
+            qe_join_key_is_whole_number(left_second_column))
         {
-          U64* identity = push_array_no_zero(scratch.arena, U64, Max(build_row_count, 1));
-          for (U64 i = 0; i < build_row_count; i++)
+          PLAN_RowSet build_rows = right_subset;
+          if (!right_rows)
           {
-            identity[i] = i;
+            U64* identity = push_array_no_zero(scratch.arena, U64, Max(build_row_count, 1));
+            for (U64 i = 0; i < build_row_count; i++)
+            {
+              identity[i] = i;
+            }
+            build_rows.tables = &right_table;
+            build_rows.aliases = &right_alias;
+            build_rows.table_count = 1;
+            build_rows.row_indices = &identity;
+            build_rows.count = build_row_count;
           }
-          build_rows.tables = &right_table;
-          build_rows.aliases = &right_alias;
-          build_rows.table_count = 1;
-          build_rows.row_indices = &identity;
-          build_rows.count = build_row_count;
-        }
-        F64* build_second = qe_gather_numeric_column(scratch.arena, &build_rows, 0, right_second_column);
-        F64* probe_second = qe_gather_numeric_column(scratch.arena, left, second_left_slot, left_second_column);
-        if (qe_join_pack_keys(scratch.arena, (F64*)build_data, build_second, build_row_count, (F64*)probe_data, probe_second, probe_row_count))
-        {
-          hints->second_key_applied = 1;
+          F64* build_second = qe_gather_numeric_column(scratch.arena, &build_rows, 0, right_second_column);
+
+          if (device_join)
+          {
+            // tec: the probe columns stay on the GPU, a kernel packs them with the spans of the build side
+            QE_JoinPackSpan span = {0};
+            if (qe_join_pack_build_keys((F64*)build_data, build_second, build_row_count, &span))
+            {
+              B32 second_narrow = 0;
+              GPU_Buffer* second_full = qe_aggregate_full_column_f64(scratch.arena, left_second_column, 0, &second_narrow);
+              GPU_Buffer* second_probe = second_full ? qe_selection_gather_column(qe_device_view(device_left, second_left_slot), second_full, 0, str8_lit("hj_probe_dense_second")) : 0;
+              GPU_Buffer* packed_probe = second_probe ? qe_join_pack_probe_keys_gpu(probe_device_buffer, second_probe, probe_row_count, &span, str8_lit("hj_probe_packed")) : 0;
+              if (packed_probe)
+              {
+                probe_device_buffer = packed_probe;
+                hints->second_key_applied = 1;
+              }
+            }
+          }
+          else
+          {
+            F64* probe_second = qe_gather_numeric_column(scratch.arena, left, second_left_slot, left_second_column);
+            if (qe_join_pack_keys(scratch.arena, (F64*)build_data, build_second, build_row_count, (F64*)probe_data, probe_second, probe_row_count))
+            {
+              hints->second_key_applied = 1;
+            }
+          }
         }
       }
     }
+
+    // tec: the planner kept this join on the device because the second key was going to be part of it, the host path can still apply it
+    if (device_join && !hints->second_key_applied)
+    {
+      out_device->declined = 1;
+      scratch_end(scratch);
+      ProfEnd();
+      return result;
+    }
   }
-  
+
   //- tec: pass 1/2
   // hash the build side into a bucket histogram. upload the build key data/offsets, dispatch, and read the bucket histogram back
   GPU_Kernel* build_kernel = gpu_kernel_alloc(str8_lit("hash_join_build_count"));
@@ -9783,7 +13578,7 @@ qe_hash_join_impl(Arena* arena, PLAN_RowSet* left, GDB_Table* right_table, Strin
     out_device->valid = 1;
     
     result.table_count = out_device->table_count;
-    result.tables = push_array(arena, GDB_Table*, result.table_count);
+    result.tables = push_array(arena, CQL_Table*, result.table_count);
     result.aliases = push_array(arena, String8, result.table_count);
     for (U32 t = 0; t < out_device->table_count; t++)
     {
@@ -9811,8 +13606,8 @@ qe_hash_join_impl(Arena* arena, PLAN_RowSet* left, GDB_Table* right_table, Strin
   // tec: expand (probe_array_index, build_row) pairs into the final multi table row set
   // the left sides existing table columns come along unchanged, the right table is appended
   result.table_count = left->table_count + 1;
-  result.tables = push_array(arena, GDB_Table*, result.table_count);
-  MemoryCopy(result.tables, left->tables, left->table_count * sizeof(GDB_Table*));
+  result.tables = push_array(arena, CQL_Table*, result.table_count);
+  MemoryCopy(result.tables, left->tables, left->table_count * sizeof(CQL_Table*));
   result.tables[left->table_count] = right_table;
   
   result.aliases = push_array(arena, String8, result.table_count);

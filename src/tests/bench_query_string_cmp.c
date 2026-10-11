@@ -8,7 +8,7 @@
 #include "os/os_inc.h"
 #include "thread_pool/thread_pool.h"
 #include "settings/settings.h"
-#include "gdb/gdb_inc.h"
+#include "cql/cql_inc.h"
 #include "ir_gen/ir_gen_inc.h"
 #include "gpu/gpu_inc.h"
 #include "planner/plan_node.h"
@@ -25,7 +25,7 @@
 #include "settings/settings.c"
 #include "gpu/gpu_inc.c"
 #include "ir_gen/ir_gen_inc.c"
-#include "gdb/gdb_inc.c"
+#include "cql/cql_inc.c"
 #include "query_exec/query_exec.c"
 #include "optimizer/optimizer_inc.c"
 #include "planner/planner.c"
@@ -81,7 +81,7 @@ scmp_write_csv(String8 path, Bench_Row* rows, U64 row_count, B32 null_first_valu
 }
 
 internal QE_TraceStrategy
-scmp_get_strategy(Arena* arena, GDB_Database* database, String8 sql_text)
+scmp_get_strategy(Arena* arena, CQL_Database* database, String8 sql_text)
 {
   SQL_TokenizeResult tok = sql_tokenize_from_text(arena, sql_text);
   SQL_Node* ast = sql_parse(arena, tok.tokens, tok.count, sql_text);
@@ -121,46 +121,46 @@ scmp_build_cases(Arena* arena, Bench_QueryCase* out_cases, String8 table_name, S
   U64 n = 0;
   
   out_cases[n].label = str8_lit("name = (dict hit)");
-  out_cases[n].gdb_sql = push_str8f(arena, "SELECT %.*s FROM %.*s WHERE name = 'kilo';", str8_varg(select_list), str8_varg(table_name));
-  out_cases[n].sqlite_sql = out_cases[n].gdb_sql; out_cases[n].duckdb_sql = out_cases[n].gdb_sql; n++;
+  out_cases[n].cql_sql = push_str8f(arena, "SELECT %.*s FROM %.*s WHERE name = 'kilo';", str8_varg(select_list), str8_varg(table_name));
+  out_cases[n].sqlite_sql = out_cases[n].cql_sql; out_cases[n].duckdb_sql = out_cases[n].cql_sql; n++;
   
   out_cases[n].label = str8_lit("name != (dict hit)");
-  out_cases[n].gdb_sql = push_str8f(arena, "SELECT %.*s FROM %.*s WHERE name != 'kilo';", str8_varg(select_list), str8_varg(table_name));
-  out_cases[n].sqlite_sql = out_cases[n].gdb_sql; out_cases[n].duckdb_sql = out_cases[n].gdb_sql; n++;
+  out_cases[n].cql_sql = push_str8f(arena, "SELECT %.*s FROM %.*s WHERE name != 'kilo';", str8_varg(select_list), str8_varg(table_name));
+  out_cases[n].sqlite_sql = out_cases[n].cql_sql; out_cases[n].duckdb_sql = out_cases[n].cql_sql; n++;
   
   out_cases[n].label = str8_lit("name < (relational)");
-  out_cases[n].gdb_sql = push_str8f(arena, "SELECT %.*s FROM %.*s WHERE name < 'kilo';", str8_varg(select_list), str8_varg(table_name));
-  out_cases[n].sqlite_sql = out_cases[n].gdb_sql; out_cases[n].duckdb_sql = out_cases[n].gdb_sql; n++;
+  out_cases[n].cql_sql = push_str8f(arena, "SELECT %.*s FROM %.*s WHERE name < 'kilo';", str8_varg(select_list), str8_varg(table_name));
+  out_cases[n].sqlite_sql = out_cases[n].cql_sql; out_cases[n].duckdb_sql = out_cases[n].cql_sql; n++;
   
   out_cases[n].label = str8_lit("name > (relational)");
-  out_cases[n].gdb_sql = push_str8f(arena, "SELECT %.*s FROM %.*s WHERE name > 'kilo';", str8_varg(select_list), str8_varg(table_name));
-  out_cases[n].sqlite_sql = out_cases[n].gdb_sql; out_cases[n].duckdb_sql = out_cases[n].gdb_sql; n++;
+  out_cases[n].cql_sql = push_str8f(arena, "SELECT %.*s FROM %.*s WHERE name > 'kilo';", str8_varg(select_list), str8_varg(table_name));
+  out_cases[n].sqlite_sql = out_cases[n].cql_sql; out_cases[n].duckdb_sql = out_cases[n].cql_sql; n++;
   
   out_cases[n].label = str8_lit("name <= (relational)");
-  out_cases[n].gdb_sql = push_str8f(arena, "SELECT %.*s FROM %.*s WHERE name <= 'kilo';", str8_varg(select_list), str8_varg(table_name));
-  out_cases[n].sqlite_sql = out_cases[n].gdb_sql; out_cases[n].duckdb_sql = out_cases[n].gdb_sql; n++;
+  out_cases[n].cql_sql = push_str8f(arena, "SELECT %.*s FROM %.*s WHERE name <= 'kilo';", str8_varg(select_list), str8_varg(table_name));
+  out_cases[n].sqlite_sql = out_cases[n].cql_sql; out_cases[n].duckdb_sql = out_cases[n].cql_sql; n++;
   
   out_cases[n].label = str8_lit("name >= (relational)");
-  out_cases[n].gdb_sql = push_str8f(arena, "SELECT %.*s FROM %.*s WHERE name >= 'kilo';", str8_varg(select_list), str8_varg(table_name));
-  out_cases[n].sqlite_sql = out_cases[n].gdb_sql; out_cases[n].duckdb_sql = out_cases[n].gdb_sql; n++;
+  out_cases[n].cql_sql = push_str8f(arena, "SELECT %.*s FROM %.*s WHERE name >= 'kilo';", str8_varg(select_list), str8_varg(table_name));
+  out_cases[n].sqlite_sql = out_cases[n].cql_sql; out_cases[n].duckdb_sql = out_cases[n].cql_sql; n++;
   
   out_cases[n].label = str8_lit("name = (literal not in dict)");
-  out_cases[n].gdb_sql = push_str8f(arena, "SELECT %.*s FROM %.*s WHERE name = 'zzznotinlist';", str8_varg(select_list), str8_varg(table_name));
-  out_cases[n].sqlite_sql = out_cases[n].gdb_sql; out_cases[n].duckdb_sql = out_cases[n].gdb_sql; n++;
+  out_cases[n].cql_sql = push_str8f(arena, "SELECT %.*s FROM %.*s WHERE name = 'zzznotinlist';", str8_varg(select_list), str8_varg(table_name));
+  out_cases[n].sqlite_sql = out_cases[n].cql_sql; out_cases[n].duckdb_sql = out_cases[n].cql_sql; n++;
   
   out_cases[n].label = str8_lit("name != (literal not in dict)");
-  out_cases[n].gdb_sql = push_str8f(arena, "SELECT %.*s FROM %.*s WHERE name != 'zzznotinlist';", str8_varg(select_list), str8_varg(table_name));
-  out_cases[n].sqlite_sql = out_cases[n].gdb_sql; out_cases[n].duckdb_sql = out_cases[n].gdb_sql; n++;
+  out_cases[n].cql_sql = push_str8f(arena, "SELECT %.*s FROM %.*s WHERE name != 'zzznotinlist';", str8_varg(select_list), str8_varg(table_name));
+  out_cases[n].sqlite_sql = out_cases[n].cql_sql; out_cases[n].duckdb_sql = out_cases[n].cql_sql; n++;
   
   out_cases[n].label = str8_lit("name = (empty string literal)");
-  out_cases[n].gdb_sql = push_str8f(arena, "SELECT %.*s FROM %.*s WHERE name = '';", str8_varg(select_list), str8_varg(table_name));
-  out_cases[n].sqlite_sql = out_cases[n].gdb_sql; out_cases[n].duckdb_sql = out_cases[n].gdb_sql; n++;
+  out_cases[n].cql_sql = push_str8f(arena, "SELECT %.*s FROM %.*s WHERE name = '';", str8_varg(select_list), str8_varg(table_name));
+  out_cases[n].sqlite_sql = out_cases[n].cql_sql; out_cases[n].duckdb_sql = out_cases[n].cql_sql; n++;
   
   if (include_having)
   {
     out_cases[n].label = str8_lit("HAVING name > (qe_having_eval)");
-    out_cases[n].gdb_sql = push_str8f(arena, "SELECT name, COUNT(*) FROM %.*s GROUP BY name HAVING name > 'kilo';", str8_varg(table_name));
-    out_cases[n].sqlite_sql = out_cases[n].gdb_sql; out_cases[n].duckdb_sql = out_cases[n].gdb_sql; n++;
+    out_cases[n].cql_sql = push_str8f(arena, "SELECT name, COUNT(*) FROM %.*s GROUP BY name HAVING name > 'kilo';", str8_varg(table_name));
+    out_cases[n].sqlite_sql = out_cases[n].cql_sql; out_cases[n].duckdb_sql = out_cases[n].cql_sql; n++;
   }
   
   return n;
@@ -188,10 +188,10 @@ scmp_run_suite(Arena* arena, Bench_Report* report, U64 row_count, B32 low_cardin
   String8 csv_path = push_str8f(scratch.arena, "bench_data/string_cmp_%s.csv", label);
   bench_write_csv(csv_path, rows, row_count);
   
-  GDB_Database* database = gdb_database_alloc(str8_lit("string_cmp_db"));
-  gdb_add_database(database);
-  GDB_Table* table = gdb_table_import_csv_streaming(database, table_name, csv_path);
-  gdb_database_add_table(database, table);
+  CQL_Database* database = cql_database_alloc(str8_lit("string_cmp_db"));
+  cql_add_database(database);
+  CQL_Table* table = cql_table_import_csv_streaming(database, table_name, csv_path);
+  cql_database_add_table(database, table);
   
   sqlite3* sqlite_db = NULL;
   sqlite3_open(":memory:", &sqlite_db);
@@ -211,9 +211,9 @@ scmp_run_suite(Arena* arena, Bench_Report* report, U64 row_count, B32 low_cardin
   bench_print_table_header(report, label);
   for (U64 i = 0; i < case_count; i++)
   {
-    U64 gdb_rows = 0, gdb_checksum = 0;
-    Bench_Stats gdb_stats = bench_run_gdb_query(database, cases[i].gdb_sql, &gdb_rows, &gdb_checksum);
-    bench_print_table_row(report, cases[i].label, "gdb", gdb_rows, gdb_checksum, &gdb_stats);
+    U64 cql_rows = 0, cql_checksum = 0;
+    Bench_Stats cql_stats = bench_run_cql_query(database, cases[i].cql_sql, &cql_rows, &cql_checksum);
+    bench_print_table_row(report, cases[i].label, "cql", cql_rows, cql_checksum, &cql_stats);
     
     U64 sqlite_rows = 0, sqlite_checksum = 0;
     Bench_Stats sqlite_stats = bench_run_sqlite_query(sqlite_db, cases[i].sqlite_sql, &sqlite_rows, &sqlite_checksum);
@@ -223,8 +223,8 @@ scmp_run_suite(Arena* arena, Bench_Report* report, U64 row_count, B32 low_cardin
     Bench_Stats duckdb_stats = bench_run_duckdb_query(duckdb_conn, cases[i].duckdb_sql, &duckdb_rows, &duckdb_checksum);
     bench_print_table_row(report, cases[i].label, "duckdb", duckdb_rows, duckdb_checksum, &duckdb_stats);
     
-    bench_check_match(report, cases[i].label, "gdb", gdb_rows, gdb_checksum, "sqlite", sqlite_rows, sqlite_checksum);
-    bench_check_match(report, cases[i].label, "gdb", gdb_rows, gdb_checksum, "duckdb", duckdb_rows, duckdb_checksum);
+    bench_check_match(report, cases[i].label, "cql", cql_rows, cql_checksum, "sqlite", sqlite_rows, sqlite_checksum);
+    bench_check_match(report, cases[i].label, "cql", cql_rows, cql_checksum, "duckdb", duckdb_rows, duckdb_checksum);
   }
   
   // tec: confirm the '<' case above actually took the GPU bytecode path
@@ -256,10 +256,10 @@ scmp_run_cpu_fallback_check(Arena* arena, Bench_Report* report, U64 row_count)
   String8 csv_path = push_str8f(scratch.arena, "bench_data/string_cmp_cpu_fallback.csv");
   scmp_write_csv(csv_path, rows, row_count, 1);
   
-  GDB_Database* database = gdb_database_alloc(str8_lit("string_cmp_cpu_db"));
-  gdb_add_database(database);
-  GDB_Table* table = gdb_table_import_csv_streaming(database, table_name, csv_path);
-  gdb_database_add_table(database, table);
+  CQL_Database* database = cql_database_alloc(str8_lit("string_cmp_cpu_db"));
+  cql_add_database(database);
+  CQL_Table* table = cql_table_import_csv_streaming(database, table_name, csv_path);
+  cql_database_add_table(database, table);
   
   sqlite3* sqlite_db = NULL;
   sqlite3_open(":memory:", &sqlite_db);
@@ -279,9 +279,9 @@ scmp_run_cpu_fallback_check(Arena* arena, Bench_Report* report, U64 row_count)
   bench_print_table_header(report, "cpu_fallback");
   for (U64 i = 0; i < case_count; i++)
   {
-    U64 gdb_rows = 0, gdb_checksum = 0;
-    Bench_Stats gdb_stats = bench_run_gdb_query(database, cases[i].gdb_sql, &gdb_rows, &gdb_checksum);
-    bench_print_table_row(report, cases[i].label, "gdb", gdb_rows, gdb_checksum, &gdb_stats);
+    U64 cql_rows = 0, cql_checksum = 0;
+    Bench_Stats cql_stats = bench_run_cql_query(database, cases[i].cql_sql, &cql_rows, &cql_checksum);
+    bench_print_table_row(report, cases[i].label, "cql", cql_rows, cql_checksum, &cql_stats);
     
     U64 sqlite_rows = 0, sqlite_checksum = 0;
     Bench_Stats sqlite_stats = bench_run_sqlite_query(sqlite_db, cases[i].sqlite_sql, &sqlite_rows, &sqlite_checksum);
@@ -291,8 +291,8 @@ scmp_run_cpu_fallback_check(Arena* arena, Bench_Report* report, U64 row_count)
     Bench_Stats duckdb_stats = bench_run_duckdb_query(duckdb_conn, cases[i].duckdb_sql, &duckdb_rows, &duckdb_checksum);
     bench_print_table_row(report, cases[i].label, "duckdb", duckdb_rows, duckdb_checksum, &duckdb_stats);
     
-    bench_check_match(report, cases[i].label, "gdb", gdb_rows, gdb_checksum, "sqlite", sqlite_rows, sqlite_checksum);
-    bench_check_match(report, cases[i].label, "gdb", gdb_rows, gdb_checksum, "duckdb", duckdb_rows, duckdb_checksum);
+    bench_check_match(report, cases[i].label, "cql", cql_rows, cql_checksum, "sqlite", sqlite_rows, sqlite_checksum);
+    bench_check_match(report, cases[i].label, "cql", cql_rows, cql_checksum, "duckdb", duckdb_rows, duckdb_checksum);
   }
   
   String8 lt_sql = push_str8f(scratch.arena, "SELECT id FROM %.*s WHERE name < 'kilo';", str8_varg(table_name));
@@ -314,15 +314,15 @@ entry_point(CmdLine* cmdline)
   log_alloc();
   
   U64 t0 = os_now_microseconds();
-  gdb_init();
+  cql_init();
   gpu_init();
   U64 t1 = os_now_microseconds();
-  printf("engine startup (gdb_init + gpu_init, one-time): %.4f ms\n", (F64)(t1 - t0) / 1000.0);
+  printf("engine startup (cql_init + gpu_init, one-time): %.4f ms\n", (F64)(t1 - t0) / 1000.0);
   
   Arena* arena = arena_alloc(.reserve_size = GB(2), .commit_size = MB(64));
   
   Bench_Report* report = bench_report_alloc(arena, "compute_ql vs sqlite vs duckdb - string comparison opcodes");
-  bench_report_text(report, "engine startup (gdb_init + gpu_init, one-time): %.4f ms", (F64)(t1 - t0) / 1000.0);
+  bench_report_text(report, "engine startup (cql_init + gpu_init, one-time): %.4f ms", (F64)(t1 - t0) / 1000.0);
   
   scmp_run_suite(arena, report, 2000, 1, "below_dict_threshold");
   

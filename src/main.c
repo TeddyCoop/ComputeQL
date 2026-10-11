@@ -10,7 +10,7 @@
 #include "os/os_inc.h"
 #include "thread_pool/thread_pool.h"
 #include "settings/settings.h"
-#include "gdb/gdb_inc.h"
+#include "cql/cql_inc.h"
 #include "ir_gen/ir_gen_inc.h"
 #include "gpu/gpu_inc.h"
 #include "planner/plan_node.h"
@@ -29,7 +29,7 @@
 #include "settings/settings.c"
 #include "gpu/gpu_inc.c"
 #include "ir_gen/ir_gen_inc.c"
-#include "gdb/gdb_inc.c"
+#include "cql/cql_inc.c"
 #include "query_exec/query_exec.c"
 #include "optimizer/optimizer_inc.c"
 #include "planner/planner.c"
@@ -116,9 +116,9 @@ entry_point(CmdLine* cmdline)
   {
     // tec: create needed folders
     {
-      if (!os_file_path_exists(str8_lit("gdb_data/")))
+      if (!os_file_path_exists(str8_lit("cql_data/")))
       {
-        os_make_directory(str8_lit("gdb_data/"));
+        os_make_directory(str8_lit("cql_data/"));
       }
     }
     
@@ -130,7 +130,7 @@ entry_point(CmdLine* cmdline)
     settings_init();
     settings_load_from_file(settings_path);
     
-    gdb_init();
+    cql_init();
 
     String8 gpu_backend_str = cmd_line_string(cmdline, str8_lit("gpu"));
     if (gpu_backend_str.size != 0)

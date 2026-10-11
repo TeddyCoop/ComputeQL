@@ -217,17 +217,17 @@ ir_node_find_child(IR_Node* parent, IR_NodeType type)
   return NULL;
 }
 
-internal GDB_ColumnType
-ir_find_column_type(GDB_Database* database, IR_Node* select_ir_node, String8 column_name)
+internal CQL_ColumnType
+ir_find_column_type(CQL_Database* database, IR_Node* select_ir_node, String8 column_name)
 {
   IR_Node* table_node = ir_node_find_child(select_ir_node, IR_NodeType_Table);
-  if (!table_node) return GDB_ColumnType_Invalid;
+  if (!table_node) return CQL_ColumnType_Invalid;
   
-  GDB_Table* table = gdb_database_find_table(database, table_node->value);
-  if (!table) return GDB_ColumnType_Invalid;
+  CQL_Table* table = cql_database_find_table(database, table_node->value);
+  if (!table) return CQL_ColumnType_Invalid;
   
-  GDB_Column* column = gdb_table_find_column(table, column_name);
-  if (!column) return GDB_ColumnType_Invalid;
+  CQL_Column* column = cql_table_find_column(table, column_name);
+  if (!column) return CQL_ColumnType_Invalid;
   
   return column->type;
 }
@@ -261,7 +261,7 @@ ir_create_active_column_list(Arena* arena, IR_Node* parent_node, String8List* us
 }
 
 internal void
-ir_expand_star_to_columns(Arena *arena, GDB_Database *db, IR_Node *select_node)
+ir_expand_star_to_columns(Arena *arena, CQL_Database *db, IR_Node *select_node)
 {
   IR_Node *table_node = ir_node_find_child(select_node, IR_NodeType_Table);
   IR_Node *column_list = ir_node_find_child(select_node, IR_NodeType_ColumnList);
@@ -273,7 +273,7 @@ ir_expand_star_to_columns(Arena *arena, GDB_Database *db, IR_Node *select_node)
 
   column_list->first = column_list->last = NULL;
 
-  GDB_Table *table = gdb_database_find_table_or_catalog(db, table_node->value);
+  CQL_Table *table = cql_database_find_table_or_catalog(db, table_node->value);
   if (!table)
   {
     // tec: leave the column list empty - the planner's Scan resolution reports the missing table
@@ -282,7 +282,7 @@ ir_expand_star_to_columns(Arena *arena, GDB_Database *db, IR_Node *select_node)
 
   for (U64 i = 0; i < table->column_count; i++)
   {
-    GDB_Column* col = table->columns[i];
+    CQL_Column* col = table->columns[i];
     IR_Node *col_node = ir_node_make(arena, IR_NodeType_Column, col->name);
     ir_node_add_child(column_list, col_node);
   }

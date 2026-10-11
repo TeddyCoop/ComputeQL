@@ -35,7 +35,7 @@ plan_alias_from_table_ir(IR_Node* table_ir)
 
 // tec: children of the IR node are the outer key, the inner key, the inner table and an optional filter on it
 internal PLAN_Node*
-plan_add_semi_join(Arena* arena, GDB_Database* database, PLAN_Node* input, IR_Node* semi_ir)
+plan_add_semi_join(Arena* arena, CQL_Database* database, PLAN_Node* input, IR_Node* semi_ir)
 {
   IR_Node* outer_key = semi_ir->first;
   IR_Node* inner_key = outer_key->next;
@@ -44,7 +44,7 @@ plan_add_semi_join(Arena* arena, GDB_Database* database, PLAN_Node* input, IR_No
   
   PLAN_Node* scan = plan_node_make(arena, PLAN_NodeType_Scan);
   scan->value = table_ir->value;
-  scan->table = gdb_database_find_table_or_catalog(database, table_ir->value);
+  scan->table = cql_database_find_table_or_catalog(database, table_ir->value);
   scan->alias = plan_alias_from_table_ir(table_ir);
   
   PLAN_Node* right = scan;
@@ -79,7 +79,7 @@ plan_node_is_join(PLAN_Node* plan)
 }
 
 internal PLAN_Node*
-plan_build_from_select(Arena* arena, GDB_Database* database, IR_Node* select_ir_node)
+plan_build_from_select(Arena* arena, CQL_Database* database, IR_Node* select_ir_node)
 {
   if (!select_ir_node) return NULL;
   
@@ -93,7 +93,7 @@ plan_build_from_select(Arena* arena, GDB_Database* database, IR_Node* select_ir_
     {
       PLAN_Node* scan = plan_node_make(arena, PLAN_NodeType_Scan);
       scan->value = child->value;
-      scan->table = gdb_database_find_table_or_catalog(database, child->value);
+      scan->table = cql_database_find_table_or_catalog(database, child->value);
       scan->alias = plan_alias_from_table_ir(child);
       
       if (!from_plan)
@@ -117,7 +117,7 @@ plan_build_from_select(Arena* arena, GDB_Database* database, IR_Node* select_ir_
       
       PLAN_Node* scan = plan_node_make(arena, PLAN_NodeType_Scan);
       scan->value = joined_table_ir->value;
-      scan->table = gdb_database_find_table_or_catalog(database, joined_table_ir->value);
+      scan->table = cql_database_find_table_or_catalog(database, joined_table_ir->value);
       scan->alias = plan_alias_from_table_ir(joined_table_ir);
       
       PLAN_Node* join = plan_node_make(arena, PLAN_NodeType_Join);
@@ -257,10 +257,10 @@ plan_build_from_select(Arena* arena, GDB_Database* database, IR_Node* select_ir_
 }
 
 internal PLAN_ExecResult
-plan_wrap_scan_result(Arena* arena, GDB_Table* table, String8 alias, QE_ScanResult scan_result)
+plan_wrap_scan_result(Arena* arena, CQL_Table* table, String8 alias, QE_ScanResult scan_result)
 {
   PLAN_ExecResult result = {0};
-  result.rows.tables = push_array(arena, GDB_Table*, 1);
+  result.rows.tables = push_array(arena, CQL_Table*, 1);
   result.rows.tables[0] = table;
   result.rows.aliases = push_array(arena, String8, 1);
   result.rows.aliases[0] = alias;
@@ -329,16 +329,41 @@ plan_aggregate_reads_selection(PLAN_Node* aggregate)
   return settings_u64(str8_lit("QE_AGG_DEVICE_SELECTION"), 1) != 0;
 }
 
+// tec: the shared identity row list is only built up to this many rows
+internal U64
+plan_identity_cache_max_rows(void)
+{
+  return settings_u64(str8_lit("QE_IDENTITY_CACHE_MAX_ROWS"), 33554432);
+}
+
+// tec: a whole table feeding the aggregate, read on the GPU so the 8 bytes per row list is never built
+internal B32
+plan_aggregate_reads_identity_scan(PLAN_Node* aggregate)
+{
+  PLAN_Node* scan = aggregate->input;
+  if (!scan || scan->type != PLAN_NodeType_Scan || !scan->table || scan->scan_strategy != PLAN_ScanStrategy_Identity)
+  {
+    return 0;
+  }
+  if (scan->table->row_count <= plan_identity_cache_max_rows())
+  {
+    return 0;
+  }
+  return settings_u64(str8_lit("QE_AGG_DEVICE_IDENTITY"), 1) != 0;
+}
+
 // tec: out_selection may be null. when it is given, a GPU scan can leave its rows on the GPU and report them there instead of in the row set
 internal PLAN_ExecResult
-plan_execute_filter_scan(Arena* arena, GDB_Database* database, PLAN_Node* plan, QE_TraceCtx* trace, QE_DeviceSelection* out_selection)
+plan_execute_filter_scan(Arena* arena, CQL_Database* database, PLAN_Node* plan, QE_TraceCtx* trace, QE_DeviceSelection* out_selection)
 {
   PLAN_ExecResult result = {0};
+  B32 count_only = out_selection && out_selection->count_only_requested;
   if (out_selection)
   {
     MemoryZeroStruct(out_selection);
+    out_selection->count_only_requested = count_only;
   }
-  
+
   if (plan->input && plan->input->type == PLAN_NodeType_Scan && !plan->input->table)
   {
     log_error("plan_execute: table '%.*s' not found", str8_varg(plan->input->value));
@@ -397,7 +422,7 @@ plan_execute_filter_scan(Arena* arena, GDB_Database* database, PLAN_Node* plan, 
       }
     }
     // tec: then a NULL-aware CPU scan if the table has any NULLs
-    else if (gdb_table_may_have_nulls(plan->input->table))
+    else if (cql_table_may_have_nulls(plan->input->table))
     {
       if (strace)
       {
@@ -418,7 +443,7 @@ plan_execute_filter_scan(Arena* arena, GDB_Database* database, PLAN_Node* plan, 
 }
 
 internal PLAN_ExecResult
-plan_execute(Arena* arena, GDB_Database* database, PLAN_Node* plan, IR_Node* select_ir_node, QE_TraceCtx* trace)
+plan_execute(Arena* arena, CQL_Database* database, PLAN_Node* plan, IR_Node* select_ir_node, QE_TraceCtx* trace)
 {
   PLAN_ExecResult result = plan_execute_node(arena, database, plan, select_ir_node, trace);
   
@@ -431,8 +456,75 @@ plan_execute(Arena* arena, GDB_Database* database, PLAN_Node* plan, IR_Node* sel
   return result;
 }
 
+// tec: SELECT aggregates FROM big JOIN small ON big.k = small.k [WHERE on small] [GROUP BY small columns] is computed per join key when the join can't run on the GPU,
+// see qe_aggregate_join_pushdown. returns 0 with nothing done if the plan is not that shape
+internal B32
+plan_try_join_aggregate_pushdown(Arena* arena, CQL_Database* database, PLAN_Node* aggregate, IR_Node* select_ir_node, QE_TraceCtx* trace, PLAN_ExecResult* out_result)
+{
+  PLAN_Node* join = aggregate->input;
+  if (!join || join->type != PLAN_NodeType_Join || !str8_match(join->value, str8_lit("inner"), StringMatchFlag_CaseInsensitive) ||
+      ir_node_find_child(select_ir_node, IR_NodeType_Having))
+  {
+    return 0;
+  }
+  PLAN_Node* fact = join->input;
+  PLAN_Node* dim_plan = join->input2;
+  PLAN_Node* dim_scan = dim_plan && dim_plan->type == PLAN_NodeType_Filter ? dim_plan->input : dim_plan;
+  if (!fact || fact->type != PLAN_NodeType_Scan || !fact->table || !dim_scan || dim_scan->type != PLAN_NodeType_Scan || !dim_scan->table)
+  {
+    return 0;
+  }
+  IR_Node* leaves[PLAN_JOIN_MAX_ON_CONDITIONS] = {0};
+  if (qe_collect_and_leaves(join->condition, leaves, 0, PLAN_JOIN_MAX_ON_CONDITIONS) != 1)
+  {
+    return 0;
+  }
+
+  QE_ScanResult fact_scan = {0};
+  fact_scan.count = fact->table->row_count;
+  PLAN_ExecResult fact_result = plan_wrap_scan_result(arena, fact->table, fact->alias, fact_scan);
+  IR_Node* equi = qe_validate_equi_condition(&fact_result.rows, dim_scan->table, dim_scan->alias, leaves[0]);
+  if (!equi)
+  {
+    return 0;
+  }
+
+  U64* dim_rows = NULL;
+  U64 dim_count = dim_scan->table->row_count;
+  if (dim_plan->type == PLAN_NodeType_Filter)
+  {
+    PLAN_ExecResult dim_result = plan_execute(arena, database, dim_plan, select_ir_node, trace);
+    if (!dim_result.supported || dim_result.is_materialized || dim_result.rows.table_count != 1 || dim_result.rows.count == 0)
+    {
+      return 0;
+    }
+    dim_rows = dim_result.rows.row_indices[0];
+    dim_count = dim_result.rows.count;
+    if (!dim_rows)
+    {
+      return 0;
+    }
+  }
+
+  PLAN_Materialized materialized = {0};
+  if (!qe_aggregate_join_pushdown(arena, &fact_result.rows, dim_scan->table, dim_scan->alias, dim_rows, dim_count, equi, aggregate->group_by, aggregate->column_list, &materialized))
+  {
+    return 0;
+  }
+  QE_NodeTrace* node_trace = qe_trace_record_begin(trace, aggregate, PLAN_NodeType_Aggregate);
+  if (node_trace)
+  {
+    node_trace->aggregate.input_row_count = fact->table->row_count;
+    node_trace->aggregate.group_count = materialized.count;
+  }
+  out_result->supported = 1;
+  out_result->is_materialized = 1;
+  out_result->materialized = materialized;
+  return 1;
+}
+
 internal PLAN_ExecResult
-plan_execute_node(Arena* arena, GDB_Database* database, PLAN_Node* plan, IR_Node* select_ir_node, QE_TraceCtx* trace)
+plan_execute_node(Arena* arena, CQL_Database* database, PLAN_Node* plan, IR_Node* select_ir_node, QE_TraceCtx* trace)
 {
   PLAN_ExecResult result = {0};
   if (!plan) return result;
@@ -491,12 +583,42 @@ plan_execute_node(Arena* arena, GDB_Database* database, PLAN_Node* plan, IR_Node
     
     case PLAN_NodeType_Aggregate:
     {
+      if (plan_try_join_aggregate_pushdown(arena, database, plan, select_ir_node, trace, &result))
+      {
+        break;
+      }
+
       // tec: a GPU filter directly below leaves its rows on the GPU for the aggregate to read there
       QE_DeviceSelection selection = {0};
       QE_DeviceRows join_device = {0};
+      String8 device_alias = {0};
+      QE_ScanTrace* identity_trace = NULL;
+      B32 identity_device = 0;
       if (plan_aggregate_reads_selection(plan))
       {
+        // tec: a scan that does not leave its rows on the GPU can skip making them when all that is wanted is how many there are
+        IR_Node* count_having = ir_node_find_child(select_ir_node, IR_NodeType_Having);
+        selection.count_only_requested = !count_having && qe_aggregate_is_global_count(plan->group_by, plan->column_list);
         result = plan_execute_filter_scan(arena, database, plan->input, trace, &selection);
+        device_alias = plan->input->input->alias;
+      }
+      else if (plan_aggregate_reads_identity_scan(plan))
+      {
+        identity_device = 1;
+        PLAN_Node* scan = plan->input;
+        QE_NodeTrace* scan_node_trace = qe_trace_record_begin(trace, scan, PLAN_NodeType_Scan);
+        identity_trace = scan_node_trace ? &scan_node_trace->scan : NULL;
+        
+        // tec: the row set only stands in for the table and the count, no row ids exist
+        QE_ScanResult stub_scan = {0};
+        stub_scan.count = scan->table->row_count;
+        result = plan_wrap_scan_result(arena, scan->table, scan->alias, stub_scan);
+        
+        selection.valid = 1;
+        selection.table = scan->table;
+        selection.count = scan->table->row_count;
+        selection.stride_words = 1;
+        device_alias = scan->alias;
       }
       else if (plan_aggregate_reads_join(plan))
       {
@@ -522,14 +644,41 @@ plan_execute_node(Arena* arena, GDB_Database* database, PLAN_Node* plan, IR_Node
           PLAN_Materialized materialized = {0};
           B32 aggregated = 0;
           QE_DeviceRows device = join_device;
+          if (selection.count_only_done)
+          {
+            materialized = qe_aggregate_count_rows(arena, &result.rows, plan->column_list, selection.count);
+            aggregated = 1;
+            if (node_trace)
+            {
+              node_trace->aggregate.input_row_count = selection.count;
+              node_trace->aggregate.group_count = 1;
+            }
+          }
           if (selection.valid)
           {
-            device = qe_device_rows_from_selection(&selection, plan->input->input->alias);
+            device = qe_device_rows_from_selection(&selection, device_alias);
           }
           if (device.valid)
           {
             aggregated = qe_aggregate_device(arena, database, &device, plan->group_by, plan->column_list, having_ir, &hints, node_trace ? &node_trace->aggregate : NULL, &materialized);
-            if (!aggregated)
+            if (identity_device)
+            {
+              if (aggregated)
+              {
+                if (identity_trace)
+                {
+                  identity_trace->strategy = QE_TraceStrategy_Identity;
+                  identity_trace->strategy_reason = plan->input->scan_reason;
+                  identity_trace->rows_before = device.count;
+                  identity_trace->rows_after = device.count;
+                }
+              }
+              else
+              {
+                result = plan_execute_identity_scan(arena, plan->input, identity_trace);
+              }
+            }
+            else if (!aggregated)
             {
               result.rows = qe_device_rows_to_rowset(arena, &device);
             }
@@ -537,6 +686,10 @@ plan_execute_node(Arena* arena, GDB_Database* database, PLAN_Node* plan, IR_Node
           if (!aggregated)
           {
             materialized = qe_aggregate(arena, database, &result.rows, plan->group_by, plan->column_list, having_ir, &hints, node_trace ? &node_trace->aggregate : NULL);
+            if (materialized.column_count == 0)
+            {
+              result.supported = 0;
+            }
           }
           
           result.rows = (PLAN_RowSet){0};
@@ -726,7 +879,7 @@ plan_reverse_rowset(Arena* arena, PLAN_RowSet* rows)
 
 // tec: an IndexWalk answers from the index alone, so its input plan is never executed
 internal PLAN_ExecResult
-plan_execute_top_n(Arena* arena, GDB_Database* database, PLAN_Node* plan, IR_Node* select_ir_node, QE_TraceCtx* trace)
+plan_execute_top_n(Arena* arena, CQL_Database* database, PLAN_Node* plan, IR_Node* select_ir_node, QE_TraceCtx* trace)
 {
   PLAN_ExecResult result = {0};
   
@@ -812,7 +965,7 @@ plan_fill_identity_rows(Arena* arena, U64* indices, U64 count)
 internal U64*
 plan_shared_identity_rows(U64 count)
 {
-  if (count > settings_u64(str8_lit("QE_IDENTITY_CACHE_MAX_ROWS"), 33554432))
+  if (count > plan_identity_cache_max_rows())
   {
     return 0;
   }
@@ -859,12 +1012,12 @@ plan_execute_identity_scan(Arena* arena, PLAN_Node* scan, QE_ScanTrace* trace)
 }
 
 internal PLAN_RowSet
-plan_make_empty_join_rowset(Arena* arena, PLAN_RowSet* left, GDB_Table* right_table, String8 right_alias)
+plan_make_empty_join_rowset(Arena* arena, PLAN_RowSet* left, CQL_Table* right_table, String8 right_alias)
 {
   PLAN_RowSet empty = {0};
   empty.table_count = left->table_count + 1;
-  empty.tables = push_array(arena, GDB_Table*, empty.table_count);
-  MemoryCopy(empty.tables, left->tables, left->table_count * sizeof(GDB_Table*));
+  empty.tables = push_array(arena, CQL_Table*, empty.table_count);
+  MemoryCopy(empty.tables, left->tables, left->table_count * sizeof(CQL_Table*));
   empty.tables[left->table_count] = right_table;
   
   empty.aliases = push_array(arena, String8, empty.table_count);
@@ -886,7 +1039,7 @@ plan_make_empty_join_rowset(Arena* arena, PLAN_RowSet* left, GDB_Table* right_ta
 // tec: the left input of a join whose rows can stay on the GPU. out_left is valid when they did, and the row set is then only a stand in
 // for the tables and the count. every other input gives host rows as plan_execute does
 internal PLAN_ExecResult
-plan_execute_left_device(Arena* arena, GDB_Database* database, PLAN_Node* node, IR_Node* select_ir_node, QE_TraceCtx* trace, QE_DeviceRows* out_left)
+plan_execute_left_device(Arena* arena, CQL_Database* database, PLAN_Node* node, IR_Node* select_ir_node, QE_TraceCtx* trace, QE_DeviceRows* out_left)
 {
   MemoryZeroStruct(out_left);
   
@@ -963,7 +1116,7 @@ plan_aggregate_reads_join(PLAN_Node* aggregate)
 }
 
 internal PLAN_ExecResult
-plan_execute_join(Arena* arena, GDB_Database* database, PLAN_Node* join_plan, IR_Node* select_ir_node, IR_Node* residual_where_root, QE_TraceCtx* trace, QE_DeviceRows* out_device)
+plan_execute_join(Arena* arena, CQL_Database* database, PLAN_Node* join_plan, IR_Node* select_ir_node, IR_Node* residual_where_root, QE_TraceCtx* trace, QE_DeviceRows* out_device)
 {
   PLAN_ExecResult result = {0};
   if (out_device)
@@ -1002,7 +1155,7 @@ plan_execute_join(Arena* arena, GDB_Database* database, PLAN_Node* join_plan, IR
     return result;
   }
   
-  GDB_Table* right_table = right_scan->table;
+  CQL_Table* right_table = right_scan->table;
   String8 right_alias = right_scan->alias;
   
   B32 is_filter_join = join_plan->type == PLAN_NodeType_SemiJoin || join_plan->type == PLAN_NodeType_AntiJoin;
@@ -1126,7 +1279,9 @@ plan_execute_join(Arena* arena, GDB_Database* database, PLAN_Node* join_plan, IR
     join_hints.second_key = second_key_leaf;
   }
   // tec: residual conditions filter the joined rows on the host, so they keep the join from staying on the GPU
-  B32 keep_on_device = left_device.valid && residual_on_count == 0 && !residual_where_root;
+  // a lone second key is the exception, the device join applies it itself or declines
+  B32 only_second_key = residual_on_count == 1 && second_key_leaf == residual_on_leaves[0];
+  B32 keep_on_device = left_device.valid && (residual_on_count == 0 || only_second_key) && !residual_where_root;
   if (left_device.valid && !keep_on_device)
   {
     left_result.rows = qe_device_rows_to_rowset(arena, &left_device);
@@ -1392,6 +1547,16 @@ plan_print_scan_trace(Arena* arena, String8List* out, PLAN_Node* plan, QE_NodeTr
   {
     str8_list_pushf(arena, &line, " gpu=%.1fms submit/wait=%.1fms", plan_us_to_ms(s->gpu_kernel_time_us), plan_us_to_ms(s->submit_wait_time_us));
   }
+
+  if (s->stream_slot_count > 0)
+  {
+    str8_list_pushf(arena, &line, " stream=%u slots %llu chunks copied=%.0fMB (%.1fGB/s) imports=%llu in %.1fms staged=%.0fMB %s",
+                    s->stream_slot_count, s->chunk_count, (F64)s->stream_bytes_copied / (1024.0 * 1024.0),
+                    s->submit_wait_time_us ? (F64)s->stream_bytes_copied / 1e9 / ((F64)s->submit_wait_time_us / 1e6) : 0.0,
+                    s->stream_imports, plan_us_to_ms(s->stream_import_time_us), (F64)s->stream_staged_bytes / (1024.0 * 1024.0),
+                    s->stream_separate_copy_queue ? "copy queue" : "compute queue");
+    str8_list_pushf(arena, &line, " resident=%.0fMB hit %.0fMB copied", (F64)s->stream_resident_hit_bytes / (1024.0 * 1024.0), (F64)s->stream_resident_miss_bytes / (1024.0 * 1024.0));
+  }
   
   if (s->dict_decision_made)
   {
@@ -1532,7 +1697,7 @@ plan_materialize_rowset_item(Arena* arena, PLAN_RowSet* rows, IR_Node* item, U64
   B32 is_distance = 0;
   if (qe_ir_is_fuzzy_call(item, &is_distance))
   {
-    out_col->type = GDB_ColumnType_F64;
+    out_col->type = CQL_ColumnType_F64;
     out_col->numeric_values = push_array(arena, F64, Max(count, 1));
     for (U64 i = 0; i < count; i++) 
     {
@@ -1549,8 +1714,8 @@ plan_materialize_rowset_item(Arena* arena, PLAN_RowSet* rows, IR_Node* item, U64
   
   String8 bare_name = {0};
   U64 slot = max_U64;
-  GDB_Table* table = qe_resolve_column_table(rows, item->value, &bare_name, &slot);
-  GDB_Column* column = table ? gdb_table_find_column(table, bare_name) : NULL;
+  CQL_Table* table = qe_resolve_column_table(rows, item->value, &bare_name, &slot);
+  CQL_Column* column = table ? cql_table_find_column(table, bare_name) : NULL;
   if (!column) return 0;
   
   out_col->type = column->type;
@@ -1563,7 +1728,7 @@ plan_materialize_rowset_item(Arena* arena, PLAN_RowSet* rows, IR_Node* item, U64
   for (U64 i = 0; i < count; i++)
   {
     U64 row = table_rows[i];
-    if (row == PLAN_NULL_ROW || (column_has_nulls && gdb_column_is_null(column, row)))
+    if (row == PLAN_NULL_ROW || (column_has_nulls && cql_column_is_null(column, row)))
     {
       if (!out_col->is_null) 
       {
@@ -1573,9 +1738,9 @@ plan_materialize_rowset_item(Arena* arena, PLAN_RowSet* rows, IR_Node* item, U64
     }
   }
   
-  if (column->type == GDB_ColumnType_String8)
+  if (column->type == CQL_ColumnType_String8)
   {
-    GDB_StringDataChunk chunk = qe_gather_string_column(arena, rows, slot, column);
+    CQL_StringDataChunk chunk = qe_gather_string_column(arena, rows, slot, column);
     out_col->string_values = push_array(arena, String8, Max(count, 1));
     for (U64 i = 0; i < count; i++)
     {
@@ -1662,7 +1827,7 @@ plan_materialize_result(Arena* arena, PLAN_ExecResult* result, IR_Node* column_l
 }
 
 internal void
-plan_temp_column_append(GDB_Column* column, PLAN_AggColumn* src, U64 row)
+plan_temp_column_append(CQL_Column* column, PLAN_AggColumn* src, U64 row)
 {
   B32 is_null = src->is_null && src->is_null[row];
   F64 x = src->numeric_values ? src->numeric_values[row] : 0.0;
@@ -1680,30 +1845,30 @@ plan_temp_column_append(GDB_Column* column, PLAN_AggColumn* src, U64 row)
   
   switch (column->type)
   {
-    case GDB_ColumnType_String8: v.str = src->string_values ? src->string_values[row] : str8_lit(""); break;
-    case GDB_ColumnType_U32:
-    case GDB_ColumnType_Enum: v.u32 = (U32)x; break;
-    case GDB_ColumnType_U64: v.u64 = (U64)x; break;
-    case GDB_ColumnType_F32: v.f32 = (F32)x; break;
-    case GDB_ColumnType_F64: v.f64 = x; break;
-    case GDB_ColumnType_Bool: v.u8 = (U8)x; break;
-    case GDB_ColumnType_I32:
-    case GDB_ColumnType_Date: v.i32 = (S32)x; break;
-    case GDB_ColumnType_I64:
-    case GDB_ColumnType_Timestamp:
-    case GDB_ColumnType_Decimal: v.i64 = (S64)x; break;
+    case CQL_ColumnType_String8: v.str = src->string_values ? src->string_values[row] : str8_lit(""); break;
+    case CQL_ColumnType_U32:
+    case CQL_ColumnType_Enum: v.u32 = (U32)x; break;
+    case CQL_ColumnType_U64: v.u64 = (U64)x; break;
+    case CQL_ColumnType_F32: v.f32 = (F32)x; break;
+    case CQL_ColumnType_F64: v.f64 = x; break;
+    case CQL_ColumnType_Bool: v.u8 = (U8)x; break;
+    case CQL_ColumnType_I32:
+    case CQL_ColumnType_Date: v.i32 = (S32)x; break;
+    case CQL_ColumnType_I64:
+    case CQL_ColumnType_Timestamp:
+    case CQL_ColumnType_Decimal: v.i64 = (S64)x; break;
     default: break;
   }
-  gdb_column_add_data_maybe_null(column, &v, is_null);
+  cql_column_add_data_maybe_null(column, &v, is_null);
 }
 
-internal GDB_Table*
-plan_materialized_to_temp_table(GDB_Database* database, String8 name, PLAN_Materialized* m)
+internal CQL_Table*
+plan_materialized_to_temp_table(CQL_Database* database, String8 name, PLAN_Materialized* m)
 {
-  GDB_Table* table = gdb_table_alloc(name);
+  CQL_Table* table = cql_table_alloc(name);
   table->is_ephemeral = 1;
   U64 temp_index = database->temp_table_count;
-  gdb_database_add_temp_table(database, table);
+  cql_database_add_temp_table(database, table);
   
   for (U64 c = 0; c < m->column_count; c++)
   {
@@ -1712,15 +1877,15 @@ plan_materialized_to_temp_table(GDB_Database* database, String8 name, PLAN_Mater
       if (str8_match(m->columns[prev].name, m->columns[c].name, StringMatchFlag_CaseInsensitive))
       {
         log_error("'%.*s' has two columns named '%.*s' - give one of them an alias", str8_varg(name), str8_varg(m->columns[c].name));
-        gdb_database_release_temp_tables_from(database, temp_index);
+        cql_database_release_temp_tables_from(database, temp_index);
         return NULL;
       }
     }
     
-    gdb_table_add_column(table, gdb_column_schema_create(m->columns[c].name, m->columns[c].type));
-    GDB_Column* column = table->columns[c];
+    cql_table_add_column(table, cql_column_schema_create(m->columns[c].name, m->columns[c].type));
+    CQL_Column* column = table->columns[c];
     column->decimal_scale = m->columns[c].decimal_scale;
-    if (m->columns[c].type == GDB_ColumnType_Decimal)
+    if (m->columns[c].type == CQL_ColumnType_Decimal)
     {
       column->decimal_precision = 18;
     }
@@ -1733,11 +1898,11 @@ plan_materialized_to_temp_table(GDB_Database* database, String8 name, PLAN_Mater
     B32 filled = 0;
     if (m->columns[c].numeric_values)
     {
-      filled = gdb_column_fill_from_f64(table->columns[c], m->columns[c].numeric_values, m->columns[c].is_null, m->count);
+      filled = cql_column_fill_from_f64(table->columns[c], m->columns[c].numeric_values, m->columns[c].is_null, m->count);
     }
     else if (m->columns[c].string_values)
     {
-      filled = gdb_column_fill_from_strings(table->columns[c], m->columns[c].string_values, m->columns[c].is_null, m->count);
+      filled = cql_column_fill_from_strings(table->columns[c], m->columns[c].string_values, m->columns[c].is_null, m->count);
     }
     if (filled)
     {
@@ -1754,7 +1919,7 @@ plan_materialized_to_temp_table(GDB_Database* database, String8 name, PLAN_Mater
 
 // tec: runs the inner select into a temp table named after the alias, and turns the Table node into a plain reference to it
 internal B32
-plan_bind_derived_table(Arena* arena, GDB_Database* database, IR_Node* table_ir)
+plan_bind_derived_table(Arena* arena, CQL_Database* database, IR_Node* table_ir)
 {
   IR_Node* sub_select = ir_node_find_child(table_ir, IR_NodeType_Select);
   if (!sub_select)
@@ -1799,43 +1964,43 @@ plan_value_to_ir_node(Arena* arena, PLAN_AggColumn* col, U64 row, IR_Node* out)
   F64 x = col->numeric_values ? col->numeric_values[row] : 0.0;
   switch (col->type)
   {
-    case GDB_ColumnType_String8:
+    case CQL_ColumnType_String8:
     {
       out->type = IR_NodeType_Literal;
       out->value = push_str8_copy(arena, col->string_values[row]);
     } break;
-    case GDB_ColumnType_Bool:
-    case GDB_ColumnType_U32:
-    case GDB_ColumnType_U64:
+    case CQL_ColumnType_Bool:
+    case CQL_ColumnType_U32:
+    case CQL_ColumnType_U64:
     {
       out->type = IR_NodeType_Numeric;
       out->value = push_str8f(arena, "%llu", (U64)x);
     } break;
-    case GDB_ColumnType_I32:
-    case GDB_ColumnType_I64:
+    case CQL_ColumnType_I32:
+    case CQL_ColumnType_I64:
     {
       out->type = IR_NodeType_Numeric;
       out->value = push_str8f(arena, "%lld", (S64)x);
     } break;
-    case GDB_ColumnType_Date:
+    case CQL_ColumnType_Date:
     {
       out->type = IR_NodeType_Literal;
       out->value = push_iso_date_string(arena, (S32)x);
     } break;
-    case GDB_ColumnType_Timestamp:
+    case CQL_ColumnType_Timestamp:
     {
       out->type = IR_NodeType_Literal;
       out->value = push_iso_timestamp_string(arena, (S64)x);
     } break;
-    case GDB_ColumnType_Decimal:
+    case CQL_ColumnType_Decimal:
     {
       out->type = IR_NodeType_Numeric;
       out->value = decimal_to_str8(arena, (S64)x, col->decimal_scale);
     } break;
-    case GDB_ColumnType_Enum:
+    case CQL_ColumnType_Enum:
     {
       out->type = IR_NodeType_Literal;
-      out->value = col->enum_type ? push_str8_copy(arena, gdb_enum_type_label_from_code(col->enum_type, (U32)x)) : str8_lit("");
+      out->value = col->enum_type ? push_str8_copy(arena, cql_enum_type_label_from_code(col->enum_type, (U32)x)) : str8_lit("");
     } break;
     default:
     {
@@ -1856,8 +2021,8 @@ plan_make_constant_condition(Arena* arena, IR_Node* node, B32 value)
   ir_node_add_child(node, ir_node_make(arena, IR_NodeType_Numeric, value ? str8_lit("1") : str8_lit("0")));
 }
 
-internal GDB_Table*
-plan_find_table_quiet(GDB_Database* database, String8 name)
+internal CQL_Table*
+plan_find_table_quiet(CQL_Database* database, String8 name)
 {
   for (U64 i = database->temp_table_count; i > 0; i--)
   {
@@ -1901,7 +2066,7 @@ plan_column_resolves(PLAN_SubqueryTable* tables, U64 table_count, String8 name)
         continue;
       }
     }
-    if (gdb_table_find_column(tables[t].table, bare)) 
+    if (cql_table_find_column(tables[t].table, bare)) 
     {
       return 1;
     }
@@ -1910,7 +2075,7 @@ plan_column_resolves(PLAN_SubqueryTable* tables, U64 table_count, String8 name)
 }
 
 internal B32
-plan_check_uncorrelated(Arena* arena, GDB_Database* database, IR_Node* select_ir)
+plan_check_uncorrelated(Arena* arena, CQL_Database* database, IR_Node* select_ir)
 {
   PLAN_SubqueryTable tables[16];
   U64 table_count = 0;
@@ -1930,7 +2095,7 @@ plan_check_uncorrelated(Arena* arena, GDB_Database* database, IR_Node* select_ir
       return 1;
     }
     
-    GDB_Table* table = plan_find_table_quiet(database, table_ir->value);
+    CQL_Table* table = plan_find_table_quiet(database, table_ir->value);
     if (!table || table_count >= ArrayCount(tables)) 
     {
       return 1;
@@ -1978,7 +2143,7 @@ plan_check_uncorrelated(Arena* arena, GDB_Database* database, IR_Node* select_ir
 }
 
 internal B32
-plan_run_subquery_values(Arena* arena, GDB_Database* database, IR_Node* subquery_ir, PLAN_Materialized* out)
+plan_run_subquery_values(Arena* arena, CQL_Database* database, IR_Node* subquery_ir, PLAN_Materialized* out)
 {
   IR_Node* select_ir = ir_node_find_child(subquery_ir, IR_NodeType_Select);
   if (!select_ir) return 0;
@@ -2021,7 +2186,7 @@ plan_apply_subquery_in_list(Arena* arena, IR_Node* node, IR_Node* subquery_node,
 }
 
 internal B32
-plan_rewrite_predicates(Arena* arena, GDB_Database* database, IR_Node* node)
+plan_rewrite_predicates(Arena* arena, CQL_Database* database, IR_Node* node)
 {
   if (!node) return 1;
   
@@ -2157,7 +2322,7 @@ plan_window_gather_key(Arena* arena, PLAN_RowSet* rows, String8 column_name, B32
     return 0;
   }
   
-  out->is_string = (col.type == GDB_ColumnType_String8);
+  out->is_string = (col.type == CQL_ColumnType_String8);
   out->descending = descending;
   out->nums = col.numeric_values;
   out->strs = col.string_values;
@@ -2284,7 +2449,7 @@ plan_window_compute(Arena* arena, PLAN_RowSet* rows, IR_Node* call, PLAN_AggColu
   
   //- tec: the argument column, when the function reads one
   PLAN_AggColumn src = {0};
-  GDB_Column* src_column = NULL;
+  CQL_Column* src_column = NULL;
   B32 count_star = 0;
   if (func == PLAN_WindowFunc_Agg && agg_code == QE_AGG_FUNC_COUNT && args[0]->type == IR_NodeType_Column &&
       str8_match(args[0]->value, str8_lit("*"), 0))
@@ -2305,10 +2470,10 @@ plan_window_compute(Arena* arena, PLAN_RowSet* rows, IR_Node* call, PLAN_AggColu
     
     String8 bare = {0};
     U64 slot = max_U64;
-    GDB_Table* table = qe_resolve_column_table(rows, args[0]->value, &bare, &slot);
-    src_column = table ? gdb_table_find_column(table, bare) : NULL;
+    CQL_Table* table = qe_resolve_column_table(rows, args[0]->value, &bare, &slot);
+    src_column = table ? cql_table_find_column(table, bare) : NULL;
     
-    if (func == PLAN_WindowFunc_Agg && agg_code != QE_AGG_FUNC_COUNT && src.type == GDB_ColumnType_String8)
+    if (func == PLAN_WindowFunc_Agg && agg_code != QE_AGG_FUNC_COUNT && src.type == CQL_ColumnType_String8)
     {
       log_error("%.*s() over a string column is not supported", str8_varg(name));
       return 0;
@@ -2318,7 +2483,7 @@ plan_window_compute(Arena* arena, PLAN_RowSet* rows, IR_Node* call, PLAN_AggColu
   //- tec: output type
   if (is_ranking)
   {
-    out_col->type = GDB_ColumnType_U64;
+    out_col->type = CQL_ColumnType_U64;
   }
   else if (func == PLAN_WindowFunc_Lag || func == PLAN_WindowFunc_Lead)
   {
@@ -2334,7 +2499,7 @@ plan_window_compute(Arena* arena, PLAN_RowSet* rows, IR_Node* call, PLAN_AggColu
     qe_agg_output_type_for_expr(&info, &out_col->type, &out_col->decimal_scale, &out_col->enum_type);
   }
   
-  B32 out_is_string = (out_col->type == GDB_ColumnType_String8);
+  B32 out_is_string = (out_col->type == CQL_ColumnType_String8);
   if (out_is_string) out_col->string_values = push_array(arena, String8, Max(n, 1));
   else out_col->numeric_values = push_array(arena, F64, Max(n, 1));
   
@@ -2682,14 +2847,14 @@ plan_window_apply(Arena* arena, PLAN_RowSet* rows, IR_Node* column_list_ir, IR_N
 }
 
 internal PLAN_ExecResult
-plan_run_select(Arena* arena, GDB_Database* database, IR_Node* select_ir, QE_TraceCtx* trace)
+plan_run_select(Arena* arena, CQL_Database* database, IR_Node* select_ir, QE_TraceCtx* trace)
 {
   return plan_run_select_with_plan(arena, database, select_ir, trace, NULL);
 }
 
 // tec: leaves its temp tables registered, since a row set result still points into them
 internal PLAN_ExecResult
-plan_run_select_with_plan(Arena* arena, GDB_Database* database, IR_Node* select_ir, QE_TraceCtx* trace, PLAN_Node** out_plan)
+plan_run_select_with_plan(Arena* arena, CQL_Database* database, IR_Node* select_ir, QE_TraceCtx* trace, PLAN_Node** out_plan)
 {
   PLAN_ExecResult failed = {0};
   if (out_plan)
@@ -2766,7 +2931,7 @@ plan_run_select_with_plan(Arena* arena, GDB_Database* database, IR_Node* select_
 
 // tec: builds the plan EXPLAIN shows without running anything, CTEs and derived tables are estimated from their own plans
 internal PLAN_Node*
-plan_build_for_explain(Arena* arena, GDB_Database* database, IR_Node* select_ir, OPT_SourceEstimates* inherited)
+plan_build_for_explain(Arena* arena, CQL_Database* database, IR_Node* select_ir, OPT_SourceEstimates* inherited)
 {
   if (optimizer_inline_enabled())
   {
@@ -2832,7 +2997,7 @@ plan_build_for_explain(Arena* arena, GDB_Database* database, IR_Node* select_ir,
 }
 
 internal B32
-plan_run_select_materialized(Arena* arena, GDB_Database* database, IR_Node* select_ir, PLAN_Materialized* out)
+plan_run_select_materialized(Arena* arena, CQL_Database* database, IR_Node* select_ir, PLAN_Materialized* out)
 {
   U64 temp_mark = database->temp_table_count;
   
@@ -2844,6 +3009,6 @@ plan_run_select_materialized(Arena* arena, GDB_Database* database, IR_Node* sele
     ok = column_list_ir && plan_materialize_result(arena, &result, column_list_ir, out);
   }
   
-  gdb_database_release_temp_tables_from(database, temp_mark);
+  cql_database_release_temp_tables_from(database, temp_mark);
   return ok;
 }

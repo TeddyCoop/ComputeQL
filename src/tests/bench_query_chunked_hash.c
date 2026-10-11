@@ -3,13 +3,19 @@
 #define BUILD_CONSOLE_INTERFACE 1
 #define PROFILE_CUSTOM 1
 #define ARENA_FREE_LIST 1
+// tec: bench_query_join_scaling.c includes this file with the default buffer and its own report name
+#ifndef GPU_MAX_BUFFER_SIZE
 #define GPU_MAX_BUFFER_SIZE MB(4)
+#endif
+#ifndef CH_REPORT_PATH
+#define CH_REPORT_PATH "bench_reports/chunked_hash_report.md"
+#endif
 
 #include "base/base_inc.h"
 #include "os/os_inc.h"
 #include "thread_pool/thread_pool.h"
 #include "settings/settings.h"
-#include "gdb/gdb_inc.h"
+#include "cql/cql_inc.h"
 #include "ir_gen/ir_gen_inc.h"
 #include "gpu/gpu_inc.h"
 #include "planner/plan_node.h"
@@ -26,7 +32,7 @@
 #include "settings/settings.c"
 #include "gpu/gpu_inc.c"
 #include "ir_gen/ir_gen_inc.c"
-#include "gdb/gdb_inc.c"
+#include "cql/cql_inc.c"
 #include "query_exec/query_exec.c"
 #include "optimizer/optimizer_inc.c"
 #include "planner/planner.c"
@@ -380,14 +386,14 @@ ch_run_suite(Arena* arena, Bench_Report* report, U64 row_count, char* label)
   ch_write_dim2_csv(scratch.arena, dim2_csv_path, CH_NUM_GROUPS);
 
   //- tec: seed compute_ql
-  GDB_Database* database = gdb_database_alloc(str8_lit("chunked_hash_db"));
-  gdb_add_database(database);
-  GDB_Table* fact_table = gdb_table_import_csv_streaming(database, str8_lit("fact"), fact_csv_path);
-  gdb_database_add_table(database, fact_table);
-  GDB_Table* dim_table = gdb_table_import_csv_streaming(database, str8_lit("dim"), dim_csv_path);
-  gdb_database_add_table(database, dim_table);
-  GDB_Table* dim2_table = gdb_table_import_csv_streaming(database, str8_lit("dim2"), dim2_csv_path);
-  gdb_database_add_table(database, dim2_table);
+  CQL_Database* database = cql_database_alloc(str8_lit("chunked_hash_db"));
+  cql_add_database(database);
+  CQL_Table* fact_table = cql_table_import_csv_streaming(database, str8_lit("fact"), fact_csv_path);
+  cql_database_add_table(database, fact_table);
+  CQL_Table* dim_table = cql_table_import_csv_streaming(database, str8_lit("dim"), dim_csv_path);
+  cql_database_add_table(database, dim_table);
+  CQL_Table* dim2_table = cql_table_import_csv_streaming(database, str8_lit("dim2"), dim2_csv_path);
+  cql_database_add_table(database, dim2_table);
 
   //- tec: seed sqlite with the exact same rows
   sqlite3* sqlite_db = NULL;
@@ -413,50 +419,50 @@ ch_run_suite(Arena* arena, Bench_Report* report, U64 row_count, char* label)
 
   Bench_QueryCase cases[7];
   cases[0].label = str8_lit("GROUP BY numeric key");
-  cases[0].gdb_sql = str8_lit("SELECT group_key, COUNT(*), SUM(value), AVG(value), MIN(value), MAX(value) FROM fact GROUP BY group_key;");
-  cases[0].sqlite_sql = cases[0].gdb_sql;
-  cases[0].duckdb_sql = cases[0].gdb_sql;
+  cases[0].cql_sql = str8_lit("SELECT group_key, COUNT(*), SUM(value), AVG(value), MIN(value), MAX(value) FROM fact GROUP BY group_key;");
+  cases[0].sqlite_sql = cases[0].cql_sql;
+  cases[0].duckdb_sql = cases[0].cql_sql;
 
   cases[1].label = str8_lit("GROUP BY string key");
-  cases[1].gdb_sql = str8_lit("SELECT group_name, COUNT(*), SUM(value) FROM fact GROUP BY group_name;");
-  cases[1].sqlite_sql = cases[1].gdb_sql;
-  cases[1].duckdb_sql = cases[1].gdb_sql;
+  cases[1].cql_sql = str8_lit("SELECT group_name, COUNT(*), SUM(value) FROM fact GROUP BY group_name;");
+  cases[1].sqlite_sql = cases[1].cql_sql;
+  cases[1].duckdb_sql = cases[1].cql_sql;
 
   cases[2].label = str8_lit("global aggregate (no GROUP BY)");
-  cases[2].gdb_sql = str8_lit("SELECT COUNT(*), SUM(value), MIN(value), MAX(value) FROM fact;");
-  cases[2].sqlite_sql = cases[2].gdb_sql;
-  cases[2].duckdb_sql = cases[2].gdb_sql;
+  cases[2].cql_sql = str8_lit("SELECT COUNT(*), SUM(value), MIN(value), MAX(value) FROM fact;");
+  cases[2].sqlite_sql = cases[2].cql_sql;
+  cases[2].duckdb_sql = cases[2].cql_sql;
 
   cases[3].label = str8_lit("INNER JOIN, fact as build side");
-  cases[3].gdb_sql = str8_lit("SELECT dim.dim_name, fact.id, fact.value FROM dim JOIN fact ON dim.dim_key = fact.group_key;");
+  cases[3].cql_sql = str8_lit("SELECT dim.dim_name, fact.id, fact.value FROM dim JOIN fact ON dim.dim_key = fact.group_key;");
   cases[3].sqlite_sql = str8_lit("SELECT dim.dim_name, fact.id, fact.value FROM dim INNER JOIN fact ON dim.dim_key = fact.group_key;");
   cases[3].duckdb_sql = cases[3].sqlite_sql;
 
   cases[4].label = str8_lit("LEFT JOIN, fact as build side");
-  cases[4].gdb_sql = str8_lit("SELECT dim.dim_name, fact.id FROM dim LEFT JOIN fact ON dim.dim_key = fact.group_key;");
+  cases[4].cql_sql = str8_lit("SELECT dim.dim_name, fact.id FROM dim LEFT JOIN fact ON dim.dim_key = fact.group_key;");
   cases[4].sqlite_sql = str8_lit("SELECT dim.dim_name, fact.id FROM dim LEFT JOIN fact ON dim.dim_key = fact.group_key;");
   cases[4].duckdb_sql = cases[4].sqlite_sql;
 
   // tec: dim2.fk_name and fact.group_name are both dict-eligible, exercises the dict-coded join key path feeding the GROUP BY
   cases[5].label = str8_lit("JOIN + GROUP BY, string dict key");
-  cases[5].gdb_sql = str8_lit("SELECT dim2.fk_name, COUNT(*), SUM(fact.value) FROM dim2 JOIN fact ON dim2.fk_name = fact.group_name GROUP BY dim2.fk_name;");
+  cases[5].cql_sql = str8_lit("SELECT dim2.fk_name, COUNT(*), SUM(fact.value) FROM dim2 JOIN fact ON dim2.fk_name = fact.group_name GROUP BY dim2.fk_name;");
   cases[5].sqlite_sql = str8_lit("SELECT dim2.fk_name, COUNT(*), SUM(fact.value) FROM dim2 INNER JOIN fact ON dim2.fk_name = fact.group_name GROUP BY dim2.fk_name;");
   cases[5].duckdb_sql = cases[5].sqlite_sql;
 
   // tec: 10000 groups averages 5 or 200 rows/group at below/past_threshold, forcing the GPU hash-reduce path at below_threshold and the chunked-reduce fallback at past_threshold
   cases[6].label = str8_lit("GROUP BY numeric key, hash-reduce shape");
-  cases[6].gdb_sql = str8_lit("SELECT group_key, COUNT(*), SUM(id), AVG(id), MIN(id), MAX(id) FROM fact GROUP BY group_key;");
-  cases[6].sqlite_sql = cases[6].gdb_sql;
-  cases[6].duckdb_sql = cases[6].gdb_sql;
+  cases[6].cql_sql = str8_lit("SELECT group_key, COUNT(*), SUM(id), AVG(id), MIN(id), MAX(id) FROM fact GROUP BY group_key;");
+  cases[6].sqlite_sql = cases[6].cql_sql;
+  cases[6].duckdb_sql = cases[6].cql_sql;
 
   bench_print_table_header(report, label);
   for (U64 i = 0; i < ArrayCount(cases); i++)
   {
     g_bench_round_scale = (i == 0) ? 1000000.0 : 100.0;
 
-    U64 gdb_rows = 0, gdb_checksum = 0;
-    Bench_Stats gdb_stats = bench_run_gdb_query(database, cases[i].gdb_sql, &gdb_rows, &gdb_checksum);
-    bench_print_table_row(report, cases[i].label, "gdb", gdb_rows, gdb_checksum, &gdb_stats);
+    U64 cql_rows = 0, cql_checksum = 0;
+    Bench_Stats cql_stats = bench_run_cql_query(database, cases[i].cql_sql, &cql_rows, &cql_checksum);
+    bench_print_table_row(report, cases[i].label, "cql", cql_rows, cql_checksum, &cql_stats);
 
     U64 sqlite_rows = 0, sqlite_checksum = 0;
     Bench_Stats sqlite_stats = bench_run_sqlite_query(sqlite_db, cases[i].sqlite_sql, &sqlite_rows, &sqlite_checksum);
@@ -466,8 +472,8 @@ ch_run_suite(Arena* arena, Bench_Report* report, U64 row_count, char* label)
     Bench_Stats duckdb_stats = bench_run_duckdb_query(duckdb_conn, cases[i].duckdb_sql, &duckdb_rows, &duckdb_checksum);
     bench_print_table_row(report, cases[i].label, "duckdb", duckdb_rows, duckdb_checksum, &duckdb_stats);
 
-    bench_check_match(report, cases[i].label, "gdb", gdb_rows, gdb_checksum, "sqlite", sqlite_rows, sqlite_checksum);
-    bench_check_match(report, cases[i].label, "gdb", gdb_rows, gdb_checksum, "duckdb", duckdb_rows, duckdb_checksum);
+    bench_check_match(report, cases[i].label, "cql", cql_rows, cql_checksum, "sqlite", sqlite_rows, sqlite_checksum);
+    bench_check_match(report, cases[i].label, "cql", cql_rows, cql_checksum, "duckdb", duckdb_rows, duckdb_checksum);
   }
 
   sqlite3_close(sqlite_db);
@@ -485,16 +491,16 @@ entry_point(CmdLine* cmdline)
   log_alloc();
 
   U64 t0 = os_now_microseconds();
-  gdb_init();
+  cql_init();
   gpu_init();
   U64 t1 = os_now_microseconds();
-  printf("engine startup (gdb_init + gpu_init, one-time): %.4f ms\n", (F64)(t1 - t0) / 1000.0);
+  printf("engine startup (cql_init + gpu_init, one-time): %.4f ms\n", (F64)(t1 - t0) / 1000.0);
   printf("GPU_MAX_BUFFER_SIZE = %llu bytes (deliberately lowered for this test - see file header)\n", (U64)GPU_MAX_BUFFER_SIZE);
 
   Arena* arena = arena_alloc(.reserve_size = GB(4), .commit_size = MB(64));
 
   Bench_Report* report = bench_report_alloc(arena, "compute_ql vs sqlite vs duckdb - chunked cross-bucket hashing correctness");
-  bench_report_text(report, "engine startup (gdb_init + gpu_init, one-time): %.4f ms", (F64)(t1 - t0) / 1000.0);
+  bench_report_text(report, "engine startup (cql_init + gpu_init, one-time): %.4f ms", (F64)(t1 - t0) / 1000.0);
   bench_report_text(report, "GPU_MAX_BUFFER_SIZE = %llu bytes (lowered for this test)", (U64)GPU_MAX_BUFFER_SIZE);
 
   ch_run_suite(arena, report, 50000, "below_threshold");
@@ -505,7 +511,7 @@ entry_point(CmdLine* cmdline)
   {
     os_make_directory(str8_lit("bench_reports/"));
   }
-  bench_report_write(report, str8_lit("bench_reports/chunked_hash_report.md"));
+  bench_report_write(report, str8_lit(CH_REPORT_PATH));
 
   arena_release(arena);
 

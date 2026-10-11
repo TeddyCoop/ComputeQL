@@ -5,7 +5,7 @@ server_connection_thread_proc(void *ptr)
   SRV_ConnCtx *ctx = (SRV_ConnCtx*)ptr;
   OS_Handle socket = ctx->socket;
   
-  GDB_Database *current_database = 0;
+  CQL_Database *current_database = 0;
   
   log_info("server: connection opened");
   

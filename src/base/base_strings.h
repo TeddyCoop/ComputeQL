@@ -5,7 +5,7 @@
 
 //~ tec: Third Party Includes
 
-#define STB_SPRINTF_DECORATE(name) gdb_##name
+#define STB_SPRINTF_DECORATE(name) cql_##name
 #include "third_party/stb/stb_sprintf.h"
 
 ////////////////////////////////

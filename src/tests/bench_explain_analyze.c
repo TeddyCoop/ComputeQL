@@ -9,7 +9,7 @@
 #include "os/os_inc.h"
 #include "thread_pool/thread_pool.h"
 #include "settings/settings.h"
-#include "gdb/gdb_inc.h"
+#include "cql/cql_inc.h"
 #include "ir_gen/ir_gen_inc.h"
 #include "gpu/gpu_inc.h"
 #include "planner/plan_node.h"
@@ -26,7 +26,7 @@
 #include "settings/settings.c"
 #include "gpu/gpu_inc.c"
 #include "ir_gen/ir_gen_inc.c"
-#include "gdb/gdb_inc.c"
+#include "cql/cql_inc.c"
 #include "query_exec/query_exec.c"
 #include "optimizer/optimizer_inc.c"
 #include "planner/planner.c"
@@ -113,7 +113,7 @@ ea_run_suite(Arena* arena, Bench_Report* report)
   }
   
   //- tec: 'nullable_fact' - a table with at least one NULL, to force the CPU-scan fallback path
-  // (gdb_table_may_have_nulls checks the whole table, so this needs its own table separate from
+  // (cql_table_may_have_nulls checks the whole table, so this needs its own table separate from
   // 'fact' - a nullable column on 'fact' would force every filter on it through the CPU path too)
   {
     String8List lines = {0};
@@ -124,11 +124,11 @@ ea_run_suite(Arena* arena, Bench_Report* report)
     ea_write_csv(scratch.arena, str8_lit("bench_data/explain_nullable.csv"), str8_list_join(scratch.arena, &lines, 0));
   }
   
-  GDB_Database* database = gdb_database_alloc(str8_lit("explain_analyze_db"));
-  gdb_add_database(database);
-  gdb_database_add_table(database, gdb_table_import_csv_streaming(database, str8_lit("fact"), str8_lit("bench_data/explain_fact.csv")));
-  gdb_database_add_table(database, gdb_table_import_csv_streaming(database, str8_lit("dim"), str8_lit("bench_data/explain_dim.csv")));
-  gdb_database_add_table(database, gdb_table_import_csv_streaming(database, str8_lit("nullable_fact"), str8_lit("bench_data/explain_nullable.csv")));
+  CQL_Database* database = cql_database_alloc(str8_lit("explain_analyze_db"));
+  cql_add_database(database);
+  cql_database_add_table(database, cql_table_import_csv_streaming(database, str8_lit("fact"), str8_lit("bench_data/explain_fact.csv")));
+  cql_database_add_table(database, cql_table_import_csv_streaming(database, str8_lit("dim"), str8_lit("bench_data/explain_dim.csv")));
+  cql_database_add_table(database, cql_table_import_csv_streaming(database, str8_lit("nullable_fact"), str8_lit("bench_data/explain_nullable.csv")));
   
   Arena* query_arena = arena_alloc(.reserve_size = MB(64), .commit_size = MB(4));
   
@@ -270,7 +270,7 @@ entry_point(CmdLine* cmdline)
   
   log_alloc();
   g_query_exec_mutex = os_mutex_alloc();
-  gdb_init();
+  cql_init();
   gpu_init();
   
   Arena* arena = arena_alloc(.reserve_size = MB(256), .commit_size = MB(16));

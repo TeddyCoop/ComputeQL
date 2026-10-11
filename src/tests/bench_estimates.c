@@ -8,7 +8,7 @@
 #include "os/os_inc.h"
 #include "thread_pool/thread_pool.h"
 #include "settings/settings.h"
-#include "gdb/gdb_inc.h"
+#include "cql/cql_inc.h"
 #include "ir_gen/ir_gen_inc.h"
 #include "gpu/gpu_inc.h"
 #include "planner/plan_node.h"
@@ -25,7 +25,7 @@
 #include "settings/settings.c"
 #include "gpu/gpu_inc.c"
 #include "ir_gen/ir_gen_inc.c"
-#include "gdb/gdb_inc.c"
+#include "cql/cql_inc.c"
 #include "query_exec/query_exec.c"
 #include "optimizer/optimizer_inc.c"
 #include "planner/planner.c"
@@ -227,11 +227,11 @@ est_run_suite(Arena* arena, Bench_Report* report, U64 row_count, char* label)
   est_write_dimension_csv(scratch.arena, str8_lit("bench_data/est_dim.csv"), 10);
   est_write_dimension_csv(scratch.arena, str8_lit("bench_data/est_dim100.csv"), 100);
   
-  GDB_Database* database = gdb_database_alloc(push_str8f(scratch.arena, "estimates_db_%llu", row_count));
-  gdb_add_database(database);
-  gdb_database_add_table(database, gdb_table_import_csv_streaming(database, str8_lit("fact"), fact_path));
-  gdb_database_add_table(database, gdb_table_import_csv_streaming(database, str8_lit("dim"), str8_lit("bench_data/est_dim.csv")));
-  gdb_database_add_table(database, gdb_table_import_csv_streaming(database, str8_lit("dim100"), str8_lit("bench_data/est_dim100.csv")));
+  CQL_Database* database = cql_database_alloc(push_str8f(scratch.arena, "estimates_db_%llu", row_count));
+  cql_add_database(database);
+  cql_database_add_table(database, cql_table_import_csv_streaming(database, str8_lit("fact"), fact_path));
+  cql_database_add_table(database, cql_table_import_csv_streaming(database, str8_lit("dim"), str8_lit("bench_data/est_dim.csv")));
+  cql_database_add_table(database, cql_table_import_csv_streaming(database, str8_lit("dim100"), str8_lit("bench_data/est_dim100.csv")));
   
   Est_Case cases[EST_CASE_MAX];
   U64 case_count = est_build_cases(cases);
@@ -287,7 +287,7 @@ entry_point(CmdLine* cmdline)
   setvbuf(stdout, NULL, _IONBF, 0);
   log_alloc();
   g_query_exec_mutex = os_mutex_alloc();
-  gdb_init();
+  cql_init();
   gpu_init();
   
   Arena* arena = arena_alloc(.reserve_size = GB(1), .commit_size = MB(64));

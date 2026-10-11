@@ -1,0 +1,34 @@
+#version 450
+
+// tec: reads a buffer one 4 byte word per thread, compare with bandwidth_read.comp for the cost of narrow loads
+//
+//   binding 0: the buffer that is read (uint[])
+//   binding 3: a sink the result is stored to when it equals the magic value, so the loads cannot be optimized away
+//   push constant U64 slot 0: thread count
+//   push constant U64 slot 1: magic value, one the buffer never holds
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer DataBuf { uint data[]; };
+layout(std430, binding = 3) buffer SinkBuf { uint sink[]; };
+
+layout(push_constant) uniform PushConstants
+{
+  uint words[16];
+} pc;
+
+void
+main()
+{
+  uint t = gl_GlobalInvocationID.x;
+  if (t >= pc.words[0])
+  {
+    return;
+  }
+
+  uint value = data[t];
+  if (value == pc.words[2])
+  {
+    sink[0] = value;
+  }
+}

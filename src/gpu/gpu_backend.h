@@ -26,6 +26,8 @@ struct GPU_Backend
   U64    (*device_free_memory)(void);
   U64    (*device_max_storage_buffer_range)(void);
   B32    (*device_lost)(void);
+  void   (*pool_begin_epoch)(void);
+  GPU_MemoryStats (*memory_stats)(void);
   
   GPU_Buffer* (*buffer_alloc)(U64 size, GPU_BufferFlags flags, void* data);
   GPU_Buffer* (*buffer_alloc_pooled)(String8 name, U64 size, GPU_BufferFlags flags, void* data);
@@ -49,6 +51,18 @@ struct GPU_Backend
   void       (*batch_buffer_read)(GPU_Batch* batch, GPU_Buffer* buffer, void* out_data, U64 size);
   B32        (*batch_end)(GPU_Batch* batch);
   
+  GPU_Stream* (*stream_alloc)(U32 slot_count);
+  void        (*stream_release)(GPU_Stream* stream);
+  B32         (*stream_slot_begin)(GPU_Stream* stream, U32 slot, U64 upload_bytes, U64 readback_bytes);
+  B32         (*stream_copy)(GPU_Stream* stream, U32 slot, GPU_Buffer* destination, void* host_ptr, U64 size);
+  void        (*stream_zero)(GPU_Stream* stream, U32 slot, GPU_Buffer* buffer, U64 size);
+  void        (*stream_fill)(GPU_Stream* stream, U32 slot, GPU_Buffer* buffer, U64 size, U32 value);
+  void        (*stream_dispatch)(GPU_Stream* stream, U32 slot, GPU_Kernel* kernel, U32 global_work_size, U32 local_work_size);
+  void        (*stream_read)(GPU_Stream* stream, U32 slot, GPU_Buffer* buffer, void* out_data, U64 size);
+  B32         (*stream_submit)(GPU_Stream* stream, U32 slot);
+  B32         (*stream_wait)(GPU_Stream* stream, U32 slot);
+  GPU_StreamStats (*stream_get_stats)(GPU_Stream* stream);
+
   Arena*  (*scratch_arena)(void);
   String8 (*name)(void);
 };

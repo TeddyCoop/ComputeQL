@@ -8,7 +8,7 @@
 #include "os/os_inc.h"
 #include "thread_pool/thread_pool.h"
 #include "settings/settings.h"
-#include "gdb/gdb_inc.h"
+#include "cql/cql_inc.h"
 #include "ir_gen/ir_gen_inc.h"
 #include "gpu/gpu_inc.h"
 #include "planner/plan_node.h"
@@ -25,7 +25,7 @@
 #include "settings/settings.c"
 #include "gpu/gpu_inc.c"
 #include "ir_gen/ir_gen_inc.c"
-#include "gdb/gdb_inc.c"
+#include "cql/cql_inc.c"
 #include "query_exec/query_exec.c"
 #include "optimizer/optimizer_inc.c"
 #include "planner/planner.c"
@@ -71,18 +71,18 @@ stats_count_distinct(U8* seen, U64 size)
   return distinct;
 }
 
-internal GDB_Table*
-stats_build_table(Arena* arena, GDB_Database* database, char* table_name, U64 row_count, Stats_Truth* truth)
+internal CQL_Table*
+stats_build_table(Arena* arena, CQL_Database* database, char* table_name, U64 row_count, Stats_Truth* truth)
 {
-  GDB_Table* table = gdb_table_alloc(str8_cstring(table_name));
-  gdb_table_add_column(table, gdb_column_schema_create(str8_lit("id"), GDB_ColumnType_U64));
-  gdb_table_add_column(table, gdb_column_schema_create(str8_lit("low"), GDB_ColumnType_I32));
-  gdb_table_add_column(table, gdb_column_schema_create(str8_lit("mid"), GDB_ColumnType_I32));
-  gdb_table_add_column(table, gdb_column_schema_create(str8_lit("price"), GDB_ColumnType_F64));
-  gdb_table_add_column(table, gdb_column_schema_create(str8_lit("grp"), GDB_ColumnType_String8));
-  gdb_table_add_column(table, gdb_column_schema_create(str8_lit("sval"), GDB_ColumnType_String8));
-  gdb_table_add_column(table, gdb_column_schema_create(str8_lit("maybe"), GDB_ColumnType_I32));
-  gdb_database_add_table(database, table);
+  CQL_Table* table = cql_table_alloc(str8_cstring(table_name));
+  cql_table_add_column(table, cql_column_schema_create(str8_lit("id"), CQL_ColumnType_U64));
+  cql_table_add_column(table, cql_column_schema_create(str8_lit("low"), CQL_ColumnType_I32));
+  cql_table_add_column(table, cql_column_schema_create(str8_lit("mid"), CQL_ColumnType_I32));
+  cql_table_add_column(table, cql_column_schema_create(str8_lit("price"), CQL_ColumnType_F64));
+  cql_table_add_column(table, cql_column_schema_create(str8_lit("grp"), CQL_ColumnType_String8));
+  cql_table_add_column(table, cql_column_schema_create(str8_lit("sval"), CQL_ColumnType_String8));
+  cql_table_add_column(table, cql_column_schema_create(str8_lit("maybe"), CQL_ColumnType_I32));
+  cql_database_add_table(database, table);
   
   U8* low_seen = push_array(arena, U8, STATS_LOW_DISTINCT);
   U8* mid_seen = push_array(arena, U8, STATS_MID_DISTINCT);
@@ -156,7 +156,7 @@ stats_build_table(Arena* arena, GDB_Database* database, char* table_name, U64 ro
     void* row_data[7] = { &id, &low, &mid, &price, &grp, &sval, &maybe };
     B32 null_flags[7] = {0};
     null_flags[6] = maybe_is_null;
-    gdb_table_add_row(table, row_data, null_flags);
+    cql_table_add_row(table, row_data, null_flags);
   }
   
   truth->low_distinct = stats_count_distinct(low_seen, STATS_LOW_DISTINCT);
@@ -168,7 +168,7 @@ stats_build_table(Arena* arena, GDB_Database* database, char* table_name, U64 ro
   truth->low_top_fraction = (F64)low_dominant_count / (F64)row_count;
   truth->grp_top_fraction = (F64)grp_dominant_count / (F64)row_count;
   
-  quick_sort(truth->price_sorted, row_count, sizeof(F64), gdb_stats_compare_f64);
+  quick_sort(truth->price_sorted, row_count, sizeof(F64), cql_stats_compare_f64);
   truth->price_min = truth->price_sorted[0];
   truth->price_max = truth->price_sorted[row_count - 1];
   
@@ -203,7 +203,7 @@ stats_within_relative(U64 actual, U64 expected, F64 tolerance)
 }
 
 internal void
-stats_check_distinct(Bench_Report* report, char* label, GDB_Column* column, U64 expected, B32 exact_expected)
+stats_check_distinct(Bench_Report* report, char* label, CQL_Column* column, U64 expected, B32 exact_expected)
 {
   U64 actual = column->stats.distinct_count;
   B32 ok = exact_expected ? (actual == expected) : stats_within_relative(actual, expected, 0.03);
@@ -211,9 +211,9 @@ stats_check_distinct(Bench_Report* report, char* label, GDB_Column* column, U64 
 }
 
 internal void
-stats_check_mcv(Bench_Report* report, char* label, GDB_Column* column, U64 expected_key, F64 expected_fraction)
+stats_check_mcv(Bench_Report* report, char* label, CQL_Column* column, U64 expected_key, F64 expected_fraction)
 {
-  GDB_ColumnStats* stats = &column->stats;
+  CQL_ColumnStats* stats = &column->stats;
   B32 found = 0;
   F64 fraction = 0.0;
   if (stats->mcv_count > 0 && stats->mcv[0].key == expected_key)
@@ -231,9 +231,9 @@ stats_check_mcv(Bench_Report* report, char* label, GDB_Column* column, U64 expec
 }
 
 internal void
-stats_check_histogram(Bench_Report* report, GDB_Column* column, Stats_Truth* truth)
+stats_check_histogram(Bench_Report* report, CQL_Column* column, Stats_Truth* truth)
 {
-  GDB_ColumnStats* stats = &column->stats;
+  CQL_ColumnStats* stats = &column->stats;
   
   B32 monotone = 1;
   for (U32 bucket = 0; bucket < stats->histogram_bucket_count; bucket += 1)
@@ -243,7 +243,7 @@ stats_check_histogram(Bench_Report* report, GDB_Column* column, Stats_Truth* tru
       monotone = 0;
     }
   }
-  stats_check(report, "price histogram is monotone", monotone && stats->histogram_bucket_count == GDB_STATS_HISTOGRAM_BUCKETS,
+  stats_check(report, "price histogram is monotone", monotone && stats->histogram_bucket_count == CQL_STATS_HISTOGRAM_BUCKETS,
               "buckets=%u", stats->histogram_bucket_count);
   
   B32 range_ok = stats->has_range && stats->min_value == truth->price_min && stats->max_value == truth->price_max;
@@ -275,29 +275,29 @@ stats_check_histogram(Bench_Report* report, GDB_Column* column, Stats_Truth* tru
 }
 
 internal void
-stats_save_table(Arena* arena, GDB_Table* table, String8 table_dir)
+stats_save_table(Arena* arena, CQL_Table* table, String8 table_dir)
 {
-  if (!os_file_path_exists(str8_lit("gdb_data/")))
+  if (!os_file_path_exists(str8_lit("cql_data/")))
   {
-    os_make_directory(str8_lit("gdb_data/"));
+    os_make_directory(str8_lit("cql_data/"));
   }
   if (!os_file_path_exists(table_dir))
   {
     os_make_directory(table_dir);
   }
-  gdb_table_save(table, table_dir);
+  cql_table_save(table, table_dir);
 }
 
-internal GDB_Table*
+internal CQL_Table*
 stats_load_table(Arena* arena, String8 table_dir, String8 table_name)
 {
   String8 meta_path = push_str8f(arena, "%.*s/%.*s.meta", str8_varg(table_dir), str8_varg(table_name));
-  GDB_Table* loaded = gdb_table_load(NULL, table_dir, meta_path);
+  CQL_Table* loaded = cql_table_load(NULL, table_dir, meta_path);
   return loaded;
 }
 
 internal B32
-stats_equal(GDB_ColumnStats* a, GDB_ColumnStats* b)
+stats_equal(CQL_ColumnStats* a, CQL_ColumnStats* b)
 {
   B32 scalars_equal = a->row_count == b->row_count && a->null_count == b->null_count && a->distinct_count == b->distinct_count &&
     a->has_range == b->has_range && a->min_value == b->min_value && a->max_value == b->max_value &&
@@ -332,34 +332,34 @@ stats_run_size(Arena* arena, Bench_Report* report, U64 row_count, char* label)
   
   Temp scratch = scratch_begin(&arena, 1);
   
-  GDB_Database* database = gdb_database_alloc(push_str8f(scratch.arena, "stats_db_%llu", row_count));
-  gdb_add_database(database);
+  CQL_Database* database = cql_database_alloc(push_str8f(scratch.arena, "stats_db_%llu", row_count));
+  cql_add_database(database);
   
   Stats_Truth truth = {0};
-  GDB_Table* table = stats_build_table(scratch.arena, database, "stats_table", row_count, &truth);
+  CQL_Table* table = stats_build_table(scratch.arena, database, "stats_table", row_count, &truth);
   
-  GDB_Column* id_column = gdb_table_find_column(table, str8_lit("id"));
-  GDB_Column* low_column = gdb_table_find_column(table, str8_lit("low"));
-  GDB_Column* mid_column = gdb_table_find_column(table, str8_lit("mid"));
-  GDB_Column* price_column = gdb_table_find_column(table, str8_lit("price"));
-  GDB_Column* grp_column = gdb_table_find_column(table, str8_lit("grp"));
-  GDB_Column* sval_column = gdb_table_find_column(table, str8_lit("sval"));
-  GDB_Column* maybe_column = gdb_table_find_column(table, str8_lit("maybe"));
+  CQL_Column* id_column = cql_table_find_column(table, str8_lit("id"));
+  CQL_Column* low_column = cql_table_find_column(table, str8_lit("low"));
+  CQL_Column* mid_column = cql_table_find_column(table, str8_lit("mid"));
+  CQL_Column* price_column = cql_table_find_column(table, str8_lit("price"));
+  CQL_Column* grp_column = cql_table_find_column(table, str8_lit("grp"));
+  CQL_Column* sval_column = cql_table_find_column(table, str8_lit("sval"));
+  CQL_Column* maybe_column = cql_table_find_column(table, str8_lit("maybe"));
   
-  B32 exact = row_count <= GDB_STATS_SAMPLE_ROWS;
+  B32 exact = row_count <= CQL_STATS_SAMPLE_ROWS;
   
-  stats_check(report, "stats absent before first use", !gdb_column_stats_is_current(price_column), "computed=%d", (int)price_column->stats.is_computed);
+  stats_check(report, "stats absent before first use", !cql_column_stats_is_current(price_column), "computed=%d", (int)price_column->stats.is_computed);
   
-  String8 dir_without_stats = push_str8f(scratch.arena, "gdb_data/stats_test_%llu_without", row_count);
+  String8 dir_without_stats = push_str8f(scratch.arena, "cql_data/stats_test_%llu_without", row_count);
   stats_save_table(scratch.arena, table, dir_without_stats);
   
   U64 start = os_now_microseconds();
-  gdb_table_ensure_stats(table);
+  cql_table_ensure_stats(table);
   U64 elapsed = os_now_microseconds() - start;
   printf("  computing stats for %llu columns took %.2f ms\n", table->column_count, (F64)elapsed / 1000.0);
   bench_report_text(report, "%s: stats for all columns took %.2f ms", label, (F64)elapsed / 1000.0);
   
-  stats_check(report, "stats current after ensure", gdb_column_stats_is_current(price_column), "computed=%d", (int)price_column->stats.is_computed);
+  stats_check(report, "stats current after ensure", cql_column_stats_is_current(price_column), "computed=%d", (int)price_column->stats.is_computed);
   stats_check(report, "row count recorded", price_column->stats.row_count == row_count, "rows=%llu", price_column->stats.row_count);
   
   stats_check_distinct(report, "ndv id (unique)", id_column, row_count, exact);
@@ -375,8 +375,8 @@ stats_run_size(Arena* arena, Bench_Report* report, U64 row_count, char* label)
   stats_check(report, "no nulls elsewhere", price_column->stats.null_count == 0 && grp_column->stats.null_count == 0,
               "price=%llu grp=%llu", price_column->stats.null_count, grp_column->stats.null_count);
   
-  stats_check_mcv(report, "top value low", low_column, gdb_stats_hash_f64(7.0), truth.low_top_fraction);
-  stats_check_mcv(report, "top value grp (string)", grp_column, gdb_stats_hash_bytes((U8*)g_bench_words[0], strlen(g_bench_words[0])), truth.grp_top_fraction);
+  stats_check_mcv(report, "top value low", low_column, cql_stats_hash_f64(7.0), truth.low_top_fraction);
+  stats_check_mcv(report, "top value grp (string)", grp_column, cql_stats_hash_bytes((U8*)g_bench_words[0], strlen(g_bench_words[0])), truth.grp_top_fraction);
   
   stats_check(report, "string column has no range or histogram", !grp_column->stats.has_range && grp_column->stats.histogram_bucket_count == 0,
               "has_range=%d buckets=%u", (int)grp_column->stats.has_range, grp_column->stats.histogram_bucket_count);
@@ -385,11 +385,11 @@ stats_run_size(Arena* arena, Bench_Report* report, U64 row_count, char* label)
   
   //- tec: stats survive a save and reload, and a table saved without them loads without them
   {
-    String8 dir_with_stats = push_str8f(scratch.arena, "gdb_data/stats_test_%llu_with", row_count);
+    String8 dir_with_stats = push_str8f(scratch.arena, "cql_data/stats_test_%llu_with", row_count);
     stats_save_table(scratch.arena, table, dir_with_stats);
     
-    GDB_Table* reloaded = stats_load_table(scratch.arena, dir_with_stats, table->name);
-    GDB_Table* reloaded_without = stats_load_table(scratch.arena, dir_without_stats, table->name);
+    CQL_Table* reloaded = stats_load_table(scratch.arena, dir_with_stats, table->name);
+    CQL_Table* reloaded_without = stats_load_table(scratch.arena, dir_without_stats, table->name);
     
     B32 loaded_ok = reloaded != NULL && reloaded_without != NULL;
     stats_check(report, "saved tables reload", loaded_ok, "with=%d without=%d", (int)(reloaded != NULL), (int)(reloaded_without != NULL));
@@ -401,12 +401,12 @@ stats_run_size(Arena* arena, Bench_Report* report, U64 row_count, char* label)
       B32 none_current = 1;
       for (U64 column_index = 0; column_index < table->column_count; column_index += 1)
       {
-        GDB_Column* original = table->columns[column_index];
-        GDB_Column* loaded = gdb_table_find_column(reloaded, original->name);
-        GDB_Column* loaded_without = gdb_table_find_column(reloaded_without, original->name);
+        CQL_Column* original = table->columns[column_index];
+        CQL_Column* loaded = cql_table_find_column(reloaded, original->name);
+        CQL_Column* loaded_without = cql_table_find_column(reloaded_without, original->name);
         
-        all_current = all_current && gdb_column_stats_is_current(loaded);
-        none_current = none_current && !gdb_column_stats_is_current(loaded_without);
+        all_current = all_current && cql_column_stats_is_current(loaded);
+        none_current = none_current && !cql_column_stats_is_current(loaded_without);
         all_equal = all_equal && stats_equal(&original->stats, &loaded->stats);
       }
       stats_check(report, "reloaded stats are current", all_current, "current=%d", (int)all_current);
@@ -426,19 +426,19 @@ stats_run_size(Arena* arena, Bench_Report* report, U64 row_count, char* label)
     S32 maybe = 1;
     void* row_data[7] = { &id, &low, &mid, &price, &grp, &sval, &maybe };
     B32 null_flags[7] = {0};
-    gdb_table_add_row(table, row_data, null_flags);
+    cql_table_add_row(table, row_data, null_flags);
     
-    stats_check(report, "write invalidates stats", !gdb_column_stats_is_current(price_column), "computed_generation=%llu write_generation=%llu",
+    stats_check(report, "write invalidates stats", !cql_column_stats_is_current(price_column), "computed_generation=%llu write_generation=%llu",
                 price_column->stats.computed_generation, price_column->write_generation);
     
-    gdb_column_ensure_stats(price_column);
+    cql_column_ensure_stats(price_column);
     stats_check(report, "recompute sees the new row", price_column->stats.row_count == row_count + 1, "rows=%llu", price_column->stats.row_count);
   }
   
   //- tec: a second call with no writes must not recompute
   {
     U64 generation_before = price_column->stats.computed_generation;
-    gdb_column_ensure_stats(price_column);
+    cql_column_ensure_stats(price_column);
     stats_check(report, "unchanged column is not recomputed", price_column->stats.computed_generation == generation_before, "generation=%llu", generation_before);
   }
   
@@ -484,9 +484,9 @@ stats_run_analyze_statement(Arena* arena, Bench_Report* report)
   os_file_write(file, r1u64(0, csv.size), csv.str);
   os_file_close(file);
   
-  GDB_Database* database = gdb_database_alloc(str8_lit("analyze_stmt_db"));
-  gdb_add_database(database);
-  gdb_database_add_table(database, gdb_table_import_csv_streaming(database, str8_lit("astats"), str8_lit("bench_data/analyze_stmt.csv")));
+  CQL_Database* database = cql_database_alloc(str8_lit("analyze_stmt_db"));
+  cql_add_database(database);
+  cql_database_add_table(database, cql_table_import_csv_streaming(database, str8_lit("astats"), str8_lit("bench_data/analyze_stmt.csv")));
   
   Arena* query_arena = arena_alloc(.reserve_size = MB(64), .commit_size = MB(4));
   
@@ -529,10 +529,10 @@ stats_run_analyze_statement(Arena* arena, Bench_Report* report)
     arena_clear(query_arena);
   }
   
-  GDB_Table* table = gdb_database_find_table(database, str8_lit("astats"));
-  GDB_Column* id_column = gdb_table_find_column(table, str8_lit("id"));
-  GDB_Column* grp_column = gdb_table_find_column(table, str8_lit("grp"));
-  GDB_Column* sparse_column = gdb_table_find_column(table, str8_lit("sparse"));
+  CQL_Table* table = cql_database_find_table(database, str8_lit("astats"));
+  CQL_Column* id_column = cql_table_find_column(table, str8_lit("id"));
+  CQL_Column* grp_column = cql_table_find_column(table, str8_lit("grp"));
+  CQL_Column* sparse_column = cql_table_find_column(table, str8_lit("sparse"));
   
   B32 id_ok = id_column->stats.distinct_count == 50 && id_column->stats.null_count == 0;
   stats_check(report, "ANALYZE computed id", id_ok, "ndv=%llu nulls=%llu", id_column->stats.distinct_count, id_column->stats.null_count);
@@ -555,7 +555,7 @@ entry_point(CmdLine* cmdline)
   
   log_alloc();
   g_query_exec_mutex = os_mutex_alloc();
-  gdb_init();
+  cql_init();
   gpu_init();
   
   Arena* arena = arena_alloc(.reserve_size = GB(1), .commit_size = MB(64));
@@ -572,7 +572,7 @@ entry_point(CmdLine* cmdline)
   {
     os_make_directory(str8_lit("bench_reports/"));
   }
-  bench_report_write(report, str8_lit("bench_reports/gdb_stats_report.md"));
+  bench_report_write(report, str8_lit("bench_reports/cql_stats_report.md"));
   
   arena_release(arena);
   

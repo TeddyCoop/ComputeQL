@@ -8,7 +8,7 @@
 #include "os/os_inc.h"
 #include "thread_pool/thread_pool.h"
 #include "settings/settings.h"
-#include "gdb/gdb_inc.h"
+#include "cql/cql_inc.h"
 #include "ir_gen/ir_gen_inc.h"
 #include "gpu/gpu_inc.h"
 #include "planner/plan_node.h"
@@ -25,7 +25,7 @@
 #include "settings/settings.c"
 #include "gpu/gpu_inc.c"
 #include "ir_gen/ir_gen_inc.c"
-#include "gdb/gdb_inc.c"
+#include "cql/cql_inc.c"
 #include "query_exec/query_exec.c"
 #include "optimizer/optimizer_inc.c"
 #include "planner/planner.c"
@@ -55,7 +55,7 @@ app_report(Bench_Report* report, char* label, B32 ok, char* detail)
 
 // tec: also checks that no temp table is left on the database afterwards
 internal void
-app_expect_numbers(Arena* arena, Bench_Report* report, GDB_Database** database, char* label, char* sql,
+app_expect_numbers(Arena* arena, Bench_Report* report, CQL_Database** database, char* label, char* sql,
                    U64 expected_columns, APP_ExpectedRow* expected, U64 expected_count)
 {
   Arena* query_arena = arena_alloc(.reserve_size = MB(64), .commit_size = MB(1));
@@ -111,10 +111,10 @@ app_run_suite(Arena* arena, Bench_Report* report)
   String8 csv_path = str8_lit("bench_data/sql_surface_app.csv");
   bench_write_csv(csv_path, rows, 10);
   
-  GDB_Database* database = gdb_database_alloc(str8_lit("sql_surface_app_db"));
-  gdb_add_database(database);
-  GDB_Table* table = gdb_table_import_csv_streaming(database, str8_lit("t"), csv_path);
-  gdb_database_add_table(database, table);
+  CQL_Database* database = cql_database_alloc(str8_lit("sql_surface_app_db"));
+  cql_add_database(database);
+  CQL_Table* table = cql_table_import_csv_streaming(database, str8_lit("t"), csv_path);
+  cql_database_add_table(database, table);
   
   //- tec: CTEs
   {
@@ -234,15 +234,15 @@ entry_point(CmdLine* cmdline)
   log_alloc();
   
   U64 t0 = os_now_microseconds();
-  gdb_init();
+  cql_init();
   gpu_init();
   U64 t1 = os_now_microseconds();
-  printf("engine startup (gdb_init + gpu_init, one-time): %.4f ms\n", (F64)(t1 - t0) / 1000.0);
+  printf("engine startup (cql_init + gpu_init, one-time): %.4f ms\n", (F64)(t1 - t0) / 1000.0);
   
   Arena* arena = arena_alloc(.reserve_size = GB(1), .commit_size = MB(64));
   
   Bench_Report* report = bench_report_alloc(arena, "compute_ql - CTEs, subqueries and window functions through the app path");
-  bench_report_text(report, "engine startup (gdb_init + gpu_init, one-time): %.4f ms", (F64)(t1 - t0) / 1000.0);
+  bench_report_text(report, "engine startup (cql_init + gpu_init, one-time): %.4f ms", (F64)(t1 - t0) / 1000.0);
   
   app_run_suite(arena, report);
   

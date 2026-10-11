@@ -1,0 +1,140 @@
+#version 450
+#extension GL_ARB_gpu_shader_fp64 : enable
+
+// tec: SUM, MIN and MAX of whole columns with no GROUP BY, for columns whose values are all exact in F32
+// aggregate_reduce_f32.comp reduces every expression in 4096 row workgroups, this reads each column once and reduces once per column
+// a thread reads 16 byte vectors a whole grid apart so a wave touches neighbouring addresses, sums are held in double, min and max in float
+//
+//   binding 0..3: the columns (F32, dense, one value per row), up to MAX_COLUMNS of them
+//   binding 4:    partials, per workgroup and column 3 doubles: sum, min, max
+//   push constant U64 slot 0: row count
+//   push constant U64 slot 1: column count
+//   push constant U64 slot 2: workgroup count
+// NOTE: MAX_COLUMNS and the partials layout MUST stay in sync with qe_aggregate_global_gpu in query_exec.c
+
+layout(local_size_x = 256) in;
+
+#define MAX_COLUMNS 4u
+
+layout(std430, binding = 0) readonly buffer VecBuf0 { vec4 colv0[]; };
+layout(std430, binding = 1) readonly buffer VecBuf1 { vec4 colv1[]; };
+layout(std430, binding = 2) readonly buffer VecBuf2 { vec4 colv2[]; };
+layout(std430, binding = 3) readonly buffer VecBuf3 { vec4 colv3[]; };
+
+// tec: the same buffers seen as words, for the last rows when the row count is not a multiple of 4
+layout(std430, binding = 0) readonly buffer WordBuf0 { float word0[]; };
+layout(std430, binding = 1) readonly buffer WordBuf1 { float word1[]; };
+layout(std430, binding = 2) readonly buffer WordBuf2 { float word2[]; };
+layout(std430, binding = 3) readonly buffer WordBuf3 { float word3[]; };
+
+layout(std430, binding = 4) buffer PartialsBuf { double partials[]; };
+
+layout(push_constant) uniform PushConstants
+{
+  uint words[16];
+} pc;
+
+vec4
+read_vec(uint column, uint index)
+{
+  switch (column)
+  {
+    case 0u: return colv0[index];
+    case 1u: return colv1[index];
+    case 2u: return colv2[index];
+    default: return colv3[index];
+  }
+}
+
+float
+read_word(uint column, uint index)
+{
+  switch (column)
+  {
+    case 0u: return word0[index];
+    case 1u: return word1[index];
+    case 2u: return word2[index];
+    default: return word3[index];
+  }
+}
+
+shared double sh_sum[256];
+shared float sh_min[256];
+shared float sh_max[256];
+
+void
+main()
+{
+  uint row_count = pc.words[0];
+  uint column_count = pc.words[2];
+  uint group_count = pc.words[4];
+
+  uint tid = gl_LocalInvocationID.x;
+  uint t = gl_GlobalInvocationID.x;
+  uint stride = group_count * 256u;
+  uint vec_count = row_count / 4u;
+  uint tail_start = vec_count * 4u;
+
+  for (uint c = 0u; c < column_count; c++)
+  {
+    double acc = 0.0LF;
+    float mn = uintBitsToFloat(0x7f7fffffu);
+    float mx = -uintBitsToFloat(0x7f7fffffu);
+
+    // tec: four independent loads in flight per thread
+    uint i = t;
+    for (; i + 3u * stride < vec_count; i += 4u * stride)
+    {
+      vec4 a = read_vec(c, i);
+      vec4 b = read_vec(c, i + stride);
+      vec4 d = read_vec(c, i + 2u * stride);
+      vec4 e = read_vec(c, i + 3u * stride);
+      acc += (double(a.x) + double(a.y)) + (double(a.z) + double(a.w)) + (double(b.x) + double(b.y)) + (double(b.z) + double(b.w)) +
+             (double(d.x) + double(d.y)) + (double(d.z) + double(d.w)) + (double(e.x) + double(e.y)) + (double(e.z) + double(e.w));
+      vec4 lo = min(min(a, b), min(d, e));
+      vec4 hi = max(max(a, b), max(d, e));
+      mn = min(mn, min(min(lo.x, lo.y), min(lo.z, lo.w)));
+      mx = max(mx, max(max(hi.x, hi.y), max(hi.z, hi.w)));
+    }
+    for (; i < vec_count; i += stride)
+    {
+      vec4 a = read_vec(c, i);
+      acc += (double(a.x) + double(a.y)) + (double(a.z) + double(a.w));
+      mn = min(mn, min(min(a.x, a.y), min(a.z, a.w)));
+      mx = max(mx, max(max(a.x, a.y), max(a.z, a.w)));
+    }
+
+    // tec: the rows after the last whole vector, at most 3
+    if (t < row_count - tail_start)
+    {
+      float x = read_word(c, tail_start + t);
+      acc += double(x);
+      mn = min(mn, x);
+      mx = max(mx, x);
+    }
+
+    sh_sum[tid] = acc;
+    sh_min[tid] = mn;
+    sh_max[tid] = mx;
+    barrier();
+    for (uint step = 128u; step > 0u; step >>= 1u)
+    {
+      if (tid < step)
+      {
+        sh_sum[tid] += sh_sum[tid + step];
+        sh_min[tid] = min(sh_min[tid], sh_min[tid + step]);
+        sh_max[tid] = max(sh_max[tid], sh_max[tid + step]);
+      }
+      barrier();
+    }
+
+    if (tid == 0u)
+    {
+      uint base = (gl_WorkGroupID.x * column_count + c) * 3u;
+      partials[base + 0u] = sh_sum[0];
+      partials[base + 1u] = double(sh_min[0]);
+      partials[base + 2u] = double(sh_max[0]);
+    }
+    barrier();
+  }
+}

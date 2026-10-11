@@ -100,13 +100,13 @@ internal void ir_node_add_child(IR_Node* parent, IR_Node* child);
 internal IR_NodeType ir_type_from_sql_node_type(SQL_NodeType sql_type);
 internal String8 ir_node_type_to_string(IR_NodeType type);
 internal IR_Node* ir_node_find_child(IR_Node* parent, IR_NodeType type);
-internal GDB_ColumnType ir_find_column_type(GDB_Database* database, IR_Node* select_ir_node, String8 column_name);
+internal CQL_ColumnType ir_find_column_type(CQL_Database* database, IR_Node* select_ir_node, String8 column_name);
 internal void ir_print_node(IR_Node *node, U64 depth);
 internal void ir_print_query(IR_Query *query);
 
 //~ tec: generation helpers
 internal IR_Node* ir_generate_recursive(Arena* arena, SQL_Node* sql_node);
 internal void ir_create_active_column_list(Arena* arena, IR_Node* parent_node, String8List* used_columns);
-internal void ir_expand_star_to_columns(Arena *arena, GDB_Database *db, IR_Node *select_node);
+internal void ir_expand_star_to_columns(Arena *arena, CQL_Database *db, IR_Node *select_node);
 
 #endif //IR_GEN_H

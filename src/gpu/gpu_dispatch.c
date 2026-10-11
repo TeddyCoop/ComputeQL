@@ -192,6 +192,18 @@ gpu_device_lost(void)
   return g_active_gpu_backend_reg->backend->device_lost();
 }
 
+internal void
+gpu_pool_begin_epoch(void)
+{
+  g_active_gpu_backend_reg->backend->pool_begin_epoch();
+}
+
+internal GPU_MemoryStats
+gpu_memory_stats(void)
+{
+  return g_active_gpu_backend_reg->backend->memory_stats();
+}
+
 internal GPU_Buffer*
 gpu_buffer_alloc(U64 size, GPU_BufferFlags flags, void* data)
 {
@@ -304,6 +316,72 @@ internal B32
 gpu_batch_end(GPU_Batch* batch)
 {
   return g_active_gpu_backend_reg->backend->batch_end(batch);
+}
+
+internal GPU_Stream*
+gpu_stream_alloc(U32 slot_count)
+{
+  return g_active_gpu_backend_reg->backend->stream_alloc(slot_count);
+}
+
+internal void
+gpu_stream_release(GPU_Stream* stream)
+{
+  g_active_gpu_backend_reg->backend->stream_release(stream);
+}
+
+internal B32
+gpu_stream_slot_begin(GPU_Stream* stream, U32 slot, U64 upload_bytes, U64 readback_bytes)
+{
+  return g_active_gpu_backend_reg->backend->stream_slot_begin(stream, slot, upload_bytes, readback_bytes);
+}
+
+internal B32
+gpu_stream_copy(GPU_Stream* stream, U32 slot, GPU_Buffer* destination, void* host_ptr, U64 size)
+{
+  return g_active_gpu_backend_reg->backend->stream_copy(stream, slot, destination, host_ptr, size);
+}
+
+internal void
+gpu_stream_zero(GPU_Stream* stream, U32 slot, GPU_Buffer* buffer, U64 size)
+{
+  g_active_gpu_backend_reg->backend->stream_zero(stream, slot, buffer, size);
+}
+
+internal void
+gpu_stream_fill(GPU_Stream* stream, U32 slot, GPU_Buffer* buffer, U64 size, U32 value)
+{
+  g_active_gpu_backend_reg->backend->stream_fill(stream, slot, buffer, size, value);
+}
+
+internal void
+gpu_stream_dispatch(GPU_Stream* stream, U32 slot, GPU_Kernel* kernel, U32 global_work_size, U32 local_work_size)
+{
+  g_active_gpu_backend_reg->backend->stream_dispatch(stream, slot, kernel, global_work_size, local_work_size);
+}
+
+internal void
+gpu_stream_read(GPU_Stream* stream, U32 slot, GPU_Buffer* buffer, void* out_data, U64 size)
+{
+  g_active_gpu_backend_reg->backend->stream_read(stream, slot, buffer, out_data, size);
+}
+
+internal B32
+gpu_stream_submit(GPU_Stream* stream, U32 slot)
+{
+  return g_active_gpu_backend_reg->backend->stream_submit(stream, slot);
+}
+
+internal B32
+gpu_stream_wait(GPU_Stream* stream, U32 slot)
+{
+  return g_active_gpu_backend_reg->backend->stream_wait(stream, slot);
+}
+
+internal GPU_StreamStats
+gpu_stream_get_stats(GPU_Stream* stream)
+{
+  return g_active_gpu_backend_reg->backend->stream_get_stats(stream);
 }
 
 internal Arena*

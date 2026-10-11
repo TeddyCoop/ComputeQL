@@ -2,7 +2,7 @@
 
 // tec: splitmix64 finalizer
 internal U64
-gdb_stats_hash_u64(U64 value)
+cql_stats_hash_u64(U64 value)
 {
   U64 x = value + 0x9E3779B97F4A7C15ULL;
   x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
@@ -12,7 +12,7 @@ gdb_stats_hash_u64(U64 value)
 }
 
 internal U64
-gdb_stats_hash_f64(F64 value)
+cql_stats_hash_f64(F64 value)
 {
   F64 normalized = value;
   if (normalized == 0.0)
@@ -21,12 +21,12 @@ gdb_stats_hash_f64(F64 value)
   }
   U64 bits = 0;
   MemoryCopy(&bits, &normalized, sizeof(bits));
-  return gdb_stats_hash_u64(bits);
+  return cql_stats_hash_u64(bits);
 }
 
 // tec: FNV-1a, then the finalizer above to spread the low bits
 internal U64
-gdb_stats_hash_bytes(U8* bytes, U64 size)
+cql_stats_hash_bytes(U8* bytes, U64 size)
 {
   U64 hash = 14695981039346656037ULL;
   for (U64 i = 0; i < size; i += 1)
@@ -34,16 +34,16 @@ gdb_stats_hash_bytes(U8* bytes, U64 size)
     hash = hash ^ bytes[i];
     hash = hash * 1099511628211ULL;
   }
-  return gdb_stats_hash_u64(hash);
+  return cql_stats_hash_u64(hash);
 }
 
 //~ tec: HyperLogLog
 
 internal void
-gdb_stats_hll_add(U8* registers, U64 hash)
+cql_stats_hll_add(U8* registers, U64 hash)
 {
-  U64 register_index = hash >> (64 - GDB_STATS_HLL_PRECISION);
-  U64 remaining = (hash << GDB_STATS_HLL_PRECISION) | ((U64)1 << (GDB_STATS_HLL_PRECISION - 1));
+  U64 register_index = hash >> (64 - CQL_STATS_HLL_PRECISION);
+  U64 remaining = (hash << CQL_STATS_HLL_PRECISION) | ((U64)1 << (CQL_STATS_HLL_PRECISION - 1));
   
   U8 rank = 1;
   U64 top_bit = (U64)1 << 63;
@@ -60,14 +60,14 @@ gdb_stats_hll_add(U8* registers, U64 hash)
 }
 
 internal U64
-gdb_stats_hll_estimate(U8* registers)
+cql_stats_hll_estimate(U8* registers)
 {
-  F64 register_count = (F64)GDB_STATS_HLL_REGISTER_COUNT;
+  F64 register_count = (F64)CQL_STATS_HLL_REGISTER_COUNT;
   F64 alpha = 0.7213 / (1.0 + 1.079 / register_count);
   
   F64 harmonic_sum = 0.0;
   U64 zero_registers = 0;
-  for (U64 i = 0; i < GDB_STATS_HLL_REGISTER_COUNT; i += 1)
+  for (U64 i = 0; i < CQL_STATS_HLL_REGISTER_COUNT; i += 1)
   {
     harmonic_sum += 1.0 / (F64)((U64)1 << registers[i]);
     if (registers[i] == 0)
@@ -90,7 +90,7 @@ gdb_stats_hll_estimate(U8* registers)
 //~ tec: sorting
 
 internal int
-gdb_stats_compare_f64(const void* a, const void* b)
+cql_stats_compare_f64(const void* a, const void* b)
 {
   F64 left = *(const F64*)a;
   F64 right = *(const F64*)b;
@@ -106,7 +106,7 @@ gdb_stats_compare_f64(const void* a, const void* b)
 }
 
 internal int
-gdb_stats_compare_u64(const void* a, const void* b)
+cql_stats_compare_u64(const void* a, const void* b)
 {
   U64 left = *(const U64*)a;
   U64 right = *(const U64*)b;
@@ -123,16 +123,16 @@ gdb_stats_compare_u64(const void* a, const void* b)
 
 //~ tec: scan
 
-internal THREAD_POOL_TASK_FUNC(gdb_stats_scan_task)
+internal THREAD_POOL_TASK_FUNC(cql_stats_scan_task)
 {
-  GDB_StatsScanCtx* ctx = (GDB_StatsScanCtx*)raw_task;
-  GDB_StatsTaskResult* result = &ctx->results[task_id];
+  CQL_StatsScanCtx* ctx = (CQL_StatsScanCtx*)raw_task;
+  CQL_StatsTaskResult* result = &ctx->results[task_id];
   Rng1U64 range = ctx->ranges[task_id];
-  GDB_Column* column = ctx->column;
+  CQL_Column* column = ctx->column;
   
   for (U64 row = range.min; row < range.max; row += 1)
   {
-    if (gdb_column_is_null(column, row))
+    if (cql_column_is_null(column, row))
     {
       result->null_count += 1;
       continue;
@@ -141,17 +141,17 @@ internal THREAD_POOL_TASK_FUNC(gdb_stats_scan_task)
     U64 hash = 0;
     if (ctx->is_string)
     {
-      String8 value = gdb_dict_row_string(&ctx->string_chunk, row);
-      hash = gdb_stats_hash_bytes(value.str, value.size);
+      String8 value = cql_dict_row_string(&ctx->string_chunk, row);
+      hash = cql_stats_hash_bytes(value.str, value.size);
     }
     else
     {
       U8* data = (U8*)ctx->base_ptr + row * column->size;
       U64 raw_bits = 0;
       MemoryCopy(&raw_bits, data, Min(column->size, (U64)sizeof(raw_bits)));
-      hash = gdb_stats_hash_u64(raw_bits);
+      hash = cql_stats_hash_u64(raw_bits);
       
-      F64 value = gdb_numeric_value_as_f64(column->type, data);
+      F64 value = cql_numeric_value_as_f64(column->type, data);
       if (!result->has_range)
       {
         result->min_value = value;
@@ -171,7 +171,7 @@ internal THREAD_POOL_TASK_FUNC(gdb_stats_scan_task)
       }
     }
     
-    gdb_stats_hll_add(result->hll_registers, hash);
+    cql_stats_hll_add(result->hll_registers, hash);
     result->non_null_count += 1;
   }
 }
@@ -180,10 +180,10 @@ internal THREAD_POOL_TASK_FUNC(gdb_stats_scan_task)
 
 // tec: returns the number of distinct keys seen in the sample
 internal U64
-gdb_stats_build_mcv(GDB_ColumnStats* stats, U64* sorted_keys, U64 key_count)
+cql_stats_build_mcv(CQL_ColumnStats* stats, U64* sorted_keys, U64 key_count)
 {
   stats->mcv_count = 0;
-  U64 run_counts[GDB_STATS_MCV_COUNT] = {0};
+  U64 run_counts[CQL_STATS_MCV_COUNT] = {0};
   U64 distinct_keys = 0;
   
   U64 run_start = 0;
@@ -206,9 +206,9 @@ gdb_stats_build_mcv(GDB_ColumnStats* stats, U64* sorted_keys, U64 key_count)
         insert_at -= 1;
       }
       
-      if (insert_at < GDB_STATS_MCV_COUNT)
+      if (insert_at < CQL_STATS_MCV_COUNT)
       {
-        U32 last = Min(stats->mcv_count, (U32)(GDB_STATS_MCV_COUNT - 1));
+        U32 last = Min(stats->mcv_count, (U32)(CQL_STATS_MCV_COUNT - 1));
         for (U32 shift = last; shift > insert_at; shift -= 1)
         {
           run_counts[shift] = run_counts[shift - 1];
@@ -217,7 +217,7 @@ gdb_stats_build_mcv(GDB_ColumnStats* stats, U64* sorted_keys, U64 key_count)
         run_counts[insert_at] = run_length;
         stats->mcv[insert_at].key = sorted_keys[run_start];
         stats->mcv[insert_at].fraction = (F64)run_length / (F64)key_count;
-        if (stats->mcv_count < GDB_STATS_MCV_COUNT)
+        if (stats->mcv_count < CQL_STATS_MCV_COUNT)
         {
           stats->mcv_count += 1;
         }
@@ -231,7 +231,7 @@ gdb_stats_build_mcv(GDB_ColumnStats* stats, U64* sorted_keys, U64 key_count)
 }
 
 internal void
-gdb_stats_build_histogram(GDB_ColumnStats* stats, F64* sorted_values, U64 value_count)
+cql_stats_build_histogram(CQL_ColumnStats* stats, F64* sorted_values, U64 value_count)
 {
   stats->histogram_bucket_count = 0;
   if (value_count == 0)
@@ -240,7 +240,7 @@ gdb_stats_build_histogram(GDB_ColumnStats* stats, F64* sorted_values, U64 value_
   }
   
   // tec: bucket b starts at sample b * n / buckets, so a table with as few rows as buckets gets one value per bucket
-  U64 bucket_count = Min((U64)GDB_STATS_HISTOGRAM_BUCKETS, value_count);
+  U64 bucket_count = Min((U64)CQL_STATS_HISTOGRAM_BUCKETS, value_count);
   for (U64 bucket = 0; bucket <= bucket_count; bucket += 1)
   {
     U64 sample_index = Min(bucket * value_count / bucket_count, value_count - 1);
@@ -257,7 +257,7 @@ gdb_stats_build_histogram(GDB_ColumnStats* stats, F64* sorted_values, U64 value_
 
 // tec: least significant digit first, one byte at a time, a byte that is the same in every key is skipped
 internal void
-gdb_stats_radix_sort_u64(Arena* arena, U64* keys, U64 count)
+cql_stats_radix_sort_u64(Arena* arena, U64* keys, U64 count)
 {
   if (count < 2)
   {
@@ -303,7 +303,7 @@ gdb_stats_radix_sort_u64(Arena* arena, U64* keys, U64 count)
 }
 
 internal U64
-gdb_stats_f64_sort_key(F64 value)
+cql_stats_f64_sort_key(F64 value)
 {
   U64 bits = 0;
   MemoryCopy(&bits, &value, sizeof(bits));
@@ -311,7 +311,7 @@ gdb_stats_f64_sort_key(F64 value)
 }
 
 internal F64
-gdb_stats_f64_from_sort_key(U64 key)
+cql_stats_f64_from_sort_key(U64 key)
 {
   U64 bits = (key >> 63) ? (key & 0x7fffffffffffffffull) : ~key;
   F64 value = 0.0;
@@ -320,18 +320,18 @@ gdb_stats_f64_from_sort_key(U64 key)
 }
 
 internal void
-gdb_stats_sort_f64(Arena* arena, F64* values, U64 count)
+cql_stats_sort_f64(Arena* arena, F64* values, U64 count)
 {
   Temp scratch = scratch_begin(&arena, 1);
   U64* keys = push_array(scratch.arena, U64, Max(count, (U64)1));
   for (U64 i = 0; i < count; i += 1)
   {
-    keys[i] = gdb_stats_f64_sort_key(values[i]);
+    keys[i] = cql_stats_f64_sort_key(values[i]);
   }
-  gdb_stats_radix_sort_u64(scratch.arena, keys, count);
+  cql_stats_radix_sort_u64(scratch.arena, keys, count);
   for (U64 i = 0; i < count; i += 1)
   {
-    values[i] = gdb_stats_f64_from_sort_key(keys[i]);
+    values[i] = cql_stats_f64_from_sort_key(keys[i]);
   }
   scratch_end(scratch);
 }
@@ -339,72 +339,72 @@ gdb_stats_sort_f64(Arena* arena, F64* values, U64 count)
 //~ tec: entry points
 
 internal B32
-gdb_column_stats_is_current(GDB_Column* column)
+cql_column_stats_is_current(CQL_Column* column)
 {
   B32 is_current = column->stats.is_computed && column->stats.computed_generation == column->write_generation;
   return is_current;
 }
 
 internal void
-gdb_column_ensure_stats(GDB_Column* column)
+cql_column_ensure_stats(CQL_Column* column)
 {
   ProfBeginFunction();
   
-  if (gdb_column_stats_is_current(column))
+  if (cql_column_stats_is_current(column))
   {
     ProfEnd();
     return;
   }
   
-  GDB_ColumnStats* stats = &column->stats;
+  CQL_ColumnStats* stats = &column->stats;
   MemoryZeroStruct(stats);
   stats->row_count = column->row_count;
   
-  B32 is_string = column->type == GDB_ColumnType_String8;
-  B32 is_scannable = column->type != GDB_ColumnType_Invalid;
+  B32 is_string = column->type == CQL_ColumnType_String8;
+  B32 is_scannable = column->type != CQL_ColumnType_Invalid;
   
   if (column->row_count > 0 && is_scannable)
   {
     Temp scratch = scratch_begin(0, 0);
     
-    GDB_StatsScanCtx ctx = {0};
+    CQL_StatsScanCtx ctx = {0};
     ctx.column = column;
     ctx.is_string = is_string;
     if (is_string)
     {
-      ctx.string_chunk = gdb_column_get_string_chunk(scratch.arena, column, r1u64(0, column->row_count));
+      ctx.string_chunk = cql_column_get_string_chunk(scratch.arena, column, r1u64(0, column->row_count));
     }
     else
     {
       U64 range_size = 0;
-      ctx.base_ptr = gdb_column_get_data_range(scratch.arena, column, r1u64(0, column->row_count), &range_size);
+      ctx.base_ptr = cql_column_get_data_range(scratch.arena, column, r1u64(0, column->row_count), &range_size);
     }
     
     TP_Context* pool = app_thread_pool();
     U64 task_count = Max((U64)1, Min((U64)pool->worker_count, column->row_count));
     ctx.ranges = tp_divide_work(scratch.arena, column->row_count, (U32)task_count);
-    ctx.results = push_array(scratch.arena, GDB_StatsTaskResult, task_count);
+    ctx.results = push_array(scratch.arena, CQL_StatsTaskResult, task_count);
     for (U64 task = 0; task < task_count; task += 1)
     {
-      ctx.results[task].hll_registers = push_array(scratch.arena, U8, GDB_STATS_HLL_REGISTER_COUNT);
+      ctx.results[task].hll_registers = push_array(scratch.arena, U8, CQL_STATS_HLL_REGISTER_COUNT);
     }
     
     TP_Arena* pool_arena = app_thread_pool_arena();
     TP_Temp temp = tp_temp_begin(pool_arena);
-    tp_for_parallel(pool, pool_arena, task_count, gdb_stats_scan_task, &ctx);
+    tp_for_parallel(pool, pool_arena, task_count, cql_stats_scan_task, &ctx);
     tp_temp_end(temp);
     
     U8* merged_registers = ctx.results[0].hll_registers;
     U64 non_null_count = 0;
     for (U64 task = 0; task < task_count; task += 1)
     {
-      GDB_StatsTaskResult* result = &ctx.results[task];
+      CQL_StatsTaskResult* result = &ctx.results[task];
       non_null_count += result->non_null_count;
       stats->null_count += result->null_count;
       
       if (task > 0)
       {
-        for (U64 i = 0; i < GDB_STATS_HLL_REGISTER_COUNT; i += 1)
+        for (U64 i = 0; i < CQL_STATS_HLL_REGISTER_COUNT; i += 1)
         {
           if (merged_registers[i] < result->hll_registers[i])
           {
@@ -436,7 +436,7 @@ gdb_column_ensure_stats(GDB_Column* column)
     }
     
     // tec: systematic sample by row position
-    U64 stride = Max((U64)1, column->row_count / GDB_STATS_SAMPLE_ROWS);
+    U64 stride = Max((U64)1, column->row_count / CQL_STATS_SAMPLE_ROWS);
     U64 sample_capacity = column->row_count / stride + 1;
     U64 sample_count = 0;
     F64* numeric_sample = 0;
@@ -452,21 +452,21 @@ gdb_column_ensure_stats(GDB_Column* column)
     
     for (U64 row = 0; row < column->row_count; row += stride)
     {
-      if (gdb_column_is_null(column, row))
+      if (cql_column_is_null(column, row))
       {
         continue;
       }
       
       if (is_string)
       {
-        String8 value = gdb_dict_row_string(&ctx.string_chunk, row);
-        key_sample[sample_count] = gdb_stats_hash_bytes(value.str, value.size);
+        String8 value = cql_dict_row_string(&ctx.string_chunk, row);
+        key_sample[sample_count] = cql_stats_hash_bytes(value.str, value.size);
         sample_count += 1;
       }
       else
       {
         U8* data = (U8*)ctx.base_ptr + row * column->size;
-        F64 value = gdb_numeric_value_as_f64(column->type, data);
+        F64 value = cql_numeric_value_as_f64(column->type, data);
         if (value == value)
         {
           numeric_sample[sample_count] = value;
@@ -478,20 +478,20 @@ gdb_column_ensure_stats(GDB_Column* column)
     U64 sample_distinct_count = 0;
     if (is_string)
     {
-      gdb_stats_radix_sort_u64(scratch.arena, key_sample, sample_count);
-      sample_distinct_count = gdb_stats_build_mcv(stats, key_sample, sample_count);
+      cql_stats_radix_sort_u64(scratch.arena, key_sample, sample_count);
+      sample_distinct_count = cql_stats_build_mcv(stats, key_sample, sample_count);
     }
     else
     {
-      gdb_stats_sort_f64(scratch.arena, numeric_sample, sample_count);
-      gdb_stats_build_histogram(stats, numeric_sample, sample_count);
+      cql_stats_sort_f64(scratch.arena, numeric_sample, sample_count);
+      cql_stats_build_histogram(stats, numeric_sample, sample_count);
       
       U64* numeric_keys = push_array(scratch.arena, U64, Max(sample_count, (U64)1));
       for (U64 i = 0; i < sample_count; i += 1)
       {
-        numeric_keys[i] = gdb_stats_hash_f64(numeric_sample[i]);
+        numeric_keys[i] = cql_stats_hash_f64(numeric_sample[i]);
       }
-      sample_distinct_count = gdb_stats_build_mcv(stats, numeric_keys, sample_count);
+      sample_distinct_count = cql_stats_build_mcv(stats, numeric_keys, sample_count);
     }
     
     // tec: a sample that holds every row gives an exact count, otherwise fall back to HyperLogLog
@@ -502,7 +502,7 @@ gdb_column_ensure_stats(GDB_Column* column)
     }
     else
     {
-      distinct_count = gdb_stats_hll_estimate(merged_registers);
+      distinct_count = cql_stats_hll_estimate(merged_registers);
     }
     distinct_count = Min(distinct_count, non_null_count);
     if (non_null_count > 0)
@@ -523,7 +523,7 @@ gdb_column_ensure_stats(GDB_Column* column)
     
     if (is_string)
     {
-      gdb_column_close_string_chunk(column);
+      cql_column_close_string_chunk(column);
     }
     
     scratch_end(scratch);
@@ -536,20 +536,20 @@ gdb_column_ensure_stats(GDB_Column* column)
 }
 
 internal void
-gdb_table_ensure_stats(GDB_Table* table)
+cql_table_ensure_stats(CQL_Table* table)
 {
   for (U64 column_index = 0; column_index < table->column_count; column_index += 1)
   {
-    gdb_column_ensure_stats(table->columns[column_index]);
+    cql_column_ensure_stats(table->columns[column_index]);
   }
 }
 
 //~ tec: persistence
 
 internal U64
-gdb_column_stats_record_size(GDB_Column* column)
+cql_column_stats_record_size(CQL_Column* column)
 {
-  GDB_ColumnStats* stats = &column->stats;
+  CQL_ColumnStats* stats = &column->stats;
   
   U64 size = sizeof(U64) + column->name.size;
   size += sizeof(U64) * 3;
@@ -564,9 +564,9 @@ gdb_column_stats_record_size(GDB_Column* column)
 }
 
 internal U8*
-gdb_column_stats_write_record(U8* out, GDB_Column* column)
+cql_column_stats_write_record(U8* out, CQL_Column* column)
 {
-  GDB_ColumnStats* stats = &column->stats;
+  CQL_ColumnStats* stats = &column->stats;
   
   *(U64*)out = column->name.size;
   out += sizeof(U64);
@@ -613,7 +613,7 @@ gdb_column_stats_write_record(U8* out, GDB_Column* column)
 
 // tec: returns 0 on a truncated or out of range record, read_ptr is then unusable
 internal B32
-gdb_column_stats_read_record(U8** read_ptr, U8* end, String8* out_name, GDB_ColumnStats* out_stats)
+cql_column_stats_read_record(U8** read_ptr, U8* end, String8* out_name, CQL_ColumnStats* out_stats)
 {
   U8* in = *read_ptr;
   
@@ -653,7 +653,7 @@ gdb_column_stats_read_record(U8** read_ptr, U8* end, String8* out_name, GDB_Colu
   
   U64 bucket_count = *(U64*)in;
   in += sizeof(U64);
-  if (bucket_count > GDB_STATS_HISTOGRAM_BUCKETS)
+  if (bucket_count > CQL_STATS_HISTOGRAM_BUCKETS)
   {
     return 0;
   }
@@ -678,7 +678,7 @@ gdb_column_stats_read_record(U8** read_ptr, U8* end, String8* out_name, GDB_Colu
   }
   U64 mcv_count = *(U64*)in;
   in += sizeof(U64);
-  if (mcv_count > GDB_STATS_MCV_COUNT)
+  if (mcv_count > CQL_STATS_MCV_COUNT)
   {
     return 0;
   }

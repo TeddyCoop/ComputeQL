@@ -1,0 +1,334 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+
+// tec: GROUP BY one whole number key with a small range, no hash table: the group of a row is its key minus the smallest key
+//   binding 0: the key column
+//   binding 1..4: the argument columns, up to MAX_ARGS
+//   binding 5: per group, a word the kernel does not use, then its row count
+//   binding 6: per group and expr, the low then the high word of the sum
+//   binding 7: per group and expr, the minimum
+//   binding 8: per group and expr, the maximum
+//   push constant U64 slot 0: row count
+//   push constant U64 slot 1: expr count
+//   push constant U64 slot 2: function of each expr, 4 bits each
+//   push constant U64 slot 3: low word, the argument column of each expr, 4 bits each. high word, a bit per argument column set when it is signed,
+//                             and bit 31 set when every SUM of the workgroup is known to fit a signed 32 bit word
+//   push constant U64 slot 4: group count
+//   push constant U64 slot 5: the smallest key
+//   push constant U64 slot 6: groups per tile, high word: rows per workgroup
+//   push constant U64 slot 7: tile count, high word: the chunk's first row
+//   push constant U64 slot 0, high word: the encoding width of the key (bits 0 to 3) and of argument column 0..3 (bits 4 to 19)
+//   push constant U64 slot 1, 2, 4, 5, high word: the encoding base of argument column 0..3
+//
+// a column may be stored narrow (1 or 2 bytes per row) as the difference from its smallest value, the encoding base. width 0 or 4 is as stored,
+// width 3 is not stored at all: its value is the encoding base plus the row number
+// NOTE: binding layout and push constant slot order MUST stay in sync with qe_dense_stream_core in query_exec.c
+
+layout(local_size_x = 256) in;
+
+
+// tec: shared memory per workgroup is 12 KB, a larger one leaves room for fewer workgroups and this kernel needs the others to hide its load and atomic latency
+// 10k groups: 48 KB took 213 ms, 16 KB 123 ms, 12 KB 74 ms
+#ifndef UNROLL
+#define UNROLL 8u
+#endif
+#ifndef SHARED_ACC_WORDS
+#define SHARED_ACC_WORDS 2048u
+#endif
+#ifndef SHARED_MM_WORDS
+#define SHARED_MM_WORDS 1024u
+#endif
+
+#define FUNC_COUNT 0u
+#define FUNC_SUM   1u
+#define FUNC_AVG   2u
+#define FUNC_MIN   3u
+#define FUNC_MAX   4u
+
+layout(std430, binding = 0) readonly buffer KeyBuf   { uint keys[]; };
+layout(std430, binding = 1) readonly buffer Arg0Buf  { uint arg0[]; };
+layout(std430, binding = 2) readonly buffer Arg1Buf  { uint arg1[]; };
+layout(std430, binding = 3) readonly buffer Arg2Buf  { uint arg2[]; };
+layout(std430, binding = 4) readonly buffer Arg3Buf  { uint arg3[]; };
+layout(std430, binding = 5) buffer InfoBuf           { uint info[]; };
+layout(std430, binding = 6) buffer SumBuf            { uint sum_words[]; };
+layout(std430, binding = 7) buffer MinBuf            { int min_out[]; };
+layout(std430, binding = 8) buffer MaxBuf            { int max_out[]; };
+
+layout(push_constant) uniform PushConstants
+{
+  uint words[16];
+} pc;
+
+// tec: per group: one word for the count, then per expr a low and a high sum word (one word when sums are narrow)
+shared uint s_acc[SHARED_ACC_WORDS];
+// tec: per group and expr, a min then a max, signed so the atomics order them as numbers
+shared int s_mm[SHARED_MM_WORDS];
+
+// tec: how each column is read, worked out once in main. a value stored width bytes per row is a word shifted and masked plus the base,
+// a whole word column takes the same code with shift 0, mask all ones and no base
+uint key_log2;
+uint key_bits;
+uint key_mask;
+uint key_base;
+uint arg_log2_0;
+uint arg_bits_0;
+uint arg_mask_0;
+uint arg_base_0;
+uint arg_log2_1;
+uint arg_bits_1;
+uint arg_mask_1;
+uint arg_base_1;
+uint arg_log2_2;
+uint arg_bits_2;
+uint arg_mask_2;
+uint arg_base_2;
+uint arg_log2_3;
+uint arg_bits_3;
+uint arg_mask_3;
+uint arg_base_3;
+uint chunk_start;
+bool arg_seq_0;
+bool arg_seq_1;
+bool arg_seq_2;
+bool arg_seq_3;
+
+void
+setup_decode()
+{
+  chunk_start = pc.words[15];
+  uint key_width = pc.words[1] & 0xfu;
+  key_log2 = (key_width == 1u) ? 2u : ((key_width == 2u) ? 1u : 0u);
+  key_bits = (key_width == 1u) ? 8u : ((key_width == 2u) ? 16u : 32u);
+  key_mask = (key_width == 1u) ? 0xffu : ((key_width == 2u) ? 0xffffu : 0xffffffffu);
+  key_base = (key_width == 1u || key_width == 2u) ? pc.words[10] : 0u;
+
+  uint width_0 = (pc.words[1] >> 4u) & 0xfu;
+  arg_log2_0 = (width_0 == 1u) ? 2u : ((width_0 == 2u) ? 1u : 0u);
+  arg_bits_0 = (width_0 == 1u) ? 8u : ((width_0 == 2u) ? 16u : 32u);
+  arg_mask_0 = (width_0 == 1u) ? 0xffu : ((width_0 == 2u) ? 0xffffu : 0xffffffffu);
+  arg_base_0 = (width_0 == 1u || width_0 == 2u || width_0 == 3u) ? pc.words[3] : 0u;
+  arg_seq_0 = width_0 == 3u;
+
+  uint width_1 = (pc.words[1] >> 8u) & 0xfu;
+  arg_log2_1 = (width_1 == 1u) ? 2u : ((width_1 == 2u) ? 1u : 0u);
+  arg_bits_1 = (width_1 == 1u) ? 8u : ((width_1 == 2u) ? 16u : 32u);
+  arg_mask_1 = (width_1 == 1u) ? 0xffu : ((width_1 == 2u) ? 0xffffu : 0xffffffffu);
+  arg_base_1 = (width_1 == 1u || width_1 == 2u || width_1 == 3u) ? pc.words[5] : 0u;
+  arg_seq_1 = width_1 == 3u;
+
+  uint width_2 = (pc.words[1] >> 12u) & 0xfu;
+  arg_log2_2 = (width_2 == 1u) ? 2u : ((width_2 == 2u) ? 1u : 0u);
+  arg_bits_2 = (width_2 == 1u) ? 8u : ((width_2 == 2u) ? 16u : 32u);
+  arg_mask_2 = (width_2 == 1u) ? 0xffu : ((width_2 == 2u) ? 0xffffu : 0xffffffffu);
+  arg_base_2 = (width_2 == 1u || width_2 == 2u || width_2 == 3u) ? pc.words[9] : 0u;
+  arg_seq_2 = width_2 == 3u;
+
+  uint width_3 = (pc.words[1] >> 16u) & 0xfu;
+  arg_log2_3 = (width_3 == 1u) ? 2u : ((width_3 == 2u) ? 1u : 0u);
+  arg_bits_3 = (width_3 == 1u) ? 8u : ((width_3 == 2u) ? 16u : 32u);
+  arg_mask_3 = (width_3 == 1u) ? 0xffu : ((width_3 == 2u) ? 0xffffu : 0xffffffffu);
+  arg_base_3 = (width_3 == 1u || width_3 == 2u || width_3 == 3u) ? pc.words[11] : 0u;
+  arg_seq_3 = width_3 == 3u;
+}
+
+// tec: the value of row `row` of argument column `a`, as the word of its type
+uint
+read_arg(uint a, uint row)
+{
+  switch (a)
+  {
+    case 0u: if (arg_seq_0) { return arg_base_0 + chunk_start + row; } return arg_base_0 + ((arg0[row >> arg_log2_0] >> (((row & ((1u << arg_log2_0) - 1u)) * arg_bits_0) & 31u)) & arg_mask_0);
+    case 1u: if (arg_seq_1) { return arg_base_1 + chunk_start + row; } return arg_base_1 + ((arg1[row >> arg_log2_1] >> (((row & ((1u << arg_log2_1) - 1u)) * arg_bits_1) & 31u)) & arg_mask_1);
+    case 2u: if (arg_seq_2) { return arg_base_2 + chunk_start + row; } return arg_base_2 + ((arg2[row >> arg_log2_2] >> (((row & ((1u << arg_log2_2) - 1u)) * arg_bits_2) & 31u)) & arg_mask_2);
+    default: if (arg_seq_3) { return arg_base_3 + chunk_start + row; } return arg_base_3 + ((arg3[row >> arg_log2_3] >> (((row & ((1u << arg_log2_3) - 1u)) * arg_bits_3) & 31u)) & arg_mask_3);
+  }
+}
+
+// tec: the key of row `row`
+uint
+read_key(uint row)
+{
+  return key_base + ((keys[row >> key_log2] >> (((row & ((1u << key_log2) - 1u)) * key_bits) & 31u)) & key_mask);
+}
+
+// tec: counts one row into the tile's shared accumulators if its group is in the tile
+void
+count_row(uint row, uint key, int min_key, uint base_group, uint tile_size, uint num_exprs, uint func_codes, uint arg_index, uint arg_signed,
+          uint stride, uint mm_stride)
+{
+  int id = int(key) - min_key - int(base_group);
+  if (id < 0 || uint(id) >= tile_size)
+  {
+    return;
+  }
+  uint base = uint(id) * stride;
+  uint mm_base = uint(id) * mm_stride;
+  atomicAdd(s_acc[base], 1u);
+
+  for (uint e = 0u; e < num_exprs; e++)
+  {
+    uint func = (func_codes >> (e * 4u)) & 0xfu;
+    if (func == FUNC_COUNT)
+    {
+      continue;
+    }
+
+    uint a = (arg_index >> (e * 4u)) & 0xfu;
+    uint word = read_arg(a, row);
+
+    if (func == FUNC_SUM || func == FUNC_AVG)
+    {
+      if ((arg_signed & 0x80000000u) != 0u)
+      {
+        atomicAdd(s_acc[base + 1u + e], word);
+      }
+      else
+      {
+        bool is_signed = ((arg_signed >> a) & 1u) != 0u;
+        uint entry = base + 1u + e * 2u;
+        uint before = atomicAdd(s_acc[entry], word);
+        uint high_add = ((is_signed && int(word) < 0) ? 0xffffffffu : 0u) + ((before + word < before) ? 1u : 0u);
+        if (high_add != 0u)
+        {
+          atomicAdd(s_acc[entry + 1u], high_add);
+        }
+      }
+    }
+    else if (func == FUNC_MIN)
+    {
+      atomicMin(s_mm[mm_base + e * 2u], int(word));
+    }
+    else if (func == FUNC_MAX)
+    {
+      atomicMax(s_mm[mm_base + e * 2u + 1u], int(word));
+    }
+  }
+}
+
+void
+main()
+{
+  uint row_count   = pc.words[0];
+  uint num_exprs   = pc.words[2];
+  uint func_codes  = pc.words[4];
+  uint arg_index   = pc.words[6];
+  uint arg_signed  = pc.words[7];
+  uint num_groups  = pc.words[8];
+  int  min_key     = int(pc.words[10]);
+  uint tile_groups = pc.words[12];
+  uint slice_rows  = pc.words[13];
+  uint tile_count  = pc.words[14];
+
+  uint thread = gl_LocalInvocationID.x;
+  setup_decode();
+
+  bool narrow = (arg_signed & 0x80000000u) != 0u;
+  uint stride = 1u + num_exprs * (narrow ? 1u : 2u);
+  stride |= 1u;
+  uint mm_stride = 0u;
+  for (uint e = 0u; e < num_exprs; e++)
+  {
+    uint func = (func_codes >> (e * 4u)) & 0xfu;
+    if (func == FUNC_MIN || func == FUNC_MAX)
+    {
+      mm_stride = num_exprs * 2u;
+    }
+  }
+  mm_stride |= (mm_stride != 0u) ? 1u : 0u;
+
+  uint first = gl_WorkGroupID.x * slice_rows;
+  uint last = min(first + slice_rows, row_count);u
+
+
+  for (uint tile = 0u; tile < tile_count; tile++)
+  {
+    uint base_group = tile * tile_groups;
+    uint tile_size = min(tile_groups, num_groups - base_group);
+
+    for (uint i = thread; i < tile_size * stride; i += 256u)
+    {
+      s_acc[i] = 0u;
+    }
+    for (uint i = thread; i < tile_size * mm_stride; i += 256u)
+    {
+      s_mm[i] = (((i % mm_stride) & 1u) == 0u) ? 0x7fffffff : int(0x80000000);
+    }
+    barrier();
+
+    // tec: UNROLL keys are loaded before any is used, so a thread has that many loads in flight instead of one
+    for (uint row = first + thread; row < last; row += 256u * UNROLL)
+    {
+      uint keys_in_flight[UNROLL];
+      [[unroll]] for (uint u = 0u; u < UNROLL; u++)
+      {
+        uint at = row + u * 256u;
+        keys_in_flight[u] = (at < last) ? read_key(at) : 0u;
+      }
+      [[unroll]] for (uint u = 0u; u < UNROLL; u++)
+      {
+        uint at = row + u * 256u;
+        int id = int(keys_in_flight[u]) - min_key - int(base_group);
+        if (at < last && id >= 0 && uint(id) < tile_size)
+        {
+          count_row(at, keys_in_flight[u], min_key, base_group, tile_size, num_exprs, func_codes, arg_index, arg_signed, stride, mm_stride);
+        }
+      }
+    }
+    barrier();
+
+    // tec: fold the replicas of this workgroup into the global accumulators, skipping the groups it never saw
+    for (uint g = thread; g < tile_size; g += 256u)
+    {
+      uint base = g * stride;
+      uint count = s_acc[base];
+      if (count == 0u)
+      {
+        continue;
+      }
+
+      uint global_group = base_group + g;
+      atomicAdd(info[global_group * 2u + 1u], count);
+
+      for (uint e = 0u; e < num_exprs; e++)
+      {
+        uint func = (func_codes >> (e * 4u)) & 0xfu;
+        uint index = global_group * num_exprs + e;
+
+        if (func == FUNC_SUM || func == FUNC_AVG)
+        {
+          uint low;
+          uint high;
+          if (narrow)
+          {
+            // tec: a narrow sum is a signed 32 bit value, widened here
+            low = s_acc[base + 1u + e];
+            high = (int(low) < 0) ? 0xffffffffu : 0u;
+          }
+          else
+          {
+            low = s_acc[base + 1u + e * 2u];
+            high = s_acc[base + 1u + e * 2u + 1u];
+          }
+          uint before = atomicAdd(sum_words[index * 2u], low);
+          uint high_add = high + ((before + low < before) ? 1u : 0u);
+          if (high_add != 0u)
+          {
+            atomicAdd(sum_words[index * 2u + 1u], high_add);
+          }
+        }
+        else if (func == FUNC_MIN)
+        {
+          int value = s_mm[g * mm_stride + e * 2u];
+          atomicMin(min_out[index], value);
+        }
+        else if (func == FUNC_MAX)
+        {
+          int value = s_mm[g * mm_stride + e * 2u + 1u];
+          atomicMax(max_out[index], value);
+        }
+      }
+    }
+    barrier();
+  }
+}

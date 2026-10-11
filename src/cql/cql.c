@@ -1,88 +1,88 @@
 internal void
-gdb_init(void)
+cql_init(void)
 {
   ProfBeginFunction();
   
-  U64 state_arena_reserve_size = settings_u64(str8_lit("GDB_STATE_ARENA_RESERVE_SIZE"), GDB_STATE_ARENA_RESERVE_SIZE);
-  U64 state_arena_commit_size = settings_u64(str8_lit("GDB_STATE_ARENA_COMMIT_SIZE"), GDB_STATE_ARENA_COMMIT_SIZE);
+  U64 state_arena_reserve_size = settings_u64(str8_lit("CQL_STATE_ARENA_RESERVE_SIZE"), CQL_STATE_ARENA_RESERVE_SIZE);
+  U64 state_arena_commit_size = settings_u64(str8_lit("CQL_STATE_ARENA_COMMIT_SIZE"), CQL_STATE_ARENA_COMMIT_SIZE);
   Arena* arena = arena_alloc(.reserve_size=state_arena_reserve_size, .commit_size=state_arena_commit_size);
-  g_gdb_state = push_array(arena, GDB_State, 1);
-  g_gdb_state->arena = arena;
+  g_cql_state = push_array(arena, CQL_State, 1);
+  g_cql_state->arena = arena;
   
-  g_gdb_state->databases = NULL;
-  g_gdb_state->rw_mutex = os_rw_mutex_alloc();
+  g_cql_state->databases = NULL;
+  g_cql_state->rw_mutex = os_rw_mutex_alloc();
   
-  g_gdb_state->disk_backed_threshold_size = settings_u64(str8_lit("GDB_DISK_BACKED_THRESHOLD_SIZE"), GDB_DISK_BACKED_THRESHOLD_SIZE);
-  g_gdb_state->column_expand_count = settings_u64(str8_lit("GDB_COLUMN_EXPAND_COUNT"), GDB_COLUMN_EXPAND_COUNT);
-  g_gdb_state->column_variable_capacity_alloc_size = settings_u64(str8_lit("GDB_COLUMN_VARIABLE_CAPACITY_ALLOC_SIZE"), GDB_COLUMN_VARIABLE_CAPACITY_ALLOC_SIZE);
-  g_gdb_state->column_max_grow_by_size = settings_u64(str8_lit("GDB_COLUMN_MAX_GROW_BY_SIZE"), GDB_COLUMN_MAX_GROW_BY_SIZE);
-  g_gdb_state->table_expand_factor = settings_f64(str8_lit("GDB_TABLE_EXPAND_FACTOR"), GDB_TABLE_EXPAND_FACTOR);
-  g_gdb_state->dict_encode_min_rows = settings_u64(str8_lit("GDB_DICT_ENCODE_MIN_ROWS"), GDB_DICT_ENCODE_MIN_ROWS);
-  g_gdb_state->dict_encode_max_distinct = settings_u64(str8_lit("GDB_DICT_ENCODE_MAX_DISTINCT"), GDB_DICT_ENCODE_MAX_DISTINCT);
-  g_gdb_state->dict_encode_max_cardinality_ratio = settings_f64(str8_lit("GDB_DICT_ENCODE_MAX_CARDINALITY_RATIO"), GDB_DICT_ENCODE_MAX_CARDINALITY_RATIO);
+  g_cql_state->disk_backed_threshold_size = settings_u64(str8_lit("CQL_DISK_BACKED_THRESHOLD_SIZE"), CQL_DISK_BACKED_THRESHOLD_SIZE);
+  g_cql_state->column_expand_count = settings_u64(str8_lit("CQL_COLUMN_EXPAND_COUNT"), CQL_COLUMN_EXPAND_COUNT);
+  g_cql_state->column_variable_capacity_alloc_size = settings_u64(str8_lit("CQL_COLUMN_VARIABLE_CAPACITY_ALLOC_SIZE"), CQL_COLUMN_VARIABLE_CAPACITY_ALLOC_SIZE);
+  g_cql_state->column_max_grow_by_size = settings_u64(str8_lit("CQL_COLUMN_MAX_GROW_BY_SIZE"), CQL_COLUMN_MAX_GROW_BY_SIZE);
+  g_cql_state->table_expand_factor = settings_f64(str8_lit("CQL_TABLE_EXPAND_FACTOR"), CQL_TABLE_EXPAND_FACTOR);
+  g_cql_state->dict_encode_min_rows = settings_u64(str8_lit("CQL_DICT_ENCODE_MIN_ROWS"), CQL_DICT_ENCODE_MIN_ROWS);
+  g_cql_state->dict_encode_max_distinct = settings_u64(str8_lit("CQL_DICT_ENCODE_MAX_DISTINCT"), CQL_DICT_ENCODE_MAX_DISTINCT);
+  g_cql_state->dict_encode_max_cardinality_ratio = settings_f64(str8_lit("CQL_DICT_ENCODE_MAX_CARDINALITY_RATIO"), CQL_DICT_ENCODE_MAX_CARDINALITY_RATIO);
   
-  U64 zonemap_chunk_rows = settings_u64(str8_lit("GDB_ZONEMAP_CHUNK_ROWS"), GDB_ZONEMAP_CHUNK_ROWS);
+  U64 zonemap_chunk_rows = settings_u64(str8_lit("CQL_ZONEMAP_CHUNK_ROWS"), CQL_ZONEMAP_CHUNK_ROWS);
   if (!IsPow2(zonemap_chunk_rows))
   {
-    log_error("settings: GDB_ZONEMAP_CHUNK_ROWS (%llu) must be a power of two, using default (%d)", zonemap_chunk_rows, GDB_ZONEMAP_CHUNK_ROWS);
-    zonemap_chunk_rows = GDB_ZONEMAP_CHUNK_ROWS;
+    log_error("settings: CQL_ZONEMAP_CHUNK_ROWS (%llu) must be a power of two, using default (%d)", zonemap_chunk_rows, CQL_ZONEMAP_CHUNK_ROWS);
+    zonemap_chunk_rows = CQL_ZONEMAP_CHUNK_ROWS;
   }
-  g_gdb_state->zonemap_chunk_rows = zonemap_chunk_rows;
-  g_gdb_state->zonemap_chunk_rows_log2 = 0;
-  while (((U64)1 << g_gdb_state->zonemap_chunk_rows_log2) < zonemap_chunk_rows)
+  g_cql_state->zonemap_chunk_rows = zonemap_chunk_rows;
+  g_cql_state->zonemap_chunk_rows_log2 = 0;
+  while (((U64)1 << g_cql_state->zonemap_chunk_rows_log2) < zonemap_chunk_rows)
   {
-    g_gdb_state->zonemap_chunk_rows_log2++;
+    g_cql_state->zonemap_chunk_rows_log2++;
   }
   
   ProfEnd();
 }
 
 internal void
-gdb_release(void)
+cql_release(void)
 {
-  os_mutex_release(g_gdb_state->rw_mutex);
-  arena_release(g_gdb_state->arena);
+  os_mutex_release(g_cql_state->rw_mutex);
+  arena_release(g_cql_state->arena);
 }
 
 internal void
-gdb_add_database(GDB_Database* database)
+cql_add_database(CQL_Database* database)
 {
   ProfBeginFunction();
   
-  OS_MutexScopeW(g_gdb_state->rw_mutex)
+  OS_MutexScopeW(g_cql_state->rw_mutex)
   {
-    if (g_gdb_state->database_count == 0)
+    if (g_cql_state->database_count == 0)
     {
-      g_gdb_state->databases = push_array(g_gdb_state->arena, GDB_Database*, 2);
-      g_gdb_state->database_capacity = 2;
+      g_cql_state->databases = push_array(g_cql_state->arena, CQL_Database*, 2);
+      g_cql_state->database_capacity = 2;
     }
-    else if (g_gdb_state->database_count >= g_gdb_state->database_capacity)
+    else if (g_cql_state->database_count >= g_cql_state->database_capacity)
     {
-      U64 new_capacity = g_gdb_state->database_capacity * 2;
-      GDB_Database** new_databases = push_array(g_gdb_state->arena, GDB_Database*, new_capacity);
-      MemoryCopy(new_databases, g_gdb_state->databases, sizeof(GDB_Database*) * g_gdb_state->database_count);
-      g_gdb_state->databases = new_databases;
-      g_gdb_state->database_capacity = new_capacity;
+      U64 new_capacity = g_cql_state->database_capacity * 2;
+      CQL_Database** new_databases = push_array(g_cql_state->arena, CQL_Database*, new_capacity);
+      MemoryCopy(new_databases, g_cql_state->databases, sizeof(CQL_Database*) * g_cql_state->database_count);
+      g_cql_state->databases = new_databases;
+      g_cql_state->database_capacity = new_capacity;
     }
     
-    g_gdb_state->databases[g_gdb_state->database_count++] = database;
+    g_cql_state->databases[g_cql_state->database_count++] = database;
   }
   
   ProfEnd();
 }
 
-internal GDB_Database*
-gdb_state_find_database_by_name(String8 name)
+internal CQL_Database*
+cql_state_find_database_by_name(String8 name)
 {
-  GDB_Database* found = 0;
+  CQL_Database* found = 0;
   
-  OS_MutexScopeR(g_gdb_state->rw_mutex)
+  OS_MutexScopeR(g_cql_state->rw_mutex)
   {
-    for (U64 i = 0; i < g_gdb_state->database_count; i++)
+    for (U64 i = 0; i < g_cql_state->database_count; i++)
     {
-      if (str8_match(g_gdb_state->databases[i]->name, name, 0))
+      if (str8_match(g_cql_state->databases[i]->name, name, 0))
       {
-        found = g_gdb_state->databases[i];
+        found = g_cql_state->databases[i];
         break;
       }
     }
@@ -92,13 +92,13 @@ gdb_state_find_database_by_name(String8 name)
 }
 
 //~ tec: database
-internal GDB_Database*
-gdb_database_alloc(String8 name)
+internal CQL_Database*
+cql_database_alloc(String8 name)
 {
   Arena* arena = arena_alloc(
-                             .reserve_size=settings_u64(str8_lit("GDB_DATABASE_ARENA_RESERVE_SIZE"), GDB_DATABASE_ARENA_RESERVE_SIZE),
-                             .commit_size=settings_u64(str8_lit("GDB_DATABASE_ARENA_COMMIT_SIZE"), GDB_DATABASE_ARENA_COMMIT_SIZE));
-  GDB_Database* database = push_array(arena, GDB_Database, 1);
+                             .reserve_size=settings_u64(str8_lit("CQL_DATABASE_ARENA_RESERVE_SIZE"), CQL_DATABASE_ARENA_RESERVE_SIZE),
+                             .commit_size=settings_u64(str8_lit("CQL_DATABASE_ARENA_COMMIT_SIZE"), CQL_DATABASE_ARENA_COMMIT_SIZE));
+  CQL_Database* database = push_array(arena, CQL_Database, 1);
   
   database->name = push_str8_copy(arena, name);
   database->tables = NULL;
@@ -108,24 +108,24 @@ gdb_database_alloc(String8 name)
 }
 
 internal void
-gdb_database_release(GDB_Database* database)
+cql_database_release(CQL_Database* database)
 {
   arena_release(database->arena);
 }
 
 internal void
-gdb_database_add_table(GDB_Database* database, GDB_Table* table)
+cql_database_add_table(CQL_Database* database, CQL_Table* table)
 {
   if (database->table_count == 0)
   {
-    database->tables = push_array(database->arena, GDB_Table*, 2);
+    database->tables = push_array(database->arena, CQL_Table*, 2);
     database->table_capacity = 2;
   }
   else if (database->table_count >= database->table_capacity)
   {
     U64 new_capacity = database->table_capacity * 2;
-    GDB_Table** new_tables = push_array(database->arena, GDB_Table*, new_capacity);
-    MemoryCopy(new_tables, database->tables, sizeof(GDB_Table*) * database->table_count);
+    CQL_Table** new_tables = push_array(database->arena, CQL_Table*, new_capacity);
+    MemoryCopy(new_tables, database->tables, sizeof(CQL_Table*) * database->table_count);
     database->tables = new_tables;
     database->table_capacity = new_capacity;
   }
@@ -135,18 +135,18 @@ gdb_database_add_table(GDB_Database* database, GDB_Table* table)
 }
 
 internal void
-gdb_database_replace_table(GDB_Database* database, GDB_Table* new_table)
+cql_database_replace_table(CQL_Database* database, CQL_Table* new_table)
 {
   for (U64 i = 0; i < database->table_count; i++)
   {
-    GDB_Table* old_table = database->tables[i];
+    CQL_Table* old_table = database->tables[i];
     if (str8_match(old_table->name, new_table->name, 0))
     {
       for (U64 c = 0; c < old_table->column_count; c++)
       {
-        gdb_column_close(old_table->columns[c]);
+        cql_column_close(old_table->columns[c]);
       }
-      gdb_table_release(old_table);
+      cql_table_release(old_table);
       
       new_table->parent_database = database;
       database->tables[i] = new_table;
@@ -154,22 +154,22 @@ gdb_database_replace_table(GDB_Database* database, GDB_Table* new_table)
     }
   }
   
-  gdb_database_add_table(database, new_table);
+  cql_database_add_table(database, new_table);
 }
 
 internal void
-gdb_database_add_enum_type(GDB_Database* database, GDB_EnumType* enum_type)
+cql_database_add_enum_type(CQL_Database* database, CQL_EnumType* enum_type)
 {
   if (database->enum_type_count == 0)
   {
-    database->enum_types = push_array(database->arena, GDB_EnumType*, 2);
+    database->enum_types = push_array(database->arena, CQL_EnumType*, 2);
     database->enum_type_capacity = 2;
   }
   else if (database->enum_type_count >= database->enum_type_capacity)
   {
     U64 new_capacity = database->enum_type_capacity * 2;
-    GDB_EnumType** new_enum_types = push_array(database->arena, GDB_EnumType*, new_capacity);
-    MemoryCopy(new_enum_types, database->enum_types, sizeof(GDB_EnumType*) * database->enum_type_count);
+    CQL_EnumType** new_enum_types = push_array(database->arena, CQL_EnumType*, new_capacity);
+    MemoryCopy(new_enum_types, database->enum_types, sizeof(CQL_EnumType*) * database->enum_type_count);
     database->enum_types = new_enum_types;
     database->enum_type_capacity = new_capacity;
   }
@@ -177,8 +177,8 @@ gdb_database_add_enum_type(GDB_Database* database, GDB_EnumType* enum_type)
   database->enum_types[database->enum_type_count++] = enum_type;
 }
 
-internal GDB_EnumType*
-gdb_database_find_enum_type(GDB_Database* database, String8 name)
+internal CQL_EnumType*
+cql_database_find_enum_type(CQL_Database* database, String8 name)
 {
   if (!database) return NULL;
   for (U64 i = 0; i < database->enum_type_count; i++)
@@ -192,7 +192,7 @@ gdb_database_find_enum_type(GDB_Database* database, String8 name)
 }
 
 internal B32
-gdb_enum_type_code_from_label(GDB_EnumType* enum_type, String8 label, U32* out_code)
+cql_enum_type_code_from_label(CQL_EnumType* enum_type, String8 label, U32* out_code)
 {
   for (U32 i = 0; i < enum_type->value_count; i++)
   {
@@ -206,14 +206,14 @@ gdb_enum_type_code_from_label(GDB_EnumType* enum_type, String8 label, U32* out_c
 }
 
 internal String8
-gdb_enum_type_label_from_code(GDB_EnumType* enum_type, U32 code)
+cql_enum_type_label_from_code(CQL_EnumType* enum_type, U32 code)
 {
   if (code >= enum_type->value_count) return str8_lit("?");
   return enum_type->value_labels[code];
 }
 
 internal B32
-gdb_database_save(GDB_Database* database, String8 directory)
+cql_database_save(CQL_Database* database, String8 directory)
 {
   ProfBeginFunction();
   
@@ -230,7 +230,7 @@ gdb_database_save(GDB_Database* database, String8 directory)
     U64 meta_size = sizeof(U64);
     for (U64 i = 0; i < database->enum_type_count; i++)
     {
-      GDB_EnumType* enum_type = database->enum_types[i];
+      CQL_EnumType* enum_type = database->enum_types[i];
       meta_size += sizeof(U64) + enum_type->name.size + sizeof(U32);
       for (U32 v = 0; v < enum_type->value_count; v++)
       {
@@ -244,7 +244,7 @@ gdb_database_save(GDB_Database* database, String8 directory)
     *(U64*)meta_ptr = database->enum_type_count; meta_ptr += sizeof(U64);
     for (U64 i = 0; i < database->enum_type_count; i++)
     {
-      GDB_EnumType* enum_type = database->enum_types[i];
+      CQL_EnumType* enum_type = database->enum_types[i];
       
       *(U64*)meta_ptr = enum_type->name.size; meta_ptr += sizeof(U64);
       MemoryCopy(meta_ptr, enum_type->name.str, enum_type->name.size);
@@ -274,7 +274,7 @@ gdb_database_save(GDB_Database* database, String8 directory)
   
   for (U64 i = 0; i < database->table_count; i++)
   {
-    GDB_Table* table = database->tables[i];
+    CQL_Table* table = database->tables[i];
     String8 table_dir = push_str8f(scratch.arena, "%.*s/%.*s", str8_varg(directory), str8_varg(table->name));
     
     if (!os_make_directory(table_dir))
@@ -284,7 +284,7 @@ gdb_database_save(GDB_Database* database, String8 directory)
       return 0;
     }
     
-    if (!gdb_table_save(table, table_dir))
+    if (!cql_table_save(table, table_dir))
     {
       log_error("failed to save table: %s", table->name.str);
       ProfEnd();
@@ -297,12 +297,12 @@ gdb_database_save(GDB_Database* database, String8 directory)
   return 1;
 }
 
-internal GDB_Database*
-gdb_database_load(String8 directory_path)
+internal CQL_Database*
+cql_database_load(String8 directory_path)
 {
   ProfBeginFunction();
   
-  GDB_Database* database = gdb_database_alloc(str8_lit("temp"));
+  CQL_Database* database = cql_database_alloc(str8_lit("temp"));
   Temp scratch = scratch_begin(0, 0);
   
   {
@@ -347,7 +347,7 @@ gdb_database_load(String8 directory_path)
           }
           U32 value_count = *(U32*)read_ptr; read_ptr += sizeof(U32);
           
-          GDB_EnumType* enum_type = push_array(database->arena, GDB_EnumType, 1);
+          CQL_EnumType* enum_type = push_array(database->arena, CQL_EnumType, 1);
           enum_type->name = name;
           enum_type->value_count = value_count;
           enum_type->value_labels = push_array(database->arena, String8, Max(value_count, 1));
@@ -373,7 +373,7 @@ gdb_database_load(String8 directory_path)
             enum_type->value_labels[v] = label;
           }
           
-          gdb_database_add_enum_type(database, enum_type);
+          cql_database_add_enum_type(database, enum_type);
           if (truncated) break;
         }
       }
@@ -386,10 +386,10 @@ gdb_database_load(String8 directory_path)
   {
     String8 table_dir = push_str8_cat(scratch.arena, directory_path, info.name);
     String8 meta_path = push_str8f(scratch.arena, "%.*s/%.*s.meta", str8_varg(table_dir), str8_varg(info.name));
-    GDB_Table* table = gdb_table_load(database, table_dir, meta_path);
+    CQL_Table* table = cql_table_load(database, table_dir, meta_path);
     if (table)
     {
-      gdb_database_add_table(database, table);
+      cql_database_add_table(database, table);
     }
     else
     {
@@ -403,18 +403,18 @@ gdb_database_load(String8 directory_path)
 }
 
 internal void
-gdb_database_close(GDB_Database* database)
+cql_database_close(CQL_Database* database)
 {
   
 }
 
-internal GDB_Table*
-gdb_database_find_table(GDB_Database* database, String8 table_name)
+internal CQL_Table*
+cql_database_find_table(CQL_Database* database, String8 table_name)
 {
   ProfBeginFunction();
   for (U64 i = 0; i < database->table_count; i++)
   {
-    GDB_Table* table = database->tables[i];
+    CQL_Table* table = database->tables[i];
     if (str8_match(table->name, table_name, 0))
     {
       ProfEnd();
@@ -428,7 +428,7 @@ gdb_database_find_table(GDB_Database* database, String8 table_name)
 
 
 internal B32
-gdb_database_contains_table(GDB_Database* database, String8 table_name)
+cql_database_contains_table(CQL_Database* database, String8 table_name)
 {
   ProfBeginFunction();
   
@@ -446,12 +446,12 @@ gdb_database_contains_table(GDB_Database* database, String8 table_name)
 
 
 //~ tec: tables
-internal GDB_Table*
-gdb_table_alloc(String8 name)
+internal CQL_Table*
+cql_table_alloc(String8 name)
 {
-  Arena* arena = arena_alloc(.reserve_size=settings_u64(str8_lit("GDB_TABLE_ARENA_RESERVE_SIZE"), GDB_TABLE_ARENA_RESERVE_SIZE),
-                             .commit_size=settings_u64(str8_lit("GDB_TABLE_ARENA_COMMIT_SIZE"), GDB_TABLE_ARENA_COMMIT_SIZE));
-  GDB_Table* table = push_array(arena, GDB_Table, 1);
+  Arena* arena = arena_alloc(.reserve_size=settings_u64(str8_lit("CQL_TABLE_ARENA_RESERVE_SIZE"), CQL_TABLE_ARENA_RESERVE_SIZE),
+                             .commit_size=settings_u64(str8_lit("CQL_TABLE_ARENA_COMMIT_SIZE"), CQL_TABLE_ARENA_COMMIT_SIZE));
+  CQL_Table* table = push_array(arena, CQL_Table, 1);
   
   table->name = push_str8_copy(arena, name);
   table->arena = arena;
@@ -460,31 +460,31 @@ gdb_table_alloc(String8 name)
 }
 
 internal void
-gdb_table_release(GDB_Table* table)
+cql_table_release(CQL_Table* table)
 {
   arena_release(table->arena);
 }
 
 internal void
-gdb_table_add_column(GDB_Table* table, GDB_ColumnSchema schema)
+cql_table_add_column(CQL_Table* table, CQL_ColumnSchema schema)
 {
   ProfBeginFunction();
   
   if (table->column_count == 0)
   {
-    table->columns = push_array(table->arena, GDB_Column*, 2);
+    table->columns = push_array(table->arena, CQL_Column*, 2);
     table->column_capacity = 2;
   }
   else if (table->column_count >= table->column_capacity)
   {
-    U64 new_capacity = (U64)ceil_f64(table->column_capacity * g_gdb_state->table_expand_factor);
-    GDB_Column** new_columns = push_array(table->arena, GDB_Column*, new_capacity);
-    MemoryCopy(new_columns, table->columns, sizeof(GDB_Column*) * table->column_count);
+    U64 new_capacity = (U64)ceil_f64(table->column_capacity * g_cql_state->table_expand_factor);
+    CQL_Column** new_columns = push_array(table->arena, CQL_Column*, new_capacity);
+    MemoryCopy(new_columns, table->columns, sizeof(CQL_Column*) * table->column_count);
     table->columns = new_columns;
     table->column_capacity = new_capacity;
   }
   
-  GDB_Column* column = gdb_column_alloc(schema.name, schema.type, schema.size);
+  CQL_Column* column = cql_column_alloc(schema.name, schema.type, schema.size);
   column->parent_table = table;
   table->columns[table->column_count++] = column;
   
@@ -492,7 +492,7 @@ gdb_table_add_column(GDB_Table* table, GDB_ColumnSchema schema)
 }
 
 internal void
-gdb_table_remove_column(GDB_Table* table, GDB_Column* column)
+cql_table_remove_column(CQL_Table* table, CQL_Column* column)
 {
   ProfBeginFunction();
   
@@ -504,7 +504,7 @@ gdb_table_remove_column(GDB_Table* table, GDB_Column* column)
   
   if (slot >= table->column_count)
   {
-    log_error("gdb_table_remove_column: column '%.*s' does not belong to table '%.*s'",
+    log_error("cql_table_remove_column: column '%.*s' does not belong to table '%.*s'",
               str8_varg(column->name), str8_varg(table->name));
     ProfEnd();
     return;
@@ -515,11 +515,11 @@ gdb_table_remove_column(GDB_Table* table, GDB_Column* column)
   {
     if (table->indexes[i]->column == column)
     {
-      gdb_table_drop_index(table, table->indexes[i]->name);
+      cql_table_drop_index(table, table->indexes[i]->name);
     }
   }
   
-  gdb_column_close(column);
+  cql_column_close(column);
   if (column->is_disk_backed)
   {
     os_delete_file_at_path(column->disk_path);
@@ -528,11 +528,11 @@ gdb_table_remove_column(GDB_Table* table, GDB_Column* column)
   {
     // tec: is_disk_backed only reflects this process's in-memory state, it could be stale
     Temp scratch = scratch_begin(0, 0);
-    String8 stale_path = gdb_generate_disk_path_for_column(scratch.arena, column);
+    String8 stale_path = cql_generate_disk_path_for_column(scratch.arena, column);
     os_delete_file_at_path(stale_path);
     scratch_end(scratch);
   }
-  gdb_column_release(column);
+  cql_column_release(column);
   
   for (U64 i = slot; i + 1 < table->column_count; i++)
   {
@@ -544,11 +544,11 @@ gdb_table_remove_column(GDB_Table* table, GDB_Column* column)
 }
 
 internal void
-gdb_table_add_row(GDB_Table* table, void** row_data, B32* null_flags)
+cql_table_add_row(CQL_Table* table, void** row_data, B32* null_flags)
 {
   for (U64 i = 0; i < table->column_count; ++i)
   {
-    gdb_column_add_data_maybe_null(table->columns[i], row_data[i], null_flags ? null_flags[i] : 0);
+    cql_column_add_data_maybe_null(table->columns[i], row_data[i], null_flags ? null_flags[i] : 0);
   }
   
   U64 new_row_index = table->row_count;
@@ -556,12 +556,12 @@ gdb_table_add_row(GDB_Table* table, void** row_data, B32* null_flags)
   
   for (U64 i = 0; i < table->index_count; i++)
   {
-    gdb_index_insert_row(table->indexes[i], new_row_index);
+    cql_index_insert_row(table->indexes[i], new_row_index);
   }
 }
 
 internal B32
-gdb_table_may_have_nulls(GDB_Table* table)
+cql_table_may_have_nulls(CQL_Table* table)
 {
   for (U64 i = 0; i < table->column_count; i++)
   {
@@ -571,7 +571,7 @@ gdb_table_may_have_nulls(GDB_Table* table)
 }
 
 internal void
-gdb_table_remove_row(GDB_Table* table, U64 row_index)
+cql_table_remove_row(CQL_Table* table, U64 row_index)
 {
   if (row_index >= table->row_count)
   {
@@ -581,19 +581,19 @@ gdb_table_remove_row(GDB_Table* table, U64 row_index)
   
   for (U64 i = 0; i < table->column_count; ++i)
   {
-    gdb_column_remove_data(table->columns[i], row_index);
+    cql_column_remove_data(table->columns[i], row_index);
   }
   
   for (U64 i = 0; i < table->index_count; i++)
   {
-    gdb_index_remove_row(table->indexes[i], row_index);
+    cql_index_remove_row(table->indexes[i], row_index);
   }
   
   table->row_count--;
 }
 
 internal B32
-gdb_table_save(GDB_Table* table, String8 table_dir)
+cql_table_save(CQL_Table* table, String8 table_dir)
 {
   ProfBeginFunction();
   
@@ -611,15 +611,15 @@ gdb_table_save(GDB_Table* table, String8 table_dir)
     U64 meta_size = sizeof(U64) * 2;
     for (U64 i = 0; i < table->column_count; i++)
     {
-      GDB_Column* column = table->columns[i];
-      meta_size += sizeof(GDB_ColumnType) + (sizeof(U64) * 3) + column->name.size;
+      CQL_Column* column = table->columns[i];
+      meta_size += sizeof(CQL_ColumnType) + (sizeof(U64) * 3) + column->name.size;
     }
     
     // tec: trailing, optional index declaration section
     meta_size += sizeof(U64);
     for (U64 i = 0; i < table->index_count; i++)
     {
-      GDB_Index* index = table->indexes[i];
+      CQL_Index* index = table->indexes[i];
       meta_size += sizeof(U64) + index->name.size + sizeof(U64) + index->column_name.size;
     }
     
@@ -627,7 +627,7 @@ gdb_table_save(GDB_Table* table, String8 table_dir)
     meta_size += sizeof(U64);
     for (U64 i = 0; i < table->column_count; i++)
     {
-      GDB_Column* column = table->columns[i];
+      CQL_Column* column = table->columns[i];
       if (column->null_flags) meta_size += sizeof(U64) + column->name.size;
     }
     
@@ -635,8 +635,8 @@ gdb_table_save(GDB_Table* table, String8 table_dir)
     meta_size += sizeof(U64);
     for (U64 i = 0; i < table->column_count; i++)
     {
-      GDB_Column* column = table->columns[i];
-      if (!gdb_column_has_any_constraint(column)) continue;
+      CQL_Column* column = table->columns[i];
+      if (!cql_column_has_any_constraint(column)) continue;
       
       meta_size += sizeof(U64) + column->name.size; // tec: column name
       meta_size += sizeof(U64);                     // tec: flags bitfield
@@ -654,8 +654,8 @@ gdb_table_save(GDB_Table* table, String8 table_dir)
     meta_size += sizeof(U64);
     for (U64 i = 0; i < table->column_count; i++)
     {
-      GDB_Column* column = table->columns[i];
-      if (column->type != GDB_ColumnType_Decimal) continue;
+      CQL_Column* column = table->columns[i];
+      if (column->type != CQL_ColumnType_Decimal) continue;
       meta_size += sizeof(U64) + column->name.size + sizeof(U32) + sizeof(U32);
     }
     
@@ -663,8 +663,8 @@ gdb_table_save(GDB_Table* table, String8 table_dir)
     meta_size += sizeof(U64);
     for (U64 i = 0; i < table->column_count; i++)
     {
-      GDB_Column* column = table->columns[i];
-      if (column->type != GDB_ColumnType_Enum || !column->enum_type) continue;
+      CQL_Column* column = table->columns[i];
+      if (column->type != CQL_ColumnType_Enum || !column->enum_type) continue;
       meta_size += sizeof(U64) + column->name.size + sizeof(U64) + column->enum_type->name.size;
     }
     
@@ -672,7 +672,7 @@ gdb_table_save(GDB_Table* table, String8 table_dir)
     meta_size += sizeof(U64);
     for (U64 i = 0; i < table->column_count; i++)
     {
-      GDB_Column* column = table->columns[i];
+      CQL_Column* column = table->columns[i];
       if (!column->has_zone_map) continue;
       meta_size += sizeof(U64) + column->name.size + sizeof(U64) +
         column->zone_map_chunk_count * (sizeof(F64) * 2 + sizeof(U32));
@@ -682,12 +682,12 @@ gdb_table_save(GDB_Table* table, String8 table_dir)
     meta_size += sizeof(U64);
     for (U64 i = 0; i < table->column_count; i++)
     {
-      GDB_Column* column = table->columns[i];
-      if (!gdb_column_stats_is_current(column))
+      CQL_Column* column = table->columns[i];
+      if (!cql_column_stats_is_current(column))
       {
         continue;
       }
-      meta_size += gdb_column_stats_record_size(column);
+      meta_size += cql_column_stats_record_size(column);
     }
     
     U8* meta_buffer = push_array(scratch.arena, U8, meta_size);
@@ -698,9 +698,9 @@ gdb_table_save(GDB_Table* table, String8 table_dir)
     
     for (U64 i = 0; i < table->column_count; i++)
     {
-      GDB_Column* column = table->columns[i];
+      CQL_Column* column = table->columns[i];
       
-      *(GDB_ColumnType*)meta_ptr = column->type; meta_ptr += sizeof(GDB_ColumnType);
+      *(CQL_ColumnType*)meta_ptr = column->type; meta_ptr += sizeof(CQL_ColumnType);
       *(U64*)meta_ptr = column->size; meta_ptr += sizeof(U64);
       *(U64*)meta_ptr = column->capacity; meta_ptr += sizeof(U64);
       *(U64*)meta_ptr = column->name.size; meta_ptr += sizeof(U64);
@@ -711,7 +711,7 @@ gdb_table_save(GDB_Table* table, String8 table_dir)
     *(U64*)meta_ptr = table->index_count; meta_ptr += sizeof(U64);
     for (U64 i = 0; i < table->index_count; i++)
     {
-      GDB_Index* index = table->indexes[i];
+      CQL_Index* index = table->indexes[i];
       
       *(U64*)meta_ptr = index->name.size; meta_ptr += sizeof(U64);
       MemoryCopy(meta_ptr, index->name.str, index->name.size);
@@ -734,7 +734,7 @@ gdb_table_save(GDB_Table* table, String8 table_dir)
     *(U64*)meta_ptr = null_column_count; meta_ptr += sizeof(U64);
     for (U64 i = 0; i < table->column_count; i++)
     {
-      GDB_Column* column = table->columns[i];
+      CQL_Column* column = table->columns[i];
       if (!column->null_flags) continue;
       
       *(U64*)meta_ptr = column->name.size; meta_ptr += sizeof(U64);
@@ -745,14 +745,14 @@ gdb_table_save(GDB_Table* table, String8 table_dir)
     U64 constraint_column_count = 0;
     for (U64 i = 0; i < table->column_count; i++)
     {
-      if (gdb_column_has_any_constraint(table->columns[i])) constraint_column_count++;
+      if (cql_column_has_any_constraint(table->columns[i])) constraint_column_count++;
     }
     
     *(U64*)meta_ptr = constraint_column_count; meta_ptr += sizeof(U64);
     for (U64 i = 0; i < table->column_count; i++)
     {
-      GDB_Column* column = table->columns[i];
-      if (!gdb_column_has_any_constraint(column)) continue;
+      CQL_Column* column = table->columns[i];
+      if (!cql_column_has_any_constraint(column)) continue;
       
       *(U64*)meta_ptr = column->name.size; meta_ptr += sizeof(U64);
       MemoryCopy(meta_ptr, column->name.str, column->name.size);
@@ -788,14 +788,14 @@ gdb_table_save(GDB_Table* table, String8 table_dir)
     U64 decimal_column_count = 0;
     for (U64 i = 0; i < table->column_count; i++)
     {
-      if (table->columns[i]->type == GDB_ColumnType_Decimal) decimal_column_count++;
+      if (table->columns[i]->type == CQL_ColumnType_Decimal) decimal_column_count++;
     }
     
     *(U64*)meta_ptr = decimal_column_count; meta_ptr += sizeof(U64);
     for (U64 i = 0; i < table->column_count; i++)
     {
-      GDB_Column* column = table->columns[i];
-      if (column->type != GDB_ColumnType_Decimal) continue;
+      CQL_Column* column = table->columns[i];
+      if (column->type != CQL_ColumnType_Decimal) continue;
       
       *(U64*)meta_ptr = column->name.size; meta_ptr += sizeof(U64);
       MemoryCopy(meta_ptr, column->name.str, column->name.size);
@@ -808,15 +808,15 @@ gdb_table_save(GDB_Table* table, String8 table_dir)
     U64 enum_column_count = 0;
     for (U64 i = 0; i < table->column_count; i++)
     {
-      GDB_Column* column = table->columns[i];
-      if (column->type == GDB_ColumnType_Enum && column->enum_type) enum_column_count++;
+      CQL_Column* column = table->columns[i];
+      if (column->type == CQL_ColumnType_Enum && column->enum_type) enum_column_count++;
     }
     
     *(U64*)meta_ptr = enum_column_count; meta_ptr += sizeof(U64);
     for (U64 i = 0; i < table->column_count; i++)
     {
-      GDB_Column* column = table->columns[i];
-      if (column->type != GDB_ColumnType_Enum || !column->enum_type) continue;
+      CQL_Column* column = table->columns[i];
+      if (column->type != CQL_ColumnType_Enum || !column->enum_type) continue;
       
       *(U64*)meta_ptr = column->name.size; meta_ptr += sizeof(U64);
       MemoryCopy(meta_ptr, column->name.str, column->name.size);
@@ -836,7 +836,7 @@ gdb_table_save(GDB_Table* table, String8 table_dir)
     *(U64*)meta_ptr = zone_map_column_count; meta_ptr += sizeof(U64);
     for (U64 i = 0; i < table->column_count; i++)
     {
-      GDB_Column* column = table->columns[i];
+      CQL_Column* column = table->columns[i];
       if (!column->has_zone_map) continue;
       
       *(U64*)meta_ptr = column->name.size; meta_ptr += sizeof(U64);
@@ -846,7 +846,7 @@ gdb_table_save(GDB_Table* table, String8 table_dir)
       *(U64*)meta_ptr = column->zone_map_chunk_count; meta_ptr += sizeof(U64);
       for (U64 c = 0; c < column->zone_map_chunk_count; c++)
       {
-        GDB_ZoneMapChunk* chunk = &column->zone_map[c];
+        CQL_ZoneMapChunk* chunk = &column->zone_map[c];
         *(F64*)meta_ptr = chunk->min; meta_ptr += sizeof(F64);
         *(F64*)meta_ptr = chunk->max; meta_ptr += sizeof(F64);
         *(U32*)meta_ptr = chunk->has_values; meta_ptr += sizeof(U32);
@@ -856,7 +856,7 @@ gdb_table_save(GDB_Table* table, String8 table_dir)
     U64 stats_column_count = 0;
     for (U64 i = 0; i < table->column_count; i++)
     {
-      if (gdb_column_stats_is_current(table->columns[i]))
+      if (cql_column_stats_is_current(table->columns[i]))
       {
         stats_column_count += 1;
       }
@@ -865,12 +865,12 @@ gdb_table_save(GDB_Table* table, String8 table_dir)
     *(U64*)meta_ptr = stats_column_count; meta_ptr += sizeof(U64);
     for (U64 i = 0; i < table->column_count; i++)
     {
-      GDB_Column* column = table->columns[i];
-      if (!gdb_column_stats_is_current(column))
+      CQL_Column* column = table->columns[i];
+      if (!cql_column_stats_is_current(column))
       {
         continue;
       }
-      meta_ptr = gdb_column_stats_write_record(meta_ptr, column);
+      meta_ptr = cql_column_stats_write_record(meta_ptr, column);
     }
     
     os_file_write(meta_file, r1u64(0, meta_size), meta_buffer);
@@ -882,8 +882,9 @@ gdb_table_save(GDB_Table* table, String8 table_dir)
   scratch = scratch_begin(0, 0);
   for (U64 i = 0; i < table->column_count; i++)
   {
-    GDB_Column* column = table->columns[i];
+    CQL_Column* column = table->columns[i];
     
+    cql_column_flush_pending(column);
     if (!column->is_disk_backed)
     {
       String8 column_path = push_str8f(scratch.arena, "%.*s/%.*s.dat", str8_varg(table_dir), str8_varg(column->name));
@@ -895,7 +896,7 @@ gdb_table_save(GDB_Table* table, String8 table_dir)
         //return 0;
       }
       
-      if (column->type == GDB_ColumnType_String8)
+      if (column->type == CQL_ColumnType_String8)
       {
         U64 header_size = sizeof(U64);
         U64 data_size = column->variable_capacity;
@@ -941,7 +942,7 @@ gdb_table_save(GDB_Table* table, String8 table_dir)
   //- tec: index order files
   for (U64 i = 0; i < table->index_count; i++)
   {
-    gdb_index_save(table->indexes[i], table_dir);
+    cql_index_save(table->indexes[i], table_dir);
   }
   
   ProfEnd();
@@ -949,7 +950,7 @@ gdb_table_save(GDB_Table* table, String8 table_dir)
 }
 
 internal B32
-gdb_table_export_csv(GDB_Table* table, String8 path)
+cql_table_export_csv(CQL_Table* table, String8 path)
 {
   ProfBeginFunction();
   
@@ -960,7 +961,7 @@ gdb_table_export_csv(GDB_Table* table, String8 path)
     return 0;
   }
   
-  Temp scratch = temp_begin(g_gdb_state->arena);
+  Temp scratch = temp_begin(g_cql_state->arena);
   U64 chunk_cap = KB(8);
   String8 chunk = str8_from_memory_size(scratch.arena, chunk_cap);
   chunk.size = 0;
@@ -999,67 +1000,67 @@ chunk.size += __s.size; \
   {
     for (U64 col = 0; col < table->column_count; col++)
     {
-      GDB_Column* column = table->columns[col];
+      CQL_Column* column = table->columns[col];
       String8 output = {0};
       
-      if (column->type == GDB_ColumnType_U64)
+      if (column->type == CQL_ColumnType_U64)
       {
-        U64* data = (U64*)gdb_column_get_data(column, row);
+        U64* data = (U64*)cql_column_get_data(column, row);
         output = str8_from_u64(scratch.arena, *data, 10, 0, 0);
       }
-      else if (column->type == GDB_ColumnType_U32)
+      else if (column->type == CQL_ColumnType_U32)
       {
-        U32* data = (U32*)gdb_column_get_data(column, row);
+        U32* data = (U32*)cql_column_get_data(column, row);
         output = str8_from_u64(scratch.arena, *data, 10, 0, 0);
       }
-      else if (column->type == GDB_ColumnType_F64)
+      else if (column->type == CQL_ColumnType_F64)
       {
-        F64* data = (F64*)gdb_column_get_data(column, row);
+        F64* data = (F64*)cql_column_get_data(column, row);
         output = str8_from_f64(scratch.arena, *data, 6);
       }
-      else if (column->type == GDB_ColumnType_F32)
+      else if (column->type == CQL_ColumnType_F32)
       {
-        F32* data = (F32*)gdb_column_get_data(column, row);
+        F32* data = (F32*)cql_column_get_data(column, row);
         output = str8_from_f64(scratch.arena, *data, 6);
       }
-      else if (column->type == GDB_ColumnType_String8)
+      else if (column->type == CQL_ColumnType_String8)
       {
-        output = gdb_column_get_string(scratch.arena, column, row);
+        output = cql_column_get_string(scratch.arena, column, row);
       }
-      else if (column->type == GDB_ColumnType_I64)
+      else if (column->type == CQL_ColumnType_I64)
       {
-        S64* data = (S64*)gdb_column_get_data(column, row);
+        S64* data = (S64*)cql_column_get_data(column, row);
         output = str8_from_s64(scratch.arena, *data, 10, 0, 0);
       }
-      else if (column->type == GDB_ColumnType_I32)
+      else if (column->type == CQL_ColumnType_I32)
       {
-        S32* data = (S32*)gdb_column_get_data(column, row);
+        S32* data = (S32*)cql_column_get_data(column, row);
         output = str8_from_s64(scratch.arena, *data, 10, 0, 0);
       }
-      else if (column->type == GDB_ColumnType_Bool)
+      else if (column->type == CQL_ColumnType_Bool)
       {
-        U8* data = (U8*)gdb_column_get_data(column, row);
+        U8* data = (U8*)cql_column_get_data(column, row);
         output = *data ? str8_lit("true") : str8_lit("false");
       }
-      else if (column->type == GDB_ColumnType_Date)
+      else if (column->type == CQL_ColumnType_Date)
       {
-        S32* data = (S32*)gdb_column_get_data(column, row);
+        S32* data = (S32*)cql_column_get_data(column, row);
         output = push_iso_date_string(scratch.arena, *data);
       }
-      else if (column->type == GDB_ColumnType_Timestamp)
+      else if (column->type == CQL_ColumnType_Timestamp)
       {
-        S64* data = (S64*)gdb_column_get_data(column, row);
+        S64* data = (S64*)cql_column_get_data(column, row);
         output = push_iso_timestamp_string(scratch.arena, *data);
       }
-      else if (column->type == GDB_ColumnType_Decimal)
+      else if (column->type == CQL_ColumnType_Decimal)
       {
-        S64* data = (S64*)gdb_column_get_data(column, row);
+        S64* data = (S64*)cql_column_get_data(column, row);
         output = decimal_to_str8(scratch.arena, *data, column->decimal_scale);
       }
-      else if (column->type == GDB_ColumnType_Enum && column->enum_type)
+      else if (column->type == CQL_ColumnType_Enum && column->enum_type)
       {
-        U32* data = (U32*)gdb_column_get_data(column, row);
-        output = gdb_enum_type_label_from_code(column->enum_type, *data);
+        U32* data = (U32*)cql_column_get_data(column, row);
+        output = cql_enum_type_label_from_code(column->enum_type, *data);
       }
       
       if (output.size && output.str)
@@ -1085,7 +1086,7 @@ chunk.size += __s.size; \
 }
 
 internal IR_Node*
-gdb_parse_check_expression(Arena* arena, String8 check_text)
+cql_parse_check_expression(Arena* arena, String8 check_text)
 {
   g_sql_parse_error = (SQL_ParseError){0};
   g_sql_source_text = check_text;
@@ -1096,21 +1097,21 @@ gdb_parse_check_expression(Arena* arena, String8 check_text)
   
   if (!expr_sql || g_sql_parse_error.has_error)
   {
-    log_error("gdb_parse_check_expression: failed to re-parse CHECK expression '%.*s'", str8_varg(check_text));
+    log_error("cql_parse_check_expression: failed to re-parse CHECK expression '%.*s'", str8_varg(check_text));
     return NULL;
   }
   
   return ir_generate_recursive(arena, expr_sql);
 }
 
-internal GDB_Table*
-gdb_table_load(GDB_Database* database, String8 table_dir, String8 meta_path)
+internal CQL_Table*
+cql_table_load(CQL_Database* database, String8 table_dir, String8 meta_path)
 {
   ProfBeginFunction();
   
-  GDB_Table* table = gdb_table_alloc(str8_lit("temp"));
+  CQL_Table* table = cql_table_alloc(str8_lit("temp"));
   
-  Temp scratch = temp_begin(g_gdb_state->arena);
+  Temp scratch = temp_begin(g_cql_state->arena);
   String8 meta_data = os_data_from_file_path(scratch.arena, meta_path);
   if (meta_data.size == 0)
   {
@@ -1123,11 +1124,11 @@ gdb_table_load(GDB_Database* database, String8 table_dir, String8 meta_path)
   table->column_count = *(U64*)read_ptr; read_ptr += sizeof(U64);
   table->row_count = *(U64*)read_ptr; read_ptr += sizeof(U64);
   
-  table->columns = push_array(table->arena, GDB_Column*, table->column_count);
+  table->columns = push_array(table->arena, CQL_Column*, table->column_count);
   
   for (U64 i = 0; i < table->column_count; i++)
   {
-    GDB_Column* column = gdb_column_alloc(str8_lit("temp"), 0, 0);
+    CQL_Column* column = cql_column_alloc(str8_lit("temp"), 0, 0);
     column->row_count = table->row_count;
     
     // tec: bind into the table immediately (rather than at the end of this loop body) so that
@@ -1136,7 +1137,7 @@ gdb_table_load(GDB_Database* database, String8 table_dir, String8 meta_path)
     table->columns[i] = column;
     column->parent_table = table;
     
-    column->type = *(GDB_ColumnType*)read_ptr; read_ptr += sizeof(GDB_ColumnType);
+    column->type = *(CQL_ColumnType*)read_ptr; read_ptr += sizeof(CQL_ColumnType);
     column->size = *(U64*)read_ptr; read_ptr += sizeof(U64);
     column->capacity = *(U64*)read_ptr; read_ptr += sizeof(U64);
     
@@ -1163,11 +1164,11 @@ gdb_table_load(GDB_Database* database, String8 table_dir, String8 meta_path)
       continue;
     }
     
-    if (props.size > g_gdb_state->disk_backed_threshold_size)
+    if (props.size > g_cql_state->disk_backed_threshold_size)
     {
       column->is_disk_backed = 1;
       column->disk_path = push_str8_copy(column->arena, column_path);
-      if (column->type == GDB_ColumnType_String8)
+      if (column->type == CQL_ColumnType_String8)
       {
         // tec: peek the header for reserved capacity, then read the last offset to find how many of the bytes are actually used
         OS_Handle map = os_file_map_open(OS_AccessFlag_Read, file);
@@ -1193,7 +1194,7 @@ gdb_table_load(GDB_Database* database, String8 table_dir, String8 meta_path)
       OS_Handle map = os_file_map_open(OS_AccessFlag_Read, file);
       void* mapped_ptr = os_file_map_view_open(map, OS_AccessFlag_Read, r1u64(0, props.size));
       
-      if (column->type == GDB_ColumnType_String8)
+      if (column->type == CQL_ColumnType_String8)
       {
         column->variable_capacity = *(U64*)mapped_ptr;
         mapped_ptr = (U8*)mapped_ptr + sizeof(U64);
@@ -1240,18 +1241,18 @@ gdb_table_load(GDB_Database* database, String8 table_dir, String8 meta_path)
       MemoryCopy(column_name.str, read_ptr, column_name.size);
       read_ptr += column_name.size;
       
-      GDB_Column* column = gdb_table_find_column(table, column_name);
+      CQL_Column* column = cql_table_find_column(table, column_name);
       if (column)
       {
-        GDB_Index* index = gdb_table_register_index(table, index_name, column);
-        if (!gdb_index_load(index, table_dir))
+        CQL_Index* index = cql_table_register_index(table, index_name, column);
+        if (!cql_index_load(index, table_dir))
         {
-          gdb_index_build_order(index);
+          cql_index_build_order(index);
         }
       }
       else
       {
-        log_error("gdb_table_load: index '%.*s' refers to missing column '%.*s' - dropping it",
+        log_error("cql_table_load: index '%.*s' refers to missing column '%.*s' - dropping it",
                   str8_varg(index_name), str8_varg(column_name));
       }
     }
@@ -1272,10 +1273,10 @@ gdb_table_load(GDB_Database* database, String8 table_dir, String8 meta_path)
       MemoryCopy(column_name.str, read_ptr, column_name.size);
       read_ptr += column_name.size;
       
-      GDB_Column* column = gdb_table_find_column(table, column_name);
+      CQL_Column* column = cql_table_find_column(table, column_name);
       if (!column)
       {
-        log_error("gdb_table_load: null-flags file refers to missing column '%.*s' - ignoring it", str8_varg(column_name));
+        log_error("cql_table_load: null-flags file refers to missing column '%.*s' - ignoring it", str8_varg(column_name));
         continue;
       }
       
@@ -1283,7 +1284,7 @@ gdb_table_load(GDB_Database* database, String8 table_dir, String8 meta_path)
       String8 null_data = os_data_from_file_path(scratch.arena, null_path);
       if (null_data.size < table->row_count)
       {
-        log_error("gdb_table_load: null-flags file '%.*s' is too small (%llu bytes, expected %llu) - ignoring it",
+        log_error("cql_table_load: null-flags file '%.*s' is too small (%llu bytes, expected %llu) - ignoring it",
                   str8_varg(null_path), null_data.size, table->row_count);
         continue;
       }
@@ -1294,7 +1295,7 @@ gdb_table_load(GDB_Database* database, String8 table_dir, String8 meta_path)
     }
   }
   
-  //- tec: optional trailing per-column constraint section (see gdb_table_save)
+  //- tec: optional trailing per-column constraint section (see cql_table_save)
   if (read_ptr + sizeof(U64) <= meta_data.str + meta_data.size)
   {
     U64 constraint_column_count = *(U64*)read_ptr; read_ptr += sizeof(U64);
@@ -1339,10 +1340,10 @@ gdb_table_load(GDB_Database* database, String8 table_dir, String8 meta_path)
         read_ptr += check_text.size;
       }
       
-      GDB_Column* column = gdb_table_find_column(table, column_name);
+      CQL_Column* column = cql_table_find_column(table, column_name);
       if (!column)
       {
-        log_error("gdb_table_load: constraint section refers to missing column '%.*s' - ignoring it", str8_varg(column_name));
+        log_error("cql_table_load: constraint section refers to missing column '%.*s' - ignoring it", str8_varg(column_name));
         continue;
       }
       
@@ -1361,7 +1362,7 @@ gdb_table_load(GDB_Database* database, String8 table_dir, String8 meta_path)
       {
         column->has_check = 1;
         column->check_text = push_str8_copy(table->arena, check_text);
-        column->check_expr = gdb_parse_check_expression(table->arena, column->check_text);
+        column->check_expr = cql_parse_check_expression(table->arena, column->check_text);
       }
     }
   }
@@ -1384,10 +1385,10 @@ gdb_table_load(GDB_Database* database, String8 table_dir, String8 meta_path)
       U32 precision = *(U32*)read_ptr; read_ptr += sizeof(U32);
       U32 scale = *(U32*)read_ptr; read_ptr += sizeof(U32);
       
-      GDB_Column* column = gdb_table_find_column(table, column_name);
+      CQL_Column* column = cql_table_find_column(table, column_name);
       if (!column)
       {
-        log_error("gdb_table_load: decimal section refers to missing column '%.*s' - ignoring it", str8_varg(column_name));
+        log_error("cql_table_load: decimal section refers to missing column '%.*s' - ignoring it", str8_varg(column_name));
         continue;
       }
       
@@ -1417,17 +1418,17 @@ gdb_table_load(GDB_Database* database, String8 table_dir, String8 meta_path)
       enum_type_name.str = read_ptr;
       read_ptr += enum_type_name.size;
       
-      GDB_Column* column = gdb_table_find_column(table, column_name);
+      CQL_Column* column = cql_table_find_column(table, column_name);
       if (!column)
       {
-        log_error("gdb_table_load: enum section refers to missing column '%.*s' - ignoring it", str8_varg(column_name));
+        log_error("cql_table_load: enum section refers to missing column '%.*s' - ignoring it", str8_varg(column_name));
         continue;
       }
       
-      GDB_EnumType* enum_type = gdb_database_find_enum_type(database, enum_type_name);
+      CQL_EnumType* enum_type = cql_database_find_enum_type(database, enum_type_name);
       if (!enum_type)
       {
-        log_error("gdb_table_load: column '%.*s' references unknown enum type '%.*s'",
+        log_error("cql_table_load: column '%.*s' references unknown enum type '%.*s'",
                   str8_varg(column_name), str8_varg(enum_type_name));
         continue;
       }
@@ -1456,17 +1457,17 @@ gdb_table_load(GDB_Database* database, String8 table_dir, String8 meta_path)
       U64 chunks_size = chunk_count * (sizeof(F64) * 2 + sizeof(U32));
       if (read_ptr + chunks_size > meta_data.str + meta_data.size) break;
       
-      GDB_Column* column = gdb_table_find_column(table, column_name);
+      CQL_Column* column = cql_table_find_column(table, column_name);
       // tec: a mismatched chunk count is not trusted
-      U64 expected_chunk_count = column ? (column->row_count + g_gdb_state->zonemap_chunk_rows - 1) / g_gdb_state->zonemap_chunk_rows : 0;
+      U64 expected_chunk_count = column ? (column->row_count + g_cql_state->zonemap_chunk_rows - 1) / g_cql_state->zonemap_chunk_rows : 0;
       if (!column || chunk_count != expected_chunk_count)
       {
-        if (column) log_debug("gdb_table_load: zone map chunk count mismatch for column '%.*s' - will rebuild lazily", str8_varg(column_name));
+        if (column) log_debug("cql_table_load: zone map chunk count mismatch for column '%.*s' - will rebuild lazily", str8_varg(column_name));
         read_ptr += chunks_size;
         continue;
       }
       
-      column->zone_map = push_array(column->arena, GDB_ZoneMapChunk, Max(chunk_count, 1));
+      column->zone_map = push_array(column->arena, CQL_ZoneMapChunk, Max(chunk_count, 1));
       column->zone_map_capacity = chunk_count;
       column->zone_map_chunk_count = chunk_count;
       for (U64 c = 0; c < chunk_count; c++)
@@ -1489,13 +1490,13 @@ gdb_table_load(GDB_Database* database, String8 table_dir, String8 meta_path)
     for (U64 i = 0; i < stats_column_count; i++)
     {
       String8 column_name = {0};
-      GDB_ColumnStats loaded_stats = {0};
-      if (!gdb_column_stats_read_record(&read_ptr, meta_end, &column_name, &loaded_stats))
+      CQL_ColumnStats loaded_stats = {0};
+      if (!cql_column_stats_read_record(&read_ptr, meta_end, &column_name, &loaded_stats))
       {
         break;
       }
       
-      GDB_Column* column = gdb_table_find_column(table, column_name);
+      CQL_Column* column = cql_table_find_column(table, column_name);
       // tec: a row count mismatch means the stats predate the data on disk
       if (!column || loaded_stats.row_count != column->row_count)
       {
@@ -1571,9 +1572,9 @@ parse_csv_line(U8 *input, U64 len, String8 *fields, U64 max_fields)
   return count;
 }
 
-internal THREAD_POOL_TASK_FUNC(gdb_csv_parse_task)
+internal THREAD_POOL_TASK_FUNC(cql_csv_parse_task)
 {
-  GDB_CSV_ParseTask* task = (GDB_CSV_ParseTask*)raw_task;
+  CQL_CSV_ParseTask* task = (CQL_CSV_ParseTask*)raw_task;
   Rng1U64 range = task->ranges[task_id];
   String8* fields = push_array(arena, String8, task->column_count);
   
@@ -1582,12 +1583,12 @@ internal THREAD_POOL_TASK_FUNC(gdb_csv_parse_task)
     String8 line = task->lines[row];
     U64 value_count = parse_csv_line(line.str, line.size, fields, task->column_count);
     
-    GDB_CSV_ParsedField* row_out = task->parsed + row * task->column_count;
+    CQL_CSV_ParsedField* row_out = task->parsed + row * task->column_count;
     for (U64 col_i = 0; col_i < value_count; col_i++)
     {
-      GDB_Column* column = task->table->columns[col_i];
+      CQL_Column* column = task->table->columns[col_i];
       String8 val = str8_skip_chop_whitespace(fields[col_i]);
-      GDB_CSV_ParsedField* pf = &row_out[col_i];
+      CQL_CSV_ParsedField* pf = &row_out[col_i];
       pf->present = 1;
       
       if (val.size == 0)
@@ -1599,31 +1600,31 @@ internal THREAD_POOL_TASK_FUNC(gdb_csv_parse_task)
       {
         switch (column->type)
         {
-          case GDB_ColumnType_U32:
+          case CQL_ColumnType_U32:
           {
             U32 v = (U32)u64_from_str8(val, 10);
             MemoryCopy(&pf->numeric_bits, &v, sizeof(v));
           } break;
           
-          case GDB_ColumnType_U64:
+          case CQL_ColumnType_U64:
           {
             U64 v = u64_from_str8(val, 10);
             MemoryCopy(&pf->numeric_bits, &v, sizeof(v));
           } break;
           
-          case GDB_ColumnType_F32:
+          case CQL_ColumnType_F32:
           {
             F32 v = (F32)f64_from_str8(val);
             MemoryCopy(&pf->numeric_bits, &v, sizeof(v));
           } break;
           
-          case GDB_ColumnType_F64:
+          case CQL_ColumnType_F64:
           {
             F64 v = f64_from_str8(val);
             MemoryCopy(&pf->numeric_bits, &v, sizeof(v));
           } break;
           
-          case GDB_ColumnType_String8:
+          case CQL_ColumnType_String8:
           default:
           {
             pf->str_value = val;
@@ -1635,7 +1636,7 @@ internal THREAD_POOL_TASK_FUNC(gdb_csv_parse_task)
 }
 
 internal void
-gdb_csv_append_parsed_row(GDB_Table* table, GDB_CSV_ParsedField* row_fields, U64 column_count)
+cql_csv_append_parsed_row(CQL_Table* table, CQL_CSV_ParsedField* row_fields, U64 column_count)
 {
   table->row_count++;
   if ((table->row_count % 1000000) == 0)
@@ -1645,63 +1646,63 @@ gdb_csv_append_parsed_row(GDB_Table* table, GDB_CSV_ParsedField* row_fields, U64
   
   for (U64 col_i = 0; col_i < column_count; col_i++)
   {
-    GDB_CSV_ParsedField* pf = &row_fields[col_i];
+    CQL_CSV_ParsedField* pf = &row_fields[col_i];
     if (!pf->present) continue;
     
-    GDB_Column* column = table->columns[col_i];
+    CQL_Column* column = table->columns[col_i];
     if (pf->is_null)
     {
-      gdb_column_add_data_maybe_null(column, NULL, 1);
+      cql_column_add_data_maybe_null(column, NULL, 1);
       continue;
     }
     
     switch (column->type)
     {
-      case GDB_ColumnType_U32:
+      case CQL_ColumnType_U32:
       {
         U32 v;
         MemoryCopy(&v, &pf->numeric_bits, sizeof(v));
-        gdb_column_add_data_maybe_null(column, &v, 0);
+        cql_column_add_data_maybe_null(column, &v, 0);
       } break;
       
-      case GDB_ColumnType_U64:
+      case CQL_ColumnType_U64:
       {
         U64 v;
         MemoryCopy(&v, &pf->numeric_bits, sizeof(v));
-        gdb_column_add_data_maybe_null(column, &v, 0);
+        cql_column_add_data_maybe_null(column, &v, 0);
       } break;
       
-      case GDB_ColumnType_F32:
+      case CQL_ColumnType_F32:
       {
         F32 v;
         MemoryCopy(&v, &pf->numeric_bits, sizeof(v));
-        gdb_column_add_data_maybe_null(column, &v, 0);
+        cql_column_add_data_maybe_null(column, &v, 0);
       } break;
       
-      case GDB_ColumnType_F64:
+      case CQL_ColumnType_F64:
       {
         F64 v; MemoryCopy(&v, &pf->numeric_bits, sizeof(v));
-        gdb_column_add_data_maybe_null(column, &v, 0);
+        cql_column_add_data_maybe_null(column, &v, 0);
       } break;
       
-      case GDB_ColumnType_String8:
+      case CQL_ColumnType_String8:
       default:
       {
-        gdb_column_add_data_maybe_null(column, &pf->str_value, 0);
+        cql_column_add_data_maybe_null(column, &pf->str_value, 0);
       } break;
     }
   }
 }
 
-internal GDB_Table*
-gdb_table_import_csv_streaming(GDB_Database *db, String8 table_name, String8 path)
+internal CQL_Table*
+cql_table_import_csv_streaming(CQL_Database *db, String8 table_name, String8 path)
 {
   ProfBeginFunction();
   U64 t_fn_start = os_now_microseconds();
   
-  Temp scratch = temp_begin(g_gdb_state->arena);
+  Temp scratch = temp_begin(g_cql_state->arena);
   
-  GDB_Table *table = gdb_table_alloc(table_name);
+  CQL_Table *table = cql_table_alloc(table_name);
   table->parent_database = db;
   
   OS_Handle file = os_file_open(OS_AccessFlag_Read, path);
@@ -1717,7 +1718,7 @@ gdb_table_import_csv_streaming(GDB_Database *db, String8 table_name, String8 pat
   U64 buffer_size = MB(64);
   U8 *buffer = push_array(scratch.arena, U8, buffer_size);
   
-  GDB_ColumnType *types = 0;
+  CQL_ColumnType *types = 0;
   String8 *column_names = 0;
   U64 column_count = 0;
   
@@ -1772,8 +1773,8 @@ gdb_table_import_csv_streaming(GDB_Database *db, String8 table_name, String8 pat
           {
             column_names[col_i] = str8_skip_chop_whitespace(node->string);
           }
-          types = push_array(scratch.arena, GDB_ColumnType, column_count);
-          MemorySet(types, GDB_ColumnType_Invalid, column_count * sizeof(*types));
+          types = push_array(scratch.arena, CQL_ColumnType, column_count);
+          MemorySet(types, CQL_ColumnType_Invalid, column_count * sizeof(*types));
         }
         else
         {
@@ -1781,8 +1782,8 @@ gdb_table_import_csv_streaming(GDB_Database *db, String8 table_name, String8 pat
           U64 col_i = 0;
           for (String8Node *node = values.first; node && col_i < column_count; node = node->next, col_i++)
           {
-            GDB_ColumnType type = gdb_infer_column_type(node->string);
-            types[col_i] = gdb_promote_type(types[col_i], type);
+            CQL_ColumnType type = cql_infer_column_type(node->string);
+            types[col_i] = cql_promote_type(types[col_i], type);
           }
         }
         
@@ -1792,13 +1793,13 @@ gdb_table_import_csv_streaming(GDB_Database *db, String8 table_name, String8 pat
     
     for (U64 i = 0; i < column_count; i++)
     {
-      if (types[i] == GDB_ColumnType_Invalid)
-        types[i] = GDB_ColumnType_String8;
+      if (types[i] == CQL_ColumnType_Invalid)
+        types[i] = CQL_ColumnType_String8;
       
       String8 column_name = push_str8_copy(table->arena, column_names[i]);
-      GDB_ColumnSchema schema = gdb_column_schema_create(column_name, types[i]);
-      gdb_table_add_column(table, schema);
-      //log_info("column type: %.*s", str8_varg(string_from_gdb_column_type(types[i])));
+      CQL_ColumnSchema schema = cql_column_schema_create(column_name, types[i]);
+      cql_table_add_column(table, schema);
+      //log_info("column type: %.*s", str8_varg(string_from_cql_column_type(types[i])));
     }
   }
   ProfEnd();
@@ -1870,9 +1871,9 @@ gdb_table_import_csv_streaming(GDB_Database *db, String8 table_name, String8 pat
         
         // tec: pass 2. parse each line
         U64 p2 = os_now_microseconds();
-        GDB_CSV_ParsedField* parsed = push_array(row_arena, GDB_CSV_ParsedField, chunk_row_count * column_count);
+        CQL_CSV_ParsedField* parsed = push_array(row_arena, CQL_CSV_ParsedField, chunk_row_count * column_count);
         
-        GDB_CSV_ParseTask task = {0};
+        CQL_CSV_ParseTask task = {0};
         task.lines = lines_arr;
         task.parsed = parsed;
         task.table = table;
@@ -1884,7 +1885,7 @@ gdb_table_import_csv_streaming(GDB_Database *db, String8 table_name, String8 pat
         
         TP_Arena* pool_arena = app_thread_pool_arena();
         TP_Temp temp = tp_temp_begin(pool_arena);
-        tp_for_parallel(pool, pool_arena, task_count, gdb_csv_parse_task, &task);
+        tp_for_parallel(pool, pool_arena, task_count, cql_csv_parse_task, &task);
         tp_temp_end(temp);
         t_parse += os_now_microseconds() - p2;
         
@@ -1892,7 +1893,7 @@ gdb_table_import_csv_streaming(GDB_Database *db, String8 table_name, String8 pat
         U64 p3 = os_now_microseconds();
         for (U64 row = 0; row < chunk_row_count; row++)
         {
-          gdb_csv_append_parsed_row(table, parsed + row * column_count, column_count);
+          cql_csv_append_parsed_row(table, parsed + row * column_count, column_count);
         }
         t_append += os_now_microseconds() - p3;
       }
@@ -1913,46 +1914,46 @@ gdb_table_import_csv_streaming(GDB_Database *db, String8 table_name, String8 pat
         U64 col_i = 0;
         for (String8Node *node = values.first; node && col_i < column_count; node = node->next, col_i++)
         {
-          GDB_Column *column = table->columns[col_i];
+          CQL_Column *column = table->columns[col_i];
           String8 val = str8_skip_chop_whitespace(node->string);
           
           if (val.size == 0)
           {
             // tec: an empty CSV field is a NULL
-            gdb_column_add_data_maybe_null(column, NULL, 1);
+            cql_column_add_data_maybe_null(column, NULL, 1);
           }
           else
           {
             switch (column->type)
             {
-              case GDB_ColumnType_U32:
+              case CQL_ColumnType_U32:
               {
                 U32 v = (U32)u64_from_str8(val, 10);
-                gdb_column_add_data_maybe_null(column, &v, 0);
+                cql_column_add_data_maybe_null(column, &v, 0);
               } break;
               
-              case GDB_ColumnType_U64:
+              case CQL_ColumnType_U64:
               {
                 U64 v = u64_from_str8(val, 10);
-                gdb_column_add_data_maybe_null(column, &v, 0);
+                cql_column_add_data_maybe_null(column, &v, 0);
               } break;
               
-              case GDB_ColumnType_F32:
+              case CQL_ColumnType_F32:
               {
                 F32 v = (F32)f64_from_str8(val);
-                gdb_column_add_data_maybe_null(column, &v, 0);
+                cql_column_add_data_maybe_null(column, &v, 0);
               } break;
               
-              case GDB_ColumnType_F64:
+              case CQL_ColumnType_F64:
               {
                 F64 v = f64_from_str8(val);
-                gdb_column_add_data_maybe_null(column, &v, 0);
+                cql_column_add_data_maybe_null(column, &v, 0);
               } break;
               
-              case GDB_ColumnType_String8:
+              case CQL_ColumnType_String8:
               default:
               {
-                gdb_column_add_data_maybe_null(column, &val, 0);
+                cql_column_add_data_maybe_null(column, &val, 0);
               } break;
             }
           }
@@ -1964,18 +1965,18 @@ gdb_table_import_csv_streaming(GDB_Database *db, String8 table_name, String8 pat
   os_file_close(file);
   temp_end(scratch);
   log_info("ending import csv file %.*s", str8_varg(path));
-  log_debug("gdb_table_import_csv_streaming: %llu rows, phases (us): type_sample=%llu read=%llu scan=%llu parse=%llu append=%llu total=%llu",
+  log_debug("cql_table_import_csv_streaming: %llu rows, phases (us): type_sample=%llu read=%llu scan=%llu parse=%llu append=%llu total=%llu",
             table->row_count, t_typesample, t_read, t_scan, t_parse, t_append, os_now_microseconds() - t_fn_start);
   ProfEnd();
   return table;
 }
 
-internal GDB_Column*
-gdb_table_find_column(GDB_Table* table, String8 column_name)
+internal CQL_Column*
+cql_table_find_column(CQL_Table* table, String8 column_name)
 {
   for (U64 i = 0; i < table->column_count; i++)
   {
-    GDB_Column* column = table->columns[i];
+    CQL_Column* column = table->columns[i];
     if (str8_match(column->name, column_name, 0))
     {
       return column;
@@ -1988,8 +1989,8 @@ gdb_table_find_column(GDB_Table* table, String8 column_name)
 
 //~ tec: indexes
 
-internal GDB_Index*
-gdb_table_find_index(GDB_Table* table, String8 index_name)
+internal CQL_Index*
+cql_table_find_index(CQL_Table* table, String8 index_name)
 {
   for (U64 i = 0; i < table->index_count; i++)
   {
@@ -2001,8 +2002,8 @@ gdb_table_find_index(GDB_Table* table, String8 index_name)
   return NULL;
 }
 
-internal GDB_Index*
-gdb_table_find_index_on_column(GDB_Table* table, GDB_Column* column)
+internal CQL_Index*
+cql_table_find_index_on_column(CQL_Table* table, CQL_Column* column)
 {
   for (U64 i = 0; i < table->index_count; i++)
   {
@@ -2014,24 +2015,24 @@ gdb_table_find_index_on_column(GDB_Table* table, GDB_Column* column)
   return NULL;
 }
 
-internal GDB_Index*
-gdb_table_register_index(GDB_Table* table, String8 index_name, GDB_Column* column)
+internal CQL_Index*
+cql_table_register_index(CQL_Table* table, String8 index_name, CQL_Column* column)
 {
   if (table->index_count == 0)
   {
-    table->indexes = push_array(table->arena, GDB_Index*, 2);
+    table->indexes = push_array(table->arena, CQL_Index*, 2);
     table->index_capacity = 2;
   }
   else if (table->index_count >= table->index_capacity)
   {
     U64 new_capacity = table->index_capacity * 2;
-    GDB_Index** new_indexes = push_array(table->arena, GDB_Index*, new_capacity);
-    MemoryCopy(new_indexes, table->indexes, sizeof(GDB_Index*) * table->index_count);
+    CQL_Index** new_indexes = push_array(table->arena, CQL_Index*, new_capacity);
+    MemoryCopy(new_indexes, table->indexes, sizeof(CQL_Index*) * table->index_count);
     table->indexes = new_indexes;
     table->index_capacity = new_capacity;
   }
   
-  GDB_Index* index = push_array(table->arena, GDB_Index, 1);
+  CQL_Index* index = push_array(table->arena, CQL_Index, 1);
   index->name = push_str8_copy(table->arena, index_name);
   index->column_name = push_str8_copy(table->arena, column->name);
   index->column = column;
@@ -2040,16 +2041,16 @@ gdb_table_register_index(GDB_Table* table, String8 index_name, GDB_Column* colum
   return index;
 }
 
-internal GDB_Index*
-gdb_table_create_index(GDB_Table* table, String8 index_name, GDB_Column* column)
+internal CQL_Index*
+cql_table_create_index(CQL_Table* table, String8 index_name, CQL_Column* column)
 {
-  GDB_Index* index = gdb_table_register_index(table, index_name, column);
-  gdb_index_build_order(index);
+  CQL_Index* index = cql_table_register_index(table, index_name, column);
+  cql_index_build_order(index);
   return index;
 }
 
 internal void
-gdb_table_drop_index(GDB_Table* table, String8 index_name)
+cql_table_drop_index(CQL_Table* table, String8 index_name)
 {
   U64 slot = 0;
   for (; slot < table->index_count; slot++)
@@ -2059,14 +2060,14 @@ gdb_table_drop_index(GDB_Table* table, String8 index_name)
   
   if (slot >= table->index_count)
   {
-    log_error("gdb_table_drop_index: no index '%.*s' on table '%.*s'", str8_varg(index_name), str8_varg(table->name));
+    log_error("cql_table_drop_index: no index '%.*s' on table '%.*s'", str8_varg(index_name), str8_varg(table->name));
     return;
   }
   
   if (table->parent_database)
   {
     Temp scratch = scratch_begin(0, 0);
-    String8 idx_path = gdb_generate_disk_path_for_index(scratch.arena, table, table->indexes[slot]->name);
+    String8 idx_path = cql_generate_disk_path_for_index(scratch.arena, table, table->indexes[slot]->name);
     os_delete_file_at_path(idx_path);
     scratch_end(scratch);
   }
@@ -2081,7 +2082,7 @@ gdb_table_drop_index(GDB_Table* table, String8 index_name)
 //~ tec: index order maintenance
 
 internal S32
-gdb_str8_compare(String8 a, String8 b)
+cql_str8_compare(String8 a, String8 b)
 {
   U64 min_size = Min(a.size, b.size);
   S32 cmp = min_size ? (S32)MemoryCompare(a.str, b.str, min_size) : 0;
@@ -2092,39 +2093,39 @@ gdb_str8_compare(String8 a, String8 b)
 }
 
 internal F64
-gdb_index_numeric_value(GDB_Column* column, U64 row_index)
+cql_index_numeric_value(CQL_Column* column, U64 row_index)
 {
-  void* data = gdb_column_get_data(column, row_index);
+  void* data = cql_column_get_data(column, row_index);
   switch (column->type)
   {
-    case GDB_ColumnType_U32: return (F64)(*(U32*)data);
-    case GDB_ColumnType_U64: return (F64)(*(U64*)data);
-    case GDB_ColumnType_F32: return (F64)(*(F32*)data);
-    case GDB_ColumnType_F64: return *(F64*)data;
-    case GDB_ColumnType_Bool: return (F64)(*(U8*)data);
-    case GDB_ColumnType_I32: return (F64)(*(S32*)data);
-    case GDB_ColumnType_I64: return (F64)(*(S64*)data);
-    case GDB_ColumnType_Date: return (F64)(*(S32*)data);
-    case GDB_ColumnType_Timestamp: return (F64)(*(S64*)data);
-    case GDB_ColumnType_Decimal: return (F64)(*(S64*)data);
-    case GDB_ColumnType_Enum: return (F64)(*(U32*)data);
+    case CQL_ColumnType_U32: return (F64)(*(U32*)data);
+    case CQL_ColumnType_U64: return (F64)(*(U64*)data);
+    case CQL_ColumnType_F32: return (F64)(*(F32*)data);
+    case CQL_ColumnType_F64: return *(F64*)data;
+    case CQL_ColumnType_Bool: return (F64)(*(U8*)data);
+    case CQL_ColumnType_I32: return (F64)(*(S32*)data);
+    case CQL_ColumnType_I64: return (F64)(*(S64*)data);
+    case CQL_ColumnType_Date: return (F64)(*(S32*)data);
+    case CQL_ColumnType_Timestamp: return (F64)(*(S64*)data);
+    case CQL_ColumnType_Decimal: return (F64)(*(S64*)data);
+    case CQL_ColumnType_Enum: return (F64)(*(U32*)data);
     default: return 0.0;
   }
 }
 
 internal int
-gdb_index_build_compare(const void* a, const void* b)
+cql_index_build_compare(const void* a, const void* b)
 {
   U64 ra = *(const U64*)a;
   U64 rb = *(const U64*)b;
-  GDB_IndexBuildCtx* ctx = g_gdb_index_build_ctx;
+  CQL_IndexBuildCtx* ctx = g_cql_index_build_ctx;
   
   if (ctx->is_string)
   {
-    GDB_StringDataChunk* chunk = &ctx->string_keys;
+    CQL_StringDataChunk* chunk = &ctx->string_keys;
     String8 sa = str8((U8*)chunk->data + chunk->offsets[ra], chunk->offsets[ra + 1] - chunk->offsets[ra]);
     String8 sb = str8((U8*)chunk->data + chunk->offsets[rb], chunk->offsets[rb + 1] - chunk->offsets[rb]);
-    return gdb_str8_compare(sa, sb);
+    return cql_str8_compare(sa, sb);
   }
   
   F64 va = ctx->numeric_keys[ra];
@@ -2133,10 +2134,10 @@ gdb_index_build_compare(const void* a, const void* b)
 }
 
 internal void
-gdb_index_build_order(GDB_Index* index)
+cql_index_build_order(CQL_Index* index)
 {
-  GDB_Column* column = index->column;
-  GDB_Table* table = column->parent_table;
+  CQL_Column* column = index->column;
+  CQL_Table* table = column->parent_table;
   U64 row_count = table->row_count;
   
   index->order = row_count ? push_array(table->arena, U64, row_count) : NULL;
@@ -2147,34 +2148,34 @@ gdb_index_build_order(GDB_Index* index)
   
   Temp scratch = scratch_begin(0, 0);
   
-  GDB_IndexBuildCtx ctx = {0};
-  ctx.is_string = (column->type == GDB_ColumnType_String8);
+  CQL_IndexBuildCtx ctx = {0};
+  ctx.is_string = (column->type == CQL_ColumnType_String8);
   
   if (ctx.is_string)
   {
-    ctx.string_keys = gdb_column_get_string_chunk(scratch.arena, column, r1u64(0, row_count));
+    ctx.string_keys = cql_column_get_string_chunk(scratch.arena, column, r1u64(0, row_count));
   }
   else
   {
     U64 range_size = 0;
-    void* base_ptr = gdb_column_get_data_range(scratch.arena, column, r1u64(0, row_count), &range_size);
+    void* base_ptr = cql_column_get_data_range(scratch.arena, column, r1u64(0, row_count), &range_size);
     F64* numeric_keys = push_array(scratch.arena, F64, row_count);
     for (U64 i = 0; i < row_count; i++)
     {
       void* data = (U8*)base_ptr + i * column->size;
       switch (column->type)
       {
-        case GDB_ColumnType_U32: numeric_keys[i] = (F64)(*(U32*)data); break;
-        case GDB_ColumnType_U64: numeric_keys[i] = (F64)(*(U64*)data); break;
-        case GDB_ColumnType_F32: numeric_keys[i] = (F64)(*(F32*)data); break;
-        case GDB_ColumnType_F64: numeric_keys[i] = *(F64*)data; break;
-        case GDB_ColumnType_Bool: numeric_keys[i] = (F64)(*(U8*)data); break;
-        case GDB_ColumnType_I32: numeric_keys[i] = (F64)(*(S32*)data); break;
-        case GDB_ColumnType_I64: numeric_keys[i] = (F64)(*(S64*)data); break;
-        case GDB_ColumnType_Date: numeric_keys[i] = (F64)(*(S32*)data); break;
-        case GDB_ColumnType_Timestamp: numeric_keys[i] = (F64)(*(S64*)data); break;
-        case GDB_ColumnType_Decimal: numeric_keys[i] = (F64)(*(S64*)data); break;
-        case GDB_ColumnType_Enum: numeric_keys[i] = (F64)(*(U32*)data); break;
+        case CQL_ColumnType_U32: numeric_keys[i] = (F64)(*(U32*)data); break;
+        case CQL_ColumnType_U64: numeric_keys[i] = (F64)(*(U64*)data); break;
+        case CQL_ColumnType_F32: numeric_keys[i] = (F64)(*(F32*)data); break;
+        case CQL_ColumnType_F64: numeric_keys[i] = *(F64*)data; break;
+        case CQL_ColumnType_Bool: numeric_keys[i] = (F64)(*(U8*)data); break;
+        case CQL_ColumnType_I32: numeric_keys[i] = (F64)(*(S32*)data); break;
+        case CQL_ColumnType_I64: numeric_keys[i] = (F64)(*(S64*)data); break;
+        case CQL_ColumnType_Date: numeric_keys[i] = (F64)(*(S32*)data); break;
+        case CQL_ColumnType_Timestamp: numeric_keys[i] = (F64)(*(S64*)data); break;
+        case CQL_ColumnType_Decimal: numeric_keys[i] = (F64)(*(S64*)data); break;
+        case CQL_ColumnType_Enum: numeric_keys[i] = (F64)(*(U32*)data); break;
         default: numeric_keys[i] = 0.0; break;
       }
     }
@@ -2183,20 +2184,20 @@ gdb_index_build_order(GDB_Index* index)
   
   for (U64 i = 0; i < row_count; i++) index->order[i] = i;
   
-  GDB_IndexBuildCtx* prev_ctx = g_gdb_index_build_ctx;
-  g_gdb_index_build_ctx = &ctx;
-  quick_sort(index->order, row_count, sizeof(U64), gdb_index_build_compare);
-  g_gdb_index_build_ctx = prev_ctx;
+  CQL_IndexBuildCtx* prev_ctx = g_cql_index_build_ctx;
+  g_cql_index_build_ctx = &ctx;
+  quick_sort(index->order, row_count, sizeof(U64), cql_index_build_compare);
+  g_cql_index_build_ctx = prev_ctx;
   
   scratch_end(scratch);
 }
 
 internal void
-gdb_index_ensure_order_capacity(GDB_Index* index, GDB_Table* table)
+cql_index_ensure_order_capacity(CQL_Index* index, CQL_Table* table)
 {
   if (index->order_count < index->order_capacity) return;
   
-  U64 new_capacity = (index->order_capacity > 0) ? index->order_capacity * 2 : g_gdb_state->column_expand_count;
+  U64 new_capacity = (index->order_capacity > 0) ? index->order_capacity * 2 : g_cql_state->column_expand_count;
   U64* new_order = push_array(table->arena, U64, new_capacity);
   if (index->order)
   {
@@ -2207,34 +2208,34 @@ gdb_index_ensure_order_capacity(GDB_Index* index, GDB_Table* table)
 }
 
 internal void
-gdb_index_insert_row(GDB_Index* index, U64 new_row_index)
+cql_index_insert_row(CQL_Index* index, U64 new_row_index)
 {
-  GDB_Column* column = index->column;
-  GDB_Table* table = column->parent_table;
+  CQL_Column* column = index->column;
+  CQL_Table* table = column->parent_table;
   
-  gdb_index_ensure_order_capacity(index, table);
+  cql_index_ensure_order_capacity(index, table);
   
   Temp scratch = scratch_begin(0, 0);
   
   U64 lo = 0, hi = index->order_count;
-  if (column->type == GDB_ColumnType_String8)
+  if (column->type == CQL_ColumnType_String8)
   {
-    String8 new_key = gdb_column_get_string(scratch.arena, column, new_row_index);
+    String8 new_key = cql_column_get_string(scratch.arena, column, new_row_index);
     while (lo < hi)
     {
       U64 mid = lo + (hi - lo) / 2;
-      String8 mid_key = gdb_column_get_string(scratch.arena, column, index->order[mid]);
-      if (gdb_str8_compare(mid_key, new_key) < 0) lo = mid + 1;
+      String8 mid_key = cql_column_get_string(scratch.arena, column, index->order[mid]);
+      if (cql_str8_compare(mid_key, new_key) < 0) lo = mid + 1;
       else hi = mid;
     }
   }
   else
   {
-    F64 new_key = gdb_index_numeric_value(column, new_row_index);
+    F64 new_key = cql_index_numeric_value(column, new_row_index);
     while (lo < hi)
     {
       U64 mid = lo + (hi - lo) / 2;
-      F64 mid_key = gdb_index_numeric_value(column, index->order[mid]);
+      F64 mid_key = cql_index_numeric_value(column, index->order[mid]);
       if (mid_key < new_key) lo = mid + 1;
       else hi = mid;
     }
@@ -2248,7 +2249,7 @@ gdb_index_insert_row(GDB_Index* index, U64 new_row_index)
 }
 
 internal void
-gdb_index_remove_row(GDB_Index* index, U64 removed_row_index)
+cql_index_remove_row(CQL_Index* index, U64 removed_row_index)
 {
   U64 slot = index->order_count;
   for (U64 i = 0; i < index->order_count; i++)
@@ -2269,25 +2270,25 @@ gdb_index_remove_row(GDB_Index* index, U64 removed_row_index)
 }
 
 internal String8
-gdb_generate_disk_path_for_index(Arena* arena, GDB_Table* table, String8 index_name)
+cql_generate_disk_path_for_index(Arena* arena, CQL_Table* table, String8 index_name)
 {
-  GDB_Database* database = table->parent_database;
+  CQL_Database* database = table->parent_database;
   
   {
     Temp scratch = scratch_begin(0, 0);
     
-    if (!os_file_path_exists(str8_lit("gdb_data/")))
+    if (!os_file_path_exists(str8_lit("cql_data/")))
     {
-      os_make_directory(str8_lit("gdb_data/"));
+      os_make_directory(str8_lit("cql_data/"));
     }
     
-    String8 database_path = push_str8f(arena, "gdb_data/%.*s/", str8_varg(database->name));
+    String8 database_path = push_str8f(arena, "cql_data/%.*s/", str8_varg(database->name));
     if (!os_file_path_exists(database_path))
     {
       os_make_directory(database_path);
     }
     
-    String8 table_path = push_str8f(arena, "gdb_data/%.*s/%.*s/", str8_varg(database->name), str8_varg(table->name));
+    String8 table_path = push_str8f(arena, "cql_data/%.*s/%.*s/", str8_varg(database->name), str8_varg(table->name));
     if (!os_file_path_exists(table_path))
     {
       os_make_directory(table_path);
@@ -2296,11 +2297,11 @@ gdb_generate_disk_path_for_index(Arena* arena, GDB_Table* table, String8 index_n
     scratch_end(scratch);
   }
   
-  return push_str8f(arena, "gdb_data/%.*s/%.*s/%.*s.idx", str8_varg(database->name), str8_varg(table->name), str8_varg(index_name));
+  return push_str8f(arena, "cql_data/%.*s/%.*s/%.*s.idx", str8_varg(database->name), str8_varg(table->name), str8_varg(index_name));
 }
 
 internal void
-gdb_index_save(GDB_Index* index, String8 table_dir)
+cql_index_save(CQL_Index* index, String8 table_dir)
 {
   Temp scratch = scratch_begin(0, 0);
   
@@ -2328,7 +2329,7 @@ gdb_index_save(GDB_Index* index, String8 table_dir)
 }
 
 internal B32
-gdb_index_load(GDB_Index* index, String8 table_dir)
+cql_index_load(CQL_Index* index, String8 table_dir)
 {
   Temp scratch = scratch_begin(0, 0);
   
@@ -2340,7 +2341,7 @@ gdb_index_load(GDB_Index* index, String8 table_dir)
   {
     U64 count = *(U64*)idx_data.str;
     U64 expected_size = sizeof(U64) + count * sizeof(U64);
-    GDB_Table* table = index->column->parent_table;
+    CQL_Table* table = index->column->parent_table;
     if (idx_data.size == expected_size && count == table->row_count)
     {
       index->order = count ? push_array(table->arena, U64, count) : NULL;
@@ -2358,7 +2359,7 @@ gdb_index_load(GDB_Index* index, String8 table_dir)
 //~ tec: constraints
 
 internal B32
-gdb_column_has_any_constraint(GDB_Column* column)
+cql_column_has_any_constraint(CQL_Column* column)
 {
   return column->not_null || column->is_unique || column->is_primary_key ||
     column->has_foreign_key || column->has_check;
@@ -2366,29 +2367,33 @@ gdb_column_has_any_constraint(GDB_Column* column)
 
 //~ tec: column
 internal B32
-gdb_column_is_ephemeral(GDB_Column* column)
+cql_column_is_ephemeral(CQL_Column* column)
 {
   return column->parent_table && column->parent_table->is_ephemeral;
 }
 
-internal GDB_Column*
-gdb_column_alloc(String8 name, GDB_ColumnType type, U64 size)
+global U64 g_cql_column_uid_counter = 0;
+
+internal CQL_Column*
+cql_column_alloc(String8 name, CQL_ColumnType type, U64 size)
 {
-  Arena* arena = arena_alloc(.reserve_size=settings_u64(str8_lit("GDB_COLUMN_ARENA_RESERVE_SIZE"), GDB_COLUMN_ARENA_RESERVE_SIZE),
-                             .commit_size=settings_u64(str8_lit("GDB_COLUMN_ARENA_COMMIT_SIZE"), GDB_COLUMN_ARENA_COMMIT_SIZE));
-  GDB_Column* column = push_array(arena, GDB_Column, 1);
+  Arena* arena = arena_alloc(.reserve_size=settings_u64(str8_lit("CQL_COLUMN_ARENA_RESERVE_SIZE"), CQL_COLUMN_ARENA_RESERVE_SIZE),
+                             .commit_size=settings_u64(str8_lit("CQL_COLUMN_ARENA_COMMIT_SIZE"), CQL_COLUMN_ARENA_COMMIT_SIZE));
+  CQL_Column* column = push_array(arena, CQL_Column, 1);
   
   column->name = push_str8_copy(arena, name);
   column->type = type;
   column->size = size;
   column->arena = arena;
   column->write_generation = 1;
+  g_cql_column_uid_counter += 1;
+  column->uid = g_cql_column_uid_counter;
   
   return column;
 }
 
 internal void
-gdb_column_release(GDB_Column* column)
+cql_column_release(CQL_Column* column)
 {
   if (column->dict)
   {
@@ -2402,17 +2407,18 @@ gdb_column_release(GDB_Column* column)
 }
 
 internal void
-gdb_column_open(GDB_Column* column)
+cql_column_open(CQL_Column* column)
 {
   if (!column->is_disk_backed)
   {
-    gdb_column_convert_to_disk_backed(column);
+    cql_column_convert_to_disk_backed(column);
   }
 }
 
 internal void
-gdb_column_close(GDB_Column* column)
+cql_column_close(CQL_Column* column)
 {
+  cql_column_flush_pending(column);
   if (column->is_disk_backed)
   {
     os_file_close(column->file);
@@ -2424,58 +2430,79 @@ gdb_column_close(GDB_Column* column)
 }
 
 internal void
-gdb_column_add_data_disk_backed(GDB_Column* column, void* data)
+cql_column_drop_mapping(CQL_Column* column)
 {
-  if (column->type == GDB_ColumnType_String8)
+  if (column->mapped_ptr)
   {
-    String8* str = (String8*)data;
-    OS_Handle file = column->file;
-    if (os_handle_match(os_handle_zero(), file))
-    {
-      // tec: cached in column->file for the column's whole lifetime
-      file = os_file_open(OS_AccessFlag_Read | OS_AccessFlag_Write | OS_AccessFlag_Append | OS_AccessFlag_ShareRead | OS_AccessFlag_ShareWrite, column->disk_path);
-      column->file = file;
-    }
-    
+    os_file_map_view_close(column->file_map, column->mapped_ptr, column->current_mapped_range);
+    column->mapped_ptr = 0;
+  }
+  if (!os_handle_match(os_handle_zero(), column->file_map))
+  {
+    os_file_map_close(column->file_map);
+    column->file_map = os_handle_zero();
+  }
+  if (!os_handle_match(os_handle_zero(), column->file_map_backing_file))
+  {
+    os_file_close(column->file_map_backing_file);
+    column->file_map_backing_file = os_handle_zero();
+  }
+}
+
+// tec: writes the collected appends to the file. row_count already counts the pending rows
+internal void
+cql_column_flush_pending(CQL_Column* column)
+{
+  if (column->pending_rows == 0)
+  {
+    return;
+  }
+
+  OS_Handle file = column->file;
+  if (os_handle_match(os_handle_zero(), file))
+  {
+    // tec: cached in column->file for the column's whole lifetime
+    file = os_file_open(OS_AccessFlag_Read | OS_AccessFlag_Write | OS_AccessFlag_Append | OS_AccessFlag_ShareRead | OS_AccessFlag_ShareWrite, column->disk_path);
+    column->file = file;
+  }
+
+  U64 flushed_rows = column->row_count - column->pending_rows;
+
+  if (column->type == CQL_ColumnType_String8)
+  {
+    U64 flushed_var = column->variable_capacity - column->pending_data_size;
     U64 var_reserved = 0;
     os_file_read(file, r1u64(0, sizeof(U64)), &var_reserved);
-    
+
     U64 offset_array_offset = sizeof(U64) + var_reserved;
-    U64 offset_count = column->row_count;
-    U64 total_offsets_size = (offset_count + 1) * sizeof(U64);
-    
-    if (offset_count == 0)
-    {
-      U64 zero = 0;
-      os_file_write(file, r1u64(offset_array_offset, offset_array_offset + sizeof(U64)), &zero);
-    }
-    
-    B32 needs_growth = (column->variable_capacity + str->size > var_reserved);
+    U64 total_offsets_size = (flushed_rows + 1) * sizeof(U64);
+
+    B32 needs_growth = (column->variable_capacity > var_reserved);
     if (needs_growth)
     {
-      ProfBegin("gdb_column_add_data_disk_backed growth");
+      ProfBegin("cql_column_flush_pending growth");
       U64 new_reserved = var_reserved * 2;
-      if (new_reserved < column->variable_capacity + str->size)
+      if (new_reserved < column->variable_capacity)
       {
-        new_reserved = AlignUp(column->variable_capacity + str->size + g_gdb_state->column_variable_capacity_alloc_size, 8);
+        new_reserved = AlignUp(column->variable_capacity + g_cql_state->column_variable_capacity_alloc_size, 8);
       }
-      
+
       U64 old_offset_pos = sizeof(U64) + var_reserved;
       U64 new_offset_pos = sizeof(U64) + new_reserved;
-      
-      Temp scratch = temp_begin(g_gdb_state->arena);
+
+      Temp scratch = temp_begin(g_cql_state->arena);
       void *buffer = push_array(scratch.arena, U8, total_offsets_size);
-      
+
       os_file_read(file, r1u64(old_offset_pos, old_offset_pos + total_offsets_size), buffer);
       os_file_write(file, r1u64(new_offset_pos, new_offset_pos + total_offsets_size), buffer);
-      
+
       os_file_write(file, r1u64(0, sizeof(U64)), &new_reserved);
       var_reserved = new_reserved;
       offset_array_offset = sizeof(U64) + var_reserved;
-      
+
       U64 new_size = offset_array_offset + total_offsets_size;
       os_file_resize(file, new_size);
-      
+
       // tec: clear the old offsets location
       U64 old_offset_array_end = old_offset_pos + total_offsets_size;
       if (old_offset_array_end > new_offset_pos)
@@ -2489,56 +2516,91 @@ gdb_column_add_data_disk_backed(GDB_Column* column, void* data)
         MemoryZero(zero_buf, old_offset_array_size);
         os_file_write(file, r1u64(old_offset_pos, old_offset_array_end), zero_buf);
       }
-      
+
       temp_end(scratch);
       ProfEnd();
     }
-    U64 string_offset = column->variable_capacity;
-    os_file_write(file, r1u64(sizeof(U64) + string_offset, sizeof(U64) + string_offset + str->size), str->str);
-    
-    U64 new_end_offset = string_offset + str->size;
+
+    if (column->pending_data_size > 0)
+    {
+      os_file_write(file, r1u64(sizeof(U64) + flushed_var, sizeof(U64) + flushed_var + column->pending_data_size), column->pending_data);
+    }
     os_file_write(file,
-                  r1u64(offset_array_offset + (offset_count + 0) * sizeof(U64),
-                        offset_array_offset + (offset_count + 1) * sizeof(U64)),
-                  &new_end_offset);
-    
-    column->variable_capacity += str->size;
+                  r1u64(offset_array_offset + flushed_rows * sizeof(U64),
+                        offset_array_offset + (flushed_rows + column->pending_rows) * sizeof(U64)),
+                  column->pending_offsets);
   }
   else
   {
-    OS_Handle file = column->file;
-    if (os_handle_match(os_handle_zero(), file))
+    U64 offset = flushed_rows * column->size;
+    os_file_write(file, r1u64(offset, offset + column->pending_data_size), column->pending_data);
+  }
+
+  column->pending_rows = 0;
+  column->pending_data_size = 0;
+
+  // tec: a cached mapping bakes in the file size, the flush just changed it
+  cql_column_drop_mapping(column);
+}
+
+internal void
+cql_column_add_data_disk_backed(CQL_Column* column, void* data)
+{
+  if (!column->pending_data)
+  {
+    column->pending_data_capacity = CQL_PENDING_APPEND_BYTES;
+    column->pending_data = push_array(column->arena, U8, column->pending_data_capacity);
+    if (column->type == CQL_ColumnType_String8)
     {
-      // tec: cached in column->file for the column's whole lifetime
-      file = os_file_open(OS_AccessFlag_Read | OS_AccessFlag_Write | OS_AccessFlag_Append | OS_AccessFlag_ShareRead | OS_AccessFlag_ShareWrite, column->disk_path);
-      column->file = file;
+      column->pending_offsets = push_array(column->arena, U64, CQL_PENDING_APPEND_ROWS);
     }
-    U64 offset = column->row_count * column->size;
+  }
+
+  if (column->type == CQL_ColumnType_String8)
+  {
+    String8* str = (String8*)data;
+
+    if (column->pending_rows == CQL_PENDING_APPEND_ROWS || column->pending_data_size + str->size > column->pending_data_capacity)
+    {
+      cql_column_flush_pending(column);
+    }
+    if (str->size > column->pending_data_capacity)
+    {
+      column->pending_data_capacity = AlignUp(str->size, KB(64));
+      column->pending_data = push_array(column->arena, U8, column->pending_data_capacity);
+    }
+
+    MemoryCopy(column->pending_data + column->pending_data_size, str->str, str->size);
+    column->pending_data_size += str->size;
+    column->variable_capacity += str->size;
+    column->pending_offsets[column->pending_rows] = column->variable_capacity;
+    column->pending_rows += 1;
+  }
+  else
+  {
+    if (column->pending_data_size + column->size > column->pending_data_capacity)
+    {
+      cql_column_flush_pending(column);
+    }
+
+    U8* dest = column->pending_data + column->pending_data_size;
     if (data)
     {
-      os_file_write(file, r1u64(offset, offset + column->size), data);
+      MemoryCopy(dest, data, column->size);
     }
     else
     {
-      // tec: NULL data. write a zeroed placeholder
-      Temp scratch = temp_begin(g_gdb_state->arena);
-      void* zero_buf = push_array(scratch.arena, U8, column->size);
-      MemoryZero(zero_buf, column->size);
-      os_file_write(file, r1u64(offset, offset + column->size), zero_buf);
-      temp_end(scratch);
+      MemoryZero(dest, column->size);
     }
-    
-    if (os_handle_match(os_handle_zero(), column->file))
-    {
-      os_file_close(file);
-    }
+    column->pending_data_size += column->size;
+    column->pending_rows += 1;
   }
 }
 
 internal void
-gdb_column_add_data(GDB_Column* column, void* data)
+cql_column_add_data(CQL_Column* column, void* data)
 {
-  if (column->type == GDB_ColumnType_String8)
+  if (column->type == CQL_ColumnType_String8)
   {
     String8* str = (String8*)data;
     String8 empty_str = str8_lit("");
@@ -2549,14 +2611,14 @@ gdb_column_add_data(GDB_Column* column, void* data)
     
     if (column->is_disk_backed)
     {
-      gdb_column_add_data_disk_backed(column, str);
+      cql_column_add_data_disk_backed(column, str);
     }
     else
     {
       //- tec: grow offsets array if needed
       if (column->row_count == column->capacity)
       {
-        U64 new_capacity = (column->capacity > 0) ? column->capacity * 2 : g_gdb_state->column_expand_count;
+        U64 new_capacity = (column->capacity > 0) ? column->capacity * 2 : g_cql_state->column_expand_count;
         U64* new_offsets = push_array(column->arena, U64, new_capacity);
         if (column->offsets)
         {
@@ -2571,19 +2633,19 @@ gdb_column_add_data(GDB_Column* column, void* data)
       U64 required_size = previous_offset + str->size;
       if (required_size > column->variable_capacity)
       {
-        U64 new_variable_capacity = (column->variable_capacity > 0) ? column->variable_capacity * 2 : g_gdb_state->column_variable_capacity_alloc_size;
+        U64 new_variable_capacity = (column->variable_capacity > 0) ? column->variable_capacity * 2 : g_cql_state->column_variable_capacity_alloc_size;
         while (new_variable_capacity < required_size)
         {
           new_variable_capacity *= 2;
         }
         
-        if (new_variable_capacity > g_gdb_state->disk_backed_threshold_size && !gdb_column_is_ephemeral(column))
+        if (new_variable_capacity > g_cql_state->disk_backed_threshold_size && !cql_column_is_ephemeral(column))
         {
           if (!column->is_disk_backed)
           {
-            gdb_column_convert_to_disk_backed(column);
-            gdb_column_add_data(column, data);
-            //gdb_column_add_data_disk_backed(column, data);
+            cql_column_convert_to_disk_backed(column);
+            cql_column_add_data(column, data);
+            //cql_column_add_data_disk_backed(column, data);
             return;
           }
         }
@@ -2611,7 +2673,7 @@ gdb_column_add_data(GDB_Column* column, void* data)
   {
     if (column->is_disk_backed)
     {
-      gdb_column_add_data_disk_backed(column, data);
+      cql_column_add_data_disk_backed(column, data);
     }
     else
     {
@@ -2626,10 +2688,10 @@ gdb_column_add_data(GDB_Column* column, void* data)
         }
         
         // tec: cap capacity
-        U64 new_capacity = (column->capacity > 0) ? column->capacity * 2 : g_gdb_state->column_expand_count;
-        if (new_capacity > column->capacity + g_gdb_state->column_max_grow_by_size)
+        U64 new_capacity = (column->capacity > 0) ? column->capacity * 2 : g_cql_state->column_expand_count;
+        if (new_capacity > column->capacity + g_cql_state->column_max_grow_by_size)
         {
-          new_capacity = column->capacity + g_gdb_state->column_max_grow_by_size;
+          new_capacity = column->capacity + g_cql_state->column_max_grow_by_size;
         }
         //log_debug("growing column: old_capacity=%llu, new_capacity=%llu, size=%llu", column->capacity, new_capacity, column->size);
         
@@ -2658,9 +2720,9 @@ gdb_column_add_data(GDB_Column* column, void* data)
         MemoryZero(column->data + column->row_count * column->size, column->size);
       }
       
-      if ((column->row_count + 1) * column->size > g_gdb_state->disk_backed_threshold_size && !gdb_column_is_ephemeral(column))
+      if ((column->row_count + 1) * column->size > g_cql_state->disk_backed_threshold_size && !cql_column_is_ephemeral(column))
       {
-        gdb_column_convert_to_disk_backed(column);
+        cql_column_convert_to_disk_backed(column);
       }
     }
   }
@@ -2671,28 +2733,14 @@ gdb_column_add_data(GDB_Column* column, void* data)
   // file mapping bakes in the file size at open time, so a stale mapping cant see bytes this write just appended
   if (column->is_disk_backed)
   {
-    if (column->mapped_ptr)
-    {
-      os_file_map_view_close(column->file_map, column->mapped_ptr, column->current_mapped_range);
-      column->mapped_ptr = 0;
-    }
-    if (!os_handle_match(os_handle_zero(), column->file_map))
-    {
-      os_file_map_close(column->file_map);
-      column->file_map = os_handle_zero();
-    }
-    if (!os_handle_match(os_handle_zero(), column->file_map_backing_file))
-    {
-      os_file_close(column->file_map_backing_file);
-      column->file_map_backing_file = os_handle_zero();
-    }
+    cql_column_drop_mapping(column);
   }
 }
 
 internal B32
-gdb_column_fill_from_f64(GDB_Column* column, F64* values, U8* is_null, U64 count)
+cql_column_fill_from_f64(CQL_Column* column, F64* values, U8* is_null, U64 count)
 {
-  if (column->type == GDB_ColumnType_String8 || column->type == GDB_ColumnType_Invalid || 
+  if (column->type == CQL_ColumnType_String8 || column->type == CQL_ColumnType_Invalid || 
       column->row_count != 0 || column->is_disk_backed)
   {
     return 0;
@@ -2710,8 +2758,8 @@ gdb_column_fill_from_f64(GDB_Column* column, F64* values, U8* is_null, U64 count
   
   switch (column->type)
   {
-    case GDB_ColumnType_U32:
-    case GDB_ColumnType_Enum:
+    case CQL_ColumnType_U32:
+    case CQL_ColumnType_Enum:
     { 
       U32* out = (U32*)data; 
       for (U64 i = 0; i < count; i++) 
@@ -2719,7 +2767,7 @@ gdb_column_fill_from_f64(GDB_Column* column, F64* values, U8* is_null, U64 count
         out[i] = (U32)values[i];
       }
     } break;
-    case GDB_ColumnType_U64:
+    case CQL_ColumnType_U64:
     { 
       U64* out = (U64*)data; 
       for (U64 i = 0; i < count; i++) 
@@ -2727,7 +2775,7 @@ gdb_column_fill_from_f64(GDB_Column* column, F64* values, U8* is_null, U64 count
         out[i] = (U64)values[i];
       }
     } break;
-    case GDB_ColumnType_F32: 
+    case CQL_ColumnType_F32: 
     { 
       F32* out = (F32*)data; 
       for (U64 i = 0; i < count; i++) 
@@ -2735,11 +2783,11 @@ gdb_column_fill_from_f64(GDB_Column* column, F64* values, U8* is_null, U64 count
         out[i] = (F32)values[i];
       }
     } break;
-    case GDB_ColumnType_F64: 
+    case CQL_ColumnType_F64: 
     { 
       MemoryCopy(data, values, count * sizeof(F64)); 
     } break;
-    case GDB_ColumnType_Bool: 
+    case CQL_ColumnType_Bool: 
     { 
       U8* out = data; 
       for (U64 i = 0; i < count; i++) 
@@ -2747,8 +2795,8 @@ gdb_column_fill_from_f64(GDB_Column* column, F64* values, U8* is_null, U64 count
         out[i] = (U8)values[i]; 
       }
     } break;
-    case GDB_ColumnType_I32:
-    case GDB_ColumnType_Date: 
+    case CQL_ColumnType_I32:
+    case CQL_ColumnType_Date: 
     { 
       S32* out = (S32*)data; 
       for (U64 i = 0; i < count; i++) 
@@ -2756,9 +2804,9 @@ gdb_column_fill_from_f64(GDB_Column* column, F64* values, U8* is_null, U64 count
         out[i] = (S32)values[i]; 
       }
     } break;
-    case GDB_ColumnType_I64:
-    case GDB_ColumnType_Timestamp:
-    case GDB_ColumnType_Decimal: 
+    case CQL_ColumnType_I64:
+    case CQL_ColumnType_Timestamp:
+    case CQL_ColumnType_Decimal: 
     { 
       S64* out = (S64*)data; 
       for (U64 i = 0; i < count; i++) 
@@ -2783,17 +2831,39 @@ gdb_column_fill_from_f64(GDB_Column* column, F64* values, U8* is_null, U64 count
     }
     if (any_null)
     {
-      gdb_column_ensure_null_flags_capacity(column, count);
+      cql_column_ensure_null_flags_capacity(column, count);
       MemoryCopy(column->null_flags, is_null, count);
     }
   }
   return 1;
 }
 
-internal B32
-gdb_column_fill_from_strings(GDB_Column* column, String8* values, U8* is_null, U64 count)
+internal void*
+cql_column_alloc_fixed_rows(CQL_Column* column, U64 count)
 {
-  if (column->type != GDB_ColumnType_String8 || column->row_count != 0 || 
+  if (column->type == CQL_ColumnType_String8 || column->type == CQL_ColumnType_Invalid ||
+      column->row_count != 0 || column->is_disk_backed || count == 0)
+  {
+    return 0;
+  }
+
+  U8* data = arena_push(column->arena, count * column->size, 8);
+  if (data == 0)
+  {
+    return 0;
+  }
+
+  column->data = data;
+  column->capacity = count;
+  column->row_count = count;
+  column->write_generation++;
+  return data;
+}
+
+internal B32
+cql_column_fill_from_strings(CQL_Column* column, String8* values, U8* is_null, U64 count)
+{
+  if (column->type != CQL_ColumnType_String8 || column->row_count != 0 || 
       column->is_disk_backed || column->offsets != 0)
   {
     return 0;
@@ -2844,7 +2914,7 @@ gdb_column_fill_from_strings(GDB_Column* column, String8* values, U8* is_null, U
     }
     if (any_null)
     {
-      gdb_column_ensure_null_flags_capacity(column, count);
+      cql_column_ensure_null_flags_capacity(column, count);
       MemoryCopy(column->null_flags, is_null, count);
     }
   }
@@ -2852,14 +2922,14 @@ gdb_column_fill_from_strings(GDB_Column* column, String8* values, U8* is_null, U
 }
 
 internal void
-gdb_column_ensure_null_flags_capacity(GDB_Column* column, U64 needed_count)
+cql_column_ensure_null_flags_capacity(CQL_Column* column, U64 needed_count)
 {
   if (needed_count <= column->null_flags_capacity)
   {
     return;
   }
   
-  U64 new_capacity = (column->null_flags_capacity > 0) ? column->null_flags_capacity * 2 : g_gdb_state->column_expand_count;
+  U64 new_capacity = (column->null_flags_capacity > 0) ? column->null_flags_capacity * 2 : g_cql_state->column_expand_count;
   while (new_capacity < needed_count) new_capacity *= 2;
   
   U8* new_flags = push_array(column->arena, U8, new_capacity); // tec: push_array auto-zeroes
@@ -2872,64 +2942,64 @@ gdb_column_ensure_null_flags_capacity(GDB_Column* column, U64 needed_count)
 }
 
 internal F64
-gdb_numeric_value_as_f64(GDB_ColumnType type, void* data)
+cql_numeric_value_as_f64(CQL_ColumnType type, void* data)
 {
   switch (type)
   {
-    case GDB_ColumnType_U32: return (F64)(*(U32*)data);
-    case GDB_ColumnType_U64: return (F64)(*(U64*)data);
-    case GDB_ColumnType_F32: return (F64)(*(F32*)data);
-    case GDB_ColumnType_F64: return *(F64*)data;
-    case GDB_ColumnType_Bool: return (F64)(*(U8*)data);
-    case GDB_ColumnType_I32: return (F64)(*(S32*)data);
-    case GDB_ColumnType_I64: return (F64)(*(S64*)data);
-    case GDB_ColumnType_Date: return (F64)(*(S32*)data);
-    case GDB_ColumnType_Timestamp: return (F64)(*(S64*)data);
-    case GDB_ColumnType_Decimal: return (F64)(*(S64*)data);
-    case GDB_ColumnType_Enum: return (F64)(*(U32*)data);
+    case CQL_ColumnType_U32: return (F64)(*(U32*)data);
+    case CQL_ColumnType_U64: return (F64)(*(U64*)data);
+    case CQL_ColumnType_F32: return (F64)(*(F32*)data);
+    case CQL_ColumnType_F64: return *(F64*)data;
+    case CQL_ColumnType_Bool: return (F64)(*(U8*)data);
+    case CQL_ColumnType_I32: return (F64)(*(S32*)data);
+    case CQL_ColumnType_I64: return (F64)(*(S64*)data);
+    case CQL_ColumnType_Date: return (F64)(*(S32*)data);
+    case CQL_ColumnType_Timestamp: return (F64)(*(S64*)data);
+    case CQL_ColumnType_Decimal: return (F64)(*(S64*)data);
+    case CQL_ColumnType_Enum: return (F64)(*(U32*)data);
     default: return 0.0;
   }
 }
 
 internal B32
-gdb_column_type_is_zone_map_eligible(GDB_ColumnType type)
+cql_column_type_is_zone_map_eligible(CQL_ColumnType type)
 {
-  return type != GDB_ColumnType_Invalid && type != GDB_ColumnType_String8;
+  return type != CQL_ColumnType_Invalid && type != CQL_ColumnType_String8;
 }
 
 internal void
-gdb_column_zone_map_grow(GDB_Column* column, U64 needed_count)
+cql_column_zone_map_grow(CQL_Column* column, U64 needed_count)
 {
   if (needed_count <= column->zone_map_capacity) return;
   
-  U64 new_capacity = (column->zone_map_capacity > 0) ? column->zone_map_capacity * 2 : g_gdb_state->column_expand_count;
+  U64 new_capacity = (column->zone_map_capacity > 0) ? column->zone_map_capacity * 2 : g_cql_state->column_expand_count;
   while (new_capacity < needed_count) new_capacity *= 2;
   
-  GDB_ZoneMapChunk* new_zone_map = push_array(column->arena, GDB_ZoneMapChunk, new_capacity); // tec: push_array auto-zeroes -> has_values=0
+  CQL_ZoneMapChunk* new_zone_map = push_array(column->arena, CQL_ZoneMapChunk, new_capacity); // tec: push_array auto-zeroes -> has_values=0
   if (column->zone_map)
   {
-    MemoryCopy(new_zone_map, column->zone_map, column->zone_map_chunk_count * sizeof(GDB_ZoneMapChunk));
+    MemoryCopy(new_zone_map, column->zone_map, column->zone_map_chunk_count * sizeof(CQL_ZoneMapChunk));
   }
   column->zone_map = new_zone_map;
   column->zone_map_capacity = new_capacity;
 }
 
 internal void
-gdb_column_zone_map_note_append(GDB_Column* column, void* data)
+cql_column_zone_map_note_append(CQL_Column* column, void* data)
 {
-  if (!gdb_column_type_is_zone_map_eligible(column->type)) return;
+  if (!cql_column_type_is_zone_map_eligible(column->type)) return;
   
   U64 new_row_index = column->row_count - 1; // tec: caller already incremented row_count
-  U64 chunk_index = new_row_index >> g_gdb_state->zonemap_chunk_rows_log2;
+  U64 chunk_index = new_row_index >> g_cql_state->zonemap_chunk_rows_log2;
   
   if (chunk_index >= column->zone_map_chunk_count)
   {
-    gdb_column_zone_map_grow(column, chunk_index + 1);
+    cql_column_zone_map_grow(column, chunk_index + 1);
     column->zone_map_chunk_count = chunk_index + 1;
   }
   
-  F64 value = data ? gdb_numeric_value_as_f64(column->type, data) : 0.0;
-  GDB_ZoneMapChunk* chunk = &column->zone_map[chunk_index];
+  F64 value = data ? cql_numeric_value_as_f64(column->type, data) : 0.0;
+  CQL_ZoneMapChunk* chunk = &column->zone_map[chunk_index];
   if (!chunk->has_values)
   {
     chunk->min = value;
@@ -2947,34 +3017,32 @@ gdb_column_zone_map_note_append(GDB_Column* column, void* data)
 }
 
 internal void
-gdb_column_add_data_maybe_null(GDB_Column* column, void* data, B32 is_null)
+cql_column_add_data_maybe_null(CQL_Column* column, void* data, B32 is_null)
 {
-  // tec: always append a real (placeholder) value through the existing storage path first
-  // so all of gdb_column_add_data's logic is reused, NULL tracking is a side channel byte array layered on top
-  gdb_column_add_data(column, data);
+  // tec: append a placeholder value through the existing storage path, NULL tracking is a side channel layered on top
+  cql_column_add_data(column, data);
   
-  // tec: only touch null_flags at all once this column has ever seen a NULL
-  // this keeps the all none null column at zero cost
+  // tec: null_flags is only touched once the column has seen a NULL, so a column without NULLs pays nothing
   if (is_null || column->null_flags)
   {
-    gdb_column_ensure_null_flags_capacity(column, column->row_count);
+    cql_column_ensure_null_flags_capacity(column, column->row_count);
     column->null_flags[column->row_count - 1] = is_null ? 1 : 0;
   }
   
   if (!is_null)
   {
-    gdb_column_zone_map_note_append(column, data);
+    cql_column_zone_map_note_append(column, data);
   }
 }
 
 internal B32
-gdb_column_is_null(GDB_Column* column, U64 row_index)
+cql_column_is_null(CQL_Column* column, U64 row_index)
 {
   return column->null_flags && row_index < column->null_flags_capacity && column->null_flags[row_index];
 }
 
 internal void
-gdb_column_remove_data(GDB_Column* column, U64 row_index)
+cql_column_remove_data(CQL_Column* column, U64 row_index)
 {
   if (row_index >= column->row_count)
   {
@@ -2984,10 +3052,10 @@ gdb_column_remove_data(GDB_Column* column, U64 row_index)
   
   if (column->is_disk_backed)
   {
-    gdb_column_materialize_to_memory(column);
+    cql_column_materialize_to_memory(column);
   }
   
-  if (column->type == GDB_ColumnType_String8)
+  if (column->type == CQL_ColumnType_String8)
   {
     // tec: offsets[k] is the end offset of row k (no leading zero entry)
     // the removed row's byte range is [offsets[row_index-1] or 0, offsets[row_index]), not [offsets[row_index], offsets[row_index+1])
@@ -3022,8 +3090,9 @@ gdb_column_remove_data(GDB_Column* column, U64 row_index)
 }
 
 internal void*
-gdb_column_get_data(GDB_Column* column, U64 index)
+cql_column_get_data(CQL_Column* column, U64 index)
 {
+  cql_column_flush_pending(column);
   if (index >= column->row_count)
   {
     log_error("index %llu out of bounds %llu", index, column->row_count);
@@ -3055,11 +3124,12 @@ gdb_column_get_data(GDB_Column* column, U64 index)
 }
 
 internal String8
-gdb_column_get_string(Arena *arena, GDB_Column *column, U64 index)
+cql_column_get_string(Arena *arena, CQL_Column *column, U64 index)
 {
+  cql_column_flush_pending(column);
   String8 result = {0};
   
-  if (index >= column->row_count || column->type != GDB_ColumnType_String8)
+  if (index >= column->row_count || column->type != CQL_ColumnType_String8)
     return result;
   
   if (column->is_disk_backed)
@@ -3127,8 +3197,9 @@ gdb_column_get_string(Arena *arena, GDB_Column *column, U64 index)
 // tec: TODO i think this doesnt accurately reflect the column sizes
 // because for strings the file size may be different than the actual size
 internal U64
-gdb_column_get_total_size(GDB_Column* column)
+cql_column_get_total_size(CQL_Column* column)
 {
+  cql_column_flush_pending(column);
   U64 total_size = 0;
   
   if (column->is_disk_backed)
@@ -3136,7 +3207,7 @@ gdb_column_get_total_size(GDB_Column* column)
     FileProperties props = os_properties_from_file_path(column->disk_path);
     total_size = props.size;
     
-    if (column->type == GDB_ColumnType_String8 && column->row_count > 0)
+    if (column->type == CQL_ColumnType_String8 && column->row_count > 0)
     {
       U64 expected_minimum_size = (column->row_count + 1) * sizeof(U64);
       if (total_size < expected_minimum_size)
@@ -3147,7 +3218,7 @@ gdb_column_get_total_size(GDB_Column* column)
   }
   else
   {
-    if (column->type == GDB_ColumnType_String8)
+    if (column->type == CQL_ColumnType_String8)
     {
       total_size += sizeof(U64);
       total_size += column->variable_capacity;
@@ -3164,13 +3235,14 @@ gdb_column_get_total_size(GDB_Column* column)
 }
 
 internal void*
-gdb_column_get_data_range(Arena* arena, GDB_Column* column, Rng1U64 row_range, U64* out_size)
+cql_column_get_data_range(Arena* arena, CQL_Column* column, Rng1U64 row_range, U64* out_size)
 {
+  cql_column_flush_pending(column);
   ProfBeginFunction();
   
-  if (column->type == GDB_ColumnType_String8)
+  if (column->type == CQL_ColumnType_String8)
   {
-    log_error("gdb_column_get_data_range was called, but column type is string. Use gdb_column_get_string_chunk instead.");
+    log_error("cql_column_get_data_range was called, but column type is string. Use cql_column_get_string_chunk instead.");
     *out_size = 0;
     ProfEnd();
     return NULL;
@@ -3255,12 +3327,13 @@ gdb_column_get_data_range(Arena* arena, GDB_Column* column, Rng1U64 row_range, U
 }
 
 
-internal GDB_StringDataChunk
-gdb_column_get_string_chunk(Arena* arena, GDB_Column* column, Rng1U64 row_range)
+internal CQL_StringDataChunk
+cql_column_get_string_chunk(Arena* arena, CQL_Column* column, Rng1U64 row_range)
 {
+  cql_column_flush_pending(column);
   ProfBeginFunction();
   
-  GDB_StringDataChunk result = {0};
+  CQL_StringDataChunk result = {0};
   
   U64 row_count = row_range.max - row_range.min;
   if (row_count == 0)
@@ -3289,7 +3362,7 @@ gdb_column_get_string_chunk(Arena* arena, GDB_Column* column, Rng1U64 row_range)
       column->file_map_backing_file = map_backing_file;
     }
     
-    // tec: on-disk string column layout (see gdb_table_save):
+    // tec: on-disk string column layout (see cql_table_save):
     //   [0, 8)                          : U64 variable_capacity (size of the raw string data blob)
     //   [8, 8+variable_capacity)        : raw string bytes (all rows, contiguous)
     //   [8+variable_capacity, ...)      : U64 offsets[capacity], offsets[k] = end-of-row-k byte
@@ -3381,21 +3454,21 @@ gdb_column_get_string_chunk(Arena* arena, GDB_Column* column, Rng1U64 row_range)
 }
 
 internal void
-gdb_column_close_string_chunk(GDB_Column* column)
+cql_column_close_string_chunk(CQL_Column* column)
 {
   OS_Handle file_map = column->file_map;
   os_file_map_view_close(file_map, column->mapped_ptr, column->current_mapped_range);
 }
 
 internal B32
-gdb_string_dict_code_from_value(GDB_StringDict* dict, String8 value, U32* out_code)
+cql_string_dict_code_from_value(CQL_StringDict* dict, String8 value, U32* out_code)
 {
   U64 mask = dict->index_capacity - 1;
   U64 slot = u64_hash_from_str8(value) & mask;
-  for (U32 probe = 0; probe < GDB_DICT_MAX_PROBE; probe++)
+  for (U32 probe = 0; probe < CQL_DICT_MAX_PROBE; probe++)
   {
     U32 code = dict->index_codes[slot];
-    if (code == GDB_DICT_EMPTY_SLOT)
+    if (code == CQL_DICT_EMPTY_SLOT)
     {
       return 0;
     }
@@ -3410,27 +3483,27 @@ gdb_string_dict_code_from_value(GDB_StringDict* dict, String8 value, U32* out_co
 }
 
 internal U32
-gdb_string_dict_code_or_sentinel(GDB_StringDict* dict, String8 value)
+cql_string_dict_code_or_sentinel(CQL_StringDict* dict, String8 value)
 {
   U32 code = 0;
-  return gdb_string_dict_code_from_value(dict, value, &code) ? code : GDB_DICT_NOT_FOUND;
+  return cql_string_dict_code_from_value(dict, value, &code) ? code : CQL_DICT_NOT_FOUND;
 }
 
 internal String8
-gdb_dict_row_string(GDB_StringDataChunk* chunk, U64 row)
+cql_dict_row_string(CQL_StringDataChunk* chunk, U64 row)
 {
   if (!chunk->data)
   {
-    return g_gdb_dict_empty_str8;
+    return g_cql_dict_empty_str8;
   }
   U64 start = chunk->offsets[row];
   U64 len = chunk->offsets[row + 1] - start;
   return str8((U8*)chunk->data + start, len);
 }
 
-internal THREAD_POOL_TASK_FUNC(gdb_dict_claim_task)
+internal THREAD_POOL_TASK_FUNC(cql_dict_claim_task)
 {
-  GDB_DictBuildCtx* ctx = (GDB_DictBuildCtx*)raw_task;
+  CQL_DictBuildCtx* ctx = (CQL_DictBuildCtx*)raw_task;
   Rng1U64 range = ctx->ranges[task_id];
   U64 mask = ctx->capacity - 1;
   
@@ -3438,20 +3511,20 @@ internal THREAD_POOL_TASK_FUNC(gdb_dict_claim_task)
   {
     if (ctx->overflow_flag) break;
     
-    String8 s = gdb_dict_row_string(&ctx->chunk, row);
+    String8 s = cql_dict_row_string(&ctx->chunk, row);
     U64 slot = u64_hash_from_str8(s) & mask;
     B32 placed = 0;
     
-    for (U32 probe = 0; probe < GDB_DICT_MAX_PROBE; probe++)
+    for (U32 probe = 0; probe < CQL_DICT_MAX_PROBE; probe++)
     {
-      U32 existing = ins_atomic_u32_eval_cond_assign(&ctx->owner_row[slot], (U32)row, GDB_DICT_EMPTY_SLOT);
-      if (existing == GDB_DICT_EMPTY_SLOT)
+      U32 existing = ins_atomic_u32_eval_cond_assign(&ctx->owner_row[slot], (U32)row, CQL_DICT_EMPTY_SLOT);
+      if (existing == CQL_DICT_EMPTY_SLOT)
       {
         placed = 1;
         break;
       }
       
-      String8 existing_str = gdb_dict_row_string(&ctx->chunk, existing);
+      String8 existing_str = cql_dict_row_string(&ctx->chunk, existing);
       if (MemoryMatch(existing_str.str, s.str, s.size) && existing_str.size == s.size)
       {
         placed = 1;
@@ -3469,26 +3542,26 @@ internal THREAD_POOL_TASK_FUNC(gdb_dict_claim_task)
   }
 }
 
-internal THREAD_POOL_TASK_FUNC(gdb_dict_fill_codes_task)
+internal THREAD_POOL_TASK_FUNC(cql_dict_fill_codes_task)
 {
-  GDB_DictFillCtx* ctx = (GDB_DictFillCtx*)raw_task;
+  CQL_DictFillCtx* ctx = (CQL_DictFillCtx*)raw_task;
   Rng1U64 range = ctx->ranges[task_id];
   
   for (U64 row = range.min; row < range.max; row++)
   {
-    String8 s = gdb_dict_row_string(&ctx->chunk, row);
+    String8 s = cql_dict_row_string(&ctx->chunk, row);
     U32 code = 0;
-    B32 found = gdb_string_dict_code_from_value(ctx->dict, s, &code);
+    B32 found = cql_string_dict_code_from_value(ctx->dict, s, &code);
     ctx->dict_codes[row] = found ? code : 0;
   }
 }
 
 internal void
-gdb_column_ensure_string_dict(GDB_Column* column)
+cql_column_ensure_string_dict(CQL_Column* column)
 {
   ProfBeginFunction();
   
-  if (column->type != GDB_ColumnType_String8)
+  if (column->type != CQL_ColumnType_String8)
   {
     ProfEnd();
     return;
@@ -3508,7 +3581,7 @@ gdb_column_ensure_string_dict(GDB_Column* column)
   column->dict = 0;
   column->dict_codes = 0;
   
-  if (column->row_count < g_gdb_state->dict_encode_min_rows)
+  if (column->row_count < g_cql_state->dict_encode_min_rows)
   {
     column->dict_checked_generation = column->write_generation;
     ProfEnd();
@@ -3517,11 +3590,11 @@ gdb_column_ensure_string_dict(GDB_Column* column)
   
   Temp scratch = scratch_begin(0, 0);
   
-  GDB_DictBuildCtx build_ctx = {0};
-  build_ctx.chunk = gdb_column_get_string_chunk(scratch.arena, column, r1u64(0, column->row_count));
-  build_ctx.capacity = u64_up_to_pow2(g_gdb_state->dict_encode_max_distinct * GDB_DICT_TABLE_CAPACITY_FACTOR);
+  CQL_DictBuildCtx build_ctx = {0};
+  build_ctx.chunk = cql_column_get_string_chunk(scratch.arena, column, r1u64(0, column->row_count));
+  build_ctx.capacity = u64_up_to_pow2(g_cql_state->dict_encode_max_distinct * CQL_DICT_TABLE_CAPACITY_FACTOR);
   build_ctx.owner_row = push_array(scratch.arena, U32, build_ctx.capacity);
-  for (U64 i = 0; i < build_ctx.capacity; i++) build_ctx.owner_row[i] = GDB_DICT_EMPTY_SLOT;
+  for (U64 i = 0; i < build_ctx.capacity; i++) build_ctx.owner_row[i] = CQL_DICT_EMPTY_SLOT;
   
   TP_Context* pool = app_thread_pool();
   U64 task_count = Max((U64)1, Min((U64)pool->worker_count, column->row_count));
@@ -3529,7 +3602,7 @@ gdb_column_ensure_string_dict(GDB_Column* column)
   
   TP_Arena* pool_arena = app_thread_pool_arena();
   TP_Temp temp = tp_temp_begin(pool_arena);
-  tp_for_parallel(pool, pool_arena, task_count, gdb_dict_claim_task, &build_ctx);
+  tp_for_parallel(pool, pool_arena, task_count, cql_dict_claim_task, &build_ctx);
   tp_temp_end(temp);
   
   B32 eligible = !build_ctx.overflow_flag;
@@ -3539,9 +3612,9 @@ gdb_column_ensure_string_dict(GDB_Column* column)
   {
     for (U64 slot = 0; slot < build_ctx.capacity; slot++)
     {
-      if (build_ctx.owner_row[slot] != GDB_DICT_EMPTY_SLOT)
+      if (build_ctx.owner_row[slot] != CQL_DICT_EMPTY_SLOT)
       {
-        if (distinct_count >= g_gdb_state->dict_encode_max_distinct)
+        if (distinct_count >= g_cql_state->dict_encode_max_distinct)
         {
           eligible = 0;
           break;
@@ -3551,7 +3624,7 @@ gdb_column_ensure_string_dict(GDB_Column* column)
     }
   }
   
-  if (eligible && (F64)distinct_count / (F64)column->row_count > g_gdb_state->dict_encode_max_cardinality_ratio)
+  if (eligible && (F64)distinct_count / (F64)column->row_count > g_cql_state->dict_encode_max_cardinality_ratio)
   {
     eligible = 0;
   }
@@ -3559,7 +3632,7 @@ gdb_column_ensure_string_dict(GDB_Column* column)
   if (eligible)
   {
     Arena* dict_arena = arena_alloc();
-    GDB_StringDict* dict = push_array(dict_arena, GDB_StringDict, 1);
+    CQL_StringDict* dict = push_array(dict_arena, CQL_StringDict, 1);
     dict->arena = dict_arena;
     dict->value_count = distinct_count;
     dict->values = push_array(dict_arena, String8, Max(distinct_count, 1));
@@ -3570,28 +3643,28 @@ gdb_column_ensure_string_dict(GDB_Column* column)
     for (U64 slot = 0; slot < build_ctx.capacity; slot++)
     {
       U32 owner = build_ctx.owner_row[slot];
-      if (owner == GDB_DICT_EMPTY_SLOT)
+      if (owner == CQL_DICT_EMPTY_SLOT)
       {
-        dict->index_codes[slot] = GDB_DICT_EMPTY_SLOT;
+        dict->index_codes[slot] = CQL_DICT_EMPTY_SLOT;
       }
       else
       {
         U32 code = next_code++;
-        dict->values[code] = push_str8_copy(dict_arena, gdb_dict_row_string(&build_ctx.chunk, owner));
+        dict->values[code] = push_str8_copy(dict_arena, cql_dict_row_string(&build_ctx.chunk, owner));
         dict->index_codes[slot] = code;
       }
     }
     
     U32* dict_codes = push_array(column->arena, U32, Max(column->row_count, 1));
     
-    GDB_DictFillCtx fill_ctx = {0};
+    CQL_DictFillCtx fill_ctx = {0};
     fill_ctx.chunk = build_ctx.chunk;
     fill_ctx.ranges = build_ctx.ranges;
     fill_ctx.dict = dict;
     fill_ctx.dict_codes = dict_codes;
     
     temp = tp_temp_begin(pool_arena);
-    tp_for_parallel(pool, pool_arena, task_count, gdb_dict_fill_codes_task, &fill_ctx);
+    tp_for_parallel(pool, pool_arena, task_count, cql_dict_fill_codes_task, &fill_ctx);
     tp_temp_end(temp);
     
     column->dict = dict;
@@ -3601,7 +3674,7 @@ gdb_column_ensure_string_dict(GDB_Column* column)
   
   if (build_ctx.chunk.data)
   {
-    gdb_column_close_string_chunk(column);
+    cql_column_close_string_chunk(column);
   }
   
   column->dict_checked_generation = column->write_generation;
@@ -3610,11 +3683,11 @@ gdb_column_ensure_string_dict(GDB_Column* column)
   ProfEnd();
 }
 
-internal THREAD_POOL_TASK_FUNC(gdb_zone_map_build_task)
+internal THREAD_POOL_TASK_FUNC(cql_zone_map_build_task)
 {
-  GDB_ZoneMapBuildCtx* ctx = (GDB_ZoneMapBuildCtx*)raw_task;
+  CQL_ZoneMapBuildCtx* ctx = (CQL_ZoneMapBuildCtx*)raw_task;
   Rng1U64 chunk_range = ctx->chunk_ranges[task_id];
-  GDB_Column* column = ctx->column;
+  CQL_Column* column = ctx->column;
   
   for (U64 c = chunk_range.min; c < chunk_range.max; c++)
   {
@@ -3622,14 +3695,47 @@ internal THREAD_POOL_TASK_FUNC(gdb_zone_map_build_task)
     U64 row_end = Min(row_start + ctx->chunk_rows, column->row_count);
     if (row_start >= row_end) break;
     
-    GDB_ZoneMapChunk* out = &ctx->zone_map[c];
+    CQL_ZoneMapChunk* out = &ctx->zone_map[c];
+    
+    // tec: a NULL free column of a plain 32 bit type is folded in its own type, several times faster than converting every row to a double
+    if (ctx->base_ptr && !column->null_flags && column->type == CQL_ColumnType_U32)
+    {
+      U32* values = (U32*)ctx->base_ptr + row_start;
+      U32 low = values[0];
+      U32 high = values[0];
+      for (U64 i = 1; i < row_end - row_start; i++)
+      {
+        low = Min(low, values[i]);
+        high = Max(high, values[i]);
+      }
+      out->min = (F64)low;
+      out->max = (F64)high;
+      out->has_values = 1;
+      continue;
+    }
+    if (ctx->base_ptr && !column->null_flags && column->type == CQL_ColumnType_I32)
+    {
+      S32* values = (S32*)ctx->base_ptr + row_start;
+      S32 low = values[0];
+      S32 high = values[0];
+      for (U64 i = 1; i < row_end - row_start; i++)
+      {
+        low = Min(low, values[i]);
+        high = Max(high, values[i]);
+      }
+      out->min = (F64)low;
+      out->max = (F64)high;
+      out->has_values = 1;
+      continue;
+    }
+    
     for (U64 row = row_start; row < row_end; row++)
     {
-      if (gdb_column_is_null(column, row)) continue;
+      if (cql_column_is_null(column, row)) continue;
       if (!ctx->base_ptr) continue;
       
       void* data = (U8*)ctx->base_ptr + row * column->size;
-      F64 value = gdb_numeric_value_as_f64(column->type, data);
+      F64 value = cql_numeric_value_as_f64(column->type, data);
       if (!out->has_values)
       {
         out->min = value;
@@ -3646,11 +3752,11 @@ internal THREAD_POOL_TASK_FUNC(gdb_zone_map_build_task)
 }
 
 internal void
-gdb_column_ensure_zone_map(GDB_Column* column)
+cql_column_ensure_zone_map(CQL_Column* column)
 {
   ProfBeginFunction();
   
-  if (!gdb_column_type_is_zone_map_eligible(column->type))
+  if (!cql_column_type_is_zone_map_eligible(column->type))
   {
     ProfEnd();
     return;
@@ -3667,22 +3773,22 @@ gdb_column_ensure_zone_map(GDB_Column* column)
   column->zone_map_chunk_count = 0;
   column->has_zone_map = 0;
   
-  U64 chunk_rows = g_gdb_state->zonemap_chunk_rows;
+  U64 chunk_rows = g_cql_state->zonemap_chunk_rows;
   U64 chunk_count = (column->row_count + chunk_rows - 1) / chunk_rows;
   
   if (chunk_count > 0)
   {
-    GDB_ZoneMapChunk* zone_map = push_array(column->arena, GDB_ZoneMapChunk, chunk_count);
+    CQL_ZoneMapChunk* zone_map = push_array(column->arena, CQL_ZoneMapChunk, chunk_count);
     
     Temp scratch = scratch_begin(0, 0);
     U64 range_size = 0;
-    void* base_ptr = gdb_column_get_data_range(scratch.arena, column, r1u64(0, column->row_count), &range_size);
+    void* base_ptr = cql_column_get_data_range(scratch.arena, column, r1u64(0, column->row_count), &range_size);
     
     TP_Context* pool = app_thread_pool();
     U64 task_count = Max((U64)1, Min((U64)pool->worker_count, chunk_count));
     Rng1U64* chunk_ranges = tp_divide_work(scratch.arena, chunk_count, (U32)task_count);
     
-    GDB_ZoneMapBuildCtx ctx = {0};
+    CQL_ZoneMapBuildCtx ctx = {0};
     ctx.column = column;
     ctx.zone_map = zone_map;
     ctx.chunk_ranges = chunk_ranges;
@@ -3691,7 +3797,7 @@ gdb_column_ensure_zone_map(GDB_Column* column)
     
     TP_Arena* pool_arena = app_thread_pool_arena();
     TP_Temp temp = tp_temp_begin(pool_arena);
-    tp_for_parallel(pool, pool_arena, task_count, gdb_zone_map_build_task, &ctx);
+    tp_for_parallel(pool, pool_arena, task_count, cql_zone_map_build_task, &ctx);
     tp_temp_end(temp);
     
     scratch_end(scratch);
@@ -3708,27 +3814,27 @@ gdb_column_ensure_zone_map(GDB_Column* column)
 }
 
 internal String8
-gdb_generate_disk_path_for_column(Arena* arena, GDB_Column* column)
+cql_generate_disk_path_for_column(Arena* arena, CQL_Column* column)
 {
-  GDB_Table* table = column->parent_table;
-  GDB_Database* database = table->parent_database;
+  CQL_Table* table = column->parent_table;
+  CQL_Database* database = table->parent_database;
   
   {
     Temp scratch = scratch_begin(0, 0);
     
-    if (!os_file_path_exists(str8_lit("gdb_data/")))
+    if (!os_file_path_exists(str8_lit("cql_data/")))
     {
-      os_make_directory(str8_lit("gdb_data/"));
+      os_make_directory(str8_lit("cql_data/"));
     }
     
-    String8 database_path = push_str8f(arena, "gdb_data/%.*s/", str8_varg(database->name));
+    String8 database_path = push_str8f(arena, "cql_data/%.*s/", str8_varg(database->name));
     
     if (!os_file_path_exists(database_path))
     {
       os_make_directory(database_path);
     }
     
-    String8 table_path = push_str8f(arena, "gdb_data/%.*s/%.*s/", str8_varg(database->name), str8_varg(table->name));
+    String8 table_path = push_str8f(arena, "cql_data/%.*s/%.*s/", str8_varg(database->name), str8_varg(table->name));
     if (!os_file_path_exists(table_path))
     {
       os_make_directory(table_path);
@@ -3737,21 +3843,21 @@ gdb_generate_disk_path_for_column(Arena* arena, GDB_Column* column)
     scratch_end(scratch);
   }
   
-  String8 column_path = push_str8f(arena, "gdb_data/%.*s/%.*s/%.*s.dat", str8_varg(database->name), str8_varg(table->name), str8_varg(column->name));
+  String8 column_path = push_str8f(arena, "cql_data/%.*s/%.*s/%.*s.dat", str8_varg(database->name), str8_varg(table->name), str8_varg(column->name));
   return column_path;
 }
 
 internal void
-gdb_column_convert_to_disk_backed(GDB_Column* column)
+cql_column_convert_to_disk_backed(CQL_Column* column)
 {
   ProfBeginFunction();
   
   Temp scratch = scratch_begin(0, 0);
-  String8 column_path = gdb_generate_disk_path_for_column(scratch.arena, column);
+  String8 column_path = cql_generate_disk_path_for_column(scratch.arena, column);
   // tec: this handle is cached in column->file and kept open for the column's whole lifetime
   OS_Handle file = os_file_open(OS_AccessFlag_Read | OS_AccessFlag_Write | OS_AccessFlag_Append | OS_AccessFlag_ShareRead | OS_AccessFlag_ShareWrite, column_path);
   
-  if (column->type == GDB_ColumnType_String8)
+  if (column->type == CQL_ColumnType_String8)
   {
     os_file_write(file, r1u64(0, sizeof(U64)), &column->variable_capacity);
     os_file_write(file, r1u64(sizeof(U64), sizeof(U64) + column->variable_capacity), column->data);
@@ -3780,22 +3886,23 @@ gdb_column_convert_to_disk_backed(GDB_Column* column)
 }
 
 internal void
-gdb_column_materialize_to_memory(GDB_Column* column)
+cql_column_materialize_to_memory(CQL_Column* column)
 {
+  cql_column_flush_pending(column);
   if (!column->is_disk_backed) return;
   
   ProfBeginFunction();
   
   U64 row_count = column->row_count;
   
-  if (column->type == GDB_ColumnType_String8)
+  if (column->type == CQL_ColumnType_String8)
   {
-    GDB_StringDataChunk chunk = gdb_column_get_string_chunk(column->arena, column, r1u64(0, row_count));
+    CQL_StringDataChunk chunk = cql_column_get_string_chunk(column->arena, column, r1u64(0, row_count));
     
     // tec: copy chunk.data before closing the mapping
     U8* owned_data = push_array(column->arena, U8, Max(chunk.size, 1));
     if (chunk.size > 0) MemoryCopy(owned_data, chunk.data, chunk.size);
-    gdb_column_close_string_chunk(column);
+    cql_column_close_string_chunk(column);
     column->mapped_ptr = 0;
     
     // tec: the chunk's offsets carry a leading 0 (row_count+1 entries);
@@ -3814,7 +3921,7 @@ gdb_column_materialize_to_memory(GDB_Column* column)
   else
   {
     U64 size = 0;
-    void* data_ptr = gdb_column_get_data_range(column->arena, column, r1u64(0, row_count), &size);
+    void* data_ptr = cql_column_get_data_range(column->arena, column, r1u64(0, row_count), &size);
     U8* owned_data = push_array(column->arena, U8, Max(size, column->size));
     if (size > 0) MemoryCopy(owned_data, data_ptr, size);
     
@@ -3850,115 +3957,115 @@ gdb_column_materialize_to_memory(GDB_Column* column)
 }
 
 //~ tec: utils
-internal GDB_ColumnType
-gdb_column_type_from_string(GDB_Database* database, String8 str)
+internal CQL_ColumnType
+cql_column_type_from_string(CQL_Database* database, String8 str)
 {
   if (str8_match(str, str8_lit("u32"), StringMatchFlag_CaseInsensitive))
   {
-    return GDB_ColumnType_U32;
+    return CQL_ColumnType_U32;
   }
   else if (str8_match(str, str8_lit("u64"), StringMatchFlag_CaseInsensitive))
   {
-    return GDB_ColumnType_U64;
+    return CQL_ColumnType_U64;
   }
   else if (str8_match(str, str8_lit("f32"), StringMatchFlag_CaseInsensitive))
   {
-    return GDB_ColumnType_F32;
+    return CQL_ColumnType_F32;
   }
   else if (str8_match(str, str8_lit("f64"), StringMatchFlag_CaseInsensitive))
   {
-    return GDB_ColumnType_F64;
+    return CQL_ColumnType_F64;
   }
   else if (str8_match(str, str8_lit("string8"), StringMatchFlag_CaseInsensitive))
   {
-    return GDB_ColumnType_String8;
+    return CQL_ColumnType_String8;
   }
   else if (str8_match(str, str8_lit("bool"), StringMatchFlag_CaseInsensitive))
   {
-    return GDB_ColumnType_Bool;
+    return CQL_ColumnType_Bool;
   }
   else if (str8_match(str, str8_lit("i32"), StringMatchFlag_CaseInsensitive))
   {
-    return GDB_ColumnType_I32;
+    return CQL_ColumnType_I32;
   }
   else if (str8_match(str, str8_lit("i64"), StringMatchFlag_CaseInsensitive))
   {
-    return GDB_ColumnType_I64;
+    return CQL_ColumnType_I64;
   }
   else if (str8_match(str, str8_lit("date"), StringMatchFlag_CaseInsensitive))
   {
-    return GDB_ColumnType_Date;
+    return CQL_ColumnType_Date;
   }
   else if (str8_match(str, str8_lit("timestamp"), StringMatchFlag_CaseInsensitive))
   {
-    return GDB_ColumnType_Timestamp;
+    return CQL_ColumnType_Timestamp;
   }
   else if (str8_match(str, str8_lit("decimal"), StringMatchFlag_CaseInsensitive) ||
            str8_match(str, str8_lit("numeric"), StringMatchFlag_CaseInsensitive))
   {
-    return GDB_ColumnType_Decimal;
+    return CQL_ColumnType_Decimal;
   }
-  else if (gdb_database_find_enum_type(database, str))
+  else if (cql_database_find_enum_type(database, str))
   {
-    return GDB_ColumnType_Enum;
+    return CQL_ColumnType_Enum;
   }
   
-  log_error("failed to find matching GDB_ColumnType for '%.*s'", str8_varg(str));
-  return GDB_ColumnType_Invalid;
+  log_error("failed to find matching CQL_ColumnType for '%.*s'", str8_varg(str));
+  return CQL_ColumnType_Invalid;
 }
 
 internal String8
-string_from_gdb_column_type(GDB_ColumnType type)
+string_from_cql_column_type(CQL_ColumnType type)
 {
   String8 result = str8_lit("");
   switch (type)
   {
-    case GDB_ColumnType_U32: { result = str8_lit("GDB_ColumnType_U32"); } break;
-    case GDB_ColumnType_U64: { result = str8_lit("GDB_ColumnType_U64"); } break;
-    case GDB_ColumnType_F32: { result = str8_lit("GDB_ColumnType_F32"); } break;
-    case GDB_ColumnType_F64: { result = str8_lit("GDB_ColumnType_F64"); } break;
-    case GDB_ColumnType_String8: { result = str8_lit("GDB_ColumnType_String8"); } break;
-    case GDB_ColumnType_Bool: { result = str8_lit("GDB_ColumnType_Bool"); } break;
-    case GDB_ColumnType_I32: { result = str8_lit("GDB_ColumnType_I32"); } break;
-    case GDB_ColumnType_I64: { result = str8_lit("GDB_ColumnType_I64"); } break;
-    case GDB_ColumnType_Date: { result = str8_lit("GDB_ColumnType_Date"); } break;
-    case GDB_ColumnType_Timestamp: { result = str8_lit("GDB_ColumnType_Timestamp"); } break;
-    case GDB_ColumnType_Decimal: { result = str8_lit("GDB_ColumnType_Decimal"); } break;
-    case GDB_ColumnType_Enum: { result = str8_lit("GDB_ColumnType_Enum"); } break;
+    case CQL_ColumnType_U32: { result = str8_lit("CQL_ColumnType_U32"); } break;
+    case CQL_ColumnType_U64: { result = str8_lit("CQL_ColumnType_U64"); } break;
+    case CQL_ColumnType_F32: { result = str8_lit("CQL_ColumnType_F32"); } break;
+    case CQL_ColumnType_F64: { result = str8_lit("CQL_ColumnType_F64"); } break;
+    case CQL_ColumnType_String8: { result = str8_lit("CQL_ColumnType_String8"); } break;
+    case CQL_ColumnType_Bool: { result = str8_lit("CQL_ColumnType_Bool"); } break;
+    case CQL_ColumnType_I32: { result = str8_lit("CQL_ColumnType_I32"); } break;
+    case CQL_ColumnType_I64: { result = str8_lit("CQL_ColumnType_I64"); } break;
+    case CQL_ColumnType_Date: { result = str8_lit("CQL_ColumnType_Date"); } break;
+    case CQL_ColumnType_Timestamp: { result = str8_lit("CQL_ColumnType_Timestamp"); } break;
+    case CQL_ColumnType_Decimal: { result = str8_lit("CQL_ColumnType_Decimal"); } break;
+    case CQL_ColumnType_Enum: { result = str8_lit("CQL_ColumnType_Enum"); } break;
   }
   return result;
 }
 
-internal GDB_ColumnSchema
-gdb_column_schema_create(String8 name, GDB_ColumnType type)
+internal CQL_ColumnSchema
+cql_column_schema_create(String8 name, CQL_ColumnType type)
 {
-  GDB_ColumnSchema schema = (GDB_ColumnSchema){ name, type, g_gdb_column_type_size[type] };
+  CQL_ColumnSchema schema = (CQL_ColumnSchema){ name, type, g_cql_column_type_size[type] };
   return schema;
 }
 
 internal String8
-gdb_column_type_display_name(Arena* arena, GDB_Column* column)
+cql_column_type_display_name(Arena* arena, CQL_Column* column)
 {
   String8 result = str8_lit("");
   switch (column->type)
   {
-    case GDB_ColumnType_U32:     result = str8_lit("u32");     break;
-    case GDB_ColumnType_U64:     result = str8_lit("u64");     break;
-    case GDB_ColumnType_F32:     result = str8_lit("f32");     break;
-    case GDB_ColumnType_F64:     result = str8_lit("f64");     break;
-    case GDB_ColumnType_String8: result = str8_lit("string8"); break;
-    case GDB_ColumnType_Bool:    result = str8_lit("bool");    break;
-    case GDB_ColumnType_I32:     result = str8_lit("i32");     break;
-    case GDB_ColumnType_I64:     result = str8_lit("i64");     break;
-    case GDB_ColumnType_Date:      result = str8_lit("date");      break;
-    case GDB_ColumnType_Timestamp: result = str8_lit("timestamp"); break;
-    case GDB_ColumnType_Decimal:
+    case CQL_ColumnType_U32:     result = str8_lit("u32");     break;
+    case CQL_ColumnType_U64:     result = str8_lit("u64");     break;
+    case CQL_ColumnType_F32:     result = str8_lit("f32");     break;
+    case CQL_ColumnType_F64:     result = str8_lit("f64");     break;
+    case CQL_ColumnType_String8: result = str8_lit("string8"); break;
+    case CQL_ColumnType_Bool:    result = str8_lit("bool");    break;
+    case CQL_ColumnType_I32:     result = str8_lit("i32");     break;
+    case CQL_ColumnType_I64:     result = str8_lit("i64");     break;
+    case CQL_ColumnType_Date:      result = str8_lit("date");      break;
+    case CQL_ColumnType_Timestamp: result = str8_lit("timestamp"); break;
+    case CQL_ColumnType_Decimal:
     result = push_str8f(arena, "decimal(%u,%u)", column->decimal_precision, column->decimal_scale);
     break;
-    case GDB_ColumnType_Enum:
+    case CQL_ColumnType_Enum:
     result = column->enum_type ? push_str8_copy(arena, column->enum_type->name) : str8_lit("enum");
     break;
-    default: log_error("gdb_column_type_display_name: unhandled GDB_ColumnType %u", column->type); break;
+    default: log_error("cql_column_type_display_name: unhandled CQL_ColumnType %u", column->type); break;
   }
   return result;
 }
@@ -4025,42 +4132,42 @@ decimal_to_str8(Arena* arena, S64 raw, U32 scale)
 }
 
 //~ tec: column catalog
-internal GDB_Table*
-gdb_database_build_column_catalog(GDB_Database* database)
+internal CQL_Table*
+cql_database_build_column_catalog(CQL_Database* database)
 {
-  GDB_Table* catalog = gdb_table_alloc(GDB_COLUMN_CATALOG_TABLE_NAME);
+  CQL_Table* catalog = cql_table_alloc(CQL_COLUMN_CATALOG_TABLE_NAME);
   
-  gdb_table_add_column(catalog, gdb_column_schema_create(str8_lit("table_name"), GDB_ColumnType_String8));
-  gdb_table_add_column(catalog, gdb_column_schema_create(str8_lit("column_name"), GDB_ColumnType_String8));
-  gdb_table_add_column(catalog, gdb_column_schema_create(str8_lit("type"), GDB_ColumnType_String8));
-  gdb_table_add_column(catalog, gdb_column_schema_create(str8_lit("ordinal"), GDB_ColumnType_U32));
-  gdb_table_add_column(catalog, gdb_column_schema_create(str8_lit("nullable"), GDB_ColumnType_U32));
-  gdb_table_add_column(catalog, gdb_column_schema_create(str8_lit("is_unique"), GDB_ColumnType_U32));
-  gdb_table_add_column(catalog, gdb_column_schema_create(str8_lit("is_primary_key"), GDB_ColumnType_U32));
-  gdb_table_add_column(catalog, gdb_column_schema_create(str8_lit("is_foreign_key"), GDB_ColumnType_U32));
-  gdb_table_add_column(catalog, gdb_column_schema_create(str8_lit("fk_ref_table"), GDB_ColumnType_String8));
-  gdb_table_add_column(catalog, gdb_column_schema_create(str8_lit("fk_ref_column"), GDB_ColumnType_String8));
-  gdb_table_add_column(catalog, gdb_column_schema_create(str8_lit("has_check"), GDB_ColumnType_U32));
-  gdb_table_add_column(catalog, gdb_column_schema_create(str8_lit("check_text"), GDB_ColumnType_String8));
-  gdb_table_add_column(catalog, gdb_column_schema_create(str8_lit("is_indexed"), GDB_ColumnType_U32));
-  gdb_table_add_column(catalog, gdb_column_schema_create(str8_lit("index_name"), GDB_ColumnType_String8));
-  gdb_table_add_column(catalog, gdb_column_schema_create(str8_lit("is_disk_backed"), GDB_ColumnType_U32));
-  gdb_table_add_column(catalog, gdb_column_schema_create(str8_lit("row_count"), GDB_ColumnType_U64));
-  gdb_table_add_column(catalog, gdb_column_schema_create(str8_lit("distinct_count"), GDB_ColumnType_U64));
-  gdb_table_add_column(catalog, gdb_column_schema_create(str8_lit("null_count"), GDB_ColumnType_U64));
+  cql_table_add_column(catalog, cql_column_schema_create(str8_lit("table_name"), CQL_ColumnType_String8));
+  cql_table_add_column(catalog, cql_column_schema_create(str8_lit("column_name"), CQL_ColumnType_String8));
+  cql_table_add_column(catalog, cql_column_schema_create(str8_lit("type"), CQL_ColumnType_String8));
+  cql_table_add_column(catalog, cql_column_schema_create(str8_lit("ordinal"), CQL_ColumnType_U32));
+  cql_table_add_column(catalog, cql_column_schema_create(str8_lit("nullable"), CQL_ColumnType_U32));
+  cql_table_add_column(catalog, cql_column_schema_create(str8_lit("is_unique"), CQL_ColumnType_U32));
+  cql_table_add_column(catalog, cql_column_schema_create(str8_lit("is_primary_key"), CQL_ColumnType_U32));
+  cql_table_add_column(catalog, cql_column_schema_create(str8_lit("is_foreign_key"), CQL_ColumnType_U32));
+  cql_table_add_column(catalog, cql_column_schema_create(str8_lit("fk_ref_table"), CQL_ColumnType_String8));
+  cql_table_add_column(catalog, cql_column_schema_create(str8_lit("fk_ref_column"), CQL_ColumnType_String8));
+  cql_table_add_column(catalog, cql_column_schema_create(str8_lit("has_check"), CQL_ColumnType_U32));
+  cql_table_add_column(catalog, cql_column_schema_create(str8_lit("check_text"), CQL_ColumnType_String8));
+  cql_table_add_column(catalog, cql_column_schema_create(str8_lit("is_indexed"), CQL_ColumnType_U32));
+  cql_table_add_column(catalog, cql_column_schema_create(str8_lit("index_name"), CQL_ColumnType_String8));
+  cql_table_add_column(catalog, cql_column_schema_create(str8_lit("is_disk_backed"), CQL_ColumnType_U32));
+  cql_table_add_column(catalog, cql_column_schema_create(str8_lit("row_count"), CQL_ColumnType_U64));
+  cql_table_add_column(catalog, cql_column_schema_create(str8_lit("distinct_count"), CQL_ColumnType_U64));
+  cql_table_add_column(catalog, cql_column_schema_create(str8_lit("null_count"), CQL_ColumnType_U64));
   
   String8 empty = str8_lit("");
   
   for (U64 t = 0; t < database->table_count; t++)
   {
-    GDB_Table* table = database->tables[t];
+    CQL_Table* table = database->tables[t];
     
     for (U64 c = 0; c < table->column_count; c++)
     {
-      GDB_Column* column = table->columns[c];
-      GDB_Index* index_on_column = gdb_table_find_index_on_column(table, column);
+      CQL_Column* column = table->columns[c];
+      CQL_Index* index_on_column = cql_table_find_index_on_column(table, column);
       
-      String8 type_name = gdb_column_type_display_name(catalog->arena, column);
+      String8 type_name = cql_column_type_display_name(catalog->arena, column);
       U32 ordinal = (U32)c;
       U32 nullable = column->not_null ? 0 : 1;
       U32 is_unique = column->is_unique ? 1 : 0;
@@ -4077,7 +4184,7 @@ gdb_database_build_column_catalog(GDB_Database* database)
       String8 index_name = index_on_column ? index_on_column->name : empty;
       
       // tec: stats only show up after ANALYZE or a query that needed them, this never computes them
-      B32 has_stats = gdb_column_stats_is_current(column);
+      B32 has_stats = cql_column_stats_is_current(column);
       U64 distinct_count = column->stats.distinct_count;
       U64 null_count = column->stats.null_count;
       
@@ -4091,7 +4198,7 @@ gdb_database_build_column_catalog(GDB_Database* database)
       null_flags[16] = !has_stats;
       null_flags[17] = !has_stats;
       
-      gdb_table_add_row(catalog, row_data, null_flags);
+      cql_table_add_row(catalog, row_data, null_flags);
     }
   }
   
@@ -4099,13 +4206,13 @@ gdb_database_build_column_catalog(GDB_Database* database)
 }
 
 internal void
-gdb_database_add_temp_table(GDB_Database* database, GDB_Table* table)
+cql_database_add_temp_table(CQL_Database* database, CQL_Table* table)
 {
   if (database->temp_table_count >= database->temp_table_capacity)
   {
     U64 new_capacity = Max((U64)8, database->temp_table_capacity * 2);
-    GDB_Table** new_tables = push_array(database->arena, GDB_Table*, new_capacity);
-    if (database->temp_table_count) MemoryCopy(new_tables, database->temp_tables, sizeof(GDB_Table*) * database->temp_table_count);
+    CQL_Table** new_tables = push_array(database->arena, CQL_Table*, new_capacity);
+    if (database->temp_table_count) MemoryCopy(new_tables, database->temp_tables, sizeof(CQL_Table*) * database->temp_table_count);
     database->temp_tables = new_tables;
     database->temp_table_capacity = new_capacity;
   }
@@ -4115,22 +4222,22 @@ gdb_database_add_temp_table(GDB_Database* database, GDB_Table* table)
 }
 
 internal void
-gdb_database_release_temp_tables_from(GDB_Database* database, U64 first_temp_index)
+cql_database_release_temp_tables_from(CQL_Database* database, U64 first_temp_index)
 {
   while (database->temp_table_count > first_temp_index)
   {
-    GDB_Table* table = database->temp_tables[--database->temp_table_count];
+    CQL_Table* table = database->temp_tables[--database->temp_table_count];
     for (U64 c = 0; c < table->column_count; c++)
     {
-      gdb_column_close(table->columns[c]);
-      gdb_column_release(table->columns[c]);
+      cql_column_close(table->columns[c]);
+      cql_column_release(table->columns[c]);
     }
-    gdb_table_release(table);
+    cql_table_release(table);
   }
 }
 
-internal GDB_Table*
-gdb_database_find_table_or_catalog(GDB_Database* database, String8 name)
+internal CQL_Table*
+cql_database_find_table_or_catalog(CQL_Database* database, String8 name)
 {
   // tec: newest first, so nested temp tables and CTEs shadow base tables
   for (U64 i = database->temp_table_count; i > 0; i--)
@@ -4141,20 +4248,20 @@ gdb_database_find_table_or_catalog(GDB_Database* database, String8 name)
     }
   }
   
-  if (str8_match(name, GDB_COLUMN_CATALOG_TABLE_NAME, StringMatchFlag_CaseInsensitive))
+  if (str8_match(name, CQL_COLUMN_CATALOG_TABLE_NAME, StringMatchFlag_CaseInsensitive))
   {
-    return gdb_database_build_column_catalog(database);
+    return cql_database_build_column_catalog(database);
   }
-  return gdb_database_find_table(database, name);
+  return cql_database_find_table(database, name);
 }
 
-internal GDB_ColumnType
-gdb_infer_column_type(String8 value)
+internal CQL_ColumnType
+cql_infer_column_type(String8 value)
 {
   if (!value.str || value.size == 0 || str8_match(value, str8_lit("NULL"), StringMatchFlag_CaseInsensitive))
   {
     //log_error("could not infer column type, string is invalid");
-    return GDB_ColumnType_Invalid;
+    return CQL_ColumnType_Invalid;
   }
   
   B32 is_numeric = str8_is_numeric(value);
@@ -4165,44 +4272,44 @@ gdb_infer_column_type(String8 value)
       U64 u64_value = u64_from_str8(value, 10);
       if (u64_value <= max_U32)
       {
-        return GDB_ColumnType_U32;
+        return CQL_ColumnType_U32;
       }
       
       if (u64_value > max_U32)
       {
-        return GDB_ColumnType_U64;
+        return CQL_ColumnType_U64;
       }
     }
     
     F64 f64_value = f64_from_str8(value);
     if (f64_value == (F32)f64_value)
     {
-      return GDB_ColumnType_F32;
+      return CQL_ColumnType_F32;
     }
-    return GDB_ColumnType_F64;
+    return CQL_ColumnType_F64;
   }
-  return GDB_ColumnType_String8;
+  return CQL_ColumnType_String8;
 }
 
-internal GDB_ColumnType
-gdb_promote_type(GDB_ColumnType existing, GDB_ColumnType new_type)
+internal CQL_ColumnType
+cql_promote_type(CQL_ColumnType existing, CQL_ColumnType new_type)
 {
-  if (existing == GDB_ColumnType_Invalid) return new_type;
-  if (new_type == GDB_ColumnType_Invalid) return existing;
+  if (existing == CQL_ColumnType_Invalid) return new_type;
+  if (new_type == CQL_ColumnType_Invalid) return existing;
   
   if (existing == new_type) return existing;
   
-  if ((existing == GDB_ColumnType_U32 && new_type == GDB_ColumnType_U64) ||
-      (existing == GDB_ColumnType_U64 && new_type == GDB_ColumnType_U32))
+  if ((existing == CQL_ColumnType_U32 && new_type == CQL_ColumnType_U64) ||
+      (existing == CQL_ColumnType_U64 && new_type == CQL_ColumnType_U32))
   {
-    return GDB_ColumnType_U64;
+    return CQL_ColumnType_U64;
   }
   
-  if ((existing == GDB_ColumnType_F32 && new_type == GDB_ColumnType_F64) ||
-      (existing == GDB_ColumnType_F64 && new_type == GDB_ColumnType_F32))
+  if ((existing == CQL_ColumnType_F32 && new_type == CQL_ColumnType_F64) ||
+      (existing == CQL_ColumnType_F64 && new_type == CQL_ColumnType_F32))
   {
-    return GDB_ColumnType_F64;
+    return CQL_ColumnType_F64;
   }
   
-  return GDB_ColumnType_String8;
+  return CQL_ColumnType_String8;
 }

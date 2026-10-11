@@ -58,7 +58,7 @@ struct PLAN_Node
   PLAN_Node* input2; // tec: Join only - right-hand side input plan
   
   String8 value;     // tec: Scan = table name, Join = join type ("inner"/"left"/"cross")
-  GDB_Table* table;  // tec: Scan only - resolved at plan-build time, NULL if the table lookup failed
+  CQL_Table* table;  // tec: Scan only - resolved at plan-build time, NULL if the table lookup failed
   String8 alias;     // tec: Scan only - the "AS x" alias from FROM/JOIN, or {0} if unaliased
   
   // tec: these all point back into the IR tree rather than owning a copy
@@ -82,7 +82,7 @@ struct PLAN_Node
   F64 est_round_trips;  // tec: GPU submits this node is expected to cost, the cost model prefers plans that need fewer
   
   PLAN_SortStrategy sort_strategy;
-  GDB_Index* order_index;   // tec: Presorted and IndexWalk - the index the order comes from
+  CQL_Index* order_index;   // tec: Presorted and IndexWalk - the index the order comes from
   B32 order_descending;
   String8 sort_reason;
 };

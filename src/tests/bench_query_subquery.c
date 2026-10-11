@@ -8,7 +8,7 @@
 #include "os/os_inc.h"
 #include "thread_pool/thread_pool.h"
 #include "settings/settings.h"
-#include "gdb/gdb_inc.h"
+#include "cql/cql_inc.h"
 #include "ir_gen/ir_gen_inc.h"
 #include "gpu/gpu_inc.h"
 #include "planner/plan_node.h"
@@ -25,7 +25,7 @@
 #include "settings/settings.c"
 #include "gpu/gpu_inc.c"
 #include "ir_gen/ir_gen_inc.c"
-#include "gdb/gdb_inc.c"
+#include "cql/cql_inc.c"
 #include "query_exec/query_exec.c"
 #include "optimizer/optimizer_inc.c"
 #include "planner/planner.c"
@@ -54,14 +54,14 @@ internal void
 sq_add_case(Bench_QueryCase* cases, U64* n, char* label, String8 sql)
 {
   cases[*n].label = str8_cstring(label);
-  cases[*n].gdb_sql = sql;
+  cases[*n].cql_sql = sql;
   cases[*n].sqlite_sql = sql;
   cases[*n].duckdb_sql = sql;
   (*n)++;
 }
 
 internal QE_TraceStrategy
-sq_get_strategy(Arena* arena, GDB_Database* database, String8 sql_text)
+sq_get_strategy(Arena* arena, CQL_Database* database, String8 sql_text)
 {
   SQL_TokenizeResult tok = sql_tokenize_from_text(arena, sql_text);
   SQL_Node* ast = sql_parse(arena, tok.tokens, tok.count, sql_text);
@@ -71,7 +71,7 @@ sq_get_strategy(Arena* arena, GDB_Database* database, String8 sql_text)
   QE_TraceCtx* trace = qe_trace_ctx_alloc(arena);
   U64 temp_mark = database->temp_table_count;
   plan_run_select(arena, database, select_node, trace);
-  gdb_database_release_temp_tables_from(database, temp_mark);
+  cql_database_release_temp_tables_from(database, temp_mark);
   
   // tec: the outermost scan is recorded last
   QE_TraceStrategy strategy = QE_TraceStrategy_None;
@@ -92,7 +92,7 @@ sq_check_strategy(Bench_Report* report, char* label, QE_TraceStrategy actual, QE
 
 // tec: a query the engine has to refuse without crashing
 internal void
-sq_expect_unsupported(Arena* arena, Bench_Report* report, GDB_Database* database, char* label, char* sql)
+sq_expect_unsupported(Arena* arena, Bench_Report* report, CQL_Database* database, char* label, char* sql)
 {
   Temp scratch = scratch_begin(&arena, 1);
   String8 sql_text = str8_cstring(sql);
@@ -111,7 +111,7 @@ sq_expect_unsupported(Arena* arena, Bench_Report* report, GDB_Database* database
     U64 temp_mark = database->temp_table_count;
     PLAN_ExecResult result = plan_run_select(scratch.arena, database, ir_query->execution_nodes, NULL);
     refused = !result.supported;
-    gdb_database_release_temp_tables_from(database, temp_mark);
+    cql_database_release_temp_tables_from(database, temp_mark);
   }
   
   printf("  %-48s refused=%d %s\n", label, refused, refused ? "OK" : "FAIL");
@@ -120,13 +120,13 @@ sq_expect_unsupported(Arena* arena, Bench_Report* report, GDB_Database* database
 }
 
 internal B32
-sq_seed_table(Arena* arena, GDB_Database* database, sqlite3* sqlite_db, duckdb_connection duckdb_conn, String8 table_name, Bench_Row* rows, U64 row_count)
+sq_seed_table(Arena* arena, CQL_Database* database, sqlite3* sqlite_db, duckdb_connection duckdb_conn, String8 table_name, Bench_Row* rows, U64 row_count)
 {
   String8 csv_path = push_str8f(arena, "bench_data/subquery_%.*s.csv", str8_varg(table_name));
   bench_write_csv(csv_path, rows, row_count);
   
-  GDB_Table* table = gdb_table_import_csv_streaming(database, table_name, csv_path);
-  gdb_database_add_table(database, table);
+  CQL_Table* table = cql_table_import_csv_streaming(database, table_name, csv_path);
+  cql_database_add_table(database, table);
   
   bench_sqlite_create_schema(sqlite_db, table_name);
   bench_sqlite_bulk_insert(sqlite_db, table_name, rows, row_count);
@@ -148,8 +148,8 @@ sq_run_suite(Arena* arena, Bench_Report* report, U64 bench_rows, char* label)
     os_make_directory(str8_lit("bench_data/"));
   }
   
-  GDB_Database* database = gdb_database_alloc(str8_lit("subquery_db"));
-  gdb_add_database(database);
+  CQL_Database* database = cql_database_alloc(str8_lit("subquery_db"));
+  cql_add_database(database);
   
   sqlite3* sqlite_db = NULL;
   sqlite3_open(":memory:", &sqlite_db);
@@ -225,9 +225,9 @@ sq_run_suite(Arena* arena, Bench_Report* report, U64 bench_rows, char* label)
   bench_print_table_header(report, label);
   for (U64 i = 0; i < n; i++)
   {
-    U64 gdb_rows = 0, gdb_checksum = 0;
-    Bench_Stats gdb_stats = bench_run_gdb_query(database, cases[i].gdb_sql, &gdb_rows, &gdb_checksum);
-    bench_print_table_row(report, cases[i].label, "gdb", gdb_rows, gdb_checksum, &gdb_stats);
+    U64 cql_rows = 0, cql_checksum = 0;
+    Bench_Stats cql_stats = bench_run_cql_query(database, cases[i].cql_sql, &cql_rows, &cql_checksum);
+    bench_print_table_row(report, cases[i].label, "cql", cql_rows, cql_checksum, &cql_stats);
     
     U64 sqlite_rows = 0, sqlite_checksum = 0;
     Bench_Stats sqlite_stats = bench_run_sqlite_query(sqlite_db, cases[i].sqlite_sql, &sqlite_rows, &sqlite_checksum);
@@ -237,8 +237,8 @@ sq_run_suite(Arena* arena, Bench_Report* report, U64 bench_rows, char* label)
     Bench_Stats duckdb_stats = bench_run_duckdb_query(duckdb_conn, cases[i].duckdb_sql, &duckdb_rows, &duckdb_checksum);
     bench_print_table_row(report, cases[i].label, "duckdb", duckdb_rows, duckdb_checksum, &duckdb_stats);
     
-    bench_check_match(report, cases[i].label, "gdb", gdb_rows, gdb_checksum, "sqlite", sqlite_rows, sqlite_checksum);
-    bench_check_match(report, cases[i].label, "gdb", gdb_rows, gdb_checksum, "duckdb", duckdb_rows, duckdb_checksum);
+    bench_check_match(report, cases[i].label, "cql", cql_rows, cql_checksum, "sqlite", sqlite_rows, sqlite_checksum);
+    bench_check_match(report, cases[i].label, "cql", cql_rows, cql_checksum, "duckdb", duckdb_rows, duckdb_checksum);
   }
   
   //- tec: which scan path an IN list takes
@@ -282,15 +282,15 @@ entry_point(CmdLine* cmdline)
   log_alloc();
   
   U64 t0 = os_now_microseconds();
-  gdb_init();
+  cql_init();
   gpu_init();
   U64 t1 = os_now_microseconds();
-  printf("engine startup (gdb_init + gpu_init, one-time): %.4f ms\n", (F64)(t1 - t0) / 1000.0);
+  printf("engine startup (cql_init + gpu_init, one-time): %.4f ms\n", (F64)(t1 - t0) / 1000.0);
   
   Arena* arena = arena_alloc(.reserve_size = GB(2), .commit_size = MB(64));
   
   Bench_Report* report = bench_report_alloc(arena, "compute_ql vs sqlite vs duckdb - subqueries and IN lists");
-  bench_report_text(report, "engine startup (gdb_init + gpu_init, one-time): %.4f ms", (F64)(t1 - t0) / 1000.0);
+  bench_report_text(report, "engine startup (cql_init + gpu_init, one-time): %.4f ms", (F64)(t1 - t0) / 1000.0);
   
   sq_run_suite(arena, report, 2000, "small");
   sq_run_suite(arena, report, 6000, "dict_eligible");

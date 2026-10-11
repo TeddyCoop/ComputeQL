@@ -8,7 +8,7 @@
 #include "os/os_inc.h"
 #include "thread_pool/thread_pool.h"
 #include "settings/settings.h"
-#include "gdb/gdb_inc.h"
+#include "cql/cql_inc.h"
 #include "ir_gen/ir_gen_inc.h"
 #include "gpu/gpu_inc.h"
 #include "planner/plan_node.h"
@@ -25,7 +25,7 @@
 #include "settings/settings.c"
 #include "gpu/gpu_inc.c"
 #include "ir_gen/ir_gen_inc.c"
-#include "gdb/gdb_inc.c"
+#include "cql/cql_inc.c"
 #include "query_exec/query_exec.c"
 #include "optimizer/optimizer_inc.c"
 #include "planner/planner.c"
@@ -158,7 +158,7 @@ aa_duckdb_bulk_insert(duckdb_connection conn, AA_FactRow* rows, U64 row_count)
 }
 
 internal PLAN_Materialized
-aa_run_gdb(Arena* arena, GDB_Database* database, String8 sql_text)
+aa_run_cql(Arena* arena, CQL_Database* database, String8 sql_text)
 {
   SQL_TokenizeResult tok = sql_tokenize_from_text(arena, sql_text);
   SQL_Node* ast = sql_parse(arena, tok.tokens, tok.count, sql_text);
@@ -243,10 +243,10 @@ aa_run_suite(Arena* arena, Bench_Report* report, U64 row_count, U64 user_id_rang
   aa_write_csv(scratch.arena, csv_path, rows, row_count);
   
   //- tec: seed compute_ql
-  GDB_Database* database = gdb_database_alloc(str8_lit("approx_agg_db"));
-  gdb_add_database(database);
-  GDB_Table* fact_table = gdb_table_import_csv_streaming(database, str8_lit("fact"), csv_path);
-  gdb_database_add_table(database, fact_table);
+  CQL_Database* database = cql_database_alloc(str8_lit("approx_agg_db"));
+  cql_add_database(database);
+  CQL_Table* fact_table = cql_table_import_csv_streaming(database, str8_lit("fact"), csv_path);
+  cql_database_add_table(database, fact_table);
   
   //- tec: seed sqlite with the exact same rows
   sqlite3* sqlite_db = NULL;
@@ -299,14 +299,14 @@ aa_run_suite(Arena* arena, Bench_Report* report, U64 row_count, U64 user_id_rang
   
   //- tec: global aggregate, no GROUP BY
   {
-    PLAN_Materialized m = aa_run_gdb(scratch.arena, database, str8_lit("SELECT APPROX_COUNT_DISTINCT(user_id) FROM fact;"));
+    PLAN_Materialized m = aa_run_cql(scratch.arena, database, str8_lit("SELECT APPROX_COUNT_DISTINCT(user_id) FROM fact;"));
     F64 approx = (m.column_count > 0 && m.count > 0) ? m.columns[0].numeric_values[0] : -1.0;
     aa_check_relative_error(report, str8_lit("global aggregate"), approx, exact_distinct_global, max_hll_rel_err);
   }
   
   //- tec: GROUP BY numeric key
   {
-    PLAN_Materialized m = aa_run_gdb(scratch.arena, database,
+    PLAN_Materialized m = aa_run_cql(scratch.arena, database,
                                      str8_lit("SELECT group_key, APPROX_COUNT_DISTINCT(user_id) FROM fact GROUP BY group_key;"));
     for (U64 g = 0; g < m.count; g++)
     {
@@ -319,7 +319,7 @@ aa_run_suite(Arena* arena, Bench_Report* report, U64 row_count, U64 user_id_rang
   
   //- tec: GROUP BY string key
   {
-    PLAN_Materialized m = aa_run_gdb(scratch.arena, database,
+    PLAN_Materialized m = aa_run_cql(scratch.arena, database,
                                      str8_lit("SELECT group_name, APPROX_COUNT_DISTINCT(user_id) FROM fact GROUP BY group_name;"));
     for (U64 g = 0; g < m.count; g++)
     {
@@ -340,7 +340,7 @@ aa_run_suite(Arena* arena, Bench_Report* report, U64 row_count, U64 user_id_rang
   
   //- tec: mixed SELECT list
   {
-    PLAN_Materialized m = aa_run_gdb(scratch.arena, database,
+    PLAN_Materialized m = aa_run_cql(scratch.arena, database,
                                      str8_lit("SELECT group_key, COUNT(*), APPROX_COUNT_DISTINCT(user_id) FROM fact GROUP BY group_key;"));
     for (U64 g = 0; g < m.count; g++)
     {
@@ -360,7 +360,7 @@ aa_run_suite(Arena* arena, Bench_Report* report, U64 row_count, U64 user_id_rang
     for (U32 i = 0; i < ArrayCount(fractions); i++)
     {
       String8 sql = push_str8f(scratch.arena, "SELECT APPROX_PERCENTILE(value, %.2f) FROM fact;", fractions[i]);
-      PLAN_Materialized m = aa_run_gdb(scratch.arena, database, sql);
+      PLAN_Materialized m = aa_run_cql(scratch.arena, database, sql);
       F64 approx = (m.column_count > 0 && m.count > 0) ? m.columns[0].numeric_values[0] : -1.0;
       
       String8 duckdb_sql = push_str8f(scratch.arena, "SELECT quantile_cont(value, %.2f) FROM fact;", fractions[i]);
@@ -373,7 +373,7 @@ aa_run_suite(Arena* arena, Bench_Report* report, U64 row_count, U64 user_id_rang
   
   //- tec: APPROX_PERCENTILE, GROUP BY numeric key
   {
-    PLAN_Materialized m = aa_run_gdb(scratch.arena, database,
+    PLAN_Materialized m = aa_run_cql(scratch.arena, database,
                                      str8_lit("SELECT group_key, APPROX_PERCENTILE(value, 0.5) FROM fact GROUP BY group_key;"));
     for (U64 g = 0; g < m.count; g++)
     {
@@ -390,7 +390,7 @@ aa_run_suite(Arena* arena, Bench_Report* report, U64 row_count, U64 user_id_rang
   
   //- tec: two different fractions of the same column in one query
   {
-    PLAN_Materialized m = aa_run_gdb(scratch.arena, database,
+    PLAN_Materialized m = aa_run_cql(scratch.arena, database,
                                      str8_lit("SELECT group_key, APPROX_PERCENTILE(value, 0.5), APPROX_PERCENTILE(value, 0.95) FROM fact GROUP BY group_key;"));
     for (U64 g = 0; g < m.count; g++)
     {
@@ -430,12 +430,12 @@ aa_run_edge_cases(Arena* arena, Bench_Report* report)
     String8 csv_path = str8_lit("bench_data/approx_agg_fact_zero_rows.csv");
     aa_write_csv(scratch.arena, csv_path, rows, 0);
     
-    GDB_Database* database = gdb_database_alloc(str8_lit("approx_agg_zero_db"));
-    gdb_add_database(database);
-    GDB_Table* fact_table = gdb_table_import_csv_streaming(database, str8_lit("fact"), csv_path);
-    gdb_database_add_table(database, fact_table);
+    CQL_Database* database = cql_database_alloc(str8_lit("approx_agg_zero_db"));
+    cql_add_database(database);
+    CQL_Table* fact_table = cql_table_import_csv_streaming(database, str8_lit("fact"), csv_path);
+    cql_database_add_table(database, fact_table);
     
-    PLAN_Materialized m = aa_run_gdb(scratch.arena, database, str8_lit("SELECT APPROX_COUNT_DISTINCT(user_id) FROM fact;"));
+    PLAN_Materialized m = aa_run_cql(scratch.arena, database, str8_lit("SELECT APPROX_COUNT_DISTINCT(user_id) FROM fact;"));
     F64 approx = (m.column_count > 0 && m.count > 0) ? m.columns[0].numeric_values[0] : -1.0;
     aa_check_exact(report, str8_lit("zero rows"), approx, 0.0);
   }
@@ -446,12 +446,12 @@ aa_run_edge_cases(Arena* arena, Bench_Report* report)
     String8 csv_path = str8_lit("bench_data/approx_agg_fact_one_row.csv");
     aa_write_csv(scratch.arena, csv_path, rows, 1);
     
-    GDB_Database* database = gdb_database_alloc(str8_lit("approx_agg_one_db"));
-    gdb_add_database(database);
-    GDB_Table* fact_table = gdb_table_import_csv_streaming(database, str8_lit("fact"), csv_path);
-    gdb_database_add_table(database, fact_table);
+    CQL_Database* database = cql_database_alloc(str8_lit("approx_agg_one_db"));
+    cql_add_database(database);
+    CQL_Table* fact_table = cql_table_import_csv_streaming(database, str8_lit("fact"), csv_path);
+    cql_database_add_table(database, fact_table);
     
-    PLAN_Materialized m = aa_run_gdb(scratch.arena, database, str8_lit("SELECT APPROX_COUNT_DISTINCT(user_id) FROM fact;"));
+    PLAN_Materialized m = aa_run_cql(scratch.arena, database, str8_lit("SELECT APPROX_COUNT_DISTINCT(user_id) FROM fact;"));
     F64 approx = (m.column_count > 0 && m.count > 0) ? m.columns[0].numeric_values[0] : -1.0;
     aa_check_exact(report, str8_lit("one row"), approx, 1.0);
   }
@@ -464,12 +464,12 @@ aa_run_edge_cases(Arena* arena, Bench_Report* report)
     String8 csv_path = str8_lit("bench_data/approx_agg_fact_all_identical.csv");
     aa_write_csv(scratch.arena, csv_path, rows, row_count);
     
-    GDB_Database* database = gdb_database_alloc(str8_lit("approx_agg_identical_db"));
-    gdb_add_database(database);
-    GDB_Table* fact_table = gdb_table_import_csv_streaming(database, str8_lit("fact"), csv_path);
-    gdb_database_add_table(database, fact_table);
+    CQL_Database* database = cql_database_alloc(str8_lit("approx_agg_identical_db"));
+    cql_add_database(database);
+    CQL_Table* fact_table = cql_table_import_csv_streaming(database, str8_lit("fact"), csv_path);
+    cql_database_add_table(database, fact_table);
     
-    PLAN_Materialized m = aa_run_gdb(scratch.arena, database, str8_lit("SELECT APPROX_COUNT_DISTINCT(user_id) FROM fact;"));
+    PLAN_Materialized m = aa_run_cql(scratch.arena, database, str8_lit("SELECT APPROX_COUNT_DISTINCT(user_id) FROM fact;"));
     F64 approx = (m.column_count > 0 && m.count > 0) ? m.columns[0].numeric_values[0] : -1.0;
     aa_check_exact(report, str8_lit("all identical values"), approx, 1.0);
   }
@@ -486,15 +486,15 @@ entry_point(CmdLine* cmdline)
   log_alloc();
   
   U64 t0 = os_now_microseconds();
-  gdb_init();
+  cql_init();
   gpu_init();
   U64 t1 = os_now_microseconds();
-  printf("engine startup (gdb_init + gpu_init, one-time): %.4f ms\n", (F64)(t1 - t0) / 1000.0);
+  printf("engine startup (cql_init + gpu_init, one-time): %.4f ms\n", (F64)(t1 - t0) / 1000.0);
   
   Arena* arena = arena_alloc(.reserve_size = GB(2), .commit_size = MB(64));
   
   Bench_Report* report = bench_report_alloc(arena, "compute_ql APPROX_COUNT_DISTINCT (HyperLogLog) correctness");
-  bench_report_text(report, "engine startup (gdb_init + gpu_init, one-time): %.4f ms", (F64)(t1 - t0) / 1000.0);
+  bench_report_text(report, "engine startup (cql_init + gpu_init, one-time): %.4f ms", (F64)(t1 - t0) / 1000.0);
   
   // tec: 1M rows / 20 groups = 50K rows/group = ~13 chunks/group at the default
   // QE_AGG_ROWS_PER_CHUNK=4096, giving each group's t-digest ~3300 weighted centroid samples

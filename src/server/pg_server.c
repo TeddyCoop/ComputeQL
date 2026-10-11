@@ -84,7 +84,7 @@ pg_portal_ensure_executed(PG_Session *session, PG_Portal *portal)
 
   U64 error_count_before = log_error_count();
   APP_QueryResult query_result = {0};
-  GDB_Database *db = session->current_database;
+  CQL_Database *db = session->current_database;
   OS_MutexScope(g_query_exec_mutex)
   {
     query_result = app_execute_query_capture(session->arena, portal->bound_sql_text, &db, &portal->result_set);
@@ -197,7 +197,7 @@ pg_is_valid_identifier(String8 s)
 }
 
 internal void
-pg_handle_simple_query(Arena *arena, OS_Handle socket, GDB_Database **current_database, String8 sql)
+pg_handle_simple_query(Arena *arena, OS_Handle socket, CQL_Database **current_database, String8 sql)
 {
   String8 trimmed = str8_skip_chop_whitespace(sql);
   if (trimmed.size == 0)
@@ -436,7 +436,7 @@ pg_handle_describe(PG_Session *session, OS_Handle socket, Arena *msg_arena, Stri
       String8 shape_sql = pg_substitute_params(shape_arena, stmt->sql_text, dummy_literals, dummy_count);
 
       APP_ResultSet shape_result_set = {0};
-      GDB_Database *shape_db = session->current_database;
+      CQL_Database *shape_db = session->current_database;
       OS_MutexScope(g_query_exec_mutex) { app_execute_query_capture(shape_arena, shape_sql, &shape_db, &shape_result_set); }
 
       if (shape_result_set.valid) { pg_send_row_description_from_result_set_ex(socket, msg_arena, &shape_result_set, 0, 0); }
@@ -565,7 +565,7 @@ pg_handle_close(PG_Session *session, OS_Handle socket, Arena *msg_arena, String8
 
 // tec: returns 0 if the connection should just be closed (handshake failed or cancel request)
 internal B32
-pg_do_startup_handshake(Arena *arena, OS_Handle socket, GDB_Database **out_current_database)
+pg_do_startup_handshake(Arena *arena, OS_Handle socket, CQL_Database **out_current_database)
 {
   String8 startup_params = {0};
 
@@ -648,7 +648,7 @@ pg_connection_thread_proc(void *ptr)
   log_info("pg server: connection opened");
 
   Arena *handshake_arena = arena_alloc(.reserve_size=MB(16), .commit_size=KB(64));
-  GDB_Database *current_database = 0;
+  CQL_Database *current_database = 0;
   B32 handshake_ok = pg_do_startup_handshake(handshake_arena, socket, &current_database);
   arena_release(handshake_arena);
 

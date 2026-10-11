@@ -12,7 +12,7 @@ struct PG_ConnCtx
   OS_Handle socket;
 };
 
-internal B32 pg_do_startup_handshake(Arena *arena, OS_Handle socket, GDB_Database **out_current_database);
+internal B32 pg_do_startup_handshake(Arena *arena, OS_Handle socket, CQL_Database **out_current_database);
 internal void pg_connection_thread_proc(void *ptr);
 
 //~ tec: extended query protocol session state
@@ -55,7 +55,7 @@ struct PG_Session
 {
   Arena *arena;
   
-  GDB_Database *current_database;
+  CQL_Database *current_database;
 
   // tec: after an error, Parse/Bind/Describe/Execute/Close are discarded until the next Sync
   B32 in_failed_pipeline;
@@ -93,7 +93,7 @@ internal String8 pg_reader_bytes(PG_Reader *r, U64 n);
 //~ tec: message handlers
 internal String8 pg_dummy_literal_for_oid(U32 oid);
 internal B32 pg_is_valid_identifier(String8 s);
-internal void pg_handle_simple_query(Arena *arena, OS_Handle socket, GDB_Database **current_database, String8 sql);
+internal void pg_handle_simple_query(Arena *arena, OS_Handle socket, CQL_Database **current_database, String8 sql);
 internal void pg_handle_parse(PG_Session *session, OS_Handle socket, Arena *msg_arena, String8 msg_body);
 internal void pg_handle_bind(PG_Session *session, OS_Handle socket, Arena *msg_arena, String8 msg_body);
 internal void pg_handle_describe(PG_Session *session, OS_Handle socket, Arena *msg_arena, String8 msg_body);

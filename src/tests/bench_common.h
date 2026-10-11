@@ -3,12 +3,18 @@
 
 //~ tec: shared benchmark harness for comparing compute_ql against sqlite.
 /*
-methodology: for every timed operation we do 1 discarded warm-up run followed by BENCH_TIMED_RUNS recorded runs, 
+methodology: for every timed operation we do BENCH_WARMUP_RUNS discarded warm-up runs (at least BENCH_WARMUP_MIN_MICROSECONDS of them if that is set) followed by BENCH_TIMED_RUNS recorded runs, 
 and report min/median/avg per phase. row count + an order independent per row checksum are compared between engines as a correctness sanity check
 the checksum sums a per row FNV-1a hash across rows, since compute_ql and sqlite are not guaranteed to return matching row order for the same query
 */
 
-#define BENCH_WARMUP_RUNS 1
+#ifndef BENCH_WARMUP_RUNS
+# define BENCH_WARMUP_RUNS 1
+#endif
+// tec: a GPU idles at a low clock, a test that times it sets this to keep warming up until at least this long has passed
+#ifndef BENCH_WARMUP_MIN_MICROSECONDS
+# define BENCH_WARMUP_MIN_MICROSECONDS 0
+#endif
 #ifndef BENCH_TIMED_RUNS
 # define BENCH_TIMED_RUNS 20
 #endif
@@ -173,7 +179,7 @@ bench_reduce(F64* samples, U64 n, F64* out_min, F64* out_median, F64* out_avg)
 // plan_execute + result materialization (timed as 'execute')
 
 internal U64
-bench_gdb_consume_result(PLAN_ExecResult* result, IR_Node* select_node, U64* out_row_count)
+bench_cql_consume_result(PLAN_ExecResult* result, IR_Node* select_node, U64* out_row_count)
 {
   U64 checksum = 0;
   U64 result_count = result->is_materialized ? result->materialized.count : result->rows.count;
@@ -216,15 +222,15 @@ bench_gdb_consume_result(PLAN_ExecResult* result, IR_Node* select_node, U64* out
           PLAN_AggColumn* col = output_columns[output];
           if (!col) continue;
 
-          if (col->type == GDB_ColumnType_String8)
+          if (col->type == CQL_ColumnType_String8)
           {
             row_hash = bench_fnv_mix_string(row_hash, col->string_values[i]);
           }
-          else if (col->type == GDB_ColumnType_U32 || col->type == GDB_ColumnType_U64)
+          else if (col->type == CQL_ColumnType_U32 || col->type == CQL_ColumnType_U64)
           {
             row_hash = bench_fnv_mix_u64(row_hash, (U64)col->numeric_values[i]);
           }
-          else if (col->type == GDB_ColumnType_I32 || col->type == GDB_ColumnType_I64)
+          else if (col->type == CQL_ColumnType_I32 || col->type == CQL_ColumnType_I64)
           {
             // tec: truncate to S64 (sign-preserving) before reinterpreting as U64
             row_hash = bench_fnv_mix_u64(row_hash, (U64)(S64)col->numeric_values[i]);
@@ -240,7 +246,7 @@ bench_gdb_consume_result(PLAN_ExecResult* result, IR_Node* select_node, U64* out
     }
     else
     {
-      // tec: gather each selected column once instead of one gdb_column_get_data/gdb_column_get_string
+      // tec: gather each selected column once instead of one cql_column_get_data/cql_column_get_string
       U64 column_count = 0;
       for (IR_Node* c = select_output_columns->first; c != NULL; c = c->next) column_count++;
 
@@ -249,9 +255,9 @@ bench_gdb_consume_result(PLAN_ExecResult* result, IR_Node* select_node, U64* out
       {
         B32 resolved;
         U64 table_slot;
-        GDB_ColumnType type;
+        CQL_ColumnType type;
         F64* numeric_values;
-        GDB_StringDataChunk strings;
+        CQL_StringDataChunk strings;
       };
 
       BenchColGather* gathered = push_array(scratch.arena, BenchColGather, Max(column_count, 1));
@@ -261,17 +267,17 @@ bench_gdb_consume_result(PLAN_ExecResult* result, IR_Node* select_node, U64* out
       {
         String8 bare_name = {0};
         U64 table_slot = max_U64;
-        GDB_Table* col_table = qe_resolve_column_table(&result->rows, column_node->value, &bare_name, &table_slot);
+        CQL_Table* col_table = qe_resolve_column_table(&result->rows, column_node->value, &bare_name, &table_slot);
         if (!col_table) continue;
 
-        GDB_Column* column = gdb_table_find_column(col_table, bare_name);
+        CQL_Column* column = cql_table_find_column(col_table, bare_name);
         if (!column) continue;
 
         gathered[ci].resolved = 1;
         gathered[ci].table_slot = table_slot;
         gathered[ci].type = column->type;
 
-        if (column->type == GDB_ColumnType_String8)
+        if (column->type == CQL_ColumnType_String8)
         {
           gathered[ci].strings = qe_gather_string_column(scratch.arena, &result->rows, table_slot, column);
         }
@@ -295,13 +301,13 @@ bench_gdb_consume_result(PLAN_ExecResult* result, IR_Node* select_node, U64* out
 
           switch (gathered[ci].type)
           {
-            case GDB_ColumnType_U32: row_hash = bench_fnv_mix_u64(row_hash, (U32)gathered[ci].numeric_values[i]); break;
-            case GDB_ColumnType_U64: row_hash = bench_fnv_mix_u64(row_hash, (U64)gathered[ci].numeric_values[i]); break;
-            case GDB_ColumnType_F32: row_hash = bench_fnv_mix_u64(row_hash, bench_scaled_round((F32)gathered[ci].numeric_values[i])); break;
-            case GDB_ColumnType_F64: row_hash = bench_fnv_mix_u64(row_hash, bench_scaled_round(gathered[ci].numeric_values[i])); break;
-            case GDB_ColumnType_String8:
+            case CQL_ColumnType_U32: row_hash = bench_fnv_mix_u64(row_hash, (U32)gathered[ci].numeric_values[i]); break;
+            case CQL_ColumnType_U64: row_hash = bench_fnv_mix_u64(row_hash, (U64)gathered[ci].numeric_values[i]); break;
+            case CQL_ColumnType_F32: row_hash = bench_fnv_mix_u64(row_hash, bench_scaled_round((F32)gathered[ci].numeric_values[i])); break;
+            case CQL_ColumnType_F64: row_hash = bench_fnv_mix_u64(row_hash, bench_scaled_round(gathered[ci].numeric_values[i])); break;
+            case CQL_ColumnType_String8:
             {
-              GDB_StringDataChunk* chunk = &gathered[ci].strings;
+              CQL_StringDataChunk* chunk = &gathered[ci].strings;
               U64 start = chunk->offsets[i];
               U64 end = chunk->offsets[i + 1];
               String8 str = str8((U8*)chunk->data + start, end - start);
@@ -323,9 +329,10 @@ bench_gdb_consume_result(PLAN_ExecResult* result, IR_Node* select_node, U64* out
 }
 
 internal Bench_Stats
-bench_run_gdb_query(GDB_Database* database, String8 sql_text, U64* out_row_count, U64* out_checksum)
+bench_run_cql_query(CQL_Database* database, String8 sql_text, U64* out_row_count, U64* out_checksum)
 {
-  for (U64 run = 0; run < BENCH_WARMUP_RUNS; run++)
+  U64 warmup_start = os_now_microseconds();
+  for (U64 run = 0; run < BENCH_WARMUP_RUNS || (os_now_microseconds() - warmup_start) < BENCH_WARMUP_MIN_MICROSECONDS; run++)
   {
     Temp scratch = scratch_begin(0, 0);
     Arena* arena = scratch.arena;
@@ -337,8 +344,8 @@ bench_run_gdb_query(GDB_Database* database, String8 sql_text, U64* out_row_count
     U64 temp_mark = database->temp_table_count;
     PLAN_ExecResult result = plan_run_select(arena, database, select_node, NULL);
     U64 row_count = 0;
-    bench_gdb_consume_result(&result, select_node, &row_count);
-    gdb_database_release_temp_tables_from(database, temp_mark);
+    bench_cql_consume_result(&result, select_node, &row_count);
+    cql_database_release_temp_tables_from(database, temp_mark);
 
     scratch_end(scratch);
   }
@@ -367,8 +374,8 @@ bench_run_gdb_query(GDB_Database* database, String8 sql_text, U64* out_row_count
     U64 temp_mark = database->temp_table_count;
     PLAN_ExecResult result = plan_run_select(arena, database, select_node, NULL);
     U64 row_count = 0;
-    U64 checksum = bench_gdb_consume_result(&result, select_node, &row_count);
-    gdb_database_release_temp_tables_from(database, temp_mark);
+    U64 checksum = bench_cql_consume_result(&result, select_node, &row_count);
+    cql_database_release_temp_tables_from(database, temp_mark);
 
     U64 t2 = os_now_microseconds();
 
@@ -435,7 +442,8 @@ bench_sqlite_consume_result(sqlite3_stmt* stmt, U64* out_row_count)
 internal Bench_Stats
 bench_run_sqlite_query(sqlite3* db, String8 sql_text, U64* out_row_count, U64* out_checksum)
 {
-  for (U64 run = 0; run < BENCH_WARMUP_RUNS; run++)
+  U64 warmup_start = os_now_microseconds();
+  for (U64 run = 0; run < BENCH_WARMUP_RUNS || (os_now_microseconds() - warmup_start) < BENCH_WARMUP_MIN_MICROSECONDS; run++)
   {
     sqlite3_stmt* stmt = NULL;
     if (sqlite3_prepare_v2(db, (const char*)sql_text.str, (int)sql_text.size, &stmt, NULL) == SQLITE_OK)
@@ -534,7 +542,8 @@ bench_duckdb_consume_result(duckdb_result* result, U64* out_row_count)
 internal Bench_Stats
 bench_run_duckdb_query(duckdb_connection conn, String8 sql_text, U64* out_row_count, U64* out_checksum)
 {
-  for (U64 run = 0; run < BENCH_WARMUP_RUNS; run++)
+  U64 warmup_start = os_now_microseconds();
+  for (U64 run = 0; run < BENCH_WARMUP_RUNS || (os_now_microseconds() - warmup_start) < BENCH_WARMUP_MIN_MICROSECONDS; run++)
   {
     duckdb_prepared_statement stmt = NULL;
     if (duckdb_prepare(conn, (const char*)sql_text.str, &stmt) == DuckDBSuccess)
@@ -684,6 +693,8 @@ struct Bench_Report
   String8List lines;
   String8List row_cells;
   U64 row_cell_count;
+  B32 in_table;
+  String8List deferred_lines;
 };
 
 internal Bench_Report*
@@ -701,9 +712,27 @@ bench_report_alloc(Arena* arena, char* title)
   return report;
 }
 
+// tec: a markdown table ends at the first non row line, so text ends it with a blank line and warnings wait until the table is complete
+internal void
+bench_report_table_close(Bench_Report* report)
+{
+  if (!report->in_table)
+  {
+    return;
+  }
+  str8_list_pushf(report->arena, &report->lines, "\n");
+  for (String8Node* n = report->deferred_lines.first; n != NULL; n = n->next)
+  {
+    str8_list_push(report->arena, &report->lines, n->string);
+  }
+  report->deferred_lines = (String8List){0};
+  report->in_table = 0;
+}
+
 internal void
 bench_report_section(Bench_Report* report, char* fmt, ...)
 {
+  bench_report_table_close(report);
   va_list args;
   va_start(args, fmt);
   String8 title = push_str8fv(report->arena, fmt, args);
@@ -714,6 +743,7 @@ bench_report_section(Bench_Report* report, char* fmt, ...)
 internal void
 bench_report_text(Bench_Report* report, char* fmt, ...)
 {
+  bench_report_table_close(report);
   va_list args;
   va_start(args, fmt);
   String8 text = push_str8fv(report->arena, fmt, args);
@@ -728,7 +758,8 @@ bench_report_warn(Bench_Report* report, char* fmt, ...)
   va_start(args, fmt);
   String8 text = push_str8fv(report->arena, fmt, args);
   va_end(args);
-  str8_list_pushf(report->arena, &report->lines, "> :warning: %.*s\n\n", str8_varg(text));
+  String8List* destination = report->in_table ? &report->deferred_lines : &report->lines;
+  str8_list_pushf(report->arena, destination, "> :warning: %.*s\n\n", str8_varg(text));
 }
 
 internal void
@@ -758,6 +789,7 @@ bench_report_row_end(Bench_Report* report)
     str8_list_pushf(report->arena, &report->lines, " %.*s |", str8_varg(n->string));
   }
   str8_list_pushf(report->arena, &report->lines, "\n");
+  report->in_table = 1;
 }
 
 // tec: call instead of bench_report_row_end for the header row
@@ -766,6 +798,7 @@ internal void
 bench_report_table_header_end(Bench_Report* report)
 {
   U64 column_count = report->row_cell_count;
+  bench_report_table_close(report);
   bench_report_row_end(report);
 
   str8_list_pushf(report->arena, &report->lines, "|");
@@ -779,6 +812,7 @@ bench_report_table_header_end(Bench_Report* report)
 internal void
 bench_report_write(Bench_Report* report, String8 path)
 {
+  bench_report_table_close(report);
   if (!os_write_data_list_to_file_path(path, report->lines))
   {
     log_error("failed to write bench report to '%.*s'", str8_varg(path));
@@ -860,7 +894,7 @@ typedef struct Bench_QueryCase Bench_QueryCase;
 struct Bench_QueryCase
 {
   String8 label;
-  String8 gdb_sql;
+  String8 cql_sql;
   String8 sqlite_sql;
   String8 duckdb_sql;
 };
@@ -883,10 +917,10 @@ bench_run_query_suite(Arena* arena, Bench_Report* report, U64 row_count, char* l
   bench_write_csv(csv_path, rows, row_count);
 
   //- tec: seed compute_ql (in memory database, no USE/CREATE DATABASE SQL, no disk round trip)
-  GDB_Database* database = gdb_database_alloc(str8_lit("bench_db"));
-  gdb_add_database(database);
-  GDB_Table* table = gdb_table_import_csv_streaming(database, table_name, csv_path);
-  gdb_database_add_table(database, table);
+  CQL_Database* database = cql_database_alloc(str8_lit("bench_db"));
+  cql_add_database(database);
+  CQL_Table* table = cql_table_import_csv_streaming(database, table_name, csv_path);
+  cql_database_add_table(database, table);
 
   //- tec: seed sqlite with the exact same rows
   sqlite3* sqlite_db = NULL;
@@ -911,31 +945,31 @@ bench_run_query_suite(Arena* arena, Bench_Report* report, U64 row_count, char* l
 
   Bench_QueryCase cases[4];
   cases[0].label = str8_lit("id = (int equality)");
-  cases[0].gdb_sql = push_str8f(scratch.arena, "SELECT * FROM %.*s WHERE id = %u;", str8_varg(table_name), mid_id);
+  cases[0].cql_sql = push_str8f(scratch.arena, "SELECT * FROM %.*s WHERE id = %u;", str8_varg(table_name), mid_id);
   cases[0].sqlite_sql = push_str8f(scratch.arena, "SELECT * FROM %.*s WHERE id = %u;", str8_varg(table_name), mid_id);
   cases[0].duckdb_sql = cases[0].sqlite_sql;
 
   cases[1].label = str8_lit("id > (int range)");
-  cases[1].gdb_sql = push_str8f(scratch.arena, "SELECT * FROM %.*s WHERE id > %u;", str8_varg(table_name), threshold_id);
+  cases[1].cql_sql = push_str8f(scratch.arena, "SELECT * FROM %.*s WHERE id > %u;", str8_varg(table_name), threshold_id);
   cases[1].sqlite_sql = push_str8f(scratch.arena, "SELECT * FROM %.*s WHERE id > %u;", str8_varg(table_name), threshold_id);
   cases[1].duckdb_sql = cases[1].sqlite_sql;
 
   cases[2].label = str8_lit("name = (string equality)");
-  cases[2].gdb_sql = push_str8f(scratch.arena, "SELECT * FROM %.*s WHERE name = '%.*s';", str8_varg(table_name), str8_varg(target_name));
+  cases[2].cql_sql = push_str8f(scratch.arena, "SELECT * FROM %.*s WHERE name = '%.*s';", str8_varg(table_name), str8_varg(target_name));
   cases[2].sqlite_sql = push_str8f(scratch.arena, "SELECT * FROM %.*s WHERE name = '%.*s';", str8_varg(table_name), str8_varg(target_name));
   cases[2].duckdb_sql = cases[2].sqlite_sql;
 
   cases[3].label = str8_lit("name contains (string search)");
-  cases[3].gdb_sql = push_str8f(scratch.arena, "SELECT * FROM %.*s WHERE name contains '%.*s';", str8_varg(table_name), str8_varg(substr));
+  cases[3].cql_sql = push_str8f(scratch.arena, "SELECT * FROM %.*s WHERE name contains '%.*s';", str8_varg(table_name), str8_varg(substr));
   cases[3].sqlite_sql = push_str8f(scratch.arena, "SELECT * FROM %.*s WHERE name LIKE '%%%.*s%%';", str8_varg(table_name), str8_varg(substr));
   cases[3].duckdb_sql = cases[3].sqlite_sql; // tec: duckdb supports the same LIKE syntax as sqlite
 
   bench_print_table_header(report, label);
   for (U64 i = 0; i < ArrayCount(cases); i++)
   {
-    U64 gdb_rows = 0, gdb_checksum = 0;
-    Bench_Stats gdb_stats = bench_run_gdb_query(database, cases[i].gdb_sql, &gdb_rows, &gdb_checksum);
-    bench_print_table_row(report, cases[i].label, "gdb", gdb_rows, gdb_checksum, &gdb_stats);
+    U64 cql_rows = 0, cql_checksum = 0;
+    Bench_Stats cql_stats = bench_run_cql_query(database, cases[i].cql_sql, &cql_rows, &cql_checksum);
+    bench_print_table_row(report, cases[i].label, "cql", cql_rows, cql_checksum, &cql_stats);
 
     U64 sqlite_rows = 0, sqlite_checksum = 0;
     Bench_Stats sqlite_stats = bench_run_sqlite_query(sqlite_db, cases[i].sqlite_sql, &sqlite_rows, &sqlite_checksum);
@@ -945,8 +979,8 @@ bench_run_query_suite(Arena* arena, Bench_Report* report, U64 row_count, char* l
     Bench_Stats duckdb_stats = bench_run_duckdb_query(duckdb_conn, cases[i].duckdb_sql, &duckdb_rows, &duckdb_checksum);
     bench_print_table_row(report, cases[i].label, "duckdb", duckdb_rows, duckdb_checksum, &duckdb_stats);
 
-    bench_check_match(report, cases[i].label, "gdb", gdb_rows, gdb_checksum, "sqlite", sqlite_rows, sqlite_checksum);
-    bench_check_match(report, cases[i].label, "gdb", gdb_rows, gdb_checksum, "duckdb", duckdb_rows, duckdb_checksum);
+    bench_check_match(report, cases[i].label, "cql", cql_rows, cql_checksum, "sqlite", sqlite_rows, sqlite_checksum);
+    bench_check_match(report, cases[i].label, "cql", cql_rows, cql_checksum, "duckdb", duckdb_rows, duckdb_checksum);
   }
 
   sqlite3_close(sqlite_db);

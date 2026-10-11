@@ -50,7 +50,7 @@ copy /y settings.cfg build\settings.cfg > NUL
 
 :: build
 pushd build
-%compile% ..\src\main.c %compile_link% %out%gdb.exe|| exit /b 1
+%compile% ..\src\main.c %compile_link% %out%cql.exe|| exit /b 1
 popd
 
 :: compile compute shaders (GLSL -> SPIR-V), precompiled and never built at runtime

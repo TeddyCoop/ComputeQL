@@ -54,6 +54,8 @@ layout(std430, binding = 2) readonly buffer StrConstsBuf  { uint str_consts[]; }
 layout(std430, binding = 3) buffer OutIndicesBuf          { uint out_indices[]; };
 layout(std430, binding = 4) buffer OutCountBuf            { uint out_count[]; };
 
+// tec: one bit per zone map chunk, set when the zone map proves no row of the chunk can match
+layout(std430, binding = 5) readonly buffer SkipBuf { uint skip_bits[]; };
 layout(std430, binding = 6)  readonly buffer ColBuf6  { uint col_data6[]; };
 layout(std430, binding = 7)  readonly buffer ColBuf7  { uint col_data7[]; };
 layout(std430, binding = 8)  readonly buffer ColBuf8  { uint col_data8[]; };
@@ -327,6 +329,12 @@ main()
   uint row = gl_GlobalInvocationID.x;
   // tec: a row past the end still has to reach the barriers below, it just never matches
   bool in_range = row < row_count;
+  // tec: pc.words[6]/[8] are the lo words of push-constant slots 3 and 4, a skipped row is treated like a row past the end
+  if (in_range && pc.words[8] != 0u)
+  {
+    uint skip_chunk = row >> pc.words[6];
+    in_range = (skip_bits[skip_chunk >> 5u] & (1u << (skip_chunk & 31u))) == 0u;
+  }
   if (gl_LocalInvocationIndex == 0u)
   {
     s_match_count = 0u;

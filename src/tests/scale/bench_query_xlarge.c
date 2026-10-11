@@ -3,13 +3,13 @@
 #define PROFILE_CUSTOM 1
 #define ARENA_FREE_LIST 1
 #define GPU_MAX_BUFFER_SIZE GB(2)
-#define BENCH_TIMED_RUNS 3
+#define BENCH_TIMED_RUNS 10
 
 #include "base/base_inc.h"
 #include "os/os_inc.h"
 #include "thread_pool/thread_pool.h"
 #include "settings/settings.h"
-#include "gdb/gdb_inc.h"
+#include "cql/cql_inc.h"
 #include "ir_gen/ir_gen_inc.h"
 #include "gpu/gpu_inc.h"
 #include "planner/plan_node.h"
@@ -26,7 +26,7 @@
 #include "settings/settings.c"
 #include "gpu/gpu_inc.c"
 #include "ir_gen/ir_gen_inc.c"
-#include "gdb/gdb_inc.c"
+#include "cql/cql_inc.c"
 #include "query_exec/query_exec.c"
 #include "optimizer/optimizer_inc.c"
 #include "planner/planner.c"
@@ -232,24 +232,24 @@ xl_cstr(Arena* arena, String8 text)
   return (char*)bytes;
 }
 
-internal GDB_Table*
-xl_load_gdb(GDB_Database* database, XL_TableSpec* spec)
+internal CQL_Table*
+xl_load_cql(CQL_Database* database, XL_TableSpec* spec)
 {
-  GDB_Table* table = gdb_table_alloc(str8_cstring(spec->name));
+  CQL_Table* table = cql_table_alloc(str8_cstring(spec->name));
   for (U64 c = 0; c < spec->col_count; c++)
   {
-    GDB_ColumnType type = GDB_ColumnType_String8;
+    CQL_ColumnType type = CQL_ColumnType_String8;
     if (spec->cols[c].kind == XL_ColKind_U32)
     {
-      type = GDB_ColumnType_U32;
+      type = CQL_ColumnType_U32;
     }
     else if (spec->cols[c].kind == XL_ColKind_F64)
     {
-      type = GDB_ColumnType_F64;
+      type = CQL_ColumnType_F64;
     }
-    gdb_table_add_column(table, gdb_column_schema_create(str8_cstring(spec->cols[c].name), type));
+    cql_table_add_column(table, cql_column_schema_create(str8_cstring(spec->cols[c].name), type));
   }
-  gdb_database_add_table(database, table);
+  cql_database_add_table(database, table);
   
   Bench_Rng rng = { spec->seed };
   XL_Row row = {0};
@@ -277,7 +277,7 @@ xl_load_gdb(GDB_Database* database, XL_TableSpec* spec)
         row_data[c] = &strings[c];
       }
     }
-    gdb_table_add_row(table, row_data, NULL);
+    cql_table_add_row(table, row_data, NULL);
   }
   return table;
 }
@@ -430,11 +430,11 @@ typedef struct XL_Case XL_Case;
 struct XL_Case
 {
   char* label;
-  char* gdb_sql;
+  char* cql_sql;
   char* other_sql;
 };
 
-// tec: gdb spells substring search as `contains`, sqlite and duckdb use LIKE
+// tec: cql spells substring search as `contains`, sqlite and duckdb use LIKE
 global XL_Case g_xl_cases[] =
 {
   { "filter: selective 0.1%",
@@ -554,15 +554,15 @@ entry_point(CmdLine* cmdline)
   }
   
   U64 t0 = os_now_microseconds();
-  gdb_init();
+  cql_init();
   gpu_init();
   U64 t1 = os_now_microseconds();
-  printf("engine startup (gdb_init + gpu_init, one-time): %.4f ms\n", (F64)(t1 - t0) / 1000.0);
+  printf("engine startup (cql_init + gpu_init, one-time): %.4f ms\n", (F64)(t1 - t0) / 1000.0);
   
   Arena* arena = arena_alloc(.reserve_size = GB(2), .commit_size = MB(64));
   
   Bench_Report* report = bench_report_alloc(arena, "compute_ql vs sqlite vs duckdb - large scale suite");
-  bench_report_text(report, "engine startup (gdb_init + gpu_init, one-time): %.4f ms", (F64)(t1 - t0) / 1000.0);
+  bench_report_text(report, "engine startup (cql_init + gpu_init, one-time): %.4f ms", (F64)(t1 - t0) / 1000.0);
   bench_report_text(report, "events: %llu rows, %u columns; users: %u rows; products: %u rows; %u timed runs per query",
                     event_rows, (U32)ArrayCount(g_xl_event_cols), (U32)XL_NUM_USERS, (U32)XL_NUM_PRODUCTS, (U32)BENCH_TIMED_RUNS);
   
@@ -575,13 +575,13 @@ entry_point(CmdLine* cmdline)
   
   bench_report_section(report, "load");
   
-  GDB_Database* database = gdb_database_alloc(str8_lit("xlarge_db"));
-  gdb_add_database(database);
+  CQL_Database* database = cql_database_alloc(str8_lit("xlarge_db"));
+  cql_add_database(database);
   for (U64 s = 0; s < ArrayCount(specs); s++)
   {
     U64 start = os_now_microseconds();
-    xl_load_gdb(database, &specs[s]);
-    xl_print_load(report, "gdb", specs[s].name, specs[s].row_count, start);
+    xl_load_cql(database, &specs[s]);
+    xl_print_load(report, "cql", specs[s].name, specs[s].row_count, start);
   }
   
   sqlite3* sqlite_db = NULL;
@@ -621,17 +621,17 @@ entry_point(CmdLine* cmdline)
     {
       continue;
     }
-    String8 gdb_sql = str8_cstring(test_case->gdb_sql);
-    String8 other_sql = str8_cstring(test_case->other_sql ? test_case->other_sql : test_case->gdb_sql);
+    String8 cql_sql = str8_cstring(test_case->cql_sql);
+    String8 other_sql = str8_cstring(test_case->other_sql ? test_case->other_sql : test_case->cql_sql);
     
-    U64 gdb_rows = 0, gdb_checksum = 0;
-    Bench_Stats gdb_stats = bench_run_gdb_query(database, gdb_sql, &gdb_rows, &gdb_checksum);
-    bench_print_table_row(report, label, "gdb", gdb_rows, gdb_checksum, &gdb_stats);
+    U64 cql_rows = 0, cql_checksum = 0;
+    Bench_Stats cql_stats = bench_run_cql_query(database, cql_sql, &cql_rows, &cql_checksum);
+    bench_print_table_row(report, label, "cql", cql_rows, cql_checksum, &cql_stats);
     
     if (explain)
     {
       Arena* explain_arena = arena_alloc(.reserve_size = GB(1), .commit_size = MB(4));
-      String8 explain_sql = push_str8f(explain_arena, "EXPLAIN ANALYZE %.*s", str8_varg(gdb_sql));
+      String8 explain_sql = push_str8f(explain_arena, "EXPLAIN ANALYZE %.*s", str8_varg(cql_sql));
       APP_QueryResult explain_result = app_execute_query_capture(explain_arena, explain_sql, &database, NULL);
       printf("%.*s\n", str8_varg(explain_result.output_text));
       arena_release(explain_arena);
@@ -642,7 +642,7 @@ entry_point(CmdLine* cmdline)
       U64 rows = 0, checksum = 0;
       Bench_Stats stats = bench_run_sqlite_query(sqlite_db, other_sql, &rows, &checksum);
       bench_print_table_row(report, label, "sqlite", rows, checksum, &stats);
-      bench_check_match(report, label, "gdb", gdb_rows, gdb_checksum, "sqlite", rows, checksum);
+      bench_check_match(report, label, "cql", cql_rows, cql_checksum, "sqlite", rows, checksum);
     }
     
     if (run_duckdb)
@@ -650,7 +650,7 @@ entry_point(CmdLine* cmdline)
       U64 rows = 0, checksum = 0;
       Bench_Stats stats = bench_run_duckdb_query(duckdb_conn, other_sql, &rows, &checksum);
       bench_print_table_row(report, label, "duckdb", rows, checksum, &stats);
-      bench_check_match(report, label, "gdb", gdb_rows, gdb_checksum, "duckdb", rows, checksum);
+      bench_check_match(report, label, "cql", cql_rows, cql_checksum, "duckdb", rows, checksum);
     }
     fflush(stdout);
   }

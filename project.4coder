@@ -10,7 +10,7 @@ patterns = {
 "*.4coder",
 "*.mdesk",
 "*.hlsl",
-"*.gdb",
+"*.cql",
 "*.comp",
 };
 blacklist_patterns = {

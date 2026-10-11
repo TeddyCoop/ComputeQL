@@ -96,7 +96,7 @@ client_run_interactive(String8 host, U16 port)
   char line_buf[64 * 1024];
   for (;;)
   {
-    printf("gdb> ");
+    printf("cql> ");
     fflush(stdout);
     
     if (!fgets(line_buf, sizeof(line_buf), stdin))

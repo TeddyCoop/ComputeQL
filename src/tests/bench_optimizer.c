@@ -8,7 +8,7 @@
 #include "os/os_inc.h"
 #include "thread_pool/thread_pool.h"
 #include "settings/settings.h"
-#include "gdb/gdb_inc.h"
+#include "cql/cql_inc.h"
 #include "ir_gen/ir_gen_inc.h"
 #include "gpu/gpu_inc.h"
 #include "planner/plan_node.h"
@@ -25,7 +25,7 @@
 #include "settings/settings.c"
 #include "gpu/gpu_inc.c"
 #include "ir_gen/ir_gen_inc.c"
-#include "gdb/gdb_inc.c"
+#include "cql/cql_inc.c"
 #include "query_exec/query_exec.c"
 #include "optimizer/optimizer_inc.c"
 #include "planner/planner.c"
@@ -47,7 +47,7 @@ struct Opt_Case
 typedef struct Opt_Fixture Opt_Fixture;
 struct Opt_Fixture
 {
-  GDB_Database* database;
+  CQL_Database* database;
   sqlite3* sqlite_db;
   duckdb_database duckdb_db;
   duckdb_connection duckdb_conn;
@@ -94,8 +94,8 @@ opt_fixture_add_table(Arena* arena, Opt_Fixture* fixture, char* table_name_cstr,
   String8 csv_path = push_str8f(arena, "bench_data/opt_%s.csv", table_name_cstr);
   bench_write_csv(csv_path, rows, row_count);
 
-  GDB_Table* table = gdb_table_import_csv_streaming(fixture->database, table_name, csv_path);
-  gdb_database_add_table(fixture->database, table);
+  CQL_Table* table = cql_table_import_csv_streaming(fixture->database, table_name, csv_path);
+  cql_database_add_table(fixture->database, table);
 
   bench_sqlite_create_schema(fixture->sqlite_db, table_name);
   bench_sqlite_bulk_insert(fixture->sqlite_db, table_name, rows, row_count);
@@ -116,8 +116,8 @@ opt_fixture_create(Arena* arena)
   }
 
   Opt_Fixture* fixture = push_array(arena, Opt_Fixture, 1);
-  fixture->database = gdb_database_alloc(str8_lit("optimizer_db"));
-  gdb_add_database(fixture->database);
+  fixture->database = cql_database_alloc(str8_lit("optimizer_db"));
+  cql_add_database(fixture->database);
 
   sqlite3_open(":memory:", &fixture->sqlite_db);
   duckdb_open(NULL, &fixture->duckdb_db);
@@ -140,9 +140,9 @@ opt_fixture_create(Arena* arena)
 
   // tec: same rows as big, with an index on the unique id and one on the value
   opt_fixture_add_table(scratch.arena, fixture, "ordered", big_rows, big_count);
-  GDB_Table* ordered = gdb_database_find_table(fixture->database, str8_lit("ordered"));
-  gdb_table_create_index(ordered, str8_lit("ordered_id"), gdb_table_find_column(ordered, str8_lit("id")));
-  gdb_table_create_index(ordered, str8_lit("ordered_value"), gdb_table_find_column(ordered, str8_lit("value")));
+  CQL_Table* ordered = cql_database_find_table(fixture->database, str8_lit("ordered"));
+  cql_table_create_index(ordered, str8_lit("ordered_id"), cql_table_find_column(ordered, str8_lit("id")));
+  cql_table_create_index(ordered, str8_lit("ordered_value"), cql_table_find_column(ordered, str8_lit("value")));
 
   scratch_end(scratch);
   return fixture;
@@ -202,7 +202,7 @@ opt_set_requires_optimizer(Opt_Case* cases, U64 count, char* label)
 
 // tec: the first run primes kernel caches and pooled buffers, so the counted run is steady state
 internal U64
-opt_count_round_trips(GDB_Database* database, String8 sql_text)
+opt_count_round_trips(CQL_Database* database, String8 sql_text)
 {
   U64 round_trips = 0;
 
@@ -220,9 +220,9 @@ opt_count_round_trips(GDB_Database* database, String8 sql_text)
     U64 submits_before = g_vulkan_state->submit_count;
     PLAN_ExecResult result = plan_run_select(arena, database, select_node, NULL);
     U64 row_count = 0;
-    bench_gdb_consume_result(&result, select_node, &row_count);
+    bench_cql_consume_result(&result, select_node, &row_count);
     U64 submits_after = g_vulkan_state->submit_count;
-    gdb_database_release_temp_tables_from(database, temp_mark);
+    cql_database_release_temp_tables_from(database, temp_mark);
 
     round_trips = submits_after - submits_before;
     scratch_end(scratch);
@@ -506,10 +506,10 @@ opt_run_parity_suite(Arena* arena, Bench_Report* report, Opt_Fixture* fixture, O
       continue;
     }
     
-    U64 gdb_rows = 0;
-    U64 gdb_checksum = 0;
-    Bench_Stats gdb_stats = bench_run_gdb_query(fixture->database, test_case->sql, &gdb_rows, &gdb_checksum);
-    bench_print_table_row(report, test_case->label, "gdb", gdb_rows, gdb_checksum, &gdb_stats);
+    U64 cql_rows = 0;
+    U64 cql_checksum = 0;
+    Bench_Stats cql_stats = bench_run_cql_query(fixture->database, test_case->sql, &cql_rows, &cql_checksum);
+    bench_print_table_row(report, test_case->label, "cql", cql_rows, cql_checksum, &cql_stats);
 
     U64 sqlite_rows = 0;
     U64 sqlite_checksum = 0;
@@ -521,8 +521,8 @@ opt_run_parity_suite(Arena* arena, Bench_Report* report, Opt_Fixture* fixture, O
     Bench_Stats duckdb_stats = bench_run_duckdb_query(fixture->duckdb_conn, test_case->sql, &duckdb_rows, &duckdb_checksum);
     bench_print_table_row(report, test_case->label, "duckdb", duckdb_rows, duckdb_checksum, &duckdb_stats);
 
-    B32 matches_sqlite = (gdb_rows == sqlite_rows) && (gdb_checksum == sqlite_checksum);
-    B32 matches_duckdb = (gdb_rows == duckdb_rows) && (gdb_checksum == duckdb_checksum);
+    B32 matches_sqlite = (cql_rows == sqlite_rows) && (cql_checksum == sqlite_checksum);
+    B32 matches_duckdb = (cql_rows == duckdb_rows) && (cql_checksum == duckdb_checksum);
     B32 matches = matches_sqlite && matches_duckdb;
 
     if (test_case->known_gap)
@@ -536,16 +536,16 @@ opt_run_parity_suite(Arena* arena, Bench_Report* report, Opt_Fixture* fixture, O
       else
       {
         known_gap_open += 1;
-        printf("  KNOWN GAP still open: '%.*s' (gdb rows=%llu, sqlite rows=%llu)\n",
-               str8_varg(test_case->label), gdb_rows, sqlite_rows);
-        bench_report_text(report, "known gap open: %.*s (gdb rows=%llu checksum=%llu, sqlite rows=%llu checksum=%llu)",
-                          str8_varg(test_case->label), gdb_rows, gdb_checksum, sqlite_rows, sqlite_checksum);
+        printf("  KNOWN GAP still open: '%.*s' (cql rows=%llu, sqlite rows=%llu)\n",
+               str8_varg(test_case->label), cql_rows, sqlite_rows);
+        bench_report_text(report, "known gap open: %.*s (cql rows=%llu checksum=%llu, sqlite rows=%llu checksum=%llu)",
+                          str8_varg(test_case->label), cql_rows, cql_checksum, sqlite_rows, sqlite_checksum);
       }
     }
     else
     {
-      bench_check_match(report, test_case->label, "gdb", gdb_rows, gdb_checksum, "sqlite", sqlite_rows, sqlite_checksum);
-      bench_check_match(report, test_case->label, "gdb", gdb_rows, gdb_checksum, "duckdb", duckdb_rows, duckdb_checksum);
+      bench_check_match(report, test_case->label, "cql", cql_rows, cql_checksum, "sqlite", sqlite_rows, sqlite_checksum);
+      bench_check_match(report, test_case->label, "cql", cql_rows, cql_checksum, "duckdb", duckdb_rows, duckdb_checksum);
     }
   }
 
@@ -592,7 +592,7 @@ internal void
 opt_run_ab_suite(Arena* arena, Bench_Report* report, Opt_Fixture* fixture, Opt_Case* cases, U64 count)
 {
   printf("\n########## optimizer on vs off ##########\n");
-  bench_report_section(report, "optimizer on vs off (gdb only, median total ms, GPU round trips)");
+  bench_report_section(report, "optimizer on vs off (cql only, median total ms, GPU round trips)");
   printf("  %-48s %10s %10s %7s %9s\n", "query", "on ms", "off ms", "ratio", "trips");
 
   U64 slower_count = 0;
@@ -609,13 +609,13 @@ opt_run_ab_suite(Arena* arena, Bench_Report* report, Opt_Fixture* fixture, Opt_C
     opt_set_optimizer(1);
     U64 rows_on = 0;
     U64 checksum_on = 0;
-    Bench_Stats stats_on = bench_run_gdb_query(fixture->database, test_case->sql, &rows_on, &checksum_on);
+    Bench_Stats stats_on = bench_run_cql_query(fixture->database, test_case->sql, &rows_on, &checksum_on);
     U64 trips_on = opt_count_round_trips(fixture->database, test_case->sql);
 
     opt_set_optimizer(0);
     U64 rows_off = 0;
     U64 checksum_off = 0;
-    Bench_Stats stats_off = bench_run_gdb_query(fixture->database, test_case->sql, &rows_off, &checksum_off);
+    Bench_Stats stats_off = bench_run_cql_query(fixture->database, test_case->sql, &rows_off, &checksum_off);
     U64 trips_off = opt_count_round_trips(fixture->database, test_case->sql);
 
     opt_set_optimizer(1);
@@ -715,7 +715,7 @@ opt_find_filter(PLAN_Node* plan)
 
 // tec: the column of the first condition the plan's filter will evaluate
 internal String8
-opt_first_condition_column(Arena* arena, GDB_Database* database, String8 sql_text)
+opt_first_condition_column(Arena* arena, CQL_Database* database, String8 sql_text)
 {
   SQL_TokenizeResult tokens = sql_tokenize_from_text(arena, sql_text);
   SQL_Node* ast = sql_parse(arena, tokens.tokens, tokens.count, sql_text);
@@ -745,20 +745,20 @@ opt_run_strategy_suite(Arena* arena, Bench_Report* report, Opt_Fixture* fixture)
   bench_report_section(report, "optimizer: scan strategy");
 
   Temp scratch = scratch_begin(&arena, 1);
-  GDB_Database* database = fixture->database;
+  CQL_Database* database = fixture->database;
   Arena* query_arena = arena_alloc(.reserve_size = MB(64), .commit_size = MB(4));
 
   //- tec: an indexed table with an oracle copy in sqlite and duckdb, so index results are checked too
   Bench_Row* indexed_rows = opt_generate_rows(scratch.arena, 20000, 0x1DE5ULL);
   opt_fixture_add_table(scratch.arena, fixture, "indexed", indexed_rows, 20000);
-  GDB_Table* indexed_table = gdb_database_find_table(database, str8_lit("indexed"));
-  GDB_Column* indexed_id = gdb_table_find_column(indexed_table, str8_lit("id"));
-  gdb_table_create_index(indexed_table, str8_lit("indexed_id_index"), indexed_id);
+  CQL_Table* indexed_table = cql_database_find_table(database, str8_lit("indexed"));
+  CQL_Column* indexed_id = cql_table_find_column(indexed_table, str8_lit("id"));
+  cql_table_create_index(indexed_table, str8_lit("indexed_id_index"), indexed_id);
 
   //- tec: a table with a NULL in one column only
   U64 nullable_rows = 60000;
   opt_write_nullable_csv(scratch.arena, str8_lit("bench_data/opt_nully.csv"), nullable_rows);
-  gdb_database_add_table(database, gdb_table_import_csv_streaming(database, str8_lit("nully"), str8_lit("bench_data/opt_nully.csv")));
+  cql_database_add_table(database, cql_table_import_csv_streaming(database, str8_lit("nully"), str8_lit("bench_data/opt_nully.csv")));
 
   //- tec: plan choices
   {
@@ -831,17 +831,17 @@ opt_run_strategy_suite(Arena* arena, Bench_Report* report, Opt_Fixture* fixture)
   {
     Opt_Case* test_case = &cases[index];
 
-    U64 gdb_rows = 0;
-    U64 gdb_checksum = 0;
-    Bench_Stats gdb_stats = bench_run_gdb_query(database, test_case->sql, &gdb_rows, &gdb_checksum);
-    bench_print_table_row(report, test_case->label, "gdb", gdb_rows, gdb_checksum, &gdb_stats);
+    U64 cql_rows = 0;
+    U64 cql_checksum = 0;
+    Bench_Stats cql_stats = bench_run_cql_query(database, test_case->sql, &cql_rows, &cql_checksum);
+    bench_print_table_row(report, test_case->label, "cql", cql_rows, cql_checksum, &cql_stats);
 
     U64 sqlite_rows = 0;
     U64 sqlite_checksum = 0;
     Bench_Stats sqlite_stats = bench_run_sqlite_query(fixture->sqlite_db, test_case->sql, &sqlite_rows, &sqlite_checksum);
     bench_print_table_row(report, test_case->label, "sqlite", sqlite_rows, sqlite_checksum, &sqlite_stats);
 
-    bench_check_match(report, test_case->label, "gdb", gdb_rows, gdb_checksum, "sqlite", sqlite_rows, sqlite_checksum);
+    bench_check_match(report, test_case->label, "cql", cql_rows, cql_checksum, "sqlite", sqlite_rows, sqlite_checksum);
   }
 
   //- tec: a CPU scan puts its most selective condition first, whatever order the query wrote them in
@@ -865,11 +865,11 @@ opt_run_strategy_suite(Arena* arena, Bench_Report* report, Opt_Fixture* fixture)
     settings_load_from_string(str8_lit("QE_OPT_SCAN_COST: true"));
     U64 rows_on = 0;
     U64 checksum_on = 0;
-    Bench_Stats stats_on = bench_run_gdb_query(database, sql, &rows_on, &checksum_on);
+    Bench_Stats stats_on = bench_run_cql_query(database, sql, &rows_on, &checksum_on);
     settings_load_from_string(str8_lit("QE_OPT_SCAN_COST: false"));
     U64 rows_off = 0;
     U64 checksum_off = 0;
-    Bench_Stats stats_off = bench_run_gdb_query(database, sql, &rows_off, &checksum_off);
+    Bench_Stats stats_off = bench_run_cql_query(database, sql, &rows_off, &checksum_off);
     settings_load_from_string(str8_lit("QE_OPT_SCAN_COST: true"));
 
     printf("  cpu scan, written order vs reordered: %.3f ms vs %.3f ms\n", stats_off.total_median, stats_on.total_median);
@@ -888,7 +888,7 @@ opt_run_strategy_suite(Arena* arena, Bench_Report* report, Opt_Fixture* fixture)
 
 // tec: the tables of a plan from its leftmost scan to its rightmost, for example "mid,big,small"
 internal String8
-opt_explain_table_order(Arena* arena, GDB_Database** database, char* sql)
+opt_explain_table_order(Arena* arena, CQL_Database** database, char* sql)
 {
   String8 query = push_str8f(arena, "EXPLAIN %s", sql);
   APP_QueryResult result = app_execute_query_capture(arena, query, database, NULL);
@@ -916,7 +916,7 @@ opt_explain_table_order(Arena* arena, GDB_Database** database, char* sql)
 }
 
 internal void
-opt_check_table_order(Bench_Report* report, Arena* arena, GDB_Database** database, char* label, char* sql, char* expected)
+opt_check_table_order(Bench_Report* report, Arena* arena, CQL_Database** database, char* label, char* sql, char* expected)
 {
   String8 order = opt_explain_table_order(arena, database, sql);
   B32 ok = str8_match(order, str8_cstring(expected), 0);
@@ -929,7 +929,7 @@ opt_check_table_order(Bench_Report* report, Arena* arena, GDB_Database** databas
 
 // tec: passes when the plan's join order is not the written one
 internal void
-opt_check_table_order_differs(Bench_Report* report, Arena* arena, GDB_Database** database, char* label, char* sql, char* written)
+opt_check_table_order_differs(Bench_Report* report, Arena* arena, CQL_Database** database, char* label, char* sql, char* written)
 {
   String8 order = opt_explain_table_order(arena, database, sql);
   B32 ok = !str8_match(order, str8_cstring(written), 0);
@@ -942,7 +942,7 @@ opt_check_table_order_differs(Bench_Report* report, Arena* arena, GDB_Database**
 
 // tec: passes when the last table in the plan's join order is the given one
 internal void
-opt_check_table_order_ends_with(Bench_Report* report, Arena* arena, GDB_Database** database, char* label, char* sql, char* last_table)
+opt_check_table_order_ends_with(Bench_Report* report, Arena* arena, CQL_Database** database, char* label, char* sql, char* last_table)
 {
   String8 order = opt_explain_table_order(arena, database, sql);
   String8 suffix = push_str8f(arena, ",%s", last_table);
@@ -966,16 +966,16 @@ opt_check_unit(Bench_Report* report, char* label, B32 ok)
 
 // tec: a-b and b-c written, so a-c has to be implied
 internal void
-opt_run_derived_edge_unit(Bench_Report* report, GDB_Database* database)
+opt_run_derived_edge_unit(Bench_Report* report, CQL_Database* database)
 {
-  GDB_Table* big = gdb_database_find_table(database, str8_lit("big"));
-  GDB_Table* mid = gdb_database_find_table(database, str8_lit("mid"));
-  GDB_Table* small_table = gdb_database_find_table(database, str8_lit("small"));
-  GDB_Column* big_id = gdb_table_find_column(big, str8_lit("id"));
-  GDB_Column* mid_id = gdb_table_find_column(mid, str8_lit("id"));
-  GDB_Column* small_id = gdb_table_find_column(small_table, str8_lit("id"));
-  GDB_Column* big_name = gdb_table_find_column(big, str8_lit("name"));
-  GDB_Column* small_name = gdb_table_find_column(small_table, str8_lit("name"));
+  CQL_Table* big = cql_database_find_table(database, str8_lit("big"));
+  CQL_Table* mid = cql_database_find_table(database, str8_lit("mid"));
+  CQL_Table* small_table = cql_database_find_table(database, str8_lit("small"));
+  CQL_Column* big_id = cql_table_find_column(big, str8_lit("id"));
+  CQL_Column* mid_id = cql_table_find_column(mid, str8_lit("id"));
+  CQL_Column* small_id = cql_table_find_column(small_table, str8_lit("id"));
+  CQL_Column* big_name = cql_table_find_column(big, str8_lit("name"));
+  CQL_Column* small_name = cql_table_find_column(small_table, str8_lit("name"));
 
   OPT_JoinGraph graph = {0};
   graph.relation_count = 3;
@@ -1010,7 +1010,7 @@ opt_run_derived_edge_unit(Bench_Report* report, GDB_Database* database)
   opt_check_unit(report, "unit: no order exists without a connecting edge", !optimizer_join_order_dp(&disconnected, &model, 3, order, &cost));
 
   // tec: relations 0 and 1 share a low cardinality key so joining them first makes a huge intermediate result, relation 2 is tiny and joins on a unique key
-  GDB_Column* mid_name = gdb_table_find_column(mid, str8_lit("name"));
+  CQL_Column* mid_name = cql_table_find_column(mid, str8_lit("name"));
   OPT_JoinGraph blowup = {0};
   blowup.relation_count = 3;
   blowup.rows[0] = 3000.0;
@@ -1042,7 +1042,7 @@ opt_run_join_order_suite(Arena* arena, Bench_Report* report, Opt_Fixture* fixtur
   printf("\n########## optimizer: join order ##########\n");
   bench_report_section(report, "optimizer: join order");
 
-  GDB_Database* database = fixture->database;
+  CQL_Database* database = fixture->database;
   Arena* query_arena = arena_alloc(.reserve_size = MB(64), .commit_size = MB(4));
 
   opt_run_derived_edge_unit(report, database);
@@ -1076,13 +1076,13 @@ opt_run_join_order_suite(Arena* arena, Bench_Report* report, Opt_Fixture* fixtur
     settings_load_from_string(str8_lit("QE_OPT_JOIN_ORDER: true"));
     U64 rows_ordered = 0;
     U64 checksum_ordered = 0;
-    Bench_Stats stats_ordered = bench_run_gdb_query(database, sql, &rows_ordered, &checksum_ordered);
+    Bench_Stats stats_ordered = bench_run_cql_query(database, sql, &rows_ordered, &checksum_ordered);
     U64 trips_ordered = opt_count_round_trips(database, sql);
 
     settings_load_from_string(str8_lit("QE_OPT_JOIN_ORDER: false"));
     U64 rows_written = 0;
     U64 checksum_written = 0;
-    Bench_Stats stats_written = bench_run_gdb_query(database, sql, &rows_written, &checksum_written);
+    Bench_Stats stats_written = bench_run_cql_query(database, sql, &rows_written, &checksum_written);
     settings_load_from_string(str8_lit("QE_OPT_JOIN_ORDER: true"));
 
     printf("  %-64.64s %10.3f %10.3f\n", timed_queries[index], stats_ordered.total_median, stats_written.total_median);
@@ -1151,7 +1151,7 @@ opt_run_plan_text_suite(Arena* arena, Bench_Report* report, Opt_Fixture* fixture
   printf("\n########## optimizer baseline: plan text ##########\n");
   bench_report_section(report, "optimizer baseline: plan text");
 
-  GDB_Database* database = fixture->database;
+  CQL_Database* database = fixture->database;
   Arena* query_arena = arena_alloc(.reserve_size = MB(64), .commit_size = MB(4));
 
   //- tec: a filtered scan should be reported on one line, today the Filter and its Scan child both print
@@ -1312,9 +1312,9 @@ opt_run_capacity_unit(Bench_Report* report)
 internal void
 opt_run_walk_unit(Arena* arena, Bench_Report* report, Opt_Fixture* fixture)
 {
-  GDB_Table* table = gdb_database_find_table(fixture->database, str8_lit("ordered"));
-  GDB_Column* id_column = gdb_table_find_column(table, str8_lit("id"));
-  GDB_Index* index = gdb_table_find_index_on_column(table, id_column);
+  CQL_Table* table = cql_database_find_table(fixture->database, str8_lit("ordered"));
+  CQL_Column* id_column = cql_table_find_column(table, str8_lit("id"));
+  CQL_Index* index = cql_table_find_index_on_column(table, id_column);
 
   Temp scratch = scratch_begin(&arena, 1);
   String8 sql = str8_lit("SELECT id FROM ordered WHERE value > 99990;");
@@ -1325,7 +1325,7 @@ opt_run_walk_unit(Arena* arena, Bench_Report* report, Opt_Fixture* fixture)
 
   U64 matching_rows = 0;
   U64 matching_checksum = 0;
-  bench_run_gdb_query(fixture->database, sql, &matching_rows, &matching_checksum);
+  bench_run_cql_query(fixture->database, sql, &matching_rows, &matching_checksum);
 
   QE_ScanResult everything = {0};
   qe_index_ordered_scan(scratch.arena, table, str8_lit(""), index, where->first, 0, table->row_count, &everything);
@@ -1376,7 +1376,7 @@ opt_run_walk_unit(Arena* arena, Bench_Report* report, Opt_Fixture* fixture)
 }
 
 internal String8
-opt_explain_text(Arena* arena, GDB_Database** database, char* sql)
+opt_explain_text(Arena* arena, CQL_Database** database, char* sql)
 {
   String8 query = push_str8f(arena, "EXPLAIN %s", sql);
   APP_QueryResult result = app_execute_query_capture(arena, query, database, NULL);
@@ -1384,7 +1384,7 @@ opt_explain_text(Arena* arena, GDB_Database** database, char* sql)
 }
 
 internal void
-opt_check_explain_count(Bench_Report* report, Arena* arena, GDB_Database** database, char* label, char* sql, char* needle, U64 expected)
+opt_check_explain_count(Bench_Report* report, Arena* arena, CQL_Database** database, char* label, char* sql, char* needle, U64 expected)
 {
   String8 text = opt_explain_text(arena, database, sql);
   opt_check_occurrences(report, label, text, needle, expected, 0);
@@ -1392,7 +1392,7 @@ opt_check_explain_count(Bench_Report* report, Arena* arena, GDB_Database** datab
 
 // tec: the rows come back in the order the query asked for, so equal text with the optimizer on and off means the same order
 internal void
-opt_check_same_output(Bench_Report* report, Arena* arena, GDB_Database** database, char* label, char* sql)
+opt_check_same_output(Bench_Report* report, Arena* arena, CQL_Database** database, char* label, char* sql)
 {
   opt_set_optimizer(1);
   APP_QueryResult with_optimizer = app_execute_query_capture(arena, str8_cstring(sql), database, NULL);
@@ -1414,7 +1414,7 @@ opt_check_same_output(Bench_Report* report, Arena* arena, GDB_Database** databas
 }
 
 internal void
-opt_check_trips_lower(Bench_Report* report, GDB_Database* database, char* label, char* sql)
+opt_check_trips_lower(Bench_Report* report, CQL_Database* database, char* label, char* sql)
 {
   String8 sql_text = str8_cstring(sql);
 
@@ -1438,7 +1438,7 @@ opt_run_operator_suite(Arena* arena, Bench_Report* report, Opt_Fixture* fixture)
   printf("\n########## ordering, sizing and small inputs ##########\n");
   bench_report_section(report, "ordering, sizing and small inputs");
 
-  GDB_Database* database = fixture->database;
+  CQL_Database* database = fixture->database;
   Arena* query_arena = arena_alloc(.reserve_size = MB(64), .commit_size = MB(4));
 
   opt_run_order_unit(query_arena, report);
@@ -1561,9 +1561,9 @@ opt_check_parity_query(Bench_Report* report, Opt_Fixture* fixture, char* label, 
   String8 sql_text = str8_cstring(sql);
   String8 label_text = str8_cstring(label);
 
-  U64 gdb_rows = 0;
-  U64 gdb_checksum = 0;
-  bench_run_gdb_query(fixture->database, sql_text, &gdb_rows, &gdb_checksum);
+  U64 cql_rows = 0;
+  U64 cql_checksum = 0;
+  bench_run_cql_query(fixture->database, sql_text, &cql_rows, &cql_checksum);
   U64 sqlite_rows = 0;
   U64 sqlite_checksum = 0;
   bench_run_sqlite_query(fixture->sqlite_db, sql_text, &sqlite_rows, &sqlite_checksum);
@@ -1571,9 +1571,9 @@ opt_check_parity_query(Bench_Report* report, Opt_Fixture* fixture, char* label, 
   U64 duckdb_checksum = 0;
   bench_run_duckdb_query(fixture->duckdb_conn, sql_text, &duckdb_rows, &duckdb_checksum);
 
-  printf("  %-56s rows=%llu\n", label, gdb_rows);
-  bench_check_match(report, label_text, "gdb", gdb_rows, gdb_checksum, "sqlite", sqlite_rows, sqlite_checksum);
-  bench_check_match(report, label_text, "gdb", gdb_rows, gdb_checksum, "duckdb", duckdb_rows, duckdb_checksum);
+  printf("  %-56s rows=%llu\n", label, cql_rows);
+  bench_check_match(report, label_text, "cql", cql_rows, cql_checksum, "sqlite", sqlite_rows, sqlite_checksum);
+  bench_check_match(report, label_text, "cql", cql_rows, cql_checksum, "duckdb", duckdb_rows, duckdb_checksum);
 }
 
 // tec: makes a CPU scan expensive enough that a long IN list is answered by a semi join
@@ -1600,7 +1600,7 @@ opt_check_refused(Bench_Report* report, Arena* arena, Opt_Fixture* fixture, char
   IR_Query* ir_query = ir_generate_from_ast(scratch.arena, ast);
   U64 temp_mark = fixture->database->temp_table_count;
   PLAN_ExecResult result = plan_run_select(scratch.arena, fixture->database, ir_query->execution_nodes, NULL);
-  gdb_database_release_temp_tables_from(fixture->database, temp_mark);
+  cql_database_release_temp_tables_from(fixture->database, temp_mark);
 
   B32 refused = !result.supported;
   printf("  %-56s %s\n", label, refused ? "OK" : "FAIL");
@@ -1619,7 +1619,7 @@ opt_run_semi_unit(Arena* arena, Bench_Report* report, Opt_Fixture* fixture)
   // tec: 5 left rows, probe 1 matched once, probe 3 matched twice, probe 4 unmatched
   U64 left_values[5] = { 10, 11, 12, 13, 14 };
   U64* left_indices[1] = { left_values };
-  GDB_Table* left_tables[1] = { gdb_database_find_table(fixture->database, str8_lit("tiny")) };
+  CQL_Table* left_tables[1] = { cql_database_find_table(fixture->database, str8_lit("tiny")) };
   String8 left_aliases[1] = { str8_lit("t") };
   PLAN_RowSet left = {0};
   left.tables = left_tables;
@@ -1643,8 +1643,8 @@ opt_run_semi_unit(Arena* arena, Bench_Report* report, Opt_Fixture* fixture)
   B32 unmatched_ok = unmatched.count == 1 && unmatched.row_indices[0][0] == 14;
   opt_check_unit(report, "unit: an anti join keeps the left rows with no partner", unmatched_ok);
 
-  GDB_Table* mid = gdb_database_find_table(fixture->database, str8_lit("mid"));
-  GDB_Column* name_column = gdb_table_find_column(mid, str8_lit("name"));
+  CQL_Table* mid = cql_database_find_table(fixture->database, str8_lit("mid"));
+  CQL_Column* name_column = cql_table_find_column(mid, str8_lit("name"));
   U64 distinct_names = 0;
   U64* name_rows = qe_distinct_key_rows(scratch.arena, name_column, NULL, mid->row_count, &distinct_names);
 
@@ -1671,7 +1671,7 @@ opt_run_semi_unit(Arena* arena, Bench_Report* report, Opt_Fixture* fixture)
   }
   opt_check_unit(report, "unit: distinct string keys are unique and cover every row", names_distinct && names_covered);
 
-  GDB_Column* id_column = gdb_table_find_column(mid, str8_lit("id"));
+  CQL_Column* id_column = cql_table_find_column(mid, str8_lit("id"));
   U64 distinct_ids = 0;
   qe_distinct_key_rows(scratch.arena, id_column, NULL, mid->row_count, &distinct_ids);
   opt_check_unit(report, "unit: a unique numeric key keeps every row", distinct_ids == mid->row_count);
@@ -1695,7 +1695,7 @@ opt_run_semi_suite(Arena* arena, Bench_Report* report, Opt_Fixture* fixture)
   printf("\n########## semi and anti joins ##########\n");
   bench_report_section(report, "semi and anti joins");
 
-  GDB_Database* database = fixture->database;
+  CQL_Database* database = fixture->database;
   Arena* query_arena = arena_alloc(.reserve_size = MB(64), .commit_size = MB(4));
 
   opt_run_semi_unit(query_arena, report, fixture);
@@ -1816,19 +1816,19 @@ opt_run_semi_suite(Arena* arena, Bench_Report* report, Opt_Fixture* fixture)
 //~ tec: fused GPU round trips
 
 // tec: one column of U32 keys, key = row % key_modulus
-internal GDB_Table*
-opt_build_key_table(GDB_Database* database, char* name_prefix, U64 row_count, U64 key_modulus)
+internal CQL_Table*
+opt_build_key_table(CQL_Database* database, char* name_prefix, U64 row_count, U64 key_modulus)
 {
   Temp scratch = scratch_begin(0, 0);
   String8 name = push_str8f(scratch.arena, "%s_%llu_%llu", name_prefix, row_count, key_modulus);
-  GDB_Table* table = gdb_table_alloc(name);
-  gdb_table_add_column(table, gdb_column_schema_create(str8_lit("k"), GDB_ColumnType_U32));
-  gdb_database_add_table(database, table);
+  CQL_Table* table = cql_table_alloc(name);
+  cql_table_add_column(table, cql_column_schema_create(str8_lit("k"), CQL_ColumnType_U32));
+  cql_database_add_table(database, table);
   for (U64 row = 0; row < row_count; row += 1)
   {
     U32 key = (U32)(row % key_modulus);
     void* row_data[1] = { &key };
-    gdb_table_add_row(table, row_data, NULL);
+    cql_table_add_row(table, row_data, NULL);
   }
   scratch_end(scratch);
   return table;
@@ -1844,7 +1844,7 @@ struct Opt_JoinRun
 
 // tec: the checksum ignores pair order, which the GPU does not promise
 internal Opt_JoinRun
-opt_run_key_join(Arena* arena, GDB_Table* probe_table, GDB_Table* build_table, QE_JoinHints* hints)
+opt_run_key_join(Arena* arena, CQL_Table* probe_table, CQL_Table* build_table, QE_JoinHints* hints)
 {
   Temp scratch = scratch_begin(&arena, 1);
   String8 sql = push_str8f(scratch.arena, "SELECT p.k FROM %.*s p JOIN %.*s b ON p.k = b.k;", str8_varg(probe_table->name), str8_varg(build_table->name));
@@ -1859,7 +1859,7 @@ opt_run_key_join(Arena* arena, GDB_Table* probe_table, GDB_Table* build_table, Q
   {
     identity[row] = row;
   }
-  GDB_Table* left_tables[1] = { probe_table };
+  CQL_Table* left_tables[1] = { probe_table };
   String8 left_aliases[1] = { str8_lit("p") };
   U64* left_indices[1] = { identity };
   PLAN_RowSet left = {0};
@@ -1992,8 +1992,8 @@ opt_run_fusion_suite(Arena* arena, Bench_Report* report, Opt_Fixture* fixture, O
   for (U64 index = 0; index < ArrayCount(build_sizes); index += 1)
   {
     U64 build_rows = build_sizes[index];
-    GDB_Table* build_table = opt_build_key_table(fixture->database, "fusion_build", build_rows, build_rows);
-    GDB_Table* probe_table = opt_build_key_table(fixture->database, "fusion_probe", 1000, build_rows + 3);
+    CQL_Table* build_table = opt_build_key_table(fixture->database, "fusion_build", build_rows, build_rows);
+    CQL_Table* probe_table = opt_build_key_table(fixture->database, "fusion_probe", 1000, build_rows + 3);
 
     QE_JoinHints plain = {0};
     QE_JoinHints fused = {0};
@@ -2013,8 +2013,8 @@ opt_run_fusion_suite(Arena* arena, Bench_Report* report, Opt_Fixture* fixture, O
 
   // tec: many build rows per key, so buckets hold long lists and one probe row matches several pairs
   {
-    GDB_Table* build_table = opt_build_key_table(fixture->database, "fusion_dup_build", 5000, 50);
-    GDB_Table* probe_table = opt_build_key_table(fixture->database, "fusion_dup_probe", 100, 60);
+    CQL_Table* build_table = opt_build_key_table(fixture->database, "fusion_dup_build", 5000, 50);
+    CQL_Table* probe_table = opt_build_key_table(fixture->database, "fusion_dup_probe", 100, 60);
     QE_JoinHints plain = {0};
     QE_JoinHints fused = {0};
     fused.fuse_round_trips = 1;
@@ -2041,9 +2041,9 @@ opt_run_fusion_suite(Arena* arena, Bench_Report* report, Opt_Fixture* fixture, O
 
   // tec: a probe side that matches nothing and a build side that is empty
   {
-    GDB_Table* build_table = opt_build_key_table(fixture->database, "fusion_none_build", 100, 100);
-    GDB_Table* probe_table = opt_build_key_table(fixture->database, "fusion_none_probe", 100, 100000);
-    GDB_Table* shifted = opt_build_key_table(fixture->database, "fusion_shift", 50, 100000);
+    CQL_Table* build_table = opt_build_key_table(fixture->database, "fusion_none_build", 100, 100);
+    CQL_Table* probe_table = opt_build_key_table(fixture->database, "fusion_none_probe", 100, 100000);
+    CQL_Table* shifted = opt_build_key_table(fixture->database, "fusion_shift", 50, 100000);
     (void)probe_table;
     QE_JoinHints plain = {0};
     QE_JoinHints fused = {0};
@@ -2118,7 +2118,7 @@ entry_point(CmdLine* cmdline)
   
   log_alloc();
   g_query_exec_mutex = os_mutex_alloc();
-  gdb_init();
+  cql_init();
   gpu_init();
   
   Arena* arena = arena_alloc(.reserve_size = GB(1), .commit_size = MB(64));

@@ -9,7 +9,7 @@
 #include "os/os_inc.h"
 #include "thread_pool/thread_pool.h"
 #include "settings/settings.h"
-#include "gdb/gdb_inc.h"
+#include "cql/cql_inc.h"
 #include "ir_gen/ir_gen_inc.h"
 #include "gpu/gpu_inc.h"
 #include "planner/plan_node.h"
@@ -26,7 +26,7 @@
 #include "settings/settings.c"
 #include "gpu/gpu_inc.c"
 #include "ir_gen/ir_gen_inc.c"
-#include "gdb/gdb_inc.c"
+#include "cql/cql_inc.c"
 #include "query_exec/query_exec.c"
 #include "optimizer/optimizer_inc.c"
 #include "planner/planner.c"
@@ -35,7 +35,7 @@
 #include "tests/bench_common.h"
 
 internal PLAN_Materialized
-at_run_gdb(Arena* arena, GDB_Database* database, String8 sql_text)
+at_run_cql(Arena* arena, CQL_Database* database, String8 sql_text)
 {
   SQL_TokenizeResult tok = sql_tokenize_from_text(arena, sql_text);
   SQL_Node* ast = sql_parse(arena, tok.tokens, tok.count, sql_text);
@@ -48,16 +48,16 @@ at_run_gdb(Arena* arena, GDB_Database* database, String8 sql_text)
 }
 
 internal void
-at_check_type(Bench_Report* report, String8 label, GDB_ColumnType actual, GDB_ColumnType expected)
+at_check_type(Bench_Report* report, String8 label, CQL_ColumnType actual, CQL_ColumnType expected)
 {
   B32 ok = (actual == expected);
   printf("  %-32.*s type=%-12.*s expected=%-12.*s %s\n",
-         str8_varg(label), str8_varg(string_from_gdb_column_type(actual)),
-         str8_varg(string_from_gdb_column_type(expected)), ok ? "OK" : "FAIL");
+         str8_varg(label), str8_varg(string_from_cql_column_type(actual)),
+         str8_varg(string_from_cql_column_type(expected)), ok ? "OK" : "FAIL");
   if (!ok)
   {
     bench_report_warn(report, "'%.*s' expected type %.*s, got %.*s",
-                       str8_varg(label), str8_varg(string_from_gdb_column_type(expected)), str8_varg(string_from_gdb_column_type(actual)));
+                       str8_varg(label), str8_varg(string_from_cql_column_type(expected)), str8_varg(string_from_cql_column_type(actual)));
   }
 }
 
@@ -105,12 +105,12 @@ at_run_suite(Arena* arena, Bench_Report* report)
   os_file_write(file, r1u64(0, content.size), content.str);
   os_file_close(file);
 
-  GDB_Database* database = gdb_database_alloc(str8_lit("agg_typing_db"));
-  gdb_add_database(database);
-  GDB_Table* fact_table = gdb_table_import_csv_streaming(database, str8_lit("fact"), csv_path);
-  gdb_database_add_table(database, fact_table);
+  CQL_Database* database = cql_database_alloc(str8_lit("agg_typing_db"));
+  cql_add_database(database);
+  CQL_Table* fact_table = cql_table_import_csv_streaming(database, str8_lit("fact"), csv_path);
+  cql_database_add_table(database, fact_table);
 
-  PLAN_Materialized m = at_run_gdb(scratch.arena, database,
+  PLAN_Materialized m = at_run_cql(scratch.arena, database,
     str8_lit("SELECT MIN(amount), MAX(amount), SUM(amount), AVG(amount) FROM fact;"));
 
   if (m.column_count < 4 || m.count == 0)
@@ -119,25 +119,25 @@ at_run_suite(Arena* arena, Bench_Report* report)
   }
   else
   {
-    at_check_type(report, str8_lit("MIN(amount) type"), m.columns[0].type, GDB_ColumnType_U32);
+    at_check_type(report, str8_lit("MIN(amount) type"), m.columns[0].type, CQL_ColumnType_U32);
     at_check_value(report, str8_lit("MIN(amount) value"), m.columns[0].numeric_values[0], (F64)expected_min);
 
-    at_check_type(report, str8_lit("MAX(amount) type"), m.columns[1].type, GDB_ColumnType_U32);
+    at_check_type(report, str8_lit("MAX(amount) type"), m.columns[1].type, CQL_ColumnType_U32);
     at_check_value(report, str8_lit("MAX(amount) value"), m.columns[1].numeric_values[0], (F64)expected_max);
 
-    at_check_type(report, str8_lit("SUM(amount) type"), m.columns[2].type, GDB_ColumnType_U64);
+    at_check_type(report, str8_lit("SUM(amount) type"), m.columns[2].type, CQL_ColumnType_U64);
     at_check_value(report, str8_lit("SUM(amount) value"), m.columns[2].numeric_values[0], (F64)expected_sum);
 
-    at_check_type(report, str8_lit("AVG(amount) type"), m.columns[3].type, GDB_ColumnType_F64);
+    at_check_type(report, str8_lit("AVG(amount) type"), m.columns[3].type, CQL_ColumnType_F64);
     at_check_value(report, str8_lit("AVG(amount) value"), m.columns[3].numeric_values[0], (F64)expected_sum / (F64)row_count);
   }
 
   // tec: COUNT/COUNT(*) must be unaffected by this change - still always U64
   {
-    PLAN_Materialized m2 = at_run_gdb(scratch.arena, database, str8_lit("SELECT COUNT(*) FROM fact;"));
+    PLAN_Materialized m2 = at_run_cql(scratch.arena, database, str8_lit("SELECT COUNT(*) FROM fact;"));
     if (m2.column_count > 0 && m2.count > 0)
     {
-      at_check_type(report, str8_lit("COUNT(*) type"), m2.columns[0].type, GDB_ColumnType_U64);
+      at_check_type(report, str8_lit("COUNT(*) type"), m2.columns[0].type, CQL_ColumnType_U64);
       at_check_value(report, str8_lit("COUNT(*) value"), m2.columns[0].numeric_values[0], (F64)row_count);
     }
   }
@@ -152,7 +152,7 @@ entry_point(CmdLine* cmdline)
   ProfBeginFunction();
 
   log_alloc();
-  gdb_init();
+  cql_init();
   gpu_init();
 
   Arena* arena = arena_alloc(.reserve_size = MB(256), .commit_size = MB(16));

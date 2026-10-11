@@ -9,7 +9,7 @@
 #include "os/os_inc.h"
 #include "thread_pool/thread_pool.h"
 #include "settings/settings.h"
-#include "gdb/gdb_inc.h"
+#include "cql/cql_inc.h"
 #include "ir_gen/ir_gen_inc.h"
 #include "gpu/gpu_inc.h"
 #include "planner/plan_node.h"
@@ -26,7 +26,7 @@
 #include "settings/settings.c"
 #include "gpu/gpu_inc.c"
 #include "ir_gen/ir_gen_inc.c"
-#include "gdb/gdb_inc.c"
+#include "cql/cql_inc.c"
 #include "query_exec/query_exec.c"
 #include "optimizer/optimizer_inc.c"
 #include "planner/planner.c"
@@ -61,14 +61,14 @@ ar_make_row(Bench_Rng* rng, U32 id)
 }
 
 internal void
-ar_gdb_add_row(GDB_Table* table, AR_Row* row)
+ar_cql_add_row(CQL_Table* table, AR_Row* row)
 {
   char name_buffer[16] = {0};
   snprintf(name_buffer, sizeof(name_buffer), "k%02u", row->group);
   String8 name = str8_cstring(name_buffer);
   U32 key = row->id % AR_DIM_KEYS;
   void* row_data[6] = { &row->id, &row->group, &name, &row->whole, &row->decimal, &key };
-  gdb_table_add_row(table, row_data, NULL);
+  cql_table_add_row(table, row_data, NULL);
 }
 
 internal void
@@ -95,34 +95,34 @@ ar_sqlite_add_row(sqlite3* db, AR_Row* row)
 }
 
 // tec: small dimension tables, loaded into both engines
-internal GDB_Table*
-ar_gdb_make_table(GDB_Database* database, char* name, char** column_names, GDB_ColumnType* column_types, U64 column_count)
+internal CQL_Table*
+ar_cql_make_table(CQL_Database* database, char* name, char** column_names, CQL_ColumnType* column_types, U64 column_count)
 {
-  GDB_Table* table = gdb_table_alloc(str8_cstring(name));
+  CQL_Table* table = cql_table_alloc(str8_cstring(name));
   for (U64 c = 0; c < column_count; c++)
   {
-    gdb_table_add_column(table, gdb_column_schema_create(str8_cstring(column_names[c]), column_types[c]));
+    cql_table_add_column(table, cql_column_schema_create(str8_cstring(column_names[c]), column_types[c]));
   }
-  gdb_database_add_table(database, table);
+  cql_database_add_table(database, table);
   return table;
 }
 
 internal void
-ar_add_dimensions(GDB_Database* database, sqlite3* sqlite_db)
+ar_add_dimensions(CQL_Database* database, sqlite3* sqlite_db)
 {
   char* d_names[] = { "grp", "label", "weight", "cat" };
-  GDB_ColumnType d_types[] = { GDB_ColumnType_U32, GDB_ColumnType_String8, GDB_ColumnType_F64, GDB_ColumnType_U32 };
-  GDB_Table* d_table = ar_gdb_make_table(database, "d", d_names, d_types, 4);
+  CQL_ColumnType d_types[] = { CQL_ColumnType_U32, CQL_ColumnType_String8, CQL_ColumnType_F64, CQL_ColumnType_U32 };
+  CQL_Table* d_table = ar_cql_make_table(database, "d", d_names, d_types, 4);
   ar_sqlite_run(sqlite_db, str8_lit("CREATE TABLE d (grp INTEGER, label TEXT, weight REAL, cat INTEGER);"));
 
   char* e_names[] = { "cat", "factor" };
-  GDB_ColumnType e_types[] = { GDB_ColumnType_U32, GDB_ColumnType_F64 };
-  GDB_Table* e_table = ar_gdb_make_table(database, "e", e_names, e_types, 2);
+  CQL_ColumnType e_types[] = { CQL_ColumnType_U32, CQL_ColumnType_F64 };
+  CQL_Table* e_table = ar_cql_make_table(database, "e", e_names, e_types, 2);
   ar_sqlite_run(sqlite_db, str8_lit("CREATE TABLE e (cat INTEGER, factor REAL);"));
 
   char* d2_names[] = { "grp", "v" };
-  GDB_ColumnType d2_types[] = { GDB_ColumnType_U32, GDB_ColumnType_F64 };
-  GDB_Table* d2_table = ar_gdb_make_table(database, "d2", d2_names, d2_types, 2);
+  CQL_ColumnType d2_types[] = { CQL_ColumnType_U32, CQL_ColumnType_F64 };
+  CQL_Table* d2_table = ar_cql_make_table(database, "d2", d2_names, d2_types, 2);
   ar_sqlite_run(sqlite_db, str8_lit("CREATE TABLE d2 (grp INTEGER, v REAL);"));
 
   Temp scratch = scratch_begin(0, 0);
@@ -136,14 +136,14 @@ ar_add_dimensions(GDB_Database* database, sqlite3* sqlite_db)
     F64 weight = (F64)((g * 7) % 50);
     U32 cat = g % 5;
     void* d_row[4] = { &g, &label, &weight, &cat };
-    gdb_table_add_row(d_table, d_row, NULL);
+    cql_table_add_row(d_table, d_row, NULL);
     ar_sqlite_run(sqlite_db, push_str8f(scratch.arena, "INSERT INTO d VALUES (%u, '%s', %.1f, %u);", g, label_buffer, weight, cat));
 
     for (U32 copy = 1; copy <= 2; copy++)
     {
       F64 v = (F64)copy;
       void* d2_row[2] = { &g, &v };
-      gdb_table_add_row(d2_table, d2_row, NULL);
+      cql_table_add_row(d2_table, d2_row, NULL);
       ar_sqlite_run(sqlite_db, push_str8f(scratch.arena, "INSERT INTO d2 VALUES (%u, %.1f);", g, v));
     }
   }
@@ -151,18 +151,18 @@ ar_add_dimensions(GDB_Database* database, sqlite3* sqlite_db)
   {
     F64 factor = (F64)(10 * (cat + 1));
     void* e_row[2] = { &cat, &factor };
-    gdb_table_add_row(e_table, e_row, NULL);
+    cql_table_add_row(e_table, e_row, NULL);
     ar_sqlite_run(sqlite_db, push_str8f(scratch.arena, "INSERT INTO e VALUES (%u, %.1f);", cat, factor));
   }
 
   // tec: dimensions big enough that a filter on them leaves the join's row order shuffled, which the small ones above do not
   char* u_names[] = { "uid", "seg", "age", "pid" };
-  GDB_ColumnType u_types[] = { GDB_ColumnType_U32, GDB_ColumnType_String8, GDB_ColumnType_U32, GDB_ColumnType_U32 };
-  GDB_Table* u_table = ar_gdb_make_table(database, "u", u_names, u_types, 4);
+  CQL_ColumnType u_types[] = { CQL_ColumnType_U32, CQL_ColumnType_String8, CQL_ColumnType_U32, CQL_ColumnType_U32 };
+  CQL_Table* u_table = ar_cql_make_table(database, "u", u_names, u_types, 4);
   ar_sqlite_run(sqlite_db, str8_lit("CREATE TABLE u (uid INTEGER, seg TEXT, age INTEGER, pid INTEGER);"));
   char* p_names[] = { "pid", "brand", "cost" };
-  GDB_ColumnType p_types[] = { GDB_ColumnType_U32, GDB_ColumnType_String8, GDB_ColumnType_F64 };
-  GDB_Table* p_table = ar_gdb_make_table(database, "p", p_names, p_types, 3);
+  CQL_ColumnType p_types[] = { CQL_ColumnType_U32, CQL_ColumnType_String8, CQL_ColumnType_F64 };
+  CQL_Table* p_table = ar_cql_make_table(database, "p", p_names, p_types, 3);
   ar_sqlite_run(sqlite_db, str8_lit("CREATE TABLE p (pid INTEGER, brand TEXT, cost REAL);"));
 
   ar_sqlite_run(sqlite_db, str8_lit("BEGIN TRANSACTION;"));
@@ -174,7 +174,7 @@ ar_add_dimensions(GDB_Database* database, sqlite3* sqlite_db)
     U32 age = 18 + (uid * 31) % 63;
     U32 pid = uid % AR_PRODUCTS;
     void* u_row[4] = { &uid, &seg, &age, &pid };
-    gdb_table_add_row(u_table, u_row, NULL);
+    cql_table_add_row(u_table, u_row, NULL);
     ar_sqlite_run(sqlite_db, push_str8f(scratch.arena, "INSERT INTO u VALUES (%u, '%s', %u, %u);", uid, seg_buffer, age, pid));
   }
   for (U32 pid = 0; pid < AR_PRODUCTS; pid++)
@@ -184,7 +184,7 @@ ar_add_dimensions(GDB_Database* database, sqlite3* sqlite_db)
     String8 brand = str8_cstring(brand_buffer);
     F64 cost = (F64)((pid * 37) % 400);
     void* p_row[3] = { &pid, &brand, &cost };
-    gdb_table_add_row(p_table, p_row, NULL);
+    cql_table_add_row(p_table, p_row, NULL);
     ar_sqlite_run(sqlite_db, push_str8f(scratch.arena, "INSERT INTO p VALUES (%u, '%s', %.1f);", pid, brand_buffer, cost));
   }
   ar_sqlite_run(sqlite_db, str8_lit("COMMIT;"));
@@ -224,9 +224,9 @@ global AR_Query g_ar_queries[] =
 global U64 g_ar_checks = 0;
 global U64 g_ar_failures = 0;
 
-// tec: runs every query on both engines, checks them against each other, and against the previous gdb answer when one is given
+// tec: runs every query on both engines, checks them against each other, and against the previous cql answer when one is given
 internal void
-ar_run_phase(Bench_Report* report, GDB_Database* database, sqlite3* sqlite_db, char* phase, U64* gdb_checksums, B32 expect_same_as_previous)
+ar_run_phase(Bench_Report* report, CQL_Database* database, sqlite3* sqlite_db, char* phase, U64* cql_checksums, B32 expect_same_as_previous)
 {
   printf("\n=== %s ===\n", phase);
   for (U64 i = 0; i < ArrayCount(g_ar_queries); i++)
@@ -235,25 +235,25 @@ ar_run_phase(Bench_Report* report, GDB_Database* database, sqlite3* sqlite_db, c
     String8 sql = str8_cstring(g_ar_queries[i].sql);
     String8 label = push_str8f(scratch.arena, "%s: %s", phase, g_ar_queries[i].label);
     
-    U64 gdb_rows = 0, gdb_checksum = 0;
-    bench_run_gdb_query(database, sql, &gdb_rows, &gdb_checksum);
+    U64 cql_rows = 0, cql_checksum = 0;
+    bench_run_cql_query(database, sql, &cql_rows, &cql_checksum);
     U64 sqlite_rows = 0, sqlite_checksum = 0;
     bench_run_sqlite_query(sqlite_db, sql, &sqlite_rows, &sqlite_checksum);
     
     g_ar_checks += 1;
-    B32 ok = gdb_rows == sqlite_rows && gdb_checksum == sqlite_checksum && gdb_rows > 0;
-    if (expect_same_as_previous && gdb_checksums[i] != gdb_checksum)
+    B32 ok = cql_rows == sqlite_rows && cql_checksum == sqlite_checksum && cql_rows > 0;
+    if (expect_same_as_previous && cql_checksums[i] != cql_checksum)
     {
       ok = 0;
-      bench_report_warn(report, "%.*s: gdb answer changed between two runs with no write in between", str8_varg(label));
+      bench_report_warn(report, "%.*s: cql answer changed between two runs with no write in between", str8_varg(label));
     }
-    gdb_checksums[i] = gdb_checksum;
+    cql_checksums[i] = cql_checksum;
     
-    printf("  %-64.*s %s (rows %llu)\n", str8_varg(label), ok ? "OK" : "FAIL", gdb_rows);
+    printf("  %-64.*s %s (rows %llu)\n", str8_varg(label), ok ? "OK" : "FAIL", cql_rows);
     if (!ok)
     {
       g_ar_failures += 1;
-      bench_report_warn(report, "FAIL %.*s: gdb rows=%llu checksum=%llu, sqlite rows=%llu checksum=%llu", str8_varg(label), gdb_rows, gdb_checksum, sqlite_rows, sqlite_checksum);
+      bench_report_warn(report, "FAIL %.*s: cql rows=%llu checksum=%llu, sqlite rows=%llu checksum=%llu", str8_varg(label), cql_rows, cql_checksum, sqlite_rows, sqlite_checksum);
     }
     scratch_end(scratch);
   }
@@ -267,22 +267,22 @@ entry_point(CmdLine* cmdline)
   
   log_alloc();
   
-  gdb_init();
+  cql_init();
   gpu_init();
   
   Arena* arena = arena_alloc(.reserve_size = GB(1), .commit_size = MB(64));
   Bench_Report* report = bench_report_alloc(arena, "compute_ql GROUP BY over GPU resident columns correctness");
   
-  GDB_Database* database = gdb_database_alloc(str8_lit("agg_resident_db"));
-  gdb_add_database(database);
-  GDB_Table* table = gdb_table_alloc(str8_lit("t"));
-  gdb_table_add_column(table, gdb_column_schema_create(str8_lit("id"), GDB_ColumnType_U32));
-  gdb_table_add_column(table, gdb_column_schema_create(str8_lit("grp"), GDB_ColumnType_U32));
-  gdb_table_add_column(table, gdb_column_schema_create(str8_lit("name"), GDB_ColumnType_String8));
-  gdb_table_add_column(table, gdb_column_schema_create(str8_lit("wv"), GDB_ColumnType_F64));
-  gdb_table_add_column(table, gdb_column_schema_create(str8_lit("dv"), GDB_ColumnType_F64));
-  gdb_table_add_column(table, gdb_column_schema_create(str8_lit("k"), GDB_ColumnType_U32));
-  gdb_database_add_table(database, table);
+  CQL_Database* database = cql_database_alloc(str8_lit("agg_resident_db"));
+  cql_add_database(database);
+  CQL_Table* table = cql_table_alloc(str8_lit("t"));
+  cql_table_add_column(table, cql_column_schema_create(str8_lit("id"), CQL_ColumnType_U32));
+  cql_table_add_column(table, cql_column_schema_create(str8_lit("grp"), CQL_ColumnType_U32));
+  cql_table_add_column(table, cql_column_schema_create(str8_lit("name"), CQL_ColumnType_String8));
+  cql_table_add_column(table, cql_column_schema_create(str8_lit("wv"), CQL_ColumnType_F64));
+  cql_table_add_column(table, cql_column_schema_create(str8_lit("dv"), CQL_ColumnType_F64));
+  cql_table_add_column(table, cql_column_schema_create(str8_lit("k"), CQL_ColumnType_U32));
+  cql_database_add_table(database, table);
   
   sqlite3* sqlite_db = NULL;
   sqlite3_open(":memory:", &sqlite_db);
@@ -293,7 +293,7 @@ entry_point(CmdLine* cmdline)
   for (U32 i = 0; i < AR_ROWS; i++)
   {
     AR_Row row = ar_make_row(&rng, i + 1);
-    ar_gdb_add_row(table, &row);
+    ar_cql_add_row(table, &row);
     ar_sqlite_add_row(sqlite_db, &row);
   }
   ar_sqlite_run(sqlite_db, str8_lit("COMMIT;"));
@@ -316,7 +316,7 @@ entry_point(CmdLine* cmdline)
     ar_sqlite_run(sqlite_db, str8_lit("BEGIN TRANSACTION;"));
     for (U64 i = 0; i < ArrayCount(rows); i++)
     {
-      ar_gdb_add_row(table, &rows[i]);
+      ar_cql_add_row(table, &rows[i]);
       ar_sqlite_add_row(sqlite_db, &rows[i]);
     }
     ar_sqlite_run(sqlite_db, str8_lit("COMMIT;"));
@@ -325,7 +325,7 @@ entry_point(CmdLine* cmdline)
   ar_run_phase(report, database, sqlite_db, "after insert, warm", checksums, 1);
   
   {
-    gdb_table_remove_row(table, 10);
+    cql_table_remove_row(table, 10);
     ar_sqlite_run(sqlite_db, str8_lit("DELETE FROM t WHERE id = 11;"));
   }
   ar_run_phase(report, database, sqlite_db, "after delete", checksums, 0);

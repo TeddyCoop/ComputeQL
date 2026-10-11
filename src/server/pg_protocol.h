@@ -11,9 +11,9 @@
 #define PG_CANCEL_REQUEST_CODE   80877102u
 
 //~ tec: type OIDs
-// tec: GDB_ColumnType_U64 maps to signed int8. values above INT64_MAX round trip as text but not as a binary int8
-internal U32 pg_oid_for_column_type(GDB_ColumnType type);
-internal S16 pg_typlen_for_column_type(GDB_ColumnType type);
+// tec: CQL_ColumnType_U64 maps to signed int8. values above INT64_MAX round trip as text but not as a binary int8
+internal U32 pg_oid_for_column_type(CQL_ColumnType type);
+internal S16 pg_typlen_for_column_type(CQL_ColumnType type);
 
 //~ tec: wire I/O
 // tec: startup-phase messages have no leading type byte; every message after startup does
@@ -42,7 +42,7 @@ internal B32 pg_send_data_rows_from_result_set(OS_Handle conn, Arena* arena, APP
 internal B32 pg_send_data_row_single_text_column(OS_Handle conn, Arena* arena, String8 value);
 
 internal U16 pg_result_format_code_for_column(U16* format_codes, U16 format_code_count, U64 column_index);
-internal String8 pg_encode_binary_numeric(Arena* arena, GDB_ColumnType type, F64 value);
+internal String8 pg_encode_binary_numeric(Arena* arena, CQL_ColumnType type, F64 value);
 
 //~ tec: extended protocol
 // tec: result_format_codes: 0 entries = all text, 1 entry = applies to every column, else one per column

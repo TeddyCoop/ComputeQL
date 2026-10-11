@@ -915,19 +915,19 @@ optimizer_fold_constants(OPT_JoinStep* steps, OPT_Conjunct* conjuncts, U32 conju
 //~ tec: contradiction detection
 
 internal B32
-optimizer_column_type_is_comparable_number(GDB_ColumnType type)
+optimizer_column_type_is_comparable_number(CQL_ColumnType type)
 {
-  B32 comparable = type == GDB_ColumnType_U32 ||
-    type == GDB_ColumnType_U64 ||
-    type == GDB_ColumnType_I32 ||
-    type == GDB_ColumnType_I64 ||
-    type == GDB_ColumnType_F64 ||
-    type == GDB_ColumnType_Bool;
+  B32 comparable = type == CQL_ColumnType_U32 ||
+    type == CQL_ColumnType_U64 ||
+    type == CQL_ColumnType_I32 ||
+    type == CQL_ColumnType_I64 ||
+    type == CQL_ColumnType_F64 ||
+    type == CQL_ColumnType_Bool;
   return comparable;
 }
 
 internal B32
-optimizer_column_operand(OPT_Relation* relations, U32 relation_count, IR_Node* node, U32* out_relation, String8* out_column, GDB_ColumnType* out_type)
+optimizer_column_operand(OPT_Relation* relations, U32 relation_count, IR_Node* node, U32* out_relation, String8* out_column, CQL_ColumnType* out_type)
 {
   if (!node || node->type != IR_NodeType_Column)
   {
@@ -941,7 +941,7 @@ optimizer_column_operand(OPT_Relation* relations, U32 relation_count, IR_Node* n
   }
   
   String8 bare_name = qe_bare_column_name(node->value);
-  GDB_Column* column = gdb_table_find_column(relations[relation_index].table, bare_name);
+  CQL_Column* column = cql_table_find_column(relations[relation_index].table, bare_name);
   if (!column)
   {
     return 0;
@@ -1044,11 +1044,11 @@ optimizer_bounds_are_contradictory(OPT_ColumnBounds* bounds)
 
 // tec: returns true when this comparison makes the bounds impossible
 internal B32
-optimizer_bounds_apply(OPT_ColumnBounds* bounds, String8 op, IR_Node* literal, GDB_ColumnType type)
+optimizer_bounds_apply(OPT_ColumnBounds* bounds, String8 op, IR_Node* literal, CQL_ColumnType type)
 {
   B32 is_equal_op = str8_match(op, str8_lit("="), 0) || str8_match(op, str8_lit("=="), 0);
   
-  if (type == GDB_ColumnType_String8)
+  if (type == CQL_ColumnType_String8)
   {
     if (literal->type != IR_NodeType_Literal || !is_equal_op)
     {
@@ -1154,7 +1154,7 @@ optimizer_detect_contradiction(OPT_Relation* relations, U32 relation_count, OPT_
     
     U32 relation_index = 0;
     String8 column_name = {0};
-    GDB_ColumnType column_type = GDB_ColumnType_Invalid;
+    CQL_ColumnType column_type = CQL_ColumnType_Invalid;
     B32 resolved = optimizer_column_operand(relations, relation_count, column_node, &relation_index, &column_name, &column_type);
     if (!resolved)
     {
@@ -1165,7 +1165,7 @@ optimizer_detect_contradiction(OPT_Relation* relations, U32 relation_count, OPT_
       continue;
     }
     
-    B32 string_pair = column_type == GDB_ColumnType_String8 && literal_node->type == IR_NodeType_Literal;
+    B32 string_pair = column_type == CQL_ColumnType_String8 && literal_node->type == IR_NodeType_Literal;
     B32 number_pair = optimizer_column_type_is_comparable_number(column_type) && literal_node->type == IR_NodeType_Numeric;
     if (!string_pair && !number_pair)
     {
@@ -1247,8 +1247,8 @@ optimizer_equality_is_join_key(OPT_Relation* relations, U32 relation_count, OPT_
     return 0;
   }
   
-  GDB_ColumnType left_type = GDB_ColumnType_Invalid;
-  GDB_ColumnType right_type = GDB_ColumnType_Invalid;
+  CQL_ColumnType left_type = CQL_ColumnType_Invalid;
+  CQL_ColumnType right_type = CQL_ColumnType_Invalid;
   B32 left_ok = optimizer_column_operand(relations, relation_count, node->first, out_left_relation, out_left_column, &left_type);
   B32 right_ok = optimizer_column_operand(relations, relation_count, node->first->next, out_right_relation, out_right_column, &right_type);
   if (!left_ok || !right_ok || *out_left_relation == *out_right_relation)
@@ -1264,7 +1264,7 @@ optimizer_equality_is_join_key(OPT_Relation* relations, U32 relation_count, OPT_
   }
   
   B32 both_numbers = optimizer_column_type_is_comparable_number(left_type) && optimizer_column_type_is_comparable_number(right_type);
-  B32 both_strings = left_type == GDB_ColumnType_String8 && right_type == GDB_ColumnType_String8;
+  B32 both_strings = left_type == CQL_ColumnType_String8 && right_type == CQL_ColumnType_String8;
   return both_numbers || both_strings;
 }
 
@@ -1291,7 +1291,7 @@ optimizer_constant_equality(OPT_Relation* relations, U32 relation_count, OPT_Joi
     literal_node = node->first;
   }
   
-  GDB_ColumnType column_type = GDB_ColumnType_Invalid;
+  CQL_ColumnType column_type = CQL_ColumnType_Invalid;
   B32 resolved = optimizer_column_operand(relations, relation_count, column_node, out_relation, out_column, &column_type);
   if (!resolved)
   {
@@ -1302,7 +1302,7 @@ optimizer_constant_equality(OPT_Relation* relations, U32 relation_count, OPT_Joi
     return 0;
   }
   
-  B32 string_pair = column_type == GDB_ColumnType_String8 && literal_node->type == IR_NodeType_Literal;
+  B32 string_pair = column_type == CQL_ColumnType_String8 && literal_node->type == IR_NodeType_Literal;
   B32 number_pair = optimizer_column_type_is_comparable_number(column_type) && literal_node->type == IR_NodeType_Numeric;
   if (!string_pair && !number_pair)
   {
@@ -1434,12 +1434,12 @@ optimizer_propagate_constants(Arena* arena, OPT_Relation* relations, U32 relatio
     }
     
     OPT_Relation* relation = &relations[keys[key_index].relation];
-    GDB_Column* column = gdb_table_find_column(relation->table, keys[key_index].column);
+    CQL_Column* column = cql_table_find_column(relation->table, keys[key_index].column);
     if (!column)
     {
       continue;
     }
-    B32 string_pair = column->type == GDB_ColumnType_String8 && constant->type == IR_NodeType_Literal;
+    B32 string_pair = column->type == CQL_ColumnType_String8 && constant->type == IR_NodeType_Literal;
     B32 number_pair = optimizer_column_type_is_comparable_number(column->type) && constant->type == IR_NodeType_Numeric;
     if (!string_pair && !number_pair)
     {
@@ -1615,7 +1615,7 @@ optimizer_list_has_column(IR_Node* column_list, String8 bare_name)
 }
 
 internal B32
-optimizer_inner_columns_belong_to_base(IR_Node* node, GDB_Table* base_table, String8 inner_alias)
+optimizer_inner_columns_belong_to_base(IR_Node* node, CQL_Table* base_table, String8 inner_alias)
 {
   if (!node)
   {
@@ -1638,7 +1638,7 @@ optimizer_inner_columns_belong_to_base(IR_Node* node, GDB_Table* base_table, Str
 }
 
 internal B32
-optimizer_describe_inline_source(GDB_Database* database, IR_Node* inner_select, OPT_InlineSource* out_source)
+optimizer_describe_inline_source(CQL_Database* database, IR_Node* inner_select, OPT_InlineSource* out_source)
 {
   MemoryZeroStruct(out_source);
   out_source->select = inner_select;
@@ -1674,8 +1674,8 @@ optimizer_describe_inline_source(GDB_Database* database, IR_Node* inner_select, 
     return 0;
   }
   
-  GDB_Table* base_table = gdb_database_find_table(database, out_source->table->value);
-  GDB_Table* visible_table = gdb_database_find_table_or_catalog(database, out_source->table->value);
+  CQL_Table* base_table = cql_database_find_table(database, out_source->table->value);
+  CQL_Table* visible_table = cql_database_find_table_or_catalog(database, out_source->table->value);
   if (!base_table || base_table != visible_table)
   {
     return 0;
@@ -1688,7 +1688,7 @@ optimizer_describe_inline_source(GDB_Database* database, IR_Node* inner_select, 
     for (IR_Node* item = out_source->column_list->first; item != NULL; item = item->next)
     {
       B32 plain_column = item->type == IR_NodeType_Column && item->first == NULL;
-      if (!plain_column || !gdb_table_find_column(base_table, qe_bare_column_name(item->value)))
+      if (!plain_column || !cql_table_find_column(base_table, qe_bare_column_name(item->value)))
       {
         return 0;
       }
@@ -1736,7 +1736,7 @@ optimizer_column_reference_blocks(IR_Node* node, OPT_InlineSource* source, Strin
       return names_source && !optimizer_list_has_column(source->column_list, bare_name);
     }
     
-    B32 hidden_base_column = gdb_table_find_column(source->base_table, bare_name) != NULL && !optimizer_list_has_column(source->column_list, bare_name);
+    B32 hidden_base_column = cql_table_find_column(source->base_table, bare_name) != NULL && !optimizer_list_has_column(source->column_list, bare_name);
     return hidden_base_column;
   }
   
@@ -1879,7 +1879,7 @@ optimizer_source_is_in_left_join(IR_Node* outer_select, IR_Node* table_ir)
 }
 
 internal B32
-optimizer_try_inline_reference(Arena* arena, GDB_Database* database, IR_Node* select_ir, IR_Node* table_ir, IR_Node* inner_select, String8 default_name)
+optimizer_try_inline_reference(Arena* arena, CQL_Database* database, IR_Node* select_ir, IR_Node* table_ir, IR_Node* inner_select, String8 default_name)
 {
   OPT_InlineSource source = {0};
   if (!optimizer_describe_inline_source(database, inner_select, &source))
@@ -1951,7 +1951,7 @@ optimizer_name_is_cte(IR_Node* cte_list, String8 name)
 }
 
 internal void
-optimizer_inline_sources(Arena* arena, GDB_Database* database, IR_Node* select_ir)
+optimizer_inline_sources(Arena* arena, CQL_Database* database, IR_Node* select_ir)
 {
   if (!select_ir)
   {
@@ -2044,9 +2044,9 @@ optimizer_clamp_selectivity(F64 selectivity)
 
 // tec: computing statistics reads the whole column, so a column over the row budget only gets them once something else computed them
 internal B32
-optimizer_stats_available(GDB_Column* column)
+optimizer_stats_available(CQL_Column* column)
 {
-  if (gdb_column_stats_is_current(column))
+  if (cql_column_stats_is_current(column))
   {
     return 1;
   }
@@ -2056,18 +2056,18 @@ optimizer_stats_available(GDB_Column* column)
   {
     return 0;
   }
-  gdb_column_ensure_stats(column);
+  cql_column_ensure_stats(column);
   return 1;
 }
 
 internal F64
-optimizer_non_null_fraction(GDB_Column* column)
+optimizer_non_null_fraction(CQL_Column* column)
 {
   if (!optimizer_stats_available(column))
   {
     return 1.0;
   }
-  GDB_ColumnStats* stats = &column->stats;
+  CQL_ColumnStats* stats = &column->stats;
   if (stats->row_count == 0)
   {
     return 0.0;
@@ -2077,7 +2077,7 @@ optimizer_non_null_fraction(GDB_Column* column)
 }
 
 internal F64
-optimizer_distinct_count(GDB_Column* column)
+optimizer_distinct_count(CQL_Column* column)
 {
   if (!optimizer_stats_available(column))
   {
@@ -2095,13 +2095,13 @@ optimizer_distinct_count(GDB_Column* column)
 
 // tec: a share of the non-null rows, a top value is looked up directly and the rest share what is left evenly
 internal F64
-optimizer_equality_selectivity(GDB_Column* column, B32 is_string, F64 target_numeric, String8 target_string)
+optimizer_equality_selectivity(CQL_Column* column, B32 is_string, F64 target_numeric, String8 target_string)
 {
   if (!optimizer_stats_available(column))
   {
     return OPT_DEFAULT_SELECTIVITY_EQUALITY;
   }
-  GDB_ColumnStats* stats = &column->stats;
+  CQL_ColumnStats* stats = &column->stats;
   if (stats->row_count <= stats->null_count)
   {
     return 0.0;
@@ -2118,11 +2118,11 @@ optimizer_equality_selectivity(GDB_Column* column, B32 is_string, F64 target_num
   U64 key = 0;
   if (is_string)
   {
-    key = gdb_stats_hash_bytes(target_string.str, target_string.size);
+    key = cql_stats_hash_bytes(target_string.str, target_string.size);
   }
   else
   {
-    key = gdb_stats_hash_f64(target_numeric);
+    key = cql_stats_hash_f64(target_numeric);
   }
   
   F64 top_value_total = 0.0;
@@ -2150,7 +2150,7 @@ optimizer_equality_selectivity(GDB_Column* column, B32 is_string, F64 target_num
 
 // tec: returns a negative number when the column has no histogram
 internal F64
-optimizer_histogram_fraction_below(GDB_ColumnStats* stats, F64 value)
+optimizer_histogram_fraction_below(CQL_ColumnStats* stats, F64 value)
 {
   U32 bucket_count = stats->histogram_bucket_count;
   if (bucket_count == 0)
@@ -2185,7 +2185,7 @@ optimizer_histogram_fraction_below(GDB_ColumnStats* stats, F64 value)
 }
 
 internal F64
-optimizer_range_selectivity(GDB_Column* column, B32 is_lt, B32 is_le, B32 is_gt, B32 is_ge, F64 target_numeric)
+optimizer_range_selectivity(CQL_Column* column, B32 is_lt, B32 is_le, B32 is_gt, B32 is_ge, F64 target_numeric)
 {
   F64 non_null = optimizer_non_null_fraction(column);
   if (!optimizer_stats_available(column))
@@ -2270,7 +2270,7 @@ optimizer_comparison_selectivity(Arena* arena, OPT_Relation* relations, U32 rela
   
   IR_Node* comparison = optimizer_make_comparison(arena, op, column_node, literal_node);
   
-  GDB_Column* column = NULL;
+  CQL_Column* column = NULL;
   B32 is_eq = 0;
   B32 is_lt = 0;
   B32 is_le = 0;
@@ -2338,7 +2338,7 @@ optimizer_in_list_selectivity(Arena* arena, OPT_Relation* relations, U32 relatio
   B32 is_not_in = optimizer_ir_is_operator(leaf, str8_lit("not in"));
   if (is_not_in)
   {
-    GDB_Column* column = gdb_table_find_column(relations[relation_index].table, qe_bare_column_name(column_node->value));
+    CQL_Column* column = cql_table_find_column(relations[relation_index].table, qe_bare_column_name(column_node->value));
     F64 non_null = column ? optimizer_non_null_fraction(column) : 1.0;
     return optimizer_clamp_selectivity(non_null - total);
   }
@@ -2357,7 +2357,7 @@ optimizer_null_test_selectivity(OPT_Relation* relations, U32 relation_count, IR_
     U32 relation_index = optimizer_resolve_column(relations, relation_count, column_node->value);
     if (relation_index != OPT_NO_RELATION)
     {
-      GDB_Column* column = gdb_table_find_column(relations[relation_index].table, qe_bare_column_name(column_node->value));
+      CQL_Column* column = cql_table_find_column(relations[relation_index].table, qe_bare_column_name(column_node->value));
       if (column)
       {
         null_fraction = 1.0 - optimizer_non_null_fraction(column);
@@ -2391,8 +2391,8 @@ optimizer_column_pair_selectivity(OPT_Relation* relations, U32 relation_count, I
     return OPT_DEFAULT_SELECTIVITY_EQUALITY;
   }
   
-  GDB_Column* left_column = gdb_table_find_column(relations[left_relation].table, qe_bare_column_name(left->value));
-  GDB_Column* right_column = gdb_table_find_column(relations[right_relation].table, qe_bare_column_name(right->value));
+  CQL_Column* left_column = cql_table_find_column(relations[left_relation].table, qe_bare_column_name(left->value));
+  CQL_Column* right_column = cql_table_find_column(relations[right_relation].table, qe_bare_column_name(right->value));
   if (!left_column || !right_column)
   {
     return OPT_DEFAULT_SELECTIVITY_EQUALITY;
@@ -2489,7 +2489,7 @@ optimizer_combine_and(F64* selectivities, U32 count)
 
 // tec: a numeric column compared to a literal with < <= > or >=
 internal B32
-optimizer_range_leaf_info(Arena* arena, OPT_Relation* relations, U32 relation_count, IR_Node* leaf, GDB_Column** out_column, B32* out_is_lower)
+optimizer_range_leaf_info(Arena* arena, OPT_Relation* relations, U32 relation_count, IR_Node* leaf, CQL_Column** out_column, B32* out_is_lower)
 {
   if (!leaf || leaf->type != IR_NodeType_Operator || !leaf->first || !leaf->first->next)
   {
@@ -2519,7 +2519,7 @@ optimizer_range_leaf_info(Arena* arena, OPT_Relation* relations, U32 relation_co
   }
   
   IR_Node* comparison = optimizer_make_comparison(arena, op, column_node, literal_node);
-  GDB_Column* column = NULL;
+  CQL_Column* column = NULL;
   B32 is_eq = 0;
   B32 is_lt = 0;
   B32 is_le = 0;
@@ -2543,7 +2543,7 @@ optimizer_range_leaf_info(Arena* arena, OPT_Relation* relations, U32 relation_co
 internal void
 optimizer_merge_range_pairs(Arena* arena, OPT_Relation* relations, U32 relation_count, IR_Node** leaves, F64* selectivities, U32 count)
 {
-  GDB_Column* columns[OPT_ESTIMATE_LEAF_CAPACITY] = {0};
+  CQL_Column* columns[OPT_ESTIMATE_LEAF_CAPACITY] = {0};
   B32 is_lower[OPT_ESTIMATE_LEAF_CAPACITY] = {0};
   B32 is_range[OPT_ESTIMATE_LEAF_CAPACITY] = {0};
   
@@ -2665,8 +2665,8 @@ optimizer_estimate_join_rows(Arena* arena, PLAN_Node* join, F64* out_hash_rows)
   }
   
   IR_Node* key_leaf = NULL;
-  GDB_Column* left_key = NULL;
-  GDB_Column* right_key = NULL;
+  CQL_Column* left_key = NULL;
+  CQL_Column* right_key = NULL;
   for (U32 index = 0; index < leaf_count && !key_leaf; index += 1)
   {
     IR_Node* leaf = leaves[index];
@@ -2698,8 +2698,8 @@ optimizer_estimate_join_rows(Arena* arena, PLAN_Node* join, F64* out_hash_rows)
     IR_Node* right_node = first_is_left ? leaf->first->next : leaf->first;
     U32 left_relation = first_is_left ? first_relation : second_relation;
     U32 right_relation = first_is_left ? second_relation : first_relation;
-    left_key = gdb_table_find_column(relations[left_relation].table, qe_bare_column_name(left_node->value));
-    right_key = gdb_table_find_column(relations[right_relation].table, qe_bare_column_name(right_node->value));
+    left_key = cql_table_find_column(relations[left_relation].table, qe_bare_column_name(left_node->value));
+    right_key = cql_table_find_column(relations[right_relation].table, qe_bare_column_name(right_node->value));
     if (left_key && right_key)
     {
       key_leaf = leaf;
@@ -2773,8 +2773,8 @@ optimizer_estimate_semi_rows(Arena* arena, PLAN_Node* join)
       IR_Node* right_node = first_is_left ? second_key : first_key;
       U32 left_relation = first_is_left ? first_relation : second_relation;
       U32 right_relation = first_is_left ? second_relation : first_relation;
-      GDB_Column* left_column = gdb_table_find_column(relations[left_relation].table, qe_bare_column_name(left_node->value));
-      GDB_Column* right_column = gdb_table_find_column(relations[right_relation].table, qe_bare_column_name(right_node->value));
+      CQL_Column* left_column = cql_table_find_column(relations[left_relation].table, qe_bare_column_name(left_node->value));
+      CQL_Column* right_column = cql_table_find_column(relations[right_relation].table, qe_bare_column_name(right_node->value));
       if (left_column && right_column)
       {
         F64 left_distinct = Min(optimizer_distinct_count(left_column), Max(left_rows, 1.0));
@@ -2812,7 +2812,7 @@ optimizer_estimate_group_count(PLAN_Node* aggregate, F64 input_rows)
       U32 relation_index = optimizer_resolve_column(relations, relation_count, key->value);
       if (relation_index != OPT_NO_RELATION)
       {
-        GDB_Column* column = gdb_table_find_column(relations[relation_index].table, qe_bare_column_name(key->value));
+        CQL_Column* column = cql_table_find_column(relations[relation_index].table, qe_bare_column_name(key->value));
         if (column)
         {
           distinct = optimizer_distinct_count(column);
@@ -2999,6 +2999,7 @@ optimizer_cost_model_load(void)
   model.cpu_scan_fixed_us = settings_f64(str8_lit("QE_COST_CPU_SCAN_FIXED_US"), 28.0);
   model.cpu_scan_per_row_us = settings_f64(str8_lit("QE_COST_CPU_SCAN_PER_ROW_US"), 0.0215);
   model.cpu_scan_per_extra_condition_us = settings_f64(str8_lit("QE_COST_CPU_SCAN_PER_EXTRA_CONDITION_US"), 0.0078);
+  model.cpu_fuzzy_per_row_us = settings_f64(str8_lit("QE_COST_CPU_FUZZY_PER_ROW_US"), 0.5);
   model.cpu_reference_workers = settings_f64(str8_lit("QE_COST_CPU_REFERENCE_WORKERS"), 12.0);
   
   model.index_fixed_us = settings_f64(str8_lit("QE_COST_INDEX_FIXED_US"), 2.0);
@@ -3163,7 +3164,7 @@ optimizer_scan_costing_enabled(void)
 
 // tec: a name that is not a column of this table, or too many columns to track, marks the whole condition unresolved
 internal void
-optimizer_collect_condition_columns(GDB_Table* table, IR_Node* node, GDB_Column** out_columns, U32* io_count, U32 capacity, B32* out_unresolved)
+optimizer_collect_condition_columns(CQL_Table* table, IR_Node* node, CQL_Column** out_columns, U32* io_count, U32 capacity, B32* out_unresolved)
 {
   if (!node)
   {
@@ -3177,7 +3178,7 @@ optimizer_collect_condition_columns(GDB_Table* table, IR_Node* node, GDB_Column*
       return;
     }
     
-    GDB_Column* column = gdb_table_find_column(table, qe_bare_column_name(node->value));
+    CQL_Column* column = cql_table_find_column(table, qe_bare_column_name(node->value));
     if (!column)
     {
       *out_unresolved = 1;
@@ -3210,7 +3211,7 @@ optimizer_collect_condition_columns(GDB_Table* table, IR_Node* node, GDB_Column*
 
 // tec: a column that ever held a NULL keeps a placeholder value in its data that the GPU scan would compare as a real value
 internal B32
-optimizer_columns_have_nulls(GDB_Column** columns, U32 count)
+optimizer_columns_have_nulls(CQL_Column** columns, U32 count)
 {
   for (U32 index = 0; index < count; index += 1)
   {
@@ -3223,7 +3224,7 @@ optimizer_columns_have_nulls(GDB_Column** columns, U32 count)
 }
 
 internal U32
-optimizer_count_cold_columns(GDB_Column** columns, U32 count)
+optimizer_count_cold_columns(CQL_Column** columns, U32 count)
 {
   U32 cold = 0;
   for (U32 index = 0; index < count; index += 1)
@@ -3286,7 +3287,7 @@ optimizer_order_conjuncts_for_cpu(Arena* arena, PLAN_Node* filter, IR_Node** lea
 internal void
 optimizer_choose_filter_scan(Arena* arena, OPT_CostModel* model, PLAN_Node* filter)
 {
-  GDB_Table* table = filter->input->table;
+  CQL_Table* table = filter->input->table;
   IR_Node* root = filter->condition ? filter->condition->first : NULL;
   if (!table || !root)
   {
@@ -3295,7 +3296,7 @@ optimizer_choose_filter_scan(Arena* arena, OPT_CostModel* model, PLAN_Node* filt
   
   F64 rows = (F64)table->row_count;
   
-  GDB_Column* columns[OPT_SCAN_COLUMN_CAPACITY] = {0};
+  CQL_Column* columns[OPT_SCAN_COLUMN_CAPACITY] = {0};
   U32 column_count = 0;
   B32 unresolved = 0;
   optimizer_collect_condition_columns(table, root, columns, &column_count, OPT_SCAN_COLUMN_CAPACITY, &unresolved);
@@ -3308,6 +3309,17 @@ optimizer_choose_filter_scan(Arena* arena, OPT_CostModel* model, PLAN_Node* filt
   B32 gpu_allowed = !unresolved && !has_nulls;
   
   F64 best_cost = optimizer_cost_cpu_scan(model, rows, Max(leaf_count, (U32)1));
+  
+  // tec: a fuzzy predicate scores every row's text, which costs far more than comparing a number
+  U32 fuzzy_leaf_count = 0;
+  for (U32 index = 0; index < leaf_count; index += 1)
+  {
+    if (leaves[index]->first && qe_ir_is_fuzzy_call(leaves[index]->first, 0))
+    {
+      fuzzy_leaf_count += 1;
+    }
+  }
+  best_cost += (F64)fuzzy_leaf_count * rows * model->cpu_fuzzy_per_row_us * optimizer_cost_worker_scale(model);
   PLAN_ScanStrategy best = PLAN_ScanStrategy_Cpu;
   IR_Node* best_leaf = NULL;
   String8 reason = str8_lit("cheaper than a GPU dispatch");
@@ -3417,7 +3429,7 @@ optimizer_join_enabled(void)
 //~ tec: building the graph
 
 internal B32
-optimizer_join_add_edge(OPT_JoinGraph* graph, U32 relation_a, GDB_Column* column_a, String8 name_a, U32 relation_b, GDB_Column* column_b, String8 name_b, B32 is_derived)
+optimizer_join_add_edge(OPT_JoinGraph* graph, U32 relation_a, CQL_Column* column_a, String8 name_a, U32 relation_b, CQL_Column* column_b, String8 name_b, B32 is_derived)
 {
   for (U32 index = 0; index < graph->edge_count; index += 1)
   {
@@ -3476,8 +3488,8 @@ optimizer_join_collect_edges(OPT_Relation* relations, U32 relation_count, OPT_Co
     U32 relation_b = 0;
     String8 name_a = {0};
     String8 name_b = {0};
-    GDB_ColumnType type_a = GDB_ColumnType_Invalid;
-    GDB_ColumnType type_b = GDB_ColumnType_Invalid;
+    CQL_ColumnType type_a = CQL_ColumnType_Invalid;
+    CQL_ColumnType type_b = CQL_ColumnType_Invalid;
     B32 a_ok = optimizer_column_operand(relations, relation_count, node->first, &relation_a, &name_a, &type_a);
     B32 b_ok = optimizer_column_operand(relations, relation_count, node->first->next, &relation_b, &name_b, &type_b);
     if (!a_ok || !b_ok || relation_a == relation_b)
@@ -3486,14 +3498,14 @@ optimizer_join_collect_edges(OPT_Relation* relations, U32 relation_count, OPT_Co
     }
     
     B32 both_numbers = optimizer_column_type_is_comparable_number(type_a) && optimizer_column_type_is_comparable_number(type_b);
-    B32 both_strings = type_a == GDB_ColumnType_String8 && type_b == GDB_ColumnType_String8;
+    B32 both_strings = type_a == CQL_ColumnType_String8 && type_b == CQL_ColumnType_String8;
     if (!both_numbers && !both_strings)
     {
       continue;
     }
     
-    GDB_Column* column_a = gdb_table_find_column(relations[relation_a].table, name_a);
-    GDB_Column* column_b = gdb_table_find_column(relations[relation_b].table, name_b);
+    CQL_Column* column_a = cql_table_find_column(relations[relation_a].table, name_a);
+    CQL_Column* column_b = cql_table_find_column(relations[relation_b].table, name_b);
     optimizer_join_add_edge(graph, relation_a, column_a, name_a, relation_b, column_b, name_b, 0);
   }
 }
@@ -3503,7 +3515,7 @@ internal void
 optimizer_join_add_derived_edges(OPT_JoinGraph* graph)
 {
   OPT_ColumnKey keys[OPT_JOIN_MAX_EDGES * 2] = {0};
-  GDB_Column* key_columns[OPT_JOIN_MAX_EDGES * 2] = {0};
+  CQL_Column* key_columns[OPT_JOIN_MAX_EDGES * 2] = {0};
   U32 key_count = 0;
   
   U32 original_edge_count = graph->edge_count;
@@ -4199,8 +4211,8 @@ optimizer_sort_round_trips(PLAN_Node* sort)
     {
       return 0.0;
     }
-    GDB_Column* column = gdb_table_find_column(relations[relation_index].table, qe_bare_column_name(key->value));
-    if (!column || column->type == GDB_ColumnType_String8)
+    CQL_Column* column = cql_table_find_column(relations[relation_index].table, qe_bare_column_name(key->value));
+    if (!column || column->type == CQL_ColumnType_String8)
     {
       return 0.0;
     }
@@ -4400,7 +4412,7 @@ optimizer_find_order_source(PLAN_Node* input, OPT_OrderSource* out_source)
 
 // tec: one plain column with no NULLs, which is what an index orders the same way the sort does
 internal B32
-optimizer_order_key(OPT_OrderSource* source, IR_Node* order_by, GDB_Column** out_column, B32* out_descending)
+optimizer_order_key(OPT_OrderSource* source, IR_Node* order_by, CQL_Column** out_column, B32* out_descending)
 {
   if (!order_by || !order_by->first || order_by->first->next)
   {
@@ -4417,7 +4429,7 @@ optimizer_order_key(OPT_OrderSource* source, IR_Node* order_by, GDB_Column** out
     return 0;
   }
   
-  GDB_Column* column = gdb_table_find_column(source->table, qe_bare_column_name(key->value));
+  CQL_Column* column = cql_table_find_column(source->table, qe_bare_column_name(key->value));
   if (!column || column->null_flags != NULL)
   {
     return 0;
@@ -4430,7 +4442,7 @@ optimizer_order_key(OPT_OrderSource* source, IR_Node* order_by, GDB_Column** out
 
 // tec: an index scan hands its rows over in key order, so a sort on that same column has nothing left to do
 internal B32
-optimizer_choose_presorted(Arena* arena, PLAN_Node* sort, OPT_OrderSource* source, GDB_Column* key_column, B32 descending)
+optimizer_choose_presorted(Arena* arena, PLAN_Node* sort, OPT_OrderSource* source, CQL_Column* key_column, B32 descending)
 {
   PLAN_Node* filter = source->filter;
   if (!filter || filter->scan_strategy != PLAN_ScanStrategy_Index || !filter->index_leaf)
@@ -4438,7 +4450,7 @@ optimizer_choose_presorted(Arena* arena, PLAN_Node* sort, OPT_OrderSource* sourc
     return 0;
   }
   
-  GDB_Column* leaf_columns[OPT_SCAN_COLUMN_CAPACITY] = {0};
+  CQL_Column* leaf_columns[OPT_SCAN_COLUMN_CAPACITY] = {0};
   U32 leaf_column_count = 0;
   B32 unresolved = 0;
   optimizer_collect_condition_columns(source->table, filter->index_leaf, leaf_columns, &leaf_column_count, OPT_SCAN_COLUMN_CAPACITY, &unresolved);
@@ -4447,7 +4459,7 @@ optimizer_choose_presorted(Arena* arena, PLAN_Node* sort, OPT_OrderSource* sourc
     return 0;
   }
   
-  GDB_Index* index = gdb_table_find_index_on_column(source->table, key_column);
+  CQL_Index* index = cql_table_find_index_on_column(source->table, key_column);
   if (!index)
   {
     return 0;
@@ -4462,9 +4474,9 @@ optimizer_choose_presorted(Arena* arena, PLAN_Node* sort, OPT_OrderSource* sourc
 
 // tec: reading the index in order costs the rows walked until K pass the filter, against reading the whole input and keeping K
 internal B32
-optimizer_choose_index_walk(Arena* arena, OPT_CostModel* model, PLAN_Node* top_n, OPT_OrderSource* source, GDB_Column* key_column, B32 descending, U64 keep)
+optimizer_choose_index_walk(Arena* arena, OPT_CostModel* model, PLAN_Node* top_n, OPT_OrderSource* source, CQL_Column* key_column, B32 descending, U64 keep)
 {
-  GDB_Index* index = gdb_table_find_index_on_column(source->table, key_column);
+  CQL_Index* index = cql_table_find_index_on_column(source->table, key_column);
   F64 rows = (F64)source->table->row_count;
   if (!index || rows < 1.0)
   {
@@ -4523,7 +4535,7 @@ optimizer_plan_ordering(Arena* arena, PLAN_Node* root)
   }
   
   OPT_OrderSource source = {0};
-  GDB_Column* key_column = NULL;
+  CQL_Column* key_column = NULL;
   B32 descending = 0;
   B32 has_source = optimizer_find_order_source(sort->input, &source);
   B32 has_key = has_source && optimizer_order_key(&source, sort->order_by, &key_column, &descending);
@@ -4605,7 +4617,7 @@ optimizer_semi_match_tables(OPT_OuterTable* tables, U32 count, String8 name, U32
         continue;
       }
     }
-    if (gdb_table_find_column(tables[table_index].table, bare))
+    if (cql_table_find_column(tables[table_index].table, bare))
     {
       if (matches == 0)
       {
@@ -4619,7 +4631,7 @@ optimizer_semi_match_tables(OPT_OuterTable* tables, U32 count, String8 name, U32
 
 // tec: a derived table or a table that is not there yet is not known here, so the whole select is left to the old path
 internal B32
-optimizer_collect_outer_tables(GDB_Database* database, IR_Node* select_ir, OPT_OuterTable* out_tables, U32* out_count)
+optimizer_collect_outer_tables(CQL_Database* database, IR_Node* select_ir, OPT_OuterTable* out_tables, U32* out_count)
 {
   U32 count = 0;
   for (IR_Node* child = select_ir->first; child != NULL; child = child->next)
@@ -4638,7 +4650,7 @@ optimizer_collect_outer_tables(GDB_Database* database, IR_Node* select_ir, OPT_O
       continue;
     }
     
-    GDB_Table* table = NULL;
+    CQL_Table* table = NULL;
     if (table_ir->value.size > 0)
     {
       table = plan_find_table_quiet(database, table_ir->value);
@@ -4713,19 +4725,19 @@ optimizer_make_semi_node(Arena* arena, String8 kind, String8 outer_key, String8 
 
 // tec: the join kernels know nothing about NULL, so a key that can hold one is left to the old path
 internal B32
-optimizer_semi_keys_compatible(GDB_Column* outer_key, GDB_Column* inner_key)
+optimizer_semi_keys_compatible(CQL_Column* outer_key, CQL_Column* inner_key)
 {
   if (outer_key->null_flags != NULL || inner_key->null_flags != NULL)
   {
     return 0;
   }
-  B32 outer_is_string = outer_key->type == GDB_ColumnType_String8;
-  B32 inner_is_string = inner_key->type == GDB_ColumnType_String8;
+  B32 outer_is_string = outer_key->type == CQL_ColumnType_String8;
+  B32 inner_is_string = inner_key->type == CQL_ColumnType_String8;
   return outer_is_string == inner_is_string;
 }
 
 internal B32
-optimizer_try_exists_semi(Arena* arena, GDB_Database* database, IR_Node* exists_node, OPT_OuterTable* outer, U32 outer_count, IR_Node** out_semi)
+optimizer_try_exists_semi(Arena* arena, CQL_Database* database, IR_Node* exists_node, OPT_OuterTable* outer, U32 outer_count, IR_Node** out_semi)
 {
   IR_Node* inner_select = exists_node->first;
   if (!inner_select || inner_select->type != IR_NodeType_Select)
@@ -4767,7 +4779,7 @@ optimizer_try_exists_semi(Arena* arena, GDB_Database* database, IR_Node* exists_
     return 0;
   }
   
-  GDB_Table* inner_table = plan_find_table_quiet(database, table_ir->value);
+  CQL_Table* inner_table = plan_find_table_quiet(database, table_ir->value);
   if (!inner_table)
   {
     return 0;
@@ -4839,8 +4851,8 @@ optimizer_try_exists_semi(Arena* arena, GDB_Database* database, IR_Node* exists_
     return 0;
   }
   
-  GDB_Column* inner_key = gdb_table_find_column(inner_table, qe_bare_column_name(inner_key_node->value));
-  GDB_Column* outer_key = gdb_table_find_column(outer[outer_table_index].table, qe_bare_column_name(outer_key_node->value));
+  CQL_Column* inner_key = cql_table_find_column(inner_table, qe_bare_column_name(inner_key_node->value));
+  CQL_Column* outer_key = cql_table_find_column(outer[outer_table_index].table, qe_bare_column_name(outer_key_node->value));
   if (!inner_key || !outer_key || !optimizer_semi_keys_compatible(outer_key, inner_key))
   {
     return 0;
@@ -4880,7 +4892,7 @@ optimizer_semi_pays_off(OPT_CostModel* model, U64 list_count, F64 outer_rows)
 }
 
 internal B32
-optimizer_try_in_semi(Arena* arena, GDB_Database* database, IR_Node* in_node, OPT_OuterTable* outer, U32 outer_count, IR_Node** out_semi, B32* out_failed)
+optimizer_try_in_semi(Arena* arena, CQL_Database* database, IR_Node* in_node, OPT_OuterTable* outer, U32 outer_count, IR_Node** out_semi, B32* out_failed)
 {
   B32 is_in = str8_match(in_node->value, str8_lit("in"), StringMatchFlag_CaseInsensitive);
   B32 is_not_in = str8_match(in_node->value, str8_lit("not in"), StringMatchFlag_CaseInsensitive);
@@ -4897,8 +4909,8 @@ optimizer_try_in_semi(Arena* arena, GDB_Database* database, IR_Node* in_node, OP
   {
     return 0;
   }
-  GDB_Table* outer_table = outer[outer_table_index].table;
-  GDB_Column* outer_key = gdb_table_find_column(outer_table, qe_bare_column_name(left->value));
+  CQL_Table* outer_table = outer[outer_table_index].table;
+  CQL_Column* outer_key = cql_table_find_column(outer_table, qe_bare_column_name(left->value));
   if (!outer_key || outer_key->null_flags != NULL)
   {
     return 0;
@@ -4924,8 +4936,8 @@ optimizer_try_in_semi(Arena* arena, GDB_Database* database, IR_Node* in_node, OP
     }
   }
   
-  B32 outer_is_string = outer_key->type == GDB_ColumnType_String8;
-  B32 value_is_string = value_column->type == GDB_ColumnType_String8;
+  B32 outer_is_string = outer_key->type == CQL_ColumnType_String8;
+  B32 value_is_string = value_column->type == CQL_ColumnType_String8;
   OPT_CostModel model = optimizer_cost_model_load();
   B32 pays_off = optimizer_semi_pays_off(&model, values.count, (F64)outer_table->row_count);
   if (saw_null || outer_is_string != value_is_string || !pays_off)
@@ -4936,7 +4948,7 @@ optimizer_try_in_semi(Arena* arena, GDB_Database* database, IR_Node* in_node, OP
   
   g_optimizer_semi_serial += 1;
   String8 table_name = push_str8f(arena, "__semi_%llu", g_optimizer_semi_serial);
-  GDB_Table* temp_table = plan_materialized_to_temp_table(database, table_name, &values);
+  CQL_Table* temp_table = plan_materialized_to_temp_table(database, table_name, &values);
   if (!temp_table)
   {
     *out_failed = 1;
@@ -4951,7 +4963,7 @@ optimizer_try_in_semi(Arena* arena, GDB_Database* database, IR_Node* in_node, OP
 }
 
 internal B32
-optimizer_extract_semi_joins(Arena* arena, GDB_Database* database, IR_Node* select_ir, B32 may_execute)
+optimizer_extract_semi_joins(Arena* arena, CQL_Database* database, IR_Node* select_ir, B32 may_execute)
 {
   if (!optimizer_semi_join_enabled())
   {

@@ -8,7 +8,7 @@
 #include "os/os_inc.h"
 #include "thread_pool/thread_pool.h"
 #include "settings/settings.h"
-#include "gdb/gdb_inc.h"
+#include "cql/cql_inc.h"
 #include "ir_gen/ir_gen_inc.h"
 #include "gpu/gpu_inc.h"
 #include "planner/plan_node.h"
@@ -25,7 +25,7 @@
 #include "settings/settings.c"
 #include "gpu/gpu_inc.c"
 #include "ir_gen/ir_gen_inc.c"
-#include "gdb/gdb_inc.c"
+#include "cql/cql_inc.c"
 #include "query_exec/query_exec.c"
 #include "optimizer/optimizer_inc.c"
 #include "planner/planner.c"
@@ -74,22 +74,22 @@ cal_median(F64* samples, U64 count)
   return samples[count / 2];
 }
 
-internal GDB_Table*
-cal_build_table(GDB_Database* database, U64 row_count)
+internal CQL_Table*
+cal_build_table(CQL_Database* database, U64 row_count)
 {
   Temp scratch = scratch_begin(0, 0);
   String8 name = push_str8f(scratch.arena, "cal_%llu", row_count);
-  GDB_Table* table = gdb_table_alloc(name);
-  gdb_table_add_column(table, gdb_column_schema_create(str8_lit("id"), GDB_ColumnType_U32));
-  gdb_table_add_column(table, gdb_column_schema_create(str8_lit("value"), GDB_ColumnType_F64));
-  gdb_database_add_table(database, table);
+  CQL_Table* table = cql_table_alloc(name);
+  cql_table_add_column(table, cql_column_schema_create(str8_lit("id"), CQL_ColumnType_U32));
+  cql_table_add_column(table, cql_column_schema_create(str8_lit("value"), CQL_ColumnType_F64));
+  cql_database_add_table(database, table);
   
   for (U64 row = 0; row < row_count; row += 1)
   {
     U32 id = (U32)row;
     F64 value = (F64)row;
     void* row_data[2] = { &id, &value };
-    gdb_table_add_row(table, row_data, NULL);
+    cql_table_add_row(table, row_data, NULL);
   }
   scratch_end(scratch);
   return table;
@@ -106,12 +106,12 @@ cal_parse_where(Arena* arena, String8 sql_text)
 }
 
 internal Cal_Sample
-cal_measure(Arena* arena, GDB_Database* database, U64 row_count)
+cal_measure(Arena* arena, CQL_Database* database, U64 row_count)
 {
   Cal_Sample sample = {0};
   sample.rows = row_count;
   
-  GDB_Table* table = cal_build_table(database, row_count);
+  CQL_Table* table = cal_build_table(database, row_count);
   
   // tec: matches a tenth of the rows
   U64 threshold = row_count / 10;
@@ -119,8 +119,8 @@ cal_measure(Arena* arena, GDB_Database* database, U64 row_count)
   String8 sql = push_str8f(scratch.arena, "SELECT id FROM %.*s WHERE value < %llu;", str8_varg(table->name), threshold);
   IR_Node* where = cal_parse_where(scratch.arena, sql);
   
-  GDB_Column* value_column = gdb_table_find_column(table, str8_lit("value"));
-  GDB_Index* index = gdb_table_create_index(table, str8_lit("cal_index"), value_column);
+  CQL_Column* value_column = cql_table_find_column(table, str8_lit("value"));
+  CQL_Index* index = cql_table_create_index(table, str8_lit("cal_index"), value_column);
   (void)index;
   
   //- tec: GPU scan, the first call uploads the column and later calls reuse it
@@ -234,7 +234,7 @@ cal_measure(Arena* arena, GDB_Database* database, U64 row_count)
       {
         indices[row] = row;
       }
-      GDB_Table* tables[1] = { table };
+      CQL_Table* tables[1] = { table };
       String8 aliases[1] = {0};
       U64* index_lists[1] = { indices };
       PLAN_RowSet rows = {0};
@@ -288,33 +288,33 @@ struct Cal_JoinSample
   U64 fused_round_trips;
 };
 
-internal GDB_Table*
-cal_build_join_table(GDB_Database* database, char* prefix, U64 row_count, U64 key_modulus)
+internal CQL_Table*
+cal_build_join_table(CQL_Database* database, char* prefix, U64 row_count, U64 key_modulus)
 {
   Temp scratch = scratch_begin(0, 0);
   String8 name = push_str8f(scratch.arena, "%s_%llu", prefix, row_count);
-  GDB_Table* table = gdb_table_alloc(name);
-  gdb_table_add_column(table, gdb_column_schema_create(str8_lit("k"), GDB_ColumnType_U32));
-  gdb_database_add_table(database, table);
+  CQL_Table* table = cql_table_alloc(name);
+  cql_table_add_column(table, cql_column_schema_create(str8_lit("k"), CQL_ColumnType_U32));
+  cql_database_add_table(database, table);
   for (U64 row = 0; row < row_count; row += 1)
   {
     U32 key = (U32)(row % key_modulus);
     void* row_data[1] = { &key };
-    gdb_table_add_row(table, row_data, NULL);
+    cql_table_add_row(table, row_data, NULL);
   }
   scratch_end(scratch);
   return table;
 }
 
 internal Cal_JoinSample
-cal_measure_join(Arena* arena, GDB_Database* database, U64 build_rows, U64 probe_rows)
+cal_measure_join(Arena* arena, CQL_Database* database, U64 build_rows, U64 probe_rows)
 {
   Cal_JoinSample sample = {0};
   sample.build_rows = build_rows;
   sample.probe_rows = probe_rows;
   
-  GDB_Table* build_table = cal_build_join_table(database, "jb", build_rows, build_rows);
-  GDB_Table* probe_table = cal_build_join_table(database, "jp", probe_rows, build_rows);
+  CQL_Table* build_table = cal_build_join_table(database, "jb", build_rows, build_rows);
+  CQL_Table* probe_table = cal_build_join_table(database, "jp", probe_rows, build_rows);
   
   Temp scratch = scratch_begin(&arena, 1);
   String8 sql = push_str8f(scratch.arena, "SELECT p.k FROM %.*s p JOIN %.*s b ON p.k = b.k;", str8_varg(probe_table->name), str8_varg(build_table->name));
@@ -329,7 +329,7 @@ cal_measure_join(Arena* arena, GDB_Database* database, U64 build_rows, U64 probe
   {
     identity[row] = row;
   }
-  GDB_Table* left_tables[1] = { probe_table };
+  CQL_Table* left_tables[1] = { probe_table };
   String8 left_aliases[1] = { str8_lit("p") };
   U64* left_indices[1] = { identity };
   PLAN_RowSet left = {0};
@@ -396,29 +396,29 @@ struct Cal_OperatorSample
 };
 
 // tec: g repeats every 100 rows so the aggregate has 100 groups, value is scrambled so the sort has real work to do
-internal GDB_Table*
-cal_build_operator_table(GDB_Database* database, U64 row_count)
+internal CQL_Table*
+cal_build_operator_table(CQL_Database* database, U64 row_count)
 {
   Temp scratch = scratch_begin(0, 0);
   String8 name = push_str8f(scratch.arena, "calop_%llu", row_count);
-  GDB_Table* table = gdb_table_alloc(name);
-  gdb_table_add_column(table, gdb_column_schema_create(str8_lit("g"), GDB_ColumnType_U32));
-  gdb_table_add_column(table, gdb_column_schema_create(str8_lit("value"), GDB_ColumnType_F64));
-  gdb_database_add_table(database, table);
+  CQL_Table* table = cql_table_alloc(name);
+  cql_table_add_column(table, cql_column_schema_create(str8_lit("g"), CQL_ColumnType_U32));
+  cql_table_add_column(table, cql_column_schema_create(str8_lit("value"), CQL_ColumnType_F64));
+  cql_database_add_table(database, table);
   
   for (U64 row = 0; row < row_count; row += 1)
   {
     U32 group = (U32)(row % 100);
     F64 value = (F64)((row * 2654435761ull) % 1000003ull);
     void* row_data[2] = { &group, &value };
-    gdb_table_add_row(table, row_data, NULL);
+    cql_table_add_row(table, row_data, NULL);
   }
   scratch_end(scratch);
   return table;
 }
 
 internal PLAN_RowSet
-cal_identity_rows(Arena* arena, GDB_Table* table, String8* alias_storage, GDB_Table** table_storage, U64** indices_storage)
+cal_identity_rows(Arena* arena, CQL_Table* table, String8* alias_storage, CQL_Table** table_storage, U64** indices_storage)
 {
   U64* identity = push_array(arena, U64, Max(table->row_count, (U64)1));
   for (U64 row = 0; row < table->row_count; row += 1)
@@ -468,7 +468,7 @@ cal_time_sort(Arena* arena, PLAN_RowSet* rows, IR_Node* order_by, QE_SortHints* 
 }
 
 internal F64
-cal_time_aggregate(Arena* arena, GDB_Database* database, PLAN_RowSet* rows, IR_Node* group_by, IR_Node* column_list, QE_AggregateHints* hints)
+cal_time_aggregate(Arena* arena, CQL_Database* database, PLAN_RowSet* rows, IR_Node* group_by, IR_Node* column_list, QE_AggregateHints* hints)
 {
   F64 samples[CAL_OPERATOR_RUNS] = {0};
   for (U64 run = 0; run < CAL_OPERATOR_RUNS + 1; run += 1)
@@ -488,16 +488,16 @@ cal_time_aggregate(Arena* arena, GDB_Database* database, PLAN_RowSet* rows, IR_N
 }
 
 internal Cal_OperatorSample
-cal_measure_operators(Arena* arena, GDB_Database* database, U64 row_count)
+cal_measure_operators(Arena* arena, CQL_Database* database, U64 row_count)
 {
   Cal_OperatorSample sample = {0};
   sample.rows = row_count;
   
-  GDB_Table* table = cal_build_operator_table(database, row_count);
+  CQL_Table* table = cal_build_operator_table(database, row_count);
   Temp scratch = scratch_begin(&arena, 1);
   
   String8 alias_storage[1] = {0};
-  GDB_Table* table_storage[1] = {0};
+  CQL_Table* table_storage[1] = {0};
   U64* indices_storage[1] = {0};
   PLAN_RowSet rows = cal_identity_rows(scratch.arena, table, alias_storage, table_storage, indices_storage);
   
@@ -547,14 +547,14 @@ entry_point(CmdLine* cmdline)
   setvbuf(stdout, NULL, _IONBF, 0);
   log_alloc();
   g_query_exec_mutex = os_mutex_alloc();
-  gdb_init();
+  cql_init();
   gpu_init();
   
   Arena* arena = arena_alloc(.reserve_size = GB(2), .commit_size = MB(64));
   Bench_Report* report = bench_report_alloc(arena, "compute_ql cost model calibration");
   
-  GDB_Database* database = gdb_database_alloc(str8_lit("calibrate_db"));
-  gdb_add_database(database);
+  CQL_Database* database = cql_database_alloc(str8_lit("calibrate_db"));
+  cql_add_database(database);
   
   U64 sizes[CAL_ROW_SIZE_COUNT] = { 64, 512, 4096, 32768, 262144, 2097152 };
   Cal_Sample samples[CAL_ROW_SIZE_COUNT] = {0};

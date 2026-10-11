@@ -1,0 +1,238 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+
+// tec: probe side of a hash join of a big table to a small one, fused with the aggregates. each key of a chunk is looked up in a hash table of the small table's keys,
+//
+//   binding 0: the key column of the big table
+//   binding 1..4: the argument columns, up to MAX_ARGS
+//   binding 5: the hash table's keys, table_size entries
+//   binding 6: the hash table's small table row plus one, 0 for an empty entry
+//   binding 11: a bloom filter of the keys, 2 bits of a 32 bit word per key. nearly every row of the big table has no match, and the filter answers that from a
+//               table small enough to stay in the GPU's cache, where the hash table is not
+//   binding 7: per small table row, the number of big table rows that matched it
+//   binding 8: per small table row and expr, the low then the high word of the sum
+//   binding 9: per small table row and expr, the minimum
+//   binding 10: per small table row and expr, the maximum
+//   push constant U64 slot 0: row count, high word: the encoding width of the key (bits 0 to 3) and of argument column 0..3 (bits 4 to 19)
+//   push constant U64 slot 1: expr count, high word: the encoding base of argument column 0
+//   push constant U64 slot 2: function of each expr, 4 bits each, high word: the encoding base of argument column 1
+//   push constant U64 slot 3: the argument column of each expr, 4 bits each, high word: a bit per argument column set when it is signed
+//   push constant U64 slot 4: hash table size minus one, high word: the encoding base of argument column 2
+//   push constant U64 slot 5: the encoding base of the key, high word: the encoding base of argument column 3
+//   push constant U64 slot 6: log2 of the hash table size, high word: log2 of the number of words of the bloom filter
+// NOTE: binding layout and push constant slot order MUST stay in sync with qe_join_probe_stream_core in query_exec.c
+
+layout(local_size_x = 256) in;
+
+#define FUNC_COUNT 0u
+#define FUNC_SUM   1u
+#define FUNC_AVG   2u
+#define FUNC_MIN   3u
+#define FUNC_MAX   4u
+#ifndef UNROLL
+#define UNROLL 8u
+#endif
+#define ROWS_PER_THREAD 32u
+
+layout(std430, binding = 0)  readonly buffer KeyBuf   { uint keys[]; };
+layout(std430, binding = 1)  readonly buffer Arg0Buf  { uint arg0[]; };
+layout(std430, binding = 2)  readonly buffer Arg1Buf  { uint arg1[]; };
+layout(std430, binding = 3)  readonly buffer Arg2Buf  { uint arg2[]; };
+layout(std430, binding = 4)  readonly buffer Arg3Buf  { uint arg3[]; };
+layout(std430, binding = 5)  readonly buffer TableKeyBuf  { uint table_keys[]; };
+layout(std430, binding = 6)  readonly buffer TableRowBuf  { uint table_rows[]; };
+layout(std430, binding = 7)  buffer CountBuf { uint counts[]; };
+layout(std430, binding = 8)  buffer SumBuf   { uint sum_words[]; };
+layout(std430, binding = 9)  buffer MinBuf   { int min_out[]; };
+layout(std430, binding = 10) buffer MaxBuf   { int max_out[]; };
+
+layout(std430, binding = 11) readonly buffer BloomBuf { uint bloom[]; };
+
+layout(push_constant) uniform PushConstants
+{
+  uint words[16];
+} pc;
+
+uint key_log2;
+uint key_bits;
+uint key_mask;
+uint key_base;
+uint arg_log2_0;
+uint arg_bits_0;
+uint arg_mask_0;
+uint arg_base_0;
+uint arg_log2_1;
+uint arg_bits_1;
+uint arg_mask_1;
+uint arg_base_1;
+uint arg_log2_2;
+uint arg_bits_2;
+uint arg_mask_2;
+uint arg_base_2;
+uint arg_log2_3;
+uint arg_bits_3;
+uint arg_mask_3;
+uint arg_base_3;
+
+void
+setup_decode()
+{
+  uint key_width = pc.words[1] & 0xfu;
+  key_log2 = (key_width == 1u) ? 2u : ((key_width == 2u) ? 1u : 0u);
+  key_bits = (key_width == 1u) ? 8u : ((key_width == 2u) ? 16u : 32u);
+  key_mask = (key_width == 1u) ? 0xffu : ((key_width == 2u) ? 0xffffu : 0xffffffffu);
+  key_base = (key_width == 1u || key_width == 2u) ? pc.words[10] : 0u;
+
+  uint width_0 = (pc.words[1] >> 4u) & 0xfu;
+  arg_log2_0 = (width_0 == 1u) ? 2u : ((width_0 == 2u) ? 1u : 0u);
+  arg_bits_0 = (width_0 == 1u) ? 8u : ((width_0 == 2u) ? 16u : 32u);
+  arg_mask_0 = (width_0 == 1u) ? 0xffu : ((width_0 == 2u) ? 0xffffu : 0xffffffffu);
+  arg_base_0 = (width_0 == 1u || width_0 == 2u) ? pc.words[3] : 0u;
+
+  uint width_1 = (pc.words[1] >> 8u) & 0xfu;
+  arg_log2_1 = (width_1 == 1u) ? 2u : ((width_1 == 2u) ? 1u : 0u);
+  arg_bits_1 = (width_1 == 1u) ? 8u : ((width_1 == 2u) ? 16u : 32u);
+  arg_mask_1 = (width_1 == 1u) ? 0xffu : ((width_1 == 2u) ? 0xffffu : 0xffffffffu);
+  arg_base_1 = (width_1 == 1u || width_1 == 2u) ? pc.words[5] : 0u;
+
+  uint width_2 = (pc.words[1] >> 12u) & 0xfu;
+  arg_log2_2 = (width_2 == 1u) ? 2u : ((width_2 == 2u) ? 1u : 0u);
+  arg_bits_2 = (width_2 == 1u) ? 8u : ((width_2 == 2u) ? 16u : 32u);
+  arg_mask_2 = (width_2 == 1u) ? 0xffu : ((width_2 == 2u) ? 0xffffu : 0xffffffffu);
+  arg_base_2 = (width_2 == 1u || width_2 == 2u) ? pc.words[9] : 0u;
+
+  uint width_3 = (pc.words[1] >> 16u) & 0xfu;
+  arg_log2_3 = (width_3 == 1u) ? 2u : ((width_3 == 2u) ? 1u : 0u);
+  arg_bits_3 = (width_3 == 1u) ? 8u : ((width_3 == 2u) ? 16u : 32u);
+  arg_mask_3 = (width_3 == 1u) ? 0xffu : ((width_3 == 2u) ? 0xffffu : 0xffffffffu);
+  arg_base_3 = (width_3 == 1u || width_3 == 2u) ? pc.words[11] : 0u;
+}
+
+uint
+read_arg(uint a, uint row)
+{
+  switch (a)
+  {
+    case 0u: return arg_base_0 + ((arg0[row >> arg_log2_0] >> (((row & ((1u << arg_log2_0) - 1u)) * arg_bits_0) & 31u)) & arg_mask_0);
+    case 1u: return arg_base_1 + ((arg1[row >> arg_log2_1] >> (((row & ((1u << arg_log2_1) - 1u)) * arg_bits_1) & 31u)) & arg_mask_1);
+    case 2u: return arg_base_2 + ((arg2[row >> arg_log2_2] >> (((row & ((1u << arg_log2_2) - 1u)) * arg_bits_2) & 31u)) & arg_mask_2);
+    default: return arg_base_3 + ((arg3[row >> arg_log2_3] >> (((row & ((1u << arg_log2_3) - 1u)) * arg_bits_3) & 31u)) & arg_mask_3);
+  }
+}
+
+uint
+read_key(uint row)
+{
+  return key_base + ((keys[row >> key_log2] >> (((row & ((1u << key_log2) - 1u)) * key_bits) & 31u)) & key_mask);
+}
+
+// tec: false means the key is certainly not in the small table
+bool
+bloom_maybe(uint key, uint bloom_log2)
+{
+  uint h = key * 0x9E3779B1u;
+  uint word = h >> (32u - bloom_log2);
+  uint h2 = key * 0x85EBCA6Bu;
+  uint bits = (1u << ((h2 >> 27u) & 31u)) | (1u << ((h2 >> 22u) & 31u));
+  return (bloom[word] & bits) == bits;
+}
+
+// tec: the small table row plus one that has this key, 0 if none
+uint
+lookup(uint key, uint mask, uint log2_size)
+{
+  uint slot = (key * 0x9E3779B1u) >> (32u - log2_size);
+  for (;;)
+  {
+    uint row_plus_one = table_rows[slot];
+    if (row_plus_one == 0u)
+    {
+      return 0u;
+    }
+    if (table_keys[slot] == key)
+    {
+      return row_plus_one;
+    }
+    slot = (slot + 1u) & mask;
+  }
+}
+
+void
+add_match(uint dim_row, uint row, uint num_exprs, uint func_codes, uint arg_index, uint arg_signed)
+{
+  atomicAdd(counts[dim_row], 1u);
+  for (uint e = 0u; e < num_exprs; e++)
+  {
+    uint func = (func_codes >> (e * 4u)) & 0xfu;
+    if (func == FUNC_COUNT)
+    {
+      continue;
+    }
+    uint a = (arg_index >> (e * 4u)) & 0xfu;
+    uint word = read_arg(a, row);
+    uint index = dim_row * num_exprs + e;
+    if (func == FUNC_SUM || func == FUNC_AVG)
+    {
+      bool is_signed = ((arg_signed >> a) & 1u) != 0u;
+      uint before = atomicAdd(sum_words[index * 2u], word);
+      uint high_add = ((is_signed && int(word) < 0) ? 0xffffffffu : 0u) + ((before + word < before) ? 1u : 0u);
+      if (high_add != 0u)
+      {
+        atomicAdd(sum_words[index * 2u + 1u], high_add);
+      }
+    }
+    else if (func == FUNC_MIN)
+    {
+      atomicMin(min_out[index], int(word));
+    }
+    else if (func == FUNC_MAX)
+    {
+      atomicMax(max_out[index], int(word));
+    }
+  }
+}
+
+void
+main()
+{
+  uint row_count  = pc.words[0];
+  uint num_exprs  = pc.words[2];
+  uint func_codes = pc.words[4];
+  uint arg_index  = pc.words[6];
+  uint arg_signed = pc.words[7];
+  uint mask       = pc.words[8];
+  uint log2_size  = pc.words[12];
+  uint bloom_log2 = pc.words[13];
+
+  setup_decode();
+
+  uint first = gl_WorkGroupID.x * (256u * ROWS_PER_THREAD) + gl_LocalInvocationID.x;
+  uint last = min(gl_WorkGroupID.x * (256u * ROWS_PER_THREAD) + 256u * ROWS_PER_THREAD, row_count);
+
+  // tec: the loads of a group of keys and of their bloom filter words are issued before any is used, so a thread has UNROLL loads in flight
+  for (uint row = first; row < last; row += 256u * UNROLL)
+  {
+    uint keys_in_flight[UNROLL];
+    [[unroll]] for (uint u = 0u; u < UNROLL; u++)
+    {
+      uint at = row + u * 256u;
+      keys_in_flight[u] = (at < last) ? read_key(at) : 0u;
+    }
+    bool maybe[UNROLL];
+    [[unroll]] for (uint u = 0u; u < UNROLL; u++)
+    {
+      maybe[u] = (row + u * 256u < last) && bloom_maybe(keys_in_flight[u], bloom_log2);
+    }
+    [[unroll]] for (uint u = 0u; u < UNROLL; u++)
+    {
+      if (maybe[u])
+      {
+        uint found = lookup(keys_in_flight[u], mask, log2_size);
+        if (found != 0u)
+        {
+          add_match(found - 1u, row + u * 256u, num_exprs, func_codes, arg_index, arg_signed);
+        }
+      }
+    }
+  }
+}

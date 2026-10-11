@@ -1,0 +1,44 @@
+#version 450
+
+// tec: reads a buffer and does nothing else, so its time is the GPU's memory read bandwidth, to compare with the engine's kernels
+// every thread reads UNROLL 16 byte vectors a full grid apart
+//
+//   binding 0: the buffer that is read (uvec4[])
+//   binding 3: a sink the result is stored to when it equals the magic value, so the loads cannot be optimized away
+//   push constant U64 slot 0: thread count
+//   push constant U64 slot 1: magic value, one the buffer never sums to
+
+layout(local_size_x = 256) in;
+
+#define UNROLL 8u
+
+layout(std430, binding = 0) readonly buffer DataBuf { uvec4 data[]; };
+layout(std430, binding = 3) buffer SinkBuf { uint sink[]; };
+
+layout(push_constant) uniform PushConstants
+{
+  uint words[16];
+} pc;
+
+void
+main()
+{
+  uint threads = pc.words[0];
+  uint t = gl_GlobalInvocationID.x;
+  if (t >= threads)
+  {
+    return;
+  }
+
+  uvec4 acc = uvec4(0u);
+  for (uint j = 0u; j < UNROLL; j++)
+  {
+    acc += data[t + j * threads];
+  }
+
+  uint folded = acc.x ^ acc.y ^ acc.z ^ acc.w;
+  if (folded == pc.words[2])
+  {
+    sink[0] = folded;
+  }
+}

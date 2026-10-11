@@ -1,0 +1,52 @@
+#version 450
+
+// tec: folds two whole number key columns into one join key, dest = (first - min_first) * span_second + (second - min_second)
+// the spans come from the build side, a pair outside them can't equal any build key so it becomes -1
+//
+// NOTE: push constant slots stay in sync with qe_join_pack_probe_keys_gpu
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer FirstBuf  { uint first[]; };
+layout(std430, binding = 1) readonly buffer SecondBuf { uint second[]; };
+layout(std430, binding = 2) buffer DestBuf            { uint dest[]; };
+
+layout(push_constant) uniform PushConstants
+{
+  uint words[16];
+} pc;
+
+double
+slot_double(uint slot)
+{
+  return packDouble2x32(uvec2(pc.words[slot * 2u + 0u], pc.words[slot * 2u + 1u]));
+}
+
+void
+main()
+{
+  uint count = pc.words[0];
+  uint i = gl_GlobalInvocationID.x;
+  if (i >= count)
+  {
+    return;
+  }
+
+  double min_first = slot_double(1u);
+  double min_second = slot_double(2u);
+  double span_first = slot_double(3u);
+  double span_second = slot_double(4u);
+
+  double a = packDouble2x32(uvec2(first[i * 2u + 0u], first[i * 2u + 1u])) - min_first;
+  double b = packDouble2x32(uvec2(second[i * 2u + 0u], second[i * 2u + 1u])) - min_second;
+
+  double key = -1.0LF;
+  if (a >= 0.0LF && a < span_first && b >= 0.0LF && b < span_second)
+  {
+    key = a * span_second + b;
+  }
+
+  uvec2 bits = unpackDouble2x32(key);
+  dest[i * 2u + 0u] = bits.x;
+  dest[i * 2u + 1u] = bits.y;
+}

@@ -1,32 +1,32 @@
 internal U32
-pg_oid_for_column_type(GDB_ColumnType type)
+pg_oid_for_column_type(CQL_ColumnType type)
 {
   switch (type)
   {
-    case GDB_ColumnType_U32:     return 23;  // int4
-    case GDB_ColumnType_U64:     return 20;  // int8
-    case GDB_ColumnType_F32:     return 700; // float4
-    case GDB_ColumnType_F64:     return 701; // float8
-    case GDB_ColumnType_String8: return 25;  // text
-    case GDB_ColumnType_Bool:    return 16;  // bool
-    case GDB_ColumnType_I32:     return 23;  // int4
-    case GDB_ColumnType_I64:     return 20;  // int8
+    case CQL_ColumnType_U32:     return 23;  // int4
+    case CQL_ColumnType_U64:     return 20;  // int8
+    case CQL_ColumnType_F32:     return 700; // float4
+    case CQL_ColumnType_F64:     return 701; // float8
+    case CQL_ColumnType_String8: return 25;  // text
+    case CQL_ColumnType_Bool:    return 16;  // bool
+    case CQL_ColumnType_I32:     return 23;  // int4
+    case CQL_ColumnType_I64:     return 20;  // int8
     default:                     return 25;  // text
   }
 }
 
 internal S16
-pg_typlen_for_column_type(GDB_ColumnType type)
+pg_typlen_for_column_type(CQL_ColumnType type)
 {
   switch (type)
   {
-    case GDB_ColumnType_U32:  return 4;
-    case GDB_ColumnType_U64:  return 8;
-    case GDB_ColumnType_F32:  return 4;
-    case GDB_ColumnType_F64:  return 8;
-    case GDB_ColumnType_Bool: return 1;
-    case GDB_ColumnType_I32:  return 4;
-    case GDB_ColumnType_I64:  return 8;
+    case CQL_ColumnType_U32:  return 4;
+    case CQL_ColumnType_U64:  return 8;
+    case CQL_ColumnType_F32:  return 4;
+    case CQL_ColumnType_F64:  return 8;
+    case CQL_ColumnType_Bool: return 1;
+    case CQL_ColumnType_I32:  return 4;
+    case CQL_ColumnType_I64:  return 8;
     default:                  return -1; // tec: variable-length (text)
   }
 }
@@ -398,11 +398,11 @@ pg_result_format_code_for_column(U16* format_codes, U16 format_code_count, U64 c
 }
 
 internal String8
-pg_encode_binary_numeric(Arena* arena, GDB_ColumnType type, F64 value)
+pg_encode_binary_numeric(Arena* arena, CQL_ColumnType type, F64 value)
 {
   switch (type)
   {
-    case GDB_ColumnType_U32:
+    case CQL_ColumnType_U32:
     {
       U8* b = push_array_no_zero(arena, U8, 4);
       U32 v = (U32)value;
@@ -412,7 +412,7 @@ pg_encode_binary_numeric(Arena* arena, GDB_ColumnType type, F64 value)
       b[3] = (U8)v;
       return str8(b, 4);
     }
-    case GDB_ColumnType_U64:
+    case CQL_ColumnType_U64:
     {
       U8* b = push_array_no_zero(arena, U8, 8);
       U64 v = (U64)value;
@@ -426,7 +426,7 @@ pg_encode_binary_numeric(Arena* arena, GDB_ColumnType type, F64 value)
       b[7] = (U8)v;
       return str8(b, 8);
     }
-    case GDB_ColumnType_F32:
+    case CQL_ColumnType_F32:
     {
       F32 f = (F32)value;
       U32 bits; MemoryCopy(&bits, &f, sizeof(bits));
@@ -437,7 +437,7 @@ pg_encode_binary_numeric(Arena* arena, GDB_ColumnType type, F64 value)
       b[3] = (U8)bits;
       return str8(b, 4);
     }
-    case GDB_ColumnType_F64:
+    case CQL_ColumnType_F64:
     {
       U64 bits; MemoryCopy(&bits, &value, sizeof(bits));
       U8* b = push_array_no_zero(arena, U8, 8);
@@ -451,13 +451,13 @@ pg_encode_binary_numeric(Arena* arena, GDB_ColumnType type, F64 value)
       b[7] = (U8)bits;
       return str8(b, 8);
     }
-    case GDB_ColumnType_Bool:
+    case CQL_ColumnType_Bool:
     {
       U8* b = push_array_no_zero(arena, U8, 1);
       b[0] = (U8)value;
       return str8(b, 1);
     }
-    case GDB_ColumnType_I32:
+    case CQL_ColumnType_I32:
     {
       U8* b = push_array_no_zero(arena, U8, 4);
       U32 v = (U32)(S32)value;
@@ -467,7 +467,7 @@ pg_encode_binary_numeric(Arena* arena, GDB_ColumnType type, F64 value)
       b[3] = (U8)v;
       return str8(b, 4);
     }
-    case GDB_ColumnType_I64:
+    case CQL_ColumnType_I64:
     {
       U8* b = push_array_no_zero(arena, U8, 8);
       U64 v = (U64)(S64)value;
@@ -533,10 +533,10 @@ pg_send_data_rows_from_result_set_range(OS_Handle conn, Arena* arena, APP_Result
         continue;
       }
       
-      GDB_ColumnType type = result_set->columns[c].type;
+      CQL_ColumnType type = result_set->columns[c].type;
       U16 fmt = pg_result_format_code_for_column(result_format_codes, format_code_count, c);
       
-      if (fmt == 1 && type != GDB_ColumnType_String8)
+      if (fmt == 1 && type != CQL_ColumnType_String8)
       {
         String8 bin = pg_encode_binary_numeric(scratch.arena, type, result_set->cell_numeric[cell_i]);
         str8_list_push(scratch.arena, &parts, pg_be32(scratch.arena, (U32)bin.size));

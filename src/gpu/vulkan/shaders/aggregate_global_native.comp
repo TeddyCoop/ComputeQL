@@ -1,0 +1,271 @@
+#version 450
+#extension GL_ARB_gpu_shader_fp64 : enable
+
+// tec: SUM, MIN and MAX of whole columns with no GROUP BY, reading each column in its own width: U32, I32, F32 (one word per row) or F64 (two words)
+// reads the column as stored so it can run on one streamed chunk, a column's result is the fold of its chunks' partials
+// a thread reads 16 byte vectors a whole grid apart and folds in registers in double, a workgroup reduces once per column. sums of whole numbers are exact up to 2^53
+//
+//   binding 0..3: the columns, up to MAX_COLUMNS, one value per row, rows * width words long
+//   binding 4:    partials, per workgroup and column 3 doubles: sum, min, max
+//   push constant U64 slot 0: row count
+//   push constant U64 slot 1: column count
+//   push constant U64 slot 2: workgroup count
+//   push constant U64 slot 3..6: the type of column 0..3 (bits 0 to 7), and its encoding width (bits 8 to 15, high word: the encoding base)
+//
+// a U32 or I32 column may be stored narrow (1 or 2 bytes per row) as the difference from its smallest value, the encoding base. width 0 or 4 is as stored
+// a narrow column is folded as whole number codes and the base is applied once at the end
+// NOTE: MAX_COLUMNS, the type numbers and the partials layout MUST stay in sync with qe_aggregate_global_streamed in query_exec.c
+
+layout(local_size_x = 256) in;
+
+#define MAX_COLUMNS 4u
+
+#define COLTYPE_U32 1u
+#define COLTYPE_F32 3u
+#define COLTYPE_F64 4u
+#define COLTYPE_I32 7u
+
+layout(std430, binding = 0) readonly buffer VecBuf0 { uvec4 colv0[]; };
+layout(std430, binding = 1) readonly buffer VecBuf1 { uvec4 colv1[]; };
+layout(std430, binding = 2) readonly buffer VecBuf2 { uvec4 colv2[]; };
+layout(std430, binding = 3) readonly buffer VecBuf3 { uvec4 colv3[]; };
+
+// tec: the same buffers seen as words, for the rows after the last whole vector
+layout(std430, binding = 0) readonly buffer WordBuf0 { uint word0[]; };
+layout(std430, binding = 1) readonly buffer WordBuf1 { uint word1[]; };
+layout(std430, binding = 2) readonly buffer WordBuf2 { uint word2[]; };
+layout(std430, binding = 3) readonly buffer WordBuf3 { uint word3[]; };
+
+layout(std430, binding = 4) buffer PartialsBuf { double partials[]; };
+
+layout(push_constant) uniform PushConstants
+{
+  uint words[16];
+} pc;
+
+uvec4
+read_vec(uint column, uint index)
+{
+  switch (column)
+  {
+    case 0u: return colv0[index];
+    case 1u: return colv1[index];
+    case 2u: return colv2[index];
+    default: return colv3[index];
+  }
+}
+
+uint
+read_word(uint column, uint index)
+{
+  switch (column)
+  {
+    case 0u: return word0[index];
+    case 1u: return word1[index];
+    case 2u: return word2[index];
+    default: return word3[index];
+  }
+}
+
+double
+widen(uint type, uint word)
+{
+  if (type == COLTYPE_U32)
+  {
+    return double(word);
+  }
+  if (type == COLTYPE_I32)
+  {
+    return double(int(word));
+  }
+  return double(uintBitsToFloat(word));
+}
+
+// tec: folds the rows of a narrow column that this thread reads into acc, mn and mx. a vector is 16 one byte rows or 8 two byte rows
+void
+fold_narrow(uint c, uint type, uint width, uint base, uint row_count, uint t, uint stride, inout double acc, inout double mn, inout double mx)
+{
+  uint rows_per_vec = (width == 1u) ? 16u : 8u;
+  uint vec_count = row_count / rows_per_vec;
+  uint tail_start = vec_count * rows_per_vec;
+  double base_value = (type == COLTYPE_I32) ? double(int(base)) : double(base);
+
+  uvec4 lane_sum = uvec4(0u);
+  uvec4 lane_min = uvec4(0xffffffffu);
+  uvec4 lane_max = uvec4(0u);
+  double codes = 0.0LF;
+  uint rows_done = 0u;
+  uint since_spill = 0u;
+
+  for (uint i = t; i < vec_count; i += stride)
+  {
+    uvec4 a = read_vec(c, i);
+    if (width == 1u)
+    {
+      uvec4 b0 = uvec4(a.x & 0xffu, (a.x >> 8u) & 0xffu, (a.x >> 16u) & 0xffu, a.x >> 24u);
+      uvec4 b1 = uvec4(a.y & 0xffu, (a.y >> 8u) & 0xffu, (a.y >> 16u) & 0xffu, a.y >> 24u);
+      uvec4 b2 = uvec4(a.z & 0xffu, (a.z >> 8u) & 0xffu, (a.z >> 16u) & 0xffu, a.z >> 24u);
+      uvec4 b3 = uvec4(a.w & 0xffu, (a.w >> 8u) & 0xffu, (a.w >> 16u) & 0xffu, a.w >> 24u);
+      lane_sum += (b0 + b1) + (b2 + b3);
+      lane_min = min(lane_min, min(min(b0, b1), min(b2, b3)));
+      lane_max = max(lane_max, max(max(b0, b1), max(b2, b3)));
+    }
+    else
+    {
+      uvec4 b0 = uvec4(a.x & 0xffffu, a.x >> 16u, a.y & 0xffffu, a.y >> 16u);
+      uvec4 b1 = uvec4(a.z & 0xffffu, a.z >> 16u, a.w & 0xffffu, a.w >> 16u);
+      lane_sum += b0 + b1;
+      lane_min = min(lane_min, min(b0, b1));
+      lane_max = max(lane_max, max(b0, b1));
+    }
+    rows_done += rows_per_vec;
+
+    // tec: a lane gains at most 4 * 255 or 2 * 65535 per vector, so 32 vectors keep a lane well inside 32 bits
+    since_spill += 1u;
+    if (since_spill == 32u)
+    {
+      codes += (double(lane_sum.x) + double(lane_sum.y)) + (double(lane_sum.z) + double(lane_sum.w));
+      lane_sum = uvec4(0u);
+      since_spill = 0u;
+    }
+  }
+  codes += (double(lane_sum.x) + double(lane_sum.y)) + (double(lane_sum.z) + double(lane_sum.w));
+
+  uint code_min = min(min(lane_min.x, lane_min.y), min(lane_min.z, lane_min.w));
+  uint code_max = max(max(lane_max.x, lane_max.y), max(lane_max.z, lane_max.w));
+
+  // tec: the rows after the last whole vector, at most 15
+  if (t < row_count - tail_start)
+  {
+    uint row = tail_start + t;
+    uint code;
+    if (width == 1u)
+    {
+      code = (read_word(c, row >> 2u) >> ((row & 3u) * 8u)) & 0xffu;
+    }
+    else
+    {
+      code = (read_word(c, row >> 1u) >> ((row & 1u) * 16u)) & 0xffffu;
+    }
+    codes += double(code);
+    code_min = min(code_min, code);
+    code_max = max(code_max, code);
+    rows_done += 1u;
+  }
+
+  if (rows_done > 0u)
+  {
+    acc += codes + base_value * double(rows_done);
+    mn = min(mn, base_value + double(code_min));
+    mx = max(mx, base_value + double(code_max));
+  }
+}
+
+shared double sh_sum[256];
+shared double sh_min[256];
+shared double sh_max[256];
+
+void
+main()
+{
+  uint row_count = pc.words[0];
+  uint column_count = pc.words[2];
+  uint group_count = pc.words[4];
+
+  uint tid = gl_LocalInvocationID.x;
+  uint t = gl_GlobalInvocationID.x;
+  uint stride = group_count * 256u;
+
+  double biggest = packDouble2x32(uvec2(0xffffffffu, 0x7fefffffu));
+
+  for (uint c = 0u; c < column_count; c++)
+  {
+    uint type_word = pc.words[6u + c * 2u];
+    uint type = type_word & 0xffu;
+    uint narrow_width = (type_word >> 8u) & 0xffu;
+    uint width = (type == COLTYPE_F64) ? 2u : 1u;
+    uint total_words = row_count * width;
+    uint vec_count = total_words / 4u;
+    uint tail_start = vec_count * 4u;
+
+    double acc = 0.0LF;
+    double mn = biggest;
+    double mx = -biggest;
+
+    if (narrow_width == 1u || narrow_width == 2u)
+    {
+      fold_narrow(c, type, narrow_width, pc.words[7u + c * 2u], row_count, t, stride, acc, mn, mx);
+    }
+    else
+    {
+      for (uint i = t; i < vec_count; i += stride)
+      {
+        uvec4 a = read_vec(c, i);
+        double v0;
+        double v1;
+        if (width == 1u)
+        {
+          double v2 = widen(type, a.z);
+          double v3 = widen(type, a.w);
+          v0 = widen(type, a.x);
+          v1 = widen(type, a.y);
+          acc += (v0 + v1) + (v2 + v3);
+          mn = min(mn, min(min(v0, v1), min(v2, v3)));
+          mx = max(mx, max(max(v0, v1), max(v2, v3)));
+        }
+        else
+        {
+          v0 = packDouble2x32(a.xy);
+          v1 = packDouble2x32(a.zw);
+          acc += v0 + v1;
+          mn = min(mn, min(v0, v1));
+          mx = max(mx, max(v0, v1));
+        }
+      }
+
+      // tec: the rows after the last whole vector, at most 3 of one word or 1 of two words
+      if (width == 1u)
+      {
+        if (t < total_words - tail_start)
+        {
+          double x = widen(type, read_word(c, tail_start + t));
+          acc += x;
+          mn = min(mn, x);
+          mx = max(mx, x);
+        }
+      }
+      else if (t == 0u && total_words > tail_start)
+      {
+        double x = packDouble2x32(uvec2(read_word(c, tail_start), read_word(c, tail_start + 1u)));
+        acc += x;
+        mn = min(mn, x);
+        mx = max(mx, x);
+      }
+
+    }
+
+    sh_sum[tid] = acc;
+    sh_min[tid] = mn;
+    sh_max[tid] = mx;
+    barrier();
+    for (uint step = 128u; step > 0u; step >>= 1u)
+    {
+      if (tid < step)
+      {
+        sh_sum[tid] += sh_sum[tid + step];
+        sh_min[tid] = min(sh_min[tid], sh_min[tid + step]);
+        sh_max[tid] = max(sh_max[tid], sh_max[tid + step]);
+      }
+      barrier();
+    }
+
+    if (tid == 0u)
+    {
+      uint base = (gl_WorkGroupID.x * column_count + c) * 3u;
+      partials[base + 0u] = sh_sum[0];
+      partials[base + 1u] = sh_min[0];
+      partials[base + 2u] = sh_max[0];
+    }
+    barrier();
+  }
+}

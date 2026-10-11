@@ -8,7 +8,7 @@
 #include "os/os_inc.h"
 #include "thread_pool/thread_pool.h"
 #include "settings/settings.h"
-#include "gdb/gdb_inc.h"
+#include "cql/cql_inc.h"
 #include "ir_gen/ir_gen_inc.h"
 #include "gpu/gpu_inc.h"
 #include "planner/plan_node.h"
@@ -25,7 +25,7 @@
 #include "settings/settings.c"
 #include "gpu/gpu_inc.c"
 #include "ir_gen/ir_gen_inc.c"
-#include "gdb/gdb_inc.c"
+#include "cql/cql_inc.c"
 #include "query_exec/query_exec.c"
 #include "optimizer/optimizer_inc.c"
 #include "planner/planner.c"
@@ -54,9 +54,9 @@ internal void
 cte_add_case(Bench_QueryCase* cases, U64* n, char* label, char* sql)
 {
   cases[*n].label = str8_cstring(label);
-  cases[*n].gdb_sql = str8_cstring(sql);
-  cases[*n].sqlite_sql = cases[*n].gdb_sql;
-  cases[*n].duckdb_sql = cases[*n].gdb_sql;
+  cases[*n].cql_sql = str8_cstring(sql);
+  cases[*n].sqlite_sql = cases[*n].cql_sql;
+  cases[*n].duckdb_sql = cases[*n].cql_sql;
   (*n)++;
 }
 
@@ -78,10 +78,10 @@ cte_run_suite(Arena* arena, Bench_Report* report, U64 row_count, char* label)
   String8 csv_path = push_str8f(scratch.arena, "bench_data/cte_%s.csv", label);
   bench_write_csv(csv_path, rows, row_count);
   
-  GDB_Database* database = gdb_database_alloc(str8_lit("cte_db"));
-  gdb_add_database(database);
-  GDB_Table* table = gdb_table_import_csv_streaming(database, table_name, csv_path);
-  gdb_database_add_table(database, table);
+  CQL_Database* database = cql_database_alloc(str8_lit("cte_db"));
+  cql_add_database(database);
+  CQL_Table* table = cql_table_import_csv_streaming(database, table_name, csv_path);
+  cql_database_add_table(database, table);
   
   sqlite3* sqlite_db = NULL;
   sqlite3_open(":memory:", &sqlite_db);
@@ -146,9 +146,9 @@ cte_run_suite(Arena* arena, Bench_Report* report, U64 row_count, char* label)
   bench_print_table_header(report, label);
   for (U64 i = 0; i < n; i++)
   {
-    U64 gdb_rows = 0, gdb_checksum = 0;
-    Bench_Stats gdb_stats = bench_run_gdb_query(database, cases[i].gdb_sql, &gdb_rows, &gdb_checksum);
-    bench_print_table_row(report, cases[i].label, "gdb", gdb_rows, gdb_checksum, &gdb_stats);
+    U64 cql_rows = 0, cql_checksum = 0;
+    Bench_Stats cql_stats = bench_run_cql_query(database, cases[i].cql_sql, &cql_rows, &cql_checksum);
+    bench_print_table_row(report, cases[i].label, "cql", cql_rows, cql_checksum, &cql_stats);
     
     U64 sqlite_rows = 0, sqlite_checksum = 0;
     Bench_Stats sqlite_stats = bench_run_sqlite_query(sqlite_db, cases[i].sqlite_sql, &sqlite_rows, &sqlite_checksum);
@@ -158,8 +158,8 @@ cte_run_suite(Arena* arena, Bench_Report* report, U64 row_count, char* label)
     Bench_Stats duckdb_stats = bench_run_duckdb_query(duckdb_conn, cases[i].duckdb_sql, &duckdb_rows, &duckdb_checksum);
     bench_print_table_row(report, cases[i].label, "duckdb", duckdb_rows, duckdb_checksum, &duckdb_stats);
     
-    bench_check_match(report, cases[i].label, "gdb", gdb_rows, gdb_checksum, "sqlite", sqlite_rows, sqlite_checksum);
-    bench_check_match(report, cases[i].label, "gdb", gdb_rows, gdb_checksum, "duckdb", duckdb_rows, duckdb_checksum);
+    bench_check_match(report, cases[i].label, "cql", cql_rows, cql_checksum, "sqlite", sqlite_rows, sqlite_checksum);
+    bench_check_match(report, cases[i].label, "cql", cql_rows, cql_checksum, "duckdb", duckdb_rows, duckdb_checksum);
   }
   
   // tec: nothing should be left registered on the database afterwards
@@ -184,17 +184,17 @@ entry_point(CmdLine* cmdline)
   log_alloc();
   
   U64 t0 = os_now_microseconds();
-  gdb_init();
+  cql_init();
   gpu_init();
   U64 t1 = os_now_microseconds();
-  printf("engine startup (gdb_init + gpu_init, one-time): %.4f ms\n", (F64)(t1 - t0) / 1000.0);
+  printf("engine startup (cql_init + gpu_init, one-time): %.4f ms\n", (F64)(t1 - t0) / 1000.0);
   
   Arena* arena = arena_alloc(.reserve_size = GB(2), .commit_size = MB(64));
   
   Bench_Report* report = bench_report_alloc(arena, "compute_ql vs sqlite vs duckdb - CTEs and derived tables");
-  bench_report_text(report, "engine startup (gdb_init + gpu_init, one-time): %.4f ms", (F64)(t1 - t0) / 1000.0);
+  bench_report_text(report, "engine startup (cql_init + gpu_init, one-time): %.4f ms", (F64)(t1 - t0) / 1000.0);
   
-  // tec: below GDB_DICT_ENCODE_MIN_ROWS, string join keys go through the raw-bytes path
+  // tec: below CQL_DICT_ENCODE_MIN_ROWS, string join keys go through the raw-bytes path
   cte_run_suite(arena, report, 2000, "raw_strings");
   // tec: past it, name is dictionary encoded
   cte_run_suite(arena, report, 6000, "dict_strings");

@@ -1,0 +1,43 @@
+#version 450
+
+// tec: reads a buffer and does nothing else, used by bench_gpu_transfer to time a kernel reading VRAM and a kernel reading imported host memory
+// over PCIe with the same code. every thread reads UNROLL 16 byte vectors spaced a full grid apart
+//
+//   binding 0: the buffer that is read (uvec4[])
+//   binding 1: a sink the result is stored to when it equals the magic value, so the loads cannot be optimized away
+//   push constants: thread count, magic value
+
+layout(local_size_x = 256) in;
+
+#define UNROLL 8u
+
+layout(std430, binding = 0) readonly buffer DataBuf { uvec4 data[]; };
+layout(std430, binding = 1) buffer SinkBuf { uint sink[]; };
+
+layout(push_constant) uniform PushConstants
+{
+  uint threads;
+  uint magic;
+} pc;
+
+void
+main()
+{
+  uint t = gl_GlobalInvocationID.x;
+  if (t >= pc.threads)
+  {
+    return;
+  }
+
+  uvec4 acc = uvec4(0u);
+  for (uint j = 0u; j < UNROLL; j++)
+  {
+    acc += data[t + j * pc.threads];
+  }
+
+  uint folded = acc.x ^ acc.y ^ acc.z ^ acc.w;
+  if (folded == pc.magic)
+  {
+    sink[0] = folded;
+  }
+}
