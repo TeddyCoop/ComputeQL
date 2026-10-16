@@ -382,7 +382,7 @@ bench_kernel_log_string(Arena* arena)
   String8List parts = {0};
   for (U32 i = 0; i < g_gpu_kernel_log.count; i++)
   {
-    str8_list_pushf(arena, &parts, "%s x%llu", g_gpu_kernel_log.names[i], g_gpu_kernel_log.uses[i]);
+    str8_list_pushf(arena, &parts, "%.*s x%llu", str8_varg(g_gpu_kernel_log.names[i]), g_gpu_kernel_log.uses[i]);
   }
   StringJoin join = { .sep = str8_lit(", ") };
   return str8_list_join(arena, &parts, &join);

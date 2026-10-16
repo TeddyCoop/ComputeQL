@@ -36,12 +36,11 @@ struct GPU_MemoryStats
 };
 
 #define GPU_KERNEL_LOG_CAP 32
-#define GPU_KERNEL_LOG_NAME_SIZE 48
 typedef struct GPU_KernelLog GPU_KernelLog;
 struct GPU_KernelLog
 {
   U32 count;
-  char names[GPU_KERNEL_LOG_CAP][GPU_KERNEL_LOG_NAME_SIZE];
+  String8 names[GPU_KERNEL_LOG_CAP];
   U64 uses[GPU_KERNEL_LOG_CAP];
 };
 global GPU_KernelLog g_gpu_kernel_log = {0};
@@ -61,7 +60,7 @@ global U64 g_gpu_missing_buffer_uses = 0;
 global GPU_Kernel* g_gpu_missing_arg_kernels[GPU_MISSING_ARG_KERNEL_CAP] = {0};
 global U32 g_gpu_missing_arg_kernel_count = 0;
 
-internal void gpu_note_missing_buffer(char* operation);
+internal void gpu_note_missing_buffer(String8 operation);
 internal B32 gpu_kernel_has_missing_arg(GPU_Kernel* kernel);
 internal void gpu_kernel_set_missing_arg(GPU_Kernel* kernel, B32 missing);
 internal U64 gpu_failure_count(void);

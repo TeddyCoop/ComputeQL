@@ -239,7 +239,7 @@ gpu_buffer_write(GPU_Buffer* buffer, void* data, U64 size)
 {
   if (!buffer)
   {
-    gpu_note_missing_buffer("buffer_write");
+    gpu_note_missing_buffer(str8_lit("buffer_write"));
     return;
   }
   g_active_gpu_backend_reg->backend->buffer_write(buffer, data, size);
@@ -250,7 +250,7 @@ gpu_buffer_read(GPU_Buffer* buffer, void* data, U64 size)
 {
   if (!buffer)
   {
-    gpu_note_missing_buffer("buffer_read");
+    gpu_note_missing_buffer(str8_lit("buffer_read"));
     MemoryZero(data, size);
     return;
   }
@@ -258,10 +258,10 @@ gpu_buffer_read(GPU_Buffer* buffer, void* data, U64 size)
 }
 
 internal void
-gpu_note_missing_buffer(char* operation)
+gpu_note_missing_buffer(String8 operation)
 {
   g_gpu_missing_buffer_uses += 1;
-  log_error("gpu: %s skipped, a buffer or batch it needs was never allocated", operation);
+  log_error("gpu: %.*s skipped, a buffer or batch it needs was never allocated", str8_varg(operation));
 }
 
 internal B32
@@ -314,11 +314,9 @@ gpu_kernel_log_reset(void)
 internal void
 gpu_kernel_log_note(String8 name)
 {
-  U64 size = Min(name.size, (U64)(GPU_KERNEL_LOG_NAME_SIZE - 1));
   for (U32 i = 0; i < g_gpu_kernel_log.count; i++)
   {
-    String8 logged = str8_cstring(g_gpu_kernel_log.names[i]);
-    if (str8_match(logged, str8_prefix(name, size), 0))
+    if (str8_match(g_gpu_kernel_log.names[i], name, 0))
     {
       g_gpu_kernel_log.uses[i] += 1;
       return;
@@ -329,8 +327,7 @@ gpu_kernel_log_note(String8 name)
     return;
   }
   U32 slot = g_gpu_kernel_log.count;
-  MemoryCopy(g_gpu_kernel_log.names[slot], name.str, size);
-  g_gpu_kernel_log.names[slot][size] = 0;
+  g_gpu_kernel_log.names[slot] = name;
   g_gpu_kernel_log.uses[slot] = 1;
   g_gpu_kernel_log.count += 1;
 }
@@ -355,7 +352,7 @@ gpu_kernel_execute(GPU_Kernel* kernel, U32 global_work_size, U32 local_work_size
 {
   if (!kernel || gpu_kernel_has_missing_arg(kernel))
   {
-    gpu_note_missing_buffer("kernel_execute");
+    gpu_note_missing_buffer(str8_lit("kernel_execute"));
     return;
   }
   g_active_gpu_backend_reg->backend->kernel_execute(kernel, global_work_size, local_work_size);
@@ -368,7 +365,7 @@ gpu_kernel_set_arg_buffer(GPU_Kernel* kernel, U32 index, GPU_Buffer* buffer)
   {
     // tec: the descriptor would keep the buffer an earlier query bound there, so the kernel must not run
     gpu_kernel_set_missing_arg(kernel, 1);
-    gpu_note_missing_buffer("kernel_set_arg_buffer");
+    gpu_note_missing_buffer(str8_lit("kernel_set_arg_buffer"));
     return;
   }
   g_active_gpu_backend_reg->backend->kernel_set_arg_buffer(kernel, index, buffer);
@@ -391,7 +388,7 @@ gpu_batch_buffer_write(GPU_Batch* batch, GPU_Buffer* buffer, void* data, U64 siz
 {
   if (!batch || !buffer)
   {
-    gpu_note_missing_buffer("batch_buffer_write");
+    gpu_note_missing_buffer(str8_lit("batch_buffer_write"));
     return;
   }
   g_active_gpu_backend_reg->backend->batch_buffer_write(batch, buffer, data, size);
@@ -402,7 +399,7 @@ gpu_batch_buffer_zero(GPU_Batch* batch, GPU_Buffer* buffer, U64 size)
 {
   if (!batch || !buffer)
   {
-    gpu_note_missing_buffer("batch_buffer_zero");
+    gpu_note_missing_buffer(str8_lit("batch_buffer_zero"));
     return;
   }
   g_active_gpu_backend_reg->backend->batch_buffer_zero(batch, buffer, size);
@@ -413,7 +410,7 @@ gpu_batch_buffer_fill(GPU_Batch* batch, GPU_Buffer* buffer, U64 size, U32 value)
 {
   if (!batch || !buffer)
   {
-    gpu_note_missing_buffer("batch_buffer_fill");
+    gpu_note_missing_buffer(str8_lit("batch_buffer_fill"));
     return;
   }
   g_active_gpu_backend_reg->backend->batch_buffer_fill(batch, buffer, size, value);
@@ -424,7 +421,7 @@ gpu_batch_kernel_execute(GPU_Batch* batch, GPU_Kernel* kernel, U32 global_work_s
 {
   if (!batch || !kernel || gpu_kernel_has_missing_arg(kernel))
   {
-    gpu_note_missing_buffer("batch_kernel_execute");
+    gpu_note_missing_buffer(str8_lit("batch_kernel_execute"));
     return;
   }
   g_active_gpu_backend_reg->backend->batch_kernel_execute(batch, kernel, global_work_size, local_work_size);
@@ -435,7 +432,7 @@ gpu_batch_buffer_read(GPU_Batch* batch, GPU_Buffer* buffer, void* out_data, U64 
 {
   if (!batch || !buffer)
   {
-    gpu_note_missing_buffer("batch_buffer_read");
+    gpu_note_missing_buffer(str8_lit("batch_buffer_read"));
     MemoryZero(out_data, size);
     return;
   }
@@ -447,7 +444,7 @@ gpu_batch_end(GPU_Batch* batch)
 {
   if (!batch)
   {
-    gpu_note_missing_buffer("batch_end");
+    gpu_note_missing_buffer(str8_lit("batch_end"));
     return 0;
   }
   return g_active_gpu_backend_reg->backend->batch_end(batch);
@@ -476,7 +473,7 @@ gpu_stream_copy(GPU_Stream* stream, U32 slot, GPU_Buffer* destination, void* hos
 {
   if (!stream || !destination)
   {
-    gpu_note_missing_buffer("stream_copy");
+    gpu_note_missing_buffer(str8_lit("stream_copy"));
     return 0;
   }
   return g_active_gpu_backend_reg->backend->stream_copy(stream, slot, destination, host_ptr, size);
@@ -487,7 +484,7 @@ gpu_stream_zero(GPU_Stream* stream, U32 slot, GPU_Buffer* buffer, U64 size)
 {
   if (!stream || !buffer)
   {
-    gpu_note_missing_buffer("stream_zero");
+    gpu_note_missing_buffer(str8_lit("stream_zero"));
     return;
   }
   g_active_gpu_backend_reg->backend->stream_zero(stream, slot, buffer, size);
@@ -498,7 +495,7 @@ gpu_stream_fill(GPU_Stream* stream, U32 slot, GPU_Buffer* buffer, U64 size, U32 
 {
   if (!stream || !buffer)
   {
-    gpu_note_missing_buffer("stream_fill");
+    gpu_note_missing_buffer(str8_lit("stream_fill"));
     return;
   }
   g_active_gpu_backend_reg->backend->stream_fill(stream, slot, buffer, size, value);
@@ -509,7 +506,7 @@ gpu_stream_dispatch(GPU_Stream* stream, U32 slot, GPU_Kernel* kernel, U32 global
 {
   if (!stream || !kernel || gpu_kernel_has_missing_arg(kernel))
   {
-    gpu_note_missing_buffer("stream_dispatch");
+    gpu_note_missing_buffer(str8_lit("stream_dispatch"));
     return;
   }
   g_active_gpu_backend_reg->backend->stream_dispatch(stream, slot, kernel, global_work_size, local_work_size);
@@ -520,7 +517,7 @@ gpu_stream_read(GPU_Stream* stream, U32 slot, GPU_Buffer* buffer, void* out_data
 {
   if (!stream || !buffer)
   {
-    gpu_note_missing_buffer("stream_read");
+    gpu_note_missing_buffer(str8_lit("stream_read"));
     MemoryZero(out_data, size);
     return;
   }
