@@ -4,6 +4,7 @@
 #define ARENA_FREE_LIST 1
 #define GPU_MAX_BUFFER_SIZE GB(2)
 #define BENCH_TIMED_RUNS 10
+#define BENCH_WARMUP_MIN_MICROSECONDS 300000
 
 #include "base/base_inc.h"
 #include "os/os_inc.h"
@@ -517,7 +518,7 @@ global XL_Case g_xl_cases[] =
   { "gap: substring filter then group",
     "SELECT country, COUNT(*) FROM events WHERE session contains '77' GROUP BY country;",
     "SELECT country, COUNT(*) FROM events WHERE session LIKE '%77%' GROUP BY country;" },
-
+  
   { "window: top 3 per region, 1M rows",
     "SELECT COUNT(*) FROM (SELECT id, ROW_NUMBER() OVER (PARTITION BY region_id ORDER BY amount DESC, id) AS rn FROM events WHERE amount > 9000) AS t WHERE rn <= 3;", NULL },
 };
@@ -547,6 +548,7 @@ entry_point(CmdLine* cmdline)
   B32 run_duckdb = !cmd_line_has_flag(cmdline, str8_lit("no_duckdb"));
   String8 only = cmd_line_string(cmdline, str8_lit("only"));
   B32 explain = cmd_line_has_flag(cmdline, str8_lit("explain"));
+  g_bench_print_samples = cmd_line_has_flag(cmdline, str8_lit("samples"));
   String8 setting = cmd_line_string(cmdline, str8_lit("setting"));
   if (setting.size > 0)
   {
@@ -625,8 +627,16 @@ entry_point(CmdLine* cmdline)
     String8 other_sql = str8_cstring(test_case->other_sql ? test_case->other_sql : test_case->cql_sql);
     
     U64 cql_rows = 0, cql_checksum = 0;
+    gpu_kernel_log_reset();
     Bench_Stats cql_stats = bench_run_cql_query(database, cql_sql, &cql_rows, &cql_checksum);
     bench_print_table_row(report, label, "cql", cql_rows, cql_checksum, &cql_stats);
+    {
+      // tec: uses are summed over the warmup and timed runs
+      Temp kernel_scratch = scratch_begin(0, 0);
+      String8 kernels = bench_kernel_log_string(kernel_scratch.arena);
+      printf("  kernels: %.*s\n", str8_varg(kernels));
+      scratch_end(kernel_scratch);
+    }
     
     if (explain)
     {

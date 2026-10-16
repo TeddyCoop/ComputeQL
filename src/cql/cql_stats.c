@@ -45,6 +45,10 @@ cql_stats_hll_add(U8* registers, U64 hash)
   U64 register_index = hash >> (64 - CQL_STATS_HLL_PRECISION);
   U64 remaining = (hash << CQL_STATS_HLL_PRECISION) | ((U64)1 << (CQL_STATS_HLL_PRECISION - 1));
   
+  // tec: the sentinel bit above keeps remaining from being zero
+#if COMPILER_MSVC
+  U8 rank = (U8)(clz64(remaining) + 1);
+#else
   U8 rank = 1;
   U64 top_bit = (U64)1 << 63;
   while ((remaining & top_bit) == 0)
@@ -52,6 +56,7 @@ cql_stats_hll_add(U8* registers, U64 hash)
     rank += 1;
     remaining = remaining << 1;
   }
+#endif
   
   if (registers[register_index] < rank)
   {
@@ -123,12 +128,124 @@ cql_stats_compare_u64(const void* a, const void* b)
 
 //~ tec: scan
 
+// tec: one pass over a column without NULLs, bits is the raw value read from the data and the expression after it turns it into a number
+#define CQL_STATS_FIXED_WIDTH_PASS(BITS_TYPE, VALUE_EXPR) \
+do                                                     \
+{                                                      \
+BITS_TYPE* raw_values = (BITS_TYPE*)ctx->base_ptr; \
+U8* registers = result->hll_registers;             \
+F64 low = 0.0;                                     \
+F64 high = 0.0;                                    \
+\
+for (U64 row = range.min; row < range.max; row += 1) \
+{                                                  \
+BITS_TYPE bits = raw_values[row];              \
+F64 value = (VALUE_EXPR);                      \
+\
+cql_stats_hll_add(                             \
+registers,                                 \
+cql_stats_hash_u64((U64)bits));            \
+\
+if (row == range.min)                          \
+{                                              \
+low = value;                               \
+high = value;                              \
+}                                              \
+else                                           \
+{                                              \
+if (value < low)                           \
+{                                          \
+low = value;                           \
+}                                          \
+\
+if (value > high)                          \
+{                                          \
+high = value;                           \
+}                                          \
+}                                              \
+}                                                  \
+\
+result->min_value = low;                           \
+result->max_value = high;                          \
+result->has_range = 1;                             \
+result->non_null_count = range.max - range.min;    \
+} while (0)
+
+internal F32
+cql_stats_f32_from_bits(U32 bits)
+{
+  F32 value = 0.0f;
+  MemoryCopy(&value, &bits, sizeof(value));
+  return value;
+}
+
+internal F64
+cql_stats_f64_from_bits(U64 bits)
+{
+  F64 value = 0.0;
+  MemoryCopy(&value, &bits, sizeof(value));
+  return value;
+}
+
+// tec: the common case, a numeric column of 4 or 8 byte values with no NULLs. returns 0 for any other column and the general loop runs instead
+internal B32
+cql_stats_scan_fixed_width(CQL_StatsScanCtx* ctx, CQL_StatsTaskResult* result, Rng1U64 range)
+{
+  CQL_Column* column = ctx->column;
+  if (ctx->is_string || column->null_flags != 0 || range.max <= range.min)
+  {
+    return 0;
+  }
+  
+  B32 handled = 1;
+  switch (column->type)
+  {
+    case CQL_ColumnType_U32:
+    case CQL_ColumnType_Enum:
+    {
+      CQL_STATS_FIXED_WIDTH_PASS(U32, (F64)bits);
+    } break;
+    case CQL_ColumnType_I32:
+    case CQL_ColumnType_Date:
+    {
+      CQL_STATS_FIXED_WIDTH_PASS(U32, (F64)(S32)bits);
+    } break;
+    case CQL_ColumnType_F32:
+    {
+      CQL_STATS_FIXED_WIDTH_PASS(U32, (F64)cql_stats_f32_from_bits(bits));
+    } break;
+    case CQL_ColumnType_U64:
+    {
+      CQL_STATS_FIXED_WIDTH_PASS(U64, (F64)bits);
+    } break;
+    case CQL_ColumnType_I64:
+    case CQL_ColumnType_Timestamp:
+    case CQL_ColumnType_Decimal:
+    {
+      CQL_STATS_FIXED_WIDTH_PASS(U64, (F64)(S64)bits);
+    } break;
+    case CQL_ColumnType_F64:
+    {
+      CQL_STATS_FIXED_WIDTH_PASS(U64, cql_stats_f64_from_bits(bits));
+    } break;
+    default:
+    {
+      handled = 0;
+    } break;
+  }
+  return handled;
+}
+
 internal THREAD_POOL_TASK_FUNC(cql_stats_scan_task)
 {
   CQL_StatsScanCtx* ctx = (CQL_StatsScanCtx*)raw_task;
   CQL_StatsTaskResult* result = &ctx->results[task_id];
   Rng1U64 range = ctx->ranges[task_id];
   CQL_Column* column = ctx->column;
+  if (cql_stats_scan_fixed_width(ctx, result, range))
+  {
+    return;
+  }
   
   for (U64 row = range.min; row < range.max; row += 1)
   {

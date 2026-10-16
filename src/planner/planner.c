@@ -363,7 +363,7 @@ plan_execute_filter_scan(Arena* arena, CQL_Database* database, PLAN_Node* plan, 
     MemoryZeroStruct(out_selection);
     out_selection->count_only_requested = count_only;
   }
-
+  
   if (plan->input && plan->input->type == PLAN_NodeType_Scan && !plan->input->table)
   {
     log_error("plan_execute: table '%.*s' not found", str8_varg(plan->input->value));
@@ -479,7 +479,7 @@ plan_try_join_aggregate_pushdown(Arena* arena, CQL_Database* database, PLAN_Node
   {
     return 0;
   }
-
+  
   QE_ScanResult fact_scan = {0};
   fact_scan.count = fact->table->row_count;
   PLAN_ExecResult fact_result = plan_wrap_scan_result(arena, fact->table, fact->alias, fact_scan);
@@ -488,7 +488,7 @@ plan_try_join_aggregate_pushdown(Arena* arena, CQL_Database* database, PLAN_Node
   {
     return 0;
   }
-
+  
   U64* dim_rows = NULL;
   U64 dim_count = dim_scan->table->row_count;
   if (dim_plan->type == PLAN_NodeType_Filter)
@@ -505,7 +505,7 @@ plan_try_join_aggregate_pushdown(Arena* arena, CQL_Database* database, PLAN_Node
       return 0;
     }
   }
-
+  
   PLAN_Materialized materialized = {0};
   if (!qe_aggregate_join_pushdown(arena, &fact_result.rows, dim_scan->table, dim_scan->alias, dim_rows, dim_count, equi, aggregate->group_by, aggregate->column_list, &materialized))
   {
@@ -587,7 +587,7 @@ plan_execute_node(Arena* arena, CQL_Database* database, PLAN_Node* plan, IR_Node
       {
         break;
       }
-
+      
       // tec: a GPU filter directly below leaves its rows on the GPU for the aggregate to read there
       QE_DeviceSelection selection = {0};
       QE_DeviceRows join_device = {0};
@@ -1547,7 +1547,7 @@ plan_print_scan_trace(Arena* arena, String8List* out, PLAN_Node* plan, QE_NodeTr
   {
     str8_list_pushf(arena, &line, " gpu=%.1fms submit/wait=%.1fms", plan_us_to_ms(s->gpu_kernel_time_us), plan_us_to_ms(s->submit_wait_time_us));
   }
-
+  
   if (s->stream_slot_count > 0)
   {
     str8_list_pushf(arena, &line, " stream=%u slots %llu chunks copied=%.0fMB (%.1fGB/s) imports=%llu in %.1fms staged=%.0fMB %s",
@@ -1556,6 +1556,10 @@ plan_print_scan_trace(Arena* arena, String8List* out, PLAN_Node* plan, QE_NodeTr
                     s->stream_imports, plan_us_to_ms(s->stream_import_time_us), (F64)s->stream_staged_bytes / (1024.0 * 1024.0),
                     s->stream_separate_copy_queue ? "copy queue" : "compute queue");
     str8_list_pushf(arena, &line, " resident=%.0fMB hit %.0fMB copied", (F64)s->stream_resident_hit_bytes / (1024.0 * 1024.0), (F64)s->stream_resident_miss_bytes / (1024.0 * 1024.0));
+    str8_list_pushf(arena, &line, " host phases: prepare=%.1fms (acquire/alloc=%.1fms encode=%.1fms) slot_begin=%.1fms copy_calls=%.1fms submit=%.1fms retire=%.1fms",
+                    plan_us_to_ms(s->stream_prepare_us), plan_us_to_ms(s->stream_acquire_us), plan_us_to_ms(s->stream_encode_us),
+                    plan_us_to_ms(s->stream_begin_us), plan_us_to_ms(s->stream_copy_call_us),
+                    plan_us_to_ms(s->stream_submit_us), plan_us_to_ms(s->stream_retire_us));
   }
   
   if (s->dict_decision_made)
@@ -1620,8 +1624,8 @@ plan_print_analyzed(Arena* arena, String8List* out, PLAN_Node* plan, QE_TraceCtx
     QE_AggregateTrace* a = &node_trace->aggregate;
     String8 suffix = plan_estimate_suffix(arena, plan, 1, a->group_count);
     str8_list_push(arena, out, push_str8f(arena,
-                                          "%.*s- [Aggregate] rows=%llu->%llu groups gather=%.1fms assign=%.1fms reduce=%.1fms combine=%.1fms%.*s\n",
-                                          str8_varg(indent), a->input_row_count, a->group_count,
+                                          "%.*s- [Aggregate] rows=%llu->%llu groups device=%s gather=%.1fms assign=%.1fms reduce=%.1fms combine=%.1fms%.*s\n",
+                                          str8_varg(indent), a->input_row_count, a->group_count, a->used_cpu ? "cpu" : "gpu",
                                           plan_us_to_ms(a->gather_time_us), plan_us_to_ms(a->assign_time_us), plan_us_to_ms(a->reduce_time_us), plan_us_to_ms(a->combine_time_us),
                                           str8_varg(suffix)));
   }
@@ -2926,7 +2930,20 @@ plan_run_select_with_plan(Arena* arena, CQL_Database* database, IR_Node* select_
   {
     *out_plan = plan;
   }
-  return plan_execute(arena, database, plan, select_ir, trace);
+  
+  // tec: many GPU paths do not check every buffer they allocate, so a device allocation that failed  during the query fails the whole query instead of returning what the kernels made of a missing buffer
+  U64 failures_before = gpu_failure_count();
+  PLAN_ExecResult result = plan_execute(arena, database, plan, select_ir, trace);
+  U64 failures_after = gpu_failure_count();
+  // tec: QE_GPU_FAILURE_CHECK:0 returns the result anyway, only for the fault injection test to count what the check catches
+  B32 check_failures = settings_u64(str8_lit("QE_GPU_FAILURE_CHECK"), 1) != 0;
+  if (check_failures && (failures_after != failures_before || gpu_device_lost()))
+  {
+    log_error("query failed: %llu GPU device memory allocation(s) or GPU operations on a missing buffer failed while it ran%s", failures_after - failures_before,
+              gpu_device_lost() ? ", and the device was lost" : "");
+    return failed;
+  }
+  return result;
 }
 
 // tec: builds the plan EXPLAIN shows without running anything, CTEs and derived tables are estimated from their own plans

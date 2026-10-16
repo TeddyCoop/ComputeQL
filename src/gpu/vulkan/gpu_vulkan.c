@@ -236,6 +236,17 @@ gpu_vulkan_init(void)
   U32 compute_queue_family_index = ~0u;
   for (U32 i = 0; i < dev_count; i++)
   {
+    // tec: the kernels use GLSL 'double', which compiles to the Float64 capability, a device without it cannot create their pipelines
+    VkPhysicalDeviceFeatures candidate_features;
+    vkGetPhysicalDeviceFeatures(devices[i], &candidate_features);
+    if (!candidate_features.shaderFloat64)
+    {
+      VkPhysicalDeviceProperties candidate_props;
+      vkGetPhysicalDeviceProperties(devices[i], &candidate_props);
+      log_error("skipping Vulkan GPU '%s': it does not support shaderFloat64, which the kernels require", candidate_props.deviceName);
+      continue;
+    }
+    
     U32 queue_count = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(devices[i], &queue_count, 0);
     VkQueueFamilyProperties *props = push_array(arena, VkQueueFamilyProperties, queue_count);
@@ -255,7 +266,7 @@ gpu_vulkan_init(void)
   
   if (!selected)
   {
-    log_error("no suitable Vulkan GPU found");
+    log_error("no suitable Vulkan GPU found (needs a compute queue and shaderFloat64)");
     return;
   }
   
@@ -320,6 +331,11 @@ gpu_vulkan_init(void)
   }
   
   //- tec: VK_EXT_external_memory_host
+  if (g_vulkan_state->has_external_memory_host_ext && settings_u64(str8_lit("GPU_VULKAN_HOST_IMPORT"), 1) == 0)
+  {
+    g_vulkan_state->has_external_memory_host_ext = 0;
+    log_debug("VK_EXT_external_memory_host turned off by GPU_VULKAN_HOST_IMPORT, stream copies are staged");
+  }
   if (g_vulkan_state->has_external_memory_host_ext)
   {
     VkPhysicalDeviceExternalMemoryHostPropertiesEXT ext_mem_host_props = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT };
@@ -403,20 +419,9 @@ gpu_vulkan_init(void)
     }
   }
   
-  // tec: shaderFloat64 lets scan_filter.comp use GLSL 'double' for precision-safe numeric
-  // comparisons (float alone can't exactly represent U64/large-integer column values).
-  VkPhysicalDeviceFeatures supported_features;
-  vkGetPhysicalDeviceFeatures(selected, &supported_features);
-  
+  // tec: device selection only accepts GPUs with shaderFloat64
   VkPhysicalDeviceFeatures enabled_features = {0};
-  if (supported_features.shaderFloat64)
-  {
-    enabled_features.shaderFloat64 = VK_TRUE;
-  }
-  else
-  {
-    log_error("selected Vulkan GPU does not support shaderFloat64; numeric WHERE comparisons on U64/F64 columns may lose precision");
-  }
+  enabled_features.shaderFloat64 = VK_TRUE;
   
   VkDeviceCreateInfo dev_info =
   {
@@ -693,9 +698,23 @@ gpu_vulkan_device_total_memory(void)
 internal U64
 gpu_vulkan_device_max_storage_buffer_range(void)
 {
-  VkPhysicalDeviceProperties device_props;
-  vkGetPhysicalDeviceProperties(g_vulkan_state->physical_device, &device_props);
-  return device_props.limits.maxStorageBufferRange;
+  // tec: a buffer is also one device memory allocation, which is capped separately and can be lower than the storage range
+  VkPhysicalDeviceMaintenance3Properties maintenance3 = 
+  { 
+    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_3_PROPERTIES 
+  };
+  VkPhysicalDeviceProperties2 device_props =
+  { 
+    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, 
+    .pNext = &maintenance3 
+  };
+  vkGetPhysicalDeviceProperties2(g_vulkan_state->physical_device, &device_props);
+  U64 limit = device_props.properties.limits.maxStorageBufferRange;
+  if (maintenance3.maxMemoryAllocationSize != 0)
+  {
+    limit = Min(limit, (U64)maintenance3.maxMemoryAllocationSize);
+  }
+  return limit;
 }
 
 //~ tec: streaming
@@ -1451,6 +1470,8 @@ gpu_vulkan_memory_stats(void)
   stats.alloc_retry_successes = g_vulkan_state->alloc_retry_success_count;
   stats.pool_evictions = g_vulkan_state->pool_eviction_count;
   stats.pool_evicted_bytes = g_vulkan_state->pool_evicted_bytes;
+  stats.alloc_calls = g_vulkan_state->alloc_call_count;
+  stats.unrecovered_alloc_failures = g_vulkan_state->unrecovered_alloc_failure_count;
   return stats;
 }
 
@@ -1495,6 +1516,19 @@ gpu_vulkan_pool_evict(U64 bytes_wanted)
     g_vulkan_state->pool_evicted_bytes += charge;
   }
   return freed;
+}
+
+internal B32
+gpu_vulkan_fault_injected(char* what, U64 size)
+{
+  g_vulkan_state->alloc_call_count += 1;
+  if (g_gpu_fault_alloc_at == 0 || g_vulkan_state->alloc_call_count != g_gpu_fault_alloc_at)
+  {
+    return 0;
+  }
+  g_vulkan_state->alloc_failure_count += 1;
+  log_error("gpu_vulkan: injected failure of allocation %llu (%s, %llu bytes)", g_vulkan_state->alloc_call_count, what, size);
+  return 1;
 }
 
 internal VkResult
@@ -1610,6 +1644,12 @@ gpu_vulkan_alloc_raw_buffer(U64 size, VkBufferUsageFlags usage, VkMemoryProperty
     return 0;
   }
   
+  if (gpu_vulkan_fault_injected("raw buffer", size))
+  {
+    g_vulkan_state->unrecovered_alloc_failure_count += 1;
+    return 0;
+  }
+  
   U64 raw_alloc_t0 = os_now_microseconds();
   
   VkBufferCreateInfo buf_info =
@@ -1623,6 +1663,7 @@ gpu_vulkan_alloc_raw_buffer(U64 size, VkBufferUsageFlags usage, VkMemoryProperty
   if (vkCreateBuffer(g_vulkan_state->device, &buf_info, 0, out_buffer) != VK_SUCCESS)
   {
     log_error("failed to create Vulkan buffer");
+    g_vulkan_state->unrecovered_alloc_failure_count += 1;
     return 0;
   }
   
@@ -1634,6 +1675,7 @@ gpu_vulkan_alloc_raw_buffer(U64 size, VkBufferUsageFlags usage, VkMemoryProperty
   {
     log_error("No matching memory type for Vulkan buffer.");
     vkDestroyBuffer(g_vulkan_state->device, *out_buffer, 0);
+    g_vulkan_state->unrecovered_alloc_failure_count += 1;
     return 0;
   }
   
@@ -1648,6 +1690,7 @@ gpu_vulkan_alloc_raw_buffer(U64 size, VkBufferUsageFlags usage, VkMemoryProperty
   if (alloc_result != VK_SUCCESS)
   {
     vkDestroyBuffer(g_vulkan_state->device, *out_buffer, 0);
+    g_vulkan_state->unrecovered_alloc_failure_count += 1;
     return 0;
   }
   
@@ -1765,6 +1808,12 @@ gpu_vulkan_buffer_alloc_backing(GPU_VulkanBuffer* result, U64 size, VkBufferUsag
     return 0;
   }
   
+  if (gpu_vulkan_fault_injected("buffer", size))
+  {
+    g_vulkan_state->unrecovered_alloc_failure_count += 1;
+    return 0;
+  }
+  
   U32 sharing_families[2] = { g_vulkan_state->compute_queue_family_index, g_vulkan_state->copy_queue_family_index };
   B32 concurrent = shared && sharing_families[0] != sharing_families[1];
   VkBufferCreateInfo buf_info =
@@ -1780,6 +1829,7 @@ gpu_vulkan_buffer_alloc_backing(GPU_VulkanBuffer* result, U64 size, VkBufferUsag
   if (vkCreateBuffer(g_vulkan_state->device, &buf_info, 0, &result->buffer) != VK_SUCCESS)
   {
     log_error("failed to create Vulkan buffer");
+    g_vulkan_state->unrecovered_alloc_failure_count += 1;
     return 0;
   }
   
@@ -1791,6 +1841,7 @@ gpu_vulkan_buffer_alloc_backing(GPU_VulkanBuffer* result, U64 size, VkBufferUsag
   {
     log_error("No matching memory type for Vulkan buffer.");
     vkDestroyBuffer(g_vulkan_state->device, result->buffer, 0);
+    g_vulkan_state->unrecovered_alloc_failure_count += 1;
     return 0;
   }
   
@@ -1819,6 +1870,7 @@ gpu_vulkan_buffer_alloc_backing(GPU_VulkanBuffer* result, U64 size, VkBufferUsag
   if (!gpu_vulkan_alloc_dedicated_memory(result, &mem_req, mem_type, wants_mapped))
   {
     vkDestroyBuffer(g_vulkan_state->device, result->buffer, 0);
+    g_vulkan_state->unrecovered_alloc_failure_count += 1;
     return 0;
   }
   return 1;
@@ -1924,7 +1976,11 @@ gpu_vulkan_buffer_alloc(U64 size, GPU_BufferFlags flags, void* data)
       g_vulkan_state->rebar_bytes_in_use + size <= g_vulkan_state->rebar_budget)
   {
     VkMemoryPropertyFlags rebar_props = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-    if (gpu_vulkan_buffer_alloc_backing(result, size, usage, rebar_props, 0))
+    U64 unrecovered_before = g_vulkan_state->unrecovered_alloc_failure_count;
+    B32 rebar_ok = gpu_vulkan_buffer_alloc_backing(result, size, usage, rebar_props, 0);
+    // tec: a failed rebar allocation falls through to plain device local memory below, so it is not a failure of this call
+    g_vulkan_state->unrecovered_alloc_failure_count = unrecovered_before;
+    if (rebar_ok)
     {
       // tec: a buffer suballocated out of a shared block is not freed on its own, 
       // so only a buffer with memory of its own is counted
@@ -2119,8 +2175,9 @@ gpu_vulkan_import_host_into(GPU_VulkanBuffer* result, void* host_ptr, U64 size)
     .memoryTypeIndex = mem_type
   };
   
+  // tec: a failed import is not counted as unrecovered, the caller stages the copy instead
   VkDeviceMemory memory;
-  if (vkAllocateMemory(g_vulkan_state->device, &alloc_info, 0, &memory) != VK_SUCCESS)
+  if (gpu_vulkan_fault_injected("host import", import_size) || vkAllocateMemory(g_vulkan_state->device, &alloc_info, 0, &memory) != VK_SUCCESS)
   {
     vkDestroyBuffer(g_vulkan_state->device, buffer, 0);
     return 0;

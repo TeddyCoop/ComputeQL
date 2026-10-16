@@ -31,12 +31,40 @@ struct GPU_MemoryStats
   U64 alloc_retry_successes;
   U64 pool_evictions;
   U64 pool_evicted_bytes;
+  U64 alloc_calls;
+  U64 unrecovered_alloc_failures;
 };
+
+#define GPU_KERNEL_LOG_CAP 32
+#define GPU_KERNEL_LOG_NAME_SIZE 48
+typedef struct GPU_KernelLog GPU_KernelLog;
+struct GPU_KernelLog
+{
+  U32 count;
+  char names[GPU_KERNEL_LOG_CAP][GPU_KERNEL_LOG_NAME_SIZE];
+  U64 uses[GPU_KERNEL_LOG_CAP];
+};
+global GPU_KernelLog g_gpu_kernel_log = {0};
+
+internal void gpu_kernel_log_reset(void);
+internal void gpu_kernel_log_note(String8 name);
+
+global U64 g_gpu_fault_alloc_at = 0;
 
 typedef struct GPU_Buffer GPU_Buffer;
 typedef struct GPU_Kernel GPU_Kernel;
 typedef struct GPU_Batch GPU_Batch;
 typedef struct GPU_Stream GPU_Stream;
+
+#define GPU_MISSING_ARG_KERNEL_CAP 16
+global U64 g_gpu_missing_buffer_uses = 0;
+global GPU_Kernel* g_gpu_missing_arg_kernels[GPU_MISSING_ARG_KERNEL_CAP] = {0};
+global U32 g_gpu_missing_arg_kernel_count = 0;
+
+internal void gpu_note_missing_buffer(char* operation);
+internal B32 gpu_kernel_has_missing_arg(GPU_Kernel* kernel);
+internal void gpu_kernel_set_missing_arg(GPU_Kernel* kernel, B32 missing);
+internal U64 gpu_failure_count(void);
 
 typedef struct GPU_StreamStats GPU_StreamStats;
 struct GPU_StreamStats

@@ -238,8 +238,7 @@ main()
   mm_stride |= (mm_stride != 0u) ? 1u : 0u;
 
   uint first = gl_WorkGroupID.x * slice_rows;
-  uint last = min(first + slice_rows, row_count);u
-
+  uint last = min(first + slice_rows, row_count);
 
   for (uint tile = 0u; tile < tile_count; tile++)
   {

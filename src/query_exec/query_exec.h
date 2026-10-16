@@ -166,7 +166,7 @@ struct QE_ScanTrace
   U64 buffer_alloc_time_us;
   U64 prefetch_stall_time_us;
   U64 chunk_count;
-
+  
   // tec: set when the scan was streamed through slots
   U32 stream_slot_count;
   U64 stream_bytes_copied;
@@ -176,6 +176,13 @@ struct QE_ScanTrace
   B32 stream_separate_copy_queue;
   U64 stream_resident_hit_bytes;
   U64 stream_resident_miss_bytes;
+  U64 stream_prepare_us;
+  U64 stream_acquire_us;
+  U64 stream_encode_us;
+  U64 stream_begin_us;
+  U64 stream_copy_call_us;
+  U64 stream_submit_us;
+  U64 stream_retire_us;
 };
 
 typedef struct QE_JoinTrace QE_JoinTrace;
@@ -1119,5 +1126,9 @@ struct QE_CpuScanTask
 };
 
 internal THREAD_POOL_TASK_FUNC(qe_cpu_scan_filter_task);
+
+//~
+global U64 g_qe_prepare_acquire_us = 0;
+global U64 g_qe_prepare_encode_us = 0;
 
 #endif //QUERY_EXEC_H

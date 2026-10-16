@@ -171,7 +171,9 @@ struct GPU_VulkanState
   U64 pool_eviction_count;
   U64 pool_evicted_bytes;
   U64 alloc_retry_success_count;
-  
+  U64 alloc_call_count;
+  U64 unrecovered_alloc_failure_count;
+
   GPU_VulkanBatch active_batch;
 };
 
@@ -317,6 +319,7 @@ internal GPU_MemoryStats gpu_vulkan_memory_stats(void);
 internal U64 gpu_vulkan_pool_evict(U64 bytes_wanted);
 internal void gpu_vulkan_vram_charge(U64 size);
 internal void gpu_vulkan_vram_uncharge(U64 size);
+internal B32 gpu_vulkan_fault_injected(char* what, U64 size);
 internal VkResult gpu_vulkan_allocate_memory(VkMemoryAllocateInfo* alloc_info, B32 device_local, VkDeviceMemory* out_memory);
 
 //~ tec: commands
