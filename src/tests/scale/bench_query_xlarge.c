@@ -523,6 +523,119 @@ global XL_Case g_xl_cases[] =
     "SELECT COUNT(*) FROM (SELECT id, ROW_NUMBER() OVER (PARTITION BY region_id ORDER BY amount DESC, id) AS rn FROM events WHERE amount > 9000) AS t WHERE rn <= 3;", NULL },
 };
 
+//~ tec: --cache_flush_mb=N reads an N MB GPU buffer before every timed ComputeQL run
+// this is so columns are not left in the gpu's cahce
+#define XL_CACHE_PROBE_BYTES MB(40)
+#define XL_CACHE_PROBE_PASSES 10
+
+typedef struct XL_CacheFlush XL_CacheFlush;
+struct XL_CacheFlush
+{
+  GPU_Kernel* kernel;
+  GPU_Buffer* buffer;
+  GPU_Buffer* sink;
+  U64 bytes;
+  U64 flush_count;
+};
+
+global XL_CacheFlush g_xl_cache_flush = {0};
+
+internal B32 xl_cache_flush_init(U64 bytes);
+internal void xl_cache_flush_release(void);
+internal void xl_read_buffer(GPU_Kernel* kernel, GPU_Buffer* buffer, GPU_Buffer* sink, U64 bytes);
+internal void xl_cache_flush_run(void);
+internal F64 xl_cache_probe_gbps(B32 flush_between);
+
+internal B32
+xl_cache_flush_init(U64 bytes)
+{
+  g_xl_cache_flush.bytes = bytes;
+  g_xl_cache_flush.kernel = gpu_kernel_alloc(str8_lit("bandwidth_read"));
+  g_xl_cache_flush.buffer = gpu_buffer_alloc(bytes, GPU_BufferFlag_ReadWrite, 0);
+  g_xl_cache_flush.sink = gpu_buffer_alloc(16, GPU_BufferFlag_ReadWrite, 0);
+  if (!g_xl_cache_flush.kernel || !g_xl_cache_flush.buffer || !g_xl_cache_flush.sink)
+  {
+    xl_cache_flush_release();
+    return 0;
+  }
+  GPU_Batch* fill = gpu_batch_begin(0, 0);
+  gpu_batch_buffer_fill(fill, g_xl_cache_flush.buffer, bytes, 0x5a5a5a5au);
+  gpu_batch_end(fill);
+  return 1;
+}
+
+internal void
+xl_cache_flush_release(void)
+{
+  if (g_xl_cache_flush.kernel)
+  {
+    gpu_kernel_release(g_xl_cache_flush.kernel);
+  }
+  if (g_xl_cache_flush.buffer)
+  {
+    gpu_buffer_release(g_xl_cache_flush.buffer);
+  }
+  if (g_xl_cache_flush.sink)
+  {
+    gpu_buffer_release(g_xl_cache_flush.sink);
+  }
+  MemoryZeroStruct(&g_xl_cache_flush);
+}
+
+// tec: one pass of the bandwidth_read kernel over the buffer, 128 bytes per thread
+internal void
+xl_read_buffer(GPU_Kernel* kernel, GPU_Buffer* buffer, GPU_Buffer* sink, U64 bytes)
+{
+  U64 thread_count = bytes / 128;
+  gpu_kernel_set_arg_buffer(kernel, 0, buffer);
+  gpu_kernel_set_arg_buffer(kernel, 3, sink);
+  gpu_kernel_set_arg_u64(kernel, 0, thread_count);
+  gpu_kernel_set_arg_u64(kernel, 1, 1);
+  GPU_Batch* batch = gpu_batch_begin(0, 0);
+  gpu_batch_kernel_execute(batch, kernel, (U32)thread_count, 256);
+  gpu_batch_end(batch);
+}
+
+internal void
+xl_cache_flush_run(void)
+{
+  xl_read_buffer(g_xl_cache_flush.kernel, g_xl_cache_flush.buffer, g_xl_cache_flush.sink, g_xl_cache_flush.bytes);
+  g_xl_cache_flush.flush_count += 1;
+}
+
+// tec: best read rate of a 40 MB buffer, the size of one 4 byte column of the 10M row table, read again and again (it stays in the cache)
+// or with the flush between the passes (it comes from VRAM). the gap shows the flush works
+internal F64
+xl_cache_probe_gbps(B32 flush_between)
+{
+  GPU_Buffer* probe = gpu_buffer_alloc(XL_CACHE_PROBE_BYTES, GPU_BufferFlag_ReadWrite, 0);
+  if (!probe)
+  {
+    return 0.0;
+  }
+  GPU_Batch* fill = gpu_batch_begin(0, 0);
+  gpu_batch_buffer_fill(fill, probe, XL_CACHE_PROBE_BYTES, 0x3c3c3c3cu);
+  gpu_batch_end(fill);
+  
+  F64 best_gbps = 0.0;
+  for (U32 pass = 0; pass < XL_CACHE_PROBE_PASSES; pass++)
+  {
+    if (flush_between)
+    {
+      xl_cache_flush_run();
+    }
+    xl_read_buffer(g_xl_cache_flush.kernel, probe, g_xl_cache_flush.sink, XL_CACHE_PROBE_BYTES);
+    U64 microseconds = gpu_get_executed_kernel_time_microseconds();
+    if (pass > 0 && microseconds > 0)
+    {
+      F64 gbps = (F64)XL_CACHE_PROBE_BYTES / 1000.0 / (F64)microseconds;
+      best_gbps = Max(best_gbps, gbps);
+    }
+  }
+  gpu_buffer_release(probe);
+  return best_gbps;
+}
+
 internal void
 xl_print_load(Bench_Report* report, char* engine, char* table, U64 rows, U64 start_us)
 {
@@ -549,10 +662,11 @@ entry_point(CmdLine* cmdline)
   String8 only = cmd_line_string(cmdline, str8_lit("only"));
   B32 explain = cmd_line_has_flag(cmdline, str8_lit("explain"));
   g_bench_print_samples = cmd_line_has_flag(cmdline, str8_lit("samples"));
-  String8 setting = cmd_line_string(cmdline, str8_lit("setting"));
-  if (setting.size > 0)
+  // tec: --setting=A:1,B:2 loads each comma separated setting
+  String8List setting_list = cmd_line_strings(cmdline, str8_lit("setting"));
+  for (String8Node* setting_node = setting_list.first; setting_node; setting_node = setting_node->next)
   {
-    settings_load_from_string(setting);
+    settings_load_from_string(setting_node->string);
   }
   
   U64 t0 = os_now_microseconds();
@@ -567,6 +681,31 @@ entry_point(CmdLine* cmdline)
   bench_report_text(report, "engine startup (cql_init + gpu_init, one-time): %.4f ms", (F64)(t1 - t0) / 1000.0);
   bench_report_text(report, "events: %llu rows, %u columns; users: %u rows; products: %u rows; %u timed runs per query",
                     event_rows, (U32)ArrayCount(g_xl_event_cols), (U32)XL_NUM_USERS, (U32)XL_NUM_PRODUCTS, (U32)BENCH_TIMED_RUNS);
+  
+  U64 cache_flush_mb = 0;
+  if (cmd_line_has_argument(cmdline, str8_lit("cache_flush_mb")))
+  {
+    cache_flush_mb = u64_from_str8(cmd_line_string(cmdline, str8_lit("cache_flush_mb")), 10);
+  }
+  if (cache_flush_mb > 0)
+  {
+    if (xl_cache_flush_init(MB(cache_flush_mb)))
+    {
+      g_bench_cql_before_timed_run = xl_cache_flush_run;
+      F64 resident_gbps = xl_cache_probe_gbps(0);
+      F64 flushed_gbps = xl_cache_probe_gbps(1);
+      g_xl_cache_flush.flush_count = 0;
+      printf("cache flush: %llu MB read before every timed cql run; a 40 MB buffer reads at %.1f GB/s read back to back, %.1f GB/s with the flush between reads\n",
+             cache_flush_mb, resident_gbps, flushed_gbps);
+      bench_report_text(report, "cache flush: %llu MB read before every timed cql run (--cache_flush_mb); a 40 MB buffer reads at %.1f GB/s read back to back, %.1f GB/s with the flush between reads",
+                        cache_flush_mb, resident_gbps, flushed_gbps);
+    }
+    else
+    {
+      printf("cache flush: could not allocate %llu MB, running without it\n", cache_flush_mb);
+      bench_report_warn(report, "--cache_flush_mb=%llu could not allocate its buffer, the run has no cache flush", cache_flush_mb);
+    }
+  }
   
   XL_TableSpec specs[3] =
   {
@@ -679,6 +818,12 @@ entry_point(CmdLine* cmdline)
   {
     os_make_directory(str8_lit("bench_reports/"));
   }
+  if (g_xl_cache_flush.flush_count > 0)
+  {
+    printf("cache flush: ran %llu times\n", g_xl_cache_flush.flush_count);
+  }
+  xl_cache_flush_release();
+  g_bench_cql_before_timed_run = 0;
   bench_report_write(report, str8_lit("bench_reports/xlarge_report.md"));
   
   arena_release(arena);

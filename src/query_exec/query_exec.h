@@ -323,6 +323,43 @@ internal QE_Opcode qe_opcode_from_comparison_operator(String8 op);
 internal void qe_compile_load_value(QE_BytecodeProgram* prog, CQL_Table* table, IR_Node* node);
 internal void qe_compile_condition(QE_BytecodeProgram* prog, CQL_Table* table, IR_Node* condition, QE_ScanTrace* out_trace);
 
+//~ tec: typed interpreter
+#define QE_TYPED_DOMAIN_SHIFT 8
+#define QE_TYPED_DOMAIN_U32   0
+#define QE_TYPED_DOMAIN_I32   1
+#define QE_TYPED_DOMAIN_F32   2
+
+typedef enum QE_TypedKind
+{
+  QE_TypedKind_Bool,
+  QE_TypedKind_U32,
+  QE_TypedKind_I32,
+  QE_TypedKind_F32,
+  QE_TypedKind_Const,
+  QE_TypedKind_Unsupported,
+} QE_TypedKind;
+
+typedef struct QE_TypedValue QE_TypedValue;
+struct QE_TypedValue
+{
+  QE_TypedKind kind;
+  U64 operand_ip;
+};
+
+typedef struct QE_TypedProgram QE_TypedProgram;
+struct QE_TypedProgram
+{
+  U32* words;
+  U64 word_count;
+  U32* consts;
+  U64 const_count;
+};
+
+internal QE_TypedKind qe_typed_kind_from_coltype(U32 coltype);
+internal B32 qe_typed_const_bits(F64 value, U32 domain, U32* out_bits);
+internal B32 qe_typed_bind_const(QE_BytecodeProgram* prog, QE_TypedProgram* typed, QE_TypedValue value, U32 domain);
+internal B32 qe_typed_program_from_bytecode(Arena* arena, QE_BytecodeProgram* prog, QE_TypedProgram* out);
+
 //~ tec: fuzzy search SIMILARITY()/EDIT_DISTANCE()
 internal B32 qe_ir_is_fuzzy_call(IR_Node* node, B32* out_is_distance);
 internal F64 qe_str8_trigram_similarity(String8 a, String8 b);

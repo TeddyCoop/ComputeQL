@@ -85,6 +85,9 @@ entry_point(CmdLine* cmdline)
   }
   g_bench_print_samples = cmd_line_has_flag(cmdline, str8_lit("samples"));
   B32 selective = cmd_line_has_flag(cmdline, str8_lit("selective"));
+  // tec: --typed adds a third run of each filter on the typed interpreter, the same bytecode on a 32 bit stack (QE_SCAN_TYPED_INTERP:1)
+  B32 typed = cmd_line_has_flag(cmdline, str8_lit("typed"));
+  U32 mode_count = typed ? 3 : 2;
   {
     char setting[96];
     snprintf(setting, sizeof(setting), "CQL_COLUMN_ARENA_RESERVE_SIZE:%llu", row_count * sizeof(U32) + MB(256));
@@ -137,16 +140,18 @@ entry_point(CmdLine* cmdline)
     str8_list_pushf(scratch.arena, &sql_parts, ";");
     String8 sql = str8_list_join(scratch.arena, &sql_parts, 0);
     
-    U64 checksums[2] = {0};
-    for (U32 mode = 0; mode < 2; mode++)
+    U64 checksums[3] = {0};
+    for (U32 mode = 0; mode < mode_count; mode++)
     {
       settings_load_from_string(mode == 0 ? str8_lit("QE_SCAN_SIMPLE_KERNEL:1") : str8_lit("QE_SCAN_SIMPLE_KERNEL:0"));
+      settings_load_from_string(mode == 2 ? str8_lit("QE_SCAN_TYPED_INTERP:1") : str8_lit("QE_SCAN_TYPED_INTERP:0"));
       gpu_kernel_log_reset();
       U64 rows = 0;
       Bench_Stats stats = bench_run_cql_query(database, sql, &rows, &checksums[mode]);
       String8 kernels = bench_kernel_log_string(scratch.arena);
       F64 gigabytes = (F64)(row_count * k * sizeof(U32)) / 1e9;
-      char* mode_name = mode == 0 ? "scan_simple allowed" : "interpreter";
+      char* mode_names[3] = { "scan_simple allowed", "interpreter", "typed interpreter" };
+      char* mode_name = mode_names[mode];
       printf("%u predicates, %-20s exec median %8.3f ms (min %.3f max %.3f) %6.1f GB/s  kernels: %.*s\n",
              k, mode_name, stats.execute_median, stats.execute_min, stats.execute_max, gigabytes / (stats.execute_median / 1000.0), str8_varg(kernels));
       bench_report_row_begin(report);
@@ -162,22 +167,23 @@ entry_point(CmdLine* cmdline)
       bench_report_row_end(report);
       fflush(stdout);
     }
-    if (checksums[0] != checksums[1])
+    if (checksums[0] != checksums[1] || (typed && checksums[0] != checksums[2]))
     {
       mismatches += 1;
-      bench_report_warn(report, "%u predicates: the two kernels disagree", k);
-      printf("  !! MISMATCH: %u predicates, the two kernels disagree\n", k);
+      bench_report_warn(report, "%u predicates: the kernels disagree", k);
+      printf("  !! MISMATCH: %u predicates, the kernels disagree\n", k);
     }
     scratch_end(scratch);
   }
   settings_load_from_string(str8_lit("QE_SCAN_SIMPLE_KERNEL:1"));
+  settings_load_from_string(str8_lit("QE_SCAN_TYPED_INTERP:0"));
   
   if (!os_file_path_exists(str8_lit("bench_reports/")))
   {
     os_make_directory(str8_lit("bench_reports/"));
   }
   char report_path[96];
-  snprintf(report_path, sizeof(report_path), "bench_reports/interp_overhead_%llu%s_report.md", row_count, selective ? "_selective" : "");
+  snprintf(report_path, sizeof(report_path), "bench_reports/interp_overhead_%llu%s%s_report.md", row_count, selective ? "_selective" : "", typed ? "_typed" : "");
   bench_report_write(report, str8_cstring(report_path));
   
   arena_release(arena);

@@ -616,6 +616,271 @@ qe_bytecode_program_max_stack_depth(QE_BytecodeProgram* prog)
   return max_depth;
 }
 
+//~ tec: typed interpreter program
+
+internal QE_TypedKind
+qe_typed_kind_from_coltype(U32 coltype)
+{
+  switch (coltype)
+  {
+    case CQL_ColumnType_U32:
+    case CQL_ColumnType_Enum:
+    case CQL_ColumnType_Bool:
+    {
+      return QE_TypedKind_U32;
+    }
+    case CQL_ColumnType_I32:
+    case CQL_ColumnType_Date:
+    {
+      return QE_TypedKind_I32;
+    }
+    case CQL_ColumnType_F32:
+    {
+      return QE_TypedKind_F32;
+    }
+  }
+  return QE_TypedKind_Unsupported;
+}
+
+// tec: only exact conversions, 
+// so a 32 bit comparison gives the answer the double comparison gives
+internal B32
+qe_typed_const_bits(F64 value, U32 domain, U32* out_bits)
+{
+  if (value != value)
+  {
+    return 0;
+  }
+  if (domain == QE_TYPED_DOMAIN_U32)
+  {
+    if (value < 0.0 || value > 4294967295.0 || value != floor(value))
+    {
+      return 0;
+    }
+    *out_bits = (U32)value;
+    return 1;
+  }
+  if (domain == QE_TYPED_DOMAIN_I32)
+  {
+    if (value < -2147483648.0 || value > 2147483647.0 || value != floor(value))
+    {
+      return 0;
+    }
+    S32 signed_value = (S32)value;
+    *out_bits = (U32)signed_value;
+    return 1;
+  }
+  F32 narrow = (F32)value;
+  if ((F64)narrow != value)
+  {
+    return 0;
+  }
+  MemoryCopy(out_bits, &narrow, sizeof(narrow));
+  return 1;
+}
+
+// tec: gives the PUSH_CONST behind value its own entry in the typed constant table
+internal B32
+qe_typed_bind_const(QE_BytecodeProgram* prog, QE_TypedProgram* typed, QE_TypedValue value, U32 domain)
+{
+  U32 const_index = prog->words[value.operand_ip];
+  if (const_index >= prog->const_count)
+  {
+    return 0;
+  }
+  U64 bits = (U64)prog->consts[const_index * 2 + 0] | ((U64)prog->consts[const_index * 2 + 1] << 32);
+  F64 const_value = 0.0;
+  MemoryCopy(&const_value, &bits, sizeof(const_value));
+  U32 typed_bits = 0;
+  if (!qe_typed_const_bits(const_value, domain, &typed_bits))
+  {
+    return 0;
+  }
+  typed->consts[typed->const_count] = typed_bits;
+  typed->words[value.operand_ip] = (U32)typed->const_count;
+  typed->const_count += 1;
+  return 1;
+}
+
+// tec: walks the program with a stack of value kinds. 
+// returns 0 when anything in it needs the double interpreter
+internal B32
+qe_typed_program_from_bytecode(Arena* arena, QE_BytecodeProgram* prog, QE_TypedProgram* out)
+{
+  MemoryZeroStruct(out);
+  if (prog->has_score_output || prog->word_count == 0)
+  {
+    return 0;
+  }
+  out->words = push_array(arena, U32, prog->word_count);
+  out->consts = push_array(arena, U32, prog->word_count);
+  MemoryCopy(out->words, prog->words, prog->word_count * sizeof(U32));
+  
+  QE_TypedValue stack[QE_SCAN_MAX_STACK];
+  U32 sp = 0;
+  U64 ip = 0;
+  B32 halted = 0;
+  while (ip < prog->word_count && !halted)
+  {
+    U64 opcode_ip = ip;
+    U32 opcode = prog->words[ip++];
+    switch (opcode)
+    {
+      case QE_Opcode_PushTrue:
+      case QE_Opcode_PushFalse:
+      {
+        if (sp >= QE_SCAN_MAX_STACK)
+        {
+          return 0;
+        }
+        stack[sp].kind = QE_TypedKind_Bool;
+        sp += 1;
+      } break;
+      
+      case QE_Opcode_LoadNumCol:
+      {
+        if (sp >= QE_SCAN_MAX_STACK || ip >= prog->word_count)
+        {
+          return 0;
+        }
+        U32 operand = prog->words[ip++];
+        U32 coltype = (operand >> 8) & 0xff;
+        QE_TypedKind kind = qe_typed_kind_from_coltype(coltype);
+        if (kind == QE_TypedKind_Unsupported)
+        {
+          return 0;
+        }
+        stack[sp].kind = kind;
+        sp += 1;
+      } break;
+      
+      case QE_Opcode_PushConst:
+      {
+        if (sp >= QE_SCAN_MAX_STACK || ip >= prog->word_count)
+        {
+          return 0;
+        }
+        stack[sp].kind = QE_TypedKind_Const;
+        stack[sp].operand_ip = ip;
+        sp += 1;
+        ip += 1;
+      } break;
+      
+      case QE_Opcode_CmpEq:
+      case QE_Opcode_CmpNe:
+      case QE_Opcode_CmpLt:
+      case QE_Opcode_CmpGt:
+      case QE_Opcode_CmpLe:
+      case QE_Opcode_CmpGe:
+      {
+        if (sp < 2)
+        {
+          return 0;
+        }
+        QE_TypedValue b = stack[sp - 1];
+        QE_TypedValue a = stack[sp - 2];
+        sp -= 2;
+        B32 a_is_column = a.kind == QE_TypedKind_U32 || a.kind == QE_TypedKind_I32 || a.kind == QE_TypedKind_F32;
+        B32 b_is_column = b.kind == QE_TypedKind_U32 || b.kind == QE_TypedKind_I32 || b.kind == QE_TypedKind_F32;
+        B32 a_is_const = a.kind == QE_TypedKind_Const;
+        B32 b_is_const = b.kind == QE_TypedKind_Const;
+        if (!(a_is_column || a_is_const) || !(b_is_column || b_is_const) || (a_is_const && b_is_const))
+        {
+          return 0;
+        }
+        if (a_is_column && b_is_column && a.kind != b.kind)
+        {
+          return 0;
+        }
+        QE_TypedKind column_kind = a_is_column ? a.kind : b.kind;
+        U32 domain = QE_TYPED_DOMAIN_U32;
+        if (column_kind == QE_TypedKind_I32)
+        {
+          domain = QE_TYPED_DOMAIN_I32;
+        }
+        else if (column_kind == QE_TypedKind_F32)
+        {
+          domain = QE_TYPED_DOMAIN_F32;
+        }
+        if (a_is_const && !qe_typed_bind_const(prog, out, a, domain))
+        {
+          return 0;
+        }
+        if (b_is_const && !qe_typed_bind_const(prog, out, b, domain))
+        {
+          return 0;
+        }
+        out->words[opcode_ip] = opcode | (domain << QE_TYPED_DOMAIN_SHIFT);
+        stack[sp].kind = QE_TypedKind_Bool;
+        sp += 1;
+      } break;
+      
+      // tec: a float operand is out, -0.0 is false in the double interpreter but its bits are not zero
+      case QE_Opcode_And:
+      case QE_Opcode_Or:
+      {
+        if (sp < 2)
+        {
+          return 0;
+        }
+        for (U32 k = sp - 2; k < sp; k++)
+        {
+          QE_TypedKind kind = stack[k].kind;
+          if (kind != QE_TypedKind_Bool && kind != QE_TypedKind_U32 && kind != QE_TypedKind_I32)
+          {
+            return 0;
+          }
+        }
+        sp -= 1;
+        stack[sp - 1].kind = QE_TypedKind_Bool;
+      } break;
+      
+      case QE_Opcode_StrEq:
+      case QE_Opcode_StrContains:
+      case QE_Opcode_StrNe:
+      case QE_Opcode_StrLt:
+      case QE_Opcode_StrGt:
+      case QE_Opcode_StrLe:
+      case QE_Opcode_StrGe:
+      {
+        if (sp >= QE_SCAN_MAX_STACK || ip + 3 > prog->word_count)
+        {
+          return 0;
+        }
+        ip += 3;
+        stack[sp].kind = QE_TypedKind_Bool;
+        sp += 1;
+      } break;
+      
+      case QE_Opcode_Halt:
+      {
+        halted = 1;
+      } break;
+      
+      default:
+      {
+        return 0;
+      }
+    }
+  }
+  
+  if (sp == 0)
+  {
+    return 0;
+  }
+  QE_TypedKind result_kind = stack[sp - 1].kind;
+  if (result_kind != QE_TypedKind_Bool && result_kind != QE_TypedKind_U32 && result_kind != QE_TypedKind_I32)
+  {
+    return 0;
+  }
+  out->word_count = prog->word_count;
+  if (out->const_count == 0)
+  {
+    out->consts[0] = 0;
+  }
+  return 1;
+}
+
 //~ tec: double-buffered chunk prefetch for qe_scan_filter
 /*
   abackground thread loads the next chunk from disk while the main thread uploads, dispatches, and reads back the current chunk, overlapping disk IO with GPU work
@@ -2296,9 +2561,19 @@ qe_scan_filter_selected(Arena* arena, CQL_Database* database, CQL_Table* table, 
   }
   
   GPU_Kernel* kernel = use_simple ? gpu_kernel_alloc(str8_lit("scan_simple")) : 0;
+  QE_TypedProgram typed_prog = {0};
+  B32 use_typed = 0;
   if (!kernel)
   {
     use_simple = 0;
+    if (settings_u64(str8_lit("QE_SCAN_TYPED_INTERP"), 0) != 0 && qe_typed_program_from_bytecode(arena, prog, &typed_prog))
+    {
+      kernel = gpu_kernel_alloc(str8_lit("scan_filter_typed"));
+      use_typed = kernel != 0;
+    }
+  }
+  if (!kernel)
+  {
     kernel = gpu_kernel_alloc(str8_lit("scan_filter"));
   }
   if (!kernel)
@@ -2311,25 +2586,43 @@ qe_scan_filter_selected(Arena* arena, CQL_Database* database, CQL_Table* table, 
   {
     out_trace->strategy_reason = str8_lit("numeric comparisons only, scan_simple kernel");
   }
+  if (out_trace && use_typed)
+  {
+    out_trace->strategy_reason = str8_lit("32 bit operands only, typed interpreter");
+  }
   
-  U32* program_words = use_simple ? simple_words : prog->words;
-  U64 program_word_count = use_simple ? (1 + (U64)simple_words[0] * 6) : prog->word_count;
+  U32* program_words = prog->words;
+  U64 program_word_count = prog->word_count;
+  U32* const_words = prog->consts;
+  U64 const_word_count = prog->const_count * 2;
+  if (use_simple)
+  {
+    program_words = simple_words;
+    program_word_count = 1 + (U64)simple_words[0] * 6;
+  }
+  else if (use_typed)
+  {
+    program_words = typed_prog.words;
+    program_word_count = typed_prog.word_count;
+    const_words = typed_prog.consts;
+    const_word_count = typed_prog.const_count;
+  }
   
   //- tec: upload the (query invariant) bytecode + constant pool buffers
   GPU_Buffer* bytecode_buffer = gpu_buffer_alloc_pooled(str8_lit("scan_filter_bytecode"), Max(program_word_count, (U64)1) * sizeof(U32), GPU_BufferFlag_Write, 0);
-  GPU_Buffer* num_consts_buffer = gpu_buffer_alloc_pooled(str8_lit("scan_filter_num_consts"), Max(prog->const_count * 2, 1) * sizeof(U32), GPU_BufferFlag_Write, 0);
+  GPU_Buffer* num_consts_buffer = gpu_buffer_alloc_pooled(str8_lit("scan_filter_num_consts"), Max(const_word_count, (U64)1) * sizeof(U32), GPU_BufferFlag_Write, 0);
   GPU_Buffer* str_consts_buffer = gpu_buffer_alloc_pooled(str8_lit("scan_filter_str_consts"), Max(prog->str_const_pool_size, 4), GPU_BufferFlag_Write, 0);
   
   {
     U64 word_bytes = program_word_count * sizeof(U32);
-    U64 num_consts_bytes = prog->const_count * 2 * sizeof(U32);
+    U64 num_consts_bytes = const_word_count * sizeof(U32);
     U64 str_bytes = prog->str_const_pool_size;
     
     GPU_Batch* prog_batch = gpu_batch_begin(word_bytes + num_consts_bytes + str_bytes, 0);
     gpu_batch_buffer_write(prog_batch, bytecode_buffer, program_words, word_bytes);
-    if (prog->const_count > 0)
+    if (const_word_count > 0)
     {
-      gpu_batch_buffer_write(prog_batch, num_consts_buffer, prog->consts, num_consts_bytes);
+      gpu_batch_buffer_write(prog_batch, num_consts_buffer, const_words, num_consts_bytes);
     }
     if (prog->str_const_pool_size > 0)
     {

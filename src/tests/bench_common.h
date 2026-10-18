@@ -165,6 +165,9 @@ struct Bench_Stats
 // tec: --samples prints every timed run of a query, to see whether a mean and a median differ because the runs fall into two groups
 global B32 g_bench_print_samples = 0;
 
+typedef void Bench_BeforeRunFunc(void);
+global Bench_BeforeRunFunc* g_bench_cql_before_timed_run = 0;
+
 internal void
 bench_sort_f64(F64* a, U64 n)
 {
@@ -435,6 +438,11 @@ bench_run_cql_query(CQL_Database* database, String8 sql_text, U64* out_row_count
   
   for (U64 run = 0; run < BENCH_TIMED_RUNS; run++)
   {
+    if (g_bench_cql_before_timed_run)
+    {
+      g_bench_cql_before_timed_run();
+    }
+    
     Temp scratch = scratch_begin(0, 0);
     Arena* arena = scratch.arena;
     

@@ -270,6 +270,24 @@ ss_load_key_dimension(CQL_Database* database, U64 fact_row_count)
   table->row_count = g_ss_big_dim_rows;
 }
 
+// tec: --only=<part of a label> runs the matching queries, and "a|b" runs the queries that match either part
+internal B32
+ss_label_selected(String8 label, String8List only_parts)
+{
+  if (only_parts.node_count == 0)
+  {
+    return 1;
+  }
+  for (String8Node* node = only_parts.first; node; node = node->next)
+  {
+    if (str8_find_needle(label, 0, node->string, 0) < label.size)
+    {
+      return 1;
+    }
+  }
+  return 0;
+}
+
 internal void
 ss_load_dimensions_cql(CQL_Database* database, U64 fact_row_count)
 {
@@ -1085,6 +1103,9 @@ entry_point(CmdLine* cmdline)
   // tec: text written between the rows of a markdown table ends the table, so the notes wait until it is complete
   String8List notes = {0};
   
+  U8 only_split[] = { '|' };
+  String8List only_parts = str8_split(arena, only, only_split, ArrayCount(only_split), 0);
+  
   U64 failures = 0;
   for (U64 i = 0; i < case_count; i++)
   {
@@ -1092,8 +1113,8 @@ entry_point(CmdLine* cmdline)
     String8 label = str8_cstring(test_case->label);
     String8 sql = str8_cstring(test_case->sql);
     
-    // tec: --only=<part of a label> runs the matching queries, avoid parentheses and spaces in it, cmd mangles them
-    if (only.size > 0 && str8_find_needle(label, 0, only, 0) >= label.size)
+    // tec: avoid parentheses and spaces in --only when it goes through cmd, cmd mangles them
+    if (!ss_label_selected(label, only_parts))
     {
       continue;
     }
