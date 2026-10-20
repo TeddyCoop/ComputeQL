@@ -261,6 +261,10 @@ struct CQL_Column
   B32 agg_key_whole;
   S64 agg_key_min;
   S64 agg_key_max;
+  
+  //- tec: whether every value of a 64 bit whole number column stays exact as a double, numbers are compared, hashed and summed as doubles
+  U64 f64_exact_generation;
+  B32 f64_exact;
   void* agg_f64_buffer;
   void* agg_f32_buffer;
   
@@ -575,6 +579,8 @@ struct CQL_ZoneMapBuildCtx
 internal F64 cql_numeric_value_as_f64(CQL_ColumnType type, void* data);
 internal B32 cql_column_type_is_zone_map_eligible(CQL_ColumnType type);
 internal void cql_column_ensure_zone_map(CQL_Column* column);
+internal B32 cql_column_type_is_wide_int(CQL_ColumnType type);
+internal B32 cql_column_values_exact_in_f64(CQL_Column* column);
 
 internal String8 cql_generate_disk_path_for_column(Arena* arena, CQL_Column* column);
 internal void cql_column_convert_to_disk_backed(CQL_Column* column);

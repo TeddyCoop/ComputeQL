@@ -312,12 +312,20 @@ gpu_vulkan_init(void)
   VkExtensionProperties *ext_props = push_array(arena, VkExtensionProperties, ext_count);
   vkEnumerateDeviceExtensionProperties(selected, 0, &ext_count, ext_props);
   
-  char *enabled_extensions[2];
+  char *enabled_extensions[3];
   U32 enabled_extension_count = 0;
   U64 budget_ext_name_size = cstring8_length((U8*)VK_EXT_MEMORY_BUDGET_EXTENSION_NAME) + 1;
   U64 ext_mem_host_name_size = cstring8_length((U8*)VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME) + 1;
+  U64 shader_info_name_size = cstring8_length((U8*)VK_AMD_SHADER_INFO_EXTENSION_NAME) + 1;
+  B32 want_shader_info = settings_u64(str8_lit("GPU_VULKAN_SHADER_INFO"), 0) != 0;
   for (U32 i = 0; i < ext_count; i++)
   {
+    if (want_shader_info && MemoryMatch(ext_props[i].extensionName, VK_AMD_SHADER_INFO_EXTENSION_NAME, shader_info_name_size))
+    {
+      enabled_extensions[enabled_extension_count++] = VK_AMD_SHADER_INFO_EXTENSION_NAME;
+      g_vulkan_state->has_shader_info_ext = 1;
+      continue;
+    }
     if (MemoryMatch(ext_props[i].extensionName, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME, budget_ext_name_size))
     {
       enabled_extensions[enabled_extension_count++] = VK_EXT_MEMORY_BUDGET_EXTENSION_NAME;
@@ -462,7 +470,16 @@ gpu_vulkan_init(void)
       g_vulkan_state->has_external_memory_host_ext = 0;
     }
   }
-  
+
+  if (g_vulkan_state->has_shader_info_ext)
+  {
+    g_vulkan_state->vkGetShaderInfoAMD_fn = (PFN_vkGetShaderInfoAMD)vkGetDeviceProcAddr(g_vulkan_state->device, "vkGetShaderInfoAMD");
+    if (!g_vulkan_state->vkGetShaderInfoAMD_fn)
+    {
+      g_vulkan_state->has_shader_info_ext = 0;
+    }
+  }
+
   //- tec: command pool
   VkCommandPoolCreateInfo pool_info =
   {

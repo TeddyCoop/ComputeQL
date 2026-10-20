@@ -68,6 +68,14 @@ internal CQL_Table* plan_materialized_to_temp_table(CQL_Database* database, Stri
 internal B32 plan_value_to_ir_node(Arena* arena, PLAN_AggColumn* col, U64 row, IR_Node* out);
 internal B32 plan_run_select_materialized(Arena* arena, CQL_Database* database, IR_Node* select_ir, PLAN_Materialized* out);
 
+//~ tec: 64 bit whole numbers past 2^53
+// numbers are compared, hashed, grouped, sorted and summed as doubles, so a query that would do that to such a value fails instead of answering wrongly
+thread_static U32 g_plan_materialize_depth = 0;
+internal B32 plan_numeric_literal_exact_in_f64(String8 text);
+internal B32 plan_ir_has_type(IR_Node* node, IR_NodeType type);
+internal B32 plan_wide_int_check_node(CQL_Database* database, IR_Node* node, IR_Node* bare_list, CQL_Table** tables, U64 table_count, String8* out_name);
+internal B32 plan_wide_int_check(Arena* arena, CQL_Database* database, IR_Node* select_ir, String8* out_name);
+
 //~ tec: subqueries and derived tables
 typedef struct PLAN_SubqueryTable PLAN_SubqueryTable;
 struct PLAN_SubqueryTable

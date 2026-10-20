@@ -2850,6 +2850,153 @@ plan_window_apply(Arena* arena, PLAN_RowSet* rows, IR_Node* column_list_ir, IR_N
   return 1;
 }
 
+// tec: false for a whole number literal past 2^53, it has no exact double. a literal with a point or an exponent is already a double
+internal B32
+plan_numeric_literal_exact_in_f64(String8 text)
+{
+  U64 start = 0;
+  if (start < text.size && (text.str[start] == '-' || text.str[start] == '+'))
+  {
+    start += 1;
+  }
+  while (start + 1 < text.size && text.str[start] == '0')
+  {
+    start += 1;
+  }
+  for (U64 i = start; i < text.size; i++)
+  {
+    if (text.str[i] < '0' || text.str[i] > '9')
+    {
+      return 1;
+    }
+  }
+
+  String8 digits = str8_skip(text, start);
+  String8 limit = str8_lit("9007199254740992");
+  if (digits.size != limit.size)
+  {
+    return digits.size < limit.size;
+  }
+  for (U64 i = 0; i < digits.size; i++)
+  {
+    if (digits.str[i] != limit.str[i])
+    {
+      return digits.str[i] < limit.str[i];
+    }
+  }
+  return 1;
+}
+
+internal B32
+plan_ir_has_type(IR_Node* node, IR_NodeType type)
+{
+  if (node->type == type)
+  {
+    return 1;
+  }
+  for (IR_Node* child = node->first; child != NULL; child = child->next)
+  {
+    if (plan_ir_has_type(child, type))
+    {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+// tec: false when node or a node under it uses a 64 bit column holding a value a double can not hold, or a literal like that
+// a column directly in bare_list is only copied to the result, so it is allowed
+internal B32
+plan_wide_int_check_node(CQL_Database* database, IR_Node* node, IR_Node* bare_list, CQL_Table** tables, U64 table_count, String8* out_name)
+{
+  // tec: a literal is only a problem next to a 64 bit column, every other column type is exact as a double and orders the same against the rounded literal
+  if (table_count > 0 && node->type == IR_NodeType_Numeric && !plan_numeric_literal_exact_in_f64(node->value))
+  {
+    *out_name = node->value;
+    return 0;
+  }
+
+  if (node->type == IR_NodeType_Column && !(bare_list && node->parent == bare_list))
+  {
+    String8 name = node->value;
+    for (U64 i = name.size; i > 0; i--)
+    {
+      if (name.str[i - 1] == '.')
+      {
+        name = str8_skip(name, i);
+        break;
+      }
+    }
+    for (U64 t = 0; t < table_count; t++)
+    {
+      for (U64 c = 0; c < tables[t]->column_count; c++)
+      {
+        CQL_Column* column = tables[t]->columns[c];
+        if (str8_match(column->name, name, 0) && !cql_column_values_exact_in_f64(column))
+        {
+          *out_name = node->value;
+          return 0;
+        }
+      }
+    }
+  }
+
+  for (IR_Node* child = node->first; child != NULL; child = child->next)
+  {
+    if (!plan_wide_int_check_node(database, child, bare_list, tables, table_count, out_name))
+    {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+internal B32
+plan_wide_int_check(Arena* arena, CQL_Database* database, IR_Node* select_ir, String8* out_name)
+{
+  // tec: every table named anywhere in the query, a column name is matched against all of them, which can only fail more queries than needed
+  U64 table_cap = 64;
+  CQL_Table** tables = push_array(arena, CQL_Table*, table_cap);
+  U64 table_count = 0;
+  B32 any_wide = 0;
+  IR_Node* stack[256];
+  U64 depth = 0;
+  stack[depth++] = select_ir;
+  while (depth > 0)
+  {
+    IR_Node* node = stack[--depth];
+    if (node->type == IR_NodeType_Table && table_count < table_cap)
+    {
+      CQL_Table* table = plan_find_table_quiet(database, node->value);
+      if (table)
+      {
+        tables[table_count++] = table;
+        for (U64 c = 0; c < table->column_count; c++)
+        {
+          any_wide = any_wide || cql_column_type_is_wide_int(table->columns[c]->type);
+        }
+      }
+    }
+    for (IR_Node* child = node->first; child != NULL && depth < ArrayCount(stack); child = child->next)
+    {
+      stack[depth++] = child;
+    }
+  }
+  if (!any_wide)
+  {
+    table_count = 0;
+  }
+
+  // tec: a row set result reads its columns from the table as stored, an aggregate, a window or a nested select puts every value through a double
+  IR_Node* bare_list = 0;
+  if (g_plan_materialize_depth == 0 && !plan_ir_has_type(select_ir, IR_NodeType_GroupBy) && !plan_ir_has_type(select_ir, IR_NodeType_AggregateCall) &&
+      !plan_ir_has_type(select_ir, IR_NodeType_Window))
+  {
+    bare_list = ir_node_find_child(select_ir, IR_NodeType_ColumnList);
+  }
+  return plan_wide_int_check_node(database, select_ir, bare_list, tables, table_count, out_name);
+}
+
 internal PLAN_ExecResult
 plan_run_select(Arena* arena, CQL_Database* database, IR_Node* select_ir, QE_TraceCtx* trace)
 {
@@ -2924,7 +3071,15 @@ plan_run_select_with_plan(Arena* arena, CQL_Database* database, IR_Node* select_
   }
   
   ir_expand_star_to_columns(arena, database, select_ir);
-  
+
+  String8 wide_name = {0};
+  if (settings_u64(str8_lit("QE_WIDE_INT_CHECK"), 1) != 0 && !plan_wide_int_check(arena, database, select_ir, &wide_name))
+  {
+    log_error("query failed: '%.*s' is a 64 bit whole number past 2^53, which this engine would compare, group, sort or sum as an inexact double",
+              str8_varg(wide_name));
+    return failed;
+  }
+
   PLAN_Node* plan = plan_build_from_select(arena, database, select_ir);
   if (out_plan)
   {
@@ -3017,8 +3172,10 @@ internal B32
 plan_run_select_materialized(Arena* arena, CQL_Database* database, IR_Node* select_ir, PLAN_Materialized* out)
 {
   U64 temp_mark = database->temp_table_count;
-  
+
+  g_plan_materialize_depth += 1;
   PLAN_ExecResult result = plan_run_select(arena, database, select_ir, NULL);
+  g_plan_materialize_depth -= 1;
   B32 ok = result.supported;
   if (ok)
   {

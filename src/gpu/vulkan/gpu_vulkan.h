@@ -141,7 +141,11 @@ struct GPU_VulkanState
   B32 has_external_memory_host_ext;
   U64 min_imported_host_pointer_alignment;
   PFN_vkGetMemoryHostPointerPropertiesEXT vkGetMemoryHostPointerPropertiesEXT_fn;
-  
+
+  // tec: VK_AMD_shader_info, only turned on by GPU_VULKAN_SHADER_INFO for reading a kernel's register and scratch use
+  B32 has_shader_info_ext;
+  PFN_vkGetShaderInfoAMD vkGetShaderInfoAMD_fn;
+
   // tec: Resizable BAR
   // a memory type that's both DEVICE_LOCAL and HOST_VISIBLE lets gpu_buffer_alloc write straight into vram with a memcpy,
   // skipping the staging-buffer + vkCmdCopyBuffer round trip entirely

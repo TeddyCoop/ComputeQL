@@ -340,6 +340,32 @@ ss_load_duckdb(duckdb_connection conn, U64 row_count)
   return loaded;
 }
 
+// tec: one line per column and compression of scale_events, with its segment and row counts
+internal void
+ss_print_duckdb_storage(duckdb_connection conn, char* label)
+{
+  duckdb_result result = {0};
+  char* sql = "SELECT column_name, compression, count(*), sum(count) FROM pragma_storage_info('scale_events') "
+              "WHERE segment_type <> 'VALIDITY' GROUP BY ALL ORDER BY ALL;";
+  if (duckdb_query(conn, sql, &result) != DuckDBSuccess)
+  {
+    log_error("duckdb storage_info failed: %s", duckdb_result_error(&result));
+    duckdb_destroy_result(&result);
+    return;
+  }
+  printf("duckdb storage of scale_events, %s:\n", label);
+  idx_t rows = duckdb_row_count(&result);
+  for (idx_t row = 0; row < rows; row++)
+  {
+    char* column = duckdb_value_varchar(&result, 0, row);
+    char* compression = duckdb_value_varchar(&result, 1, row);
+    printf("  %-12s %-14s %8llu segments %14llu rows\n", column, compression, (U64)duckdb_value_int64(&result, 2, row), (U64)duckdb_value_int64(&result, 3, row));
+    duckdb_free(column);
+    duckdb_free(compression);
+  }
+  duckdb_destroy_result(&result);
+}
+
 //~ tec: verification run, reads the answer back from the engine
 
 internal SS_Result
@@ -970,7 +996,39 @@ entry_point(CmdLine* cmdline)
       duckdb_close(&duckdb_db);
       run_duckdb = 0;
     }
-    
+
+    // tec: --storage_info prints how duckdb stored the table as loaded, then after a CHECKPOINT, and ends the run there
+    if (run_duckdb && cmd_line_has_flag(cmdline, str8_lit("storage_info")))
+    {
+      ss_print_duckdb_storage(duckdb_conn, "as loaded");
+      duckdb_result checkpoint_result = {0};
+      if (duckdb_query(duckdb_conn, "CHECKPOINT;", &checkpoint_result) != DuckDBSuccess)
+      {
+        log_error("duckdb CHECKPOINT failed: %s", duckdb_result_error(&checkpoint_result));
+      }
+      duckdb_destroy_result(&checkpoint_result);
+      ss_print_duckdb_storage(duckdb_conn, "after CHECKPOINT");
+      duckdb_disconnect(&duckdb_conn);
+      duckdb_close(&duckdb_db);
+      return;
+    }
+
+    // tec: --duckdb_checkpoint compresses duckdb's table before the timed queries, which a table built by CREATE TABLE AS in memory is not otherwise
+    if (run_duckdb && cmd_line_has_flag(cmdline, str8_lit("duckdb_checkpoint")))
+    {
+      U64 checkpoint_start = os_now_microseconds();
+      duckdb_result checkpoint_result = {0};
+      if (duckdb_query(duckdb_conn, "CHECKPOINT;", &checkpoint_result) != DuckDBSuccess)
+      {
+        log_error("duckdb CHECKPOINT failed: %s", duckdb_result_error(&checkpoint_result));
+      }
+      duckdb_destroy_result(&checkpoint_result);
+      F64 checkpoint_seconds = (F64)(os_now_microseconds() - checkpoint_start) / 1000000.0;
+      printf("duckdb checkpoint %8.2f s\n", checkpoint_seconds);
+      bench_report_text(report, "duckdb table checkpointed before the timed queries (--duckdb_checkpoint), %.2f s", checkpoint_seconds);
+      ss_print_duckdb_storage(duckdb_conn, "before the timed queries");
+    }
+
     // tec: --duckdb_narrow adds a second copy with region_id as TINYINT and amount as SMALLINT, 
     //  which is how duckdb would be given these columns by someone tuning for it. 
     // it costs the memory of a second copy

@@ -3751,6 +3751,69 @@ internal THREAD_POOL_TASK_FUNC(cql_zone_map_build_task)
   }
 }
 
+internal B32
+cql_column_type_is_wide_int(CQL_ColumnType type)
+{
+  return type == CQL_ColumnType_U64 || type == CQL_ColumnType_I64 || type == CQL_ColumnType_Timestamp || type == CQL_ColumnType_Decimal;
+}
+
+// tec: a double holds every whole number up to 2^53 and no further, past that two different values can become the same double
+internal B32
+cql_column_values_exact_in_f64(CQL_Column* column)
+{
+  if (!cql_column_type_is_wide_int(column->type))
+  {
+    return 1;
+  }
+  if (column->f64_exact_generation == column->write_generation)
+  {
+    return column->f64_exact;
+  }
+
+  B32 exact = 1;
+  U64 count = column->row_count;
+  if (count > 0)
+  {
+    Temp scratch = scratch_begin(0, 0);
+    U64 range_size = 0;
+    U8* data = (U8*)cql_column_get_data_range(scratch.arena, column, r1u64(0, count), &range_size);
+    if (!data)
+    {
+      exact = 0;
+    }
+    else if (column->type == CQL_ColumnType_U64)
+    {
+      U64* values = (U64*)data;
+      for (U64 i = 0; i < count; i++)
+      {
+        if (values[i] > (1ull << 53))
+        {
+          exact = 0;
+          break;
+        }
+      }
+    }
+    else
+    {
+      S64* values = (S64*)data;
+      S64 limit = (S64)(1ull << 53);
+      for (U64 i = 0; i < count; i++)
+      {
+        if (values[i] > limit || values[i] < -limit)
+        {
+          exact = 0;
+          break;
+        }
+      }
+    }
+    scratch_end(scratch);
+  }
+
+  column->f64_exact = exact;
+  column->f64_exact_generation = column->write_generation;
+  return exact;
+}
+
 internal void
 cql_column_ensure_zone_map(CQL_Column* column)
 {
