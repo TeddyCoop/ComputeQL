@@ -38,6 +38,9 @@
 
 #define WI_TWO_53 9007199254740992ull
 
+#define WI_SUM_ROWS  2500000ull
+#define WI_HASH_ROWS 300000ull
+
 global U64 g_wi_rows = 512;
 
 typedef enum WI_Kind
@@ -146,6 +149,32 @@ wi_load_tables(CQL_Database* database)
     q_b[row] = (U32)((row * 2) % 7);
   }
   q->row_count = g_wi_rows / 2;
+
+  // tec: sums that grow past 2^53 from 32 bit columns, no value is wide. u.v summed over all rows is about 1.07e16
+  CQL_Table* u = wi_table(database, "u");
+  cql_table_add_column(u, cql_column_schema_create(str8_lit("g"), CQL_ColumnType_U32));
+  cql_table_add_column(u, cql_column_schema_create(str8_lit("v"), CQL_ColumnType_U32));
+  U32* u_g = (U32*)cql_column_alloc_fixed_rows(u->columns[0], WI_SUM_ROWS);
+  U32* u_v = (U32*)cql_column_alloc_fixed_rows(u->columns[1], WI_SUM_ROWS);
+  for (U64 row = 0; row < WI_SUM_ROWS; row++)
+  {
+    u_g[row] = (U32)row;
+    u_v[row] = 4294967295u;
+  }
+  u->row_count = WI_SUM_ROWS;
+
+  // tec: groups of three rows, each group's sum is 50331645, whole but not a float: a float sum of the three rounds. keys are far apart so no dense kernel
+  CQL_Table* h = wi_table(database, "h");
+  cql_table_add_column(h, cql_column_schema_create(str8_lit("k"), CQL_ColumnType_U32));
+  cql_table_add_column(h, cql_column_schema_create(str8_lit("v"), CQL_ColumnType_U32));
+  U32* h_k = (U32*)cql_column_alloc_fixed_rows(h->columns[0], WI_HASH_ROWS);
+  U32* h_v = (U32*)cql_column_alloc_fixed_rows(h->columns[1], WI_HASH_ROWS);
+  for (U64 row = 0; row < WI_HASH_ROWS; row++)
+  {
+    h_k[row] = (U32)(row / 3) * 1000u;
+    h_v[row] = 16777215u;
+  }
+  h->row_count = WI_HASH_ROWS;
 }
 
 internal WI_Outcome
@@ -248,6 +277,10 @@ entry_point(CmdLine* cmdline)
     { "SELECT k, COUNT(*) FROM c GROUP BY k;", WI_Kind_RowCount, g_wi_rows, 1 },
     { "SELECT MAX(k) FROM c;", WI_Kind_Value, WI_TWO_53 / 2 + g_wi_rows - 1, 1 },
     { "SELECT COUNT(*) FROM p JOIN q ON p.a = q.a AND p.b = q.b;", WI_Kind_Value, g_wi_rows / 2, 1 },
+    { "SELECT SUM(v) FROM u;", WI_Kind_Value, WI_SUM_ROWS * 4294967295ull, 0 },
+    { "SELECT SUM(v), COUNT(*) FROM u;", WI_Kind_Value, WI_SUM_ROWS * 4294967295ull, 0 },
+    { "SELECT SUM(v) FROM u WHERE g < 1000000;", WI_Kind_Value, 1000000ull * 4294967295ull, 1 },
+    { "SELECT SUM(v), k FROM h GROUP BY k;", WI_Kind_Value, 50331645, 1 },
   };
 
   U64 failures = 0;

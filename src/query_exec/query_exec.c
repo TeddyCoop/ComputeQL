@@ -6699,6 +6699,39 @@ qe_agg_copy_results(F64* values, F64* results, U64 stride, U64 expr, U64 num_gro
 }
 
 // tec: assembles the final materialized result in column_list order
+// tec: the double accumulators of the aggregate kernels add whole numbers exactly only while the running sum stays below 2^53
+global U64 g_qe_exactness_failures = 0;
+
+internal U64
+qe_exactness_failure_count(void)
+{
+  return g_qe_exactness_failures;
+}
+
+// tec: a SUM of a whole number column that reached 2^53 may have lost its low digits, so the query fails instead of returning it
+internal void
+qe_aggregate_check_sum_exact(QE_AggExprInfo* expr, F64* values, U64 count)
+{
+  if (expr->func_code != QE_AGG_FUNC_SUM || !expr->arg_column || settings_u64(str8_lit("QE_WIDE_INT_CHECK"), 1) == 0)
+  {
+    return;
+  }
+  CQL_ColumnType type = expr->arg_column->type;
+  if (type != CQL_ColumnType_U32 && type != CQL_ColumnType_I32 && type != CQL_ColumnType_U64 && type != CQL_ColumnType_I64)
+  {
+    return;
+  }
+  for (U64 g = 0; g < count; g += 1)
+  {
+    if (values[g] >= 9007199254740992.0 || values[g] <= -9007199254740992.0)
+    {
+      log_error("qe_aggregate: %.*s reached 2^53, which the engine adds as an inexact double", str8_varg(expr->display_name));
+      g_qe_exactness_failures += 1;
+      return;
+    }
+  }
+}
+
 internal PLAN_Materialized
 qe_aggregate_build_output(Arena* arena, PLAN_RowSet* input, IR_Node* column_list_ir, QE_AggExprInfo* exprs, U32 num_exprs,
                           U64 num_groups, U64* representative_readback, F64* results_readback)
@@ -6730,6 +6763,7 @@ qe_aggregate_build_output(Arena* arena, PLAN_RowSet* input, IR_Node* column_list
       qe_agg_output_type_for_expr(&exprs[e], &dst->type, &dst->decimal_scale, &dst->enum_type);
       dst->numeric_values = push_array(arena, F64, Max(num_groups, 1));
       qe_agg_copy_results(dst->numeric_values, results_readback, num_exprs, e, num_groups);
+      qe_aggregate_check_sum_exact(&exprs[e], dst->numeric_values, num_groups);
       out_count++;
     }
     else if (item->type == IR_NodeType_Column)
@@ -7053,7 +7087,7 @@ qe_aggregate(Arena* arena, CQL_Database* database, PLAN_RowSet* input, IR_Node* 
   return qe_aggregate_impl(arena, database, input, group_by_ir, column_list_ir, having_ir, hints, out_trace, 0, 0);
 }
 
-// tec: the F32 hash reduce is allowed with few rows per group, or when every SUM and AVG argument is a whole number whose largest group sum is exact in F32
+// tec: the F32 hash reduce is allowed when every SUM and AVG argument is a whole number whose largest group sum is exact in F32, and the average rows per group is small enough for the atomics
 internal B32
 qe_aggregate_hash_allowed(QE_AggExprInfo* exprs, U32 num_exprs, U32* arg_owner, F64* arg_int_bound, U64 row_count, U64 num_groups, U64 max_group_rows, U64 cap, U64 exact_cap, B32 fixed_ok, U64 fixed_cap)
 {
@@ -7062,11 +7096,7 @@ qe_aggregate_hash_allowed(QE_AggExprInfo* exprs, U32 num_exprs, U32* arg_owner, 
   {
     return average_rows <= fixed_cap;
   }
-  if (average_rows <= cap)
-  {
-    return 1;
-  }
-  if (average_rows > exact_cap)
+  if (average_rows > Max(cap, exact_cap))
   {
     return 0;
   }

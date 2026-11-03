@@ -3088,6 +3088,7 @@ plan_run_select_with_plan(Arena* arena, CQL_Database* database, IR_Node* select_
   
   // tec: many GPU paths do not check every buffer they allocate, so a device allocation that failed  during the query fails the whole query instead of returning what the kernels made of a missing buffer
   U64 failures_before = gpu_failure_count();
+  U64 exactness_before = qe_exactness_failure_count();
   PLAN_ExecResult result = plan_execute(arena, database, plan, select_ir, trace);
   U64 failures_after = gpu_failure_count();
   // tec: QE_GPU_FAILURE_CHECK:0 returns the result anyway, only for the fault injection test to count what the check catches
@@ -3096,6 +3097,10 @@ plan_run_select_with_plan(Arena* arena, CQL_Database* database, IR_Node* select_
   {
     log_error("query failed: %llu GPU device memory allocation(s) or GPU operations on a missing buffer failed while it ran%s", failures_after - failures_before,
               gpu_device_lost() ? ", and the device was lost" : "");
+    return failed;
+  }
+  if (qe_exactness_failure_count() != exactness_before)
+  {
     return failed;
   }
   return result;
