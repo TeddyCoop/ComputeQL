@@ -72,6 +72,15 @@ gpu_vulkan_init(void)
   g_vulkan_state->kernel_cache_cap = (U32)kernel_cache_cap;
   g_vulkan_state->kernel_cache = push_array(arena, GPU_VulkanKernel*, kernel_cache_cap);
   
+  U64 generated_kernel_cap = settings_u64(str8_lit("GPU_VULKAN_MAX_GENERATED_KERNELS"), 64);
+  if (generated_kernel_cap < 8)
+  {
+    generated_kernel_cap = 8;
+  }
+  g_vulkan_state->generated_kernel_cap = (U32)generated_kernel_cap;
+  g_vulkan_state->generated_kernels = push_array(arena, GPU_VulkanKernel*, generated_kernel_cap);
+  g_vulkan_state->generated_kernel_last_use = push_array(arena, U64, generated_kernel_cap);
+  
   U64 pooled_buffer_cap = settings_u64(str8_lit("GPU_VULKAN_MAX_POOLED_BUFFERS"), 128);
   g_vulkan_state->pooled_buffer_cap = (U32)pooled_buffer_cap;
   g_vulkan_state->pooled_buffers = push_array(arena, GPU_PooledBuffer, pooled_buffer_cap);
@@ -666,6 +675,12 @@ gpu_vulkan_release(void)
   for (U32 i = 0; i < g_vulkan_state->kernel_cache_count; i++)
   {
     GPU_VulkanKernel* kernel = g_vulkan_state->kernel_cache[i];
+    vkDestroyPipeline(g_vulkan_state->device, kernel->pipeline, 0);
+    vkDestroyShaderModule(g_vulkan_state->device, kernel->shader, 0);
+  }
+  for (U32 i = 0; i < g_vulkan_state->generated_kernel_count; i++)
+  {
+    GPU_VulkanKernel* kernel = g_vulkan_state->generated_kernels[i];
     vkDestroyPipeline(g_vulkan_state->device, kernel->pipeline, 0);
     vkDestroyShaderModule(g_vulkan_state->device, kernel->shader, 0);
   }
@@ -2368,6 +2383,75 @@ gpu_vulkan_load_spirv_from_disk(Arena* arena, String8 kernel_name)
   return result;
 }
 
+// tec: builds the pipeline for a SPIR-V blob. `reuse` is a kernel struct to fill in, or 0 to allocate one from `arena`
+internal GPU_VulkanKernel*
+gpu_vulkan_kernel_create(Arena* arena, String8 name, String8 spirv_bin, GPU_VulkanKernel* kernel)
+{
+  VkShaderModuleCreateInfo shader_info =
+  {
+    .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+    .codeSize = spirv_bin.size,
+    .pCode = (U32*)spirv_bin.str,
+  };
+  
+  VkShaderModule shader;
+  if (vkCreateShaderModule(g_vulkan_state->device, &shader_info, 0, &shader) != VK_SUCCESS)
+  {
+    log_error("failed to create Vulkan shader module for kernel '%.*s'", str8_varg(name));
+    return 0;
+  }
+  
+  VkComputePipelineCreateInfo pipeline_info =
+  {
+    .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+    .stage =
+    {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+      .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+      .module = shader,
+      .pName = "main",
+    },
+    .layout = g_vulkan_state->shared_pipeline_layout,
+  };
+  
+  VkPipeline pipeline;
+  if (vkCreateComputePipelines(g_vulkan_state->device, 0, 1, &pipeline_info, 0, &pipeline) != VK_SUCCESS)
+  {
+    log_error("failed to create Vulkan compute pipeline for kernel '%.*s'", str8_varg(name));
+    vkDestroyShaderModule(g_vulkan_state->device, shader, 0);
+    return 0;
+  }
+  
+  VkDescriptorSetAllocateInfo desc_alloc_info =
+  {
+    .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+    .descriptorPool = g_vulkan_state->descriptor_pool,
+    .descriptorSetCount = 1,
+    .pSetLayouts = &g_vulkan_state->shared_descriptor_set_layout,
+  };
+  
+  VkDescriptorSet descriptor_set;
+  if (vkAllocateDescriptorSets(g_vulkan_state->device, &desc_alloc_info, &descriptor_set) != VK_SUCCESS)
+  {
+    log_error("failed to allocate Vulkan descriptor set for kernel '%.*s'", str8_varg(name));
+    vkDestroyPipeline(g_vulkan_state->device, pipeline, 0);
+    vkDestroyShaderModule(g_vulkan_state->device, shader, 0);
+    return 0;
+  }
+  
+  if (!kernel)
+  {
+    kernel = push_array(arena, GPU_VulkanKernel, 1);
+  }
+  MemoryZeroStruct(kernel);
+  kernel->name = push_str8_copy(arena, name);
+  kernel->shader = shader;
+  kernel->pipeline = pipeline;
+  kernel->descriptor_set = descriptor_set;
+  
+  return kernel;
+}
+
 internal GPU_Kernel*
 gpu_vulkan_kernel_alloc(String8 name)
 {
@@ -2390,66 +2474,12 @@ gpu_vulkan_kernel_alloc(String8 name)
     return 0;
   }
   
-  VkShaderModuleCreateInfo shader_info =
+  GPU_VulkanKernel* kernel = gpu_vulkan_kernel_create(g_vulkan_state->arena, name, spirv_bin, 0);
+  if (!kernel)
   {
-    .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-    .codeSize = spirv_bin.size,
-    .pCode = (U32*)spirv_bin.str,
-  };
-  
-  VkShaderModule shader;
-  if (vkCreateShaderModule(g_vulkan_state->device, &shader_info, 0, &shader) != VK_SUCCESS)
-  {
-    log_error("failed to create Vulkan shader module for kernel '%.*s'", str8_varg(name));
     ProfEnd();
     return 0;
   }
-  
-  VkComputePipelineCreateInfo pipeline_info =
-  {
-    .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
-    .stage =
-    {
-      .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-      .stage = VK_SHADER_STAGE_COMPUTE_BIT,
-      .module = shader,
-      .pName = "main",
-    },
-    .layout = g_vulkan_state->shared_pipeline_layout,
-  };
-  
-  VkPipeline pipeline;
-  if (vkCreateComputePipelines(g_vulkan_state->device, 0, 1, &pipeline_info, 0, &pipeline) != VK_SUCCESS)
-  {
-    log_error("failed to create Vulkan compute pipeline for kernel '%.*s'", str8_varg(name));
-    vkDestroyShaderModule(g_vulkan_state->device, shader, 0);
-    ProfEnd();
-    return 0;
-  }
-  
-  VkDescriptorSetAllocateInfo desc_alloc_info =
-  {
-    .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-    .descriptorPool = g_vulkan_state->descriptor_pool,
-    .descriptorSetCount = 1,
-    .pSetLayouts = &g_vulkan_state->shared_descriptor_set_layout,
-  };
-  
-  VkDescriptorSet descriptor_set;
-  if (vkAllocateDescriptorSets(g_vulkan_state->device, &desc_alloc_info, &descriptor_set) != VK_SUCCESS)
-  {
-    log_error("failed to allocate Vulkan descriptor set for kernel '%.*s'", str8_varg(name));
-    vkDestroyPipeline(g_vulkan_state->device, pipeline, 0);
-    vkDestroyShaderModule(g_vulkan_state->device, shader, 0);
-    ProfEnd();
-    return 0;
-  }
-  
-  GPU_VulkanKernel* kernel = push_array(g_vulkan_state->arena, GPU_VulkanKernel, 1);
-  kernel->name = push_str8_copy(g_vulkan_state->arena, name);
-  kernel->shader = shader;
-  kernel->pipeline = pipeline;
-  kernel->descriptor_set = descriptor_set;
   
   if (g_vulkan_state->kernel_cache_count < g_vulkan_state->kernel_cache_cap)
   {
@@ -2463,6 +2493,82 @@ gpu_vulkan_kernel_alloc(String8 name)
   
   ProfEnd();
   return (GPU_Kernel*)kernel;
+}
+
+// tec: kernels built from SPIR-V made at run time, kept in a small least recently used cache keyed by the name the caller gives
+internal GPU_Kernel*
+gpu_vulkan_kernel_alloc_from_spirv(String8 name, String8 spirv)
+{
+  ProfBeginFunction();
+  GPU_VulkanState* state = g_vulkan_state;
+  state->generated_kernel_tick += 1;
+  
+  for (U32 i = 0; i < state->generated_kernel_count; i++)
+  {
+    if (str8_match(state->generated_kernels[i]->name, name, 0))
+    {
+      state->generated_kernel_last_use[i] = state->generated_kernel_tick;
+      ProfEnd();
+      return (GPU_Kernel*)state->generated_kernels[i];
+    }
+  }
+  
+  // tec: no SPIR-V given means only look the kernel up
+  if (spirv.size == 0)
+  {
+    ProfEnd();
+    return 0;
+  }
+  
+  U32 slot = state->generated_kernel_count;
+  GPU_VulkanKernel* reuse = 0;
+  if (slot >= state->generated_kernel_cap)
+  {
+    slot = 0;
+    for (U32 i = 1; i < state->generated_kernel_count; i++)
+    {
+      if (state->generated_kernel_last_use[i] < state->generated_kernel_last_use[slot])
+      {
+        slot = i;
+      }
+    }
+    // tec: the evicted pipeline may still be referenced by work in flight
+    vkDeviceWaitIdle(state->device);
+    reuse = state->generated_kernels[slot];
+    vkDestroyPipeline(state->device, reuse->pipeline, 0);
+    vkDestroyShaderModule(state->device, reuse->shader, 0);
+    vkFreeDescriptorSets(state->device, state->descriptor_pool, 1, &reuse->descriptor_set);
+    state->generated_kernel_evictions += 1;
+  }
+  
+  GPU_VulkanKernel* kernel = gpu_vulkan_kernel_create(state->arena, name, spirv, reuse);
+  if (!kernel)
+  {
+    if (reuse)
+    {
+      state->generated_kernels[slot] = state->generated_kernels[state->generated_kernel_count - 1];
+      state->generated_kernel_last_use[slot] = state->generated_kernel_last_use[state->generated_kernel_count - 1];
+      state->generated_kernel_count -= 1;
+    }
+    ProfEnd();
+    return 0;
+  }
+  state->generated_kernel_compiles += 1;
+  state->generated_kernels[slot] = kernel;
+  state->generated_kernel_last_use[slot] = state->generated_kernel_tick;
+  if (slot == state->generated_kernel_count)
+  {
+    state->generated_kernel_count += 1;
+  }
+  ProfEnd();
+  return (GPU_Kernel*)kernel;
+}
+
+internal void
+gpu_vulkan_generated_kernel_stats(U64* out_compiles, U64* out_evictions)
+{
+  *out_compiles = g_vulkan_state->generated_kernel_compiles;
+  *out_evictions = g_vulkan_state->generated_kernel_evictions;
 }
 
 internal void
@@ -2821,6 +2927,8 @@ gpu_vulkan_get_backend(void)
   backend.buffer_read = gpu_vulkan_buffer_read;
   
   backend.kernel_alloc = gpu_vulkan_kernel_alloc;
+  backend.kernel_alloc_from_spirv = gpu_vulkan_kernel_alloc_from_spirv;
+  backend.generated_kernel_stats = gpu_vulkan_generated_kernel_stats;
   backend.kernel_release = gpu_vulkan_kernel_release;
   backend.kernel_execute = gpu_vulkan_kernel_execute;
   backend.kernel_set_arg_buffer = gpu_vulkan_kernel_set_arg_buffer;

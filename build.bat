@@ -48,6 +48,9 @@ if not exist build\shaders mkdir build\shaders
 :: copy settings to build
 copy /y settings.cfg build\settings.cfg > NUL
 
+:: per query kernels load shaderc at run time, without it every scan keeps using the interpreter
+if exist "%VULKAN_SDK%\Bin\shaderc_shared.dll" copy /y "%VULKAN_SDK%\Bin\shaderc_shared.dll" build\shaderc_shared.dll > NUL
+
 :: build
 pushd build
 %compile% ..\src\main.c %compile_link% %out%cql.exe|| exit /b 1

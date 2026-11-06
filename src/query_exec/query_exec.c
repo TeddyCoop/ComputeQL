@@ -1058,7 +1058,7 @@ qe_scan_filter(Arena* arena, CQL_Database* database, CQL_Table* table, IR_Node* 
 #define QE_CPU_SCAN_MAX_LEAVES 8
 
 // tec: scan_simple.comp reads its comparisons from a buffer of this many
-#define QE_SIMPLE_SCAN_MAX_LEAVES 4
+#define QE_SIMPLE_SCAN_MAX_LEAVES 8
 
 // tec: rows one thread of scan_simple.comp takes, must match its ROWS_PER_THREAD. it reads them with 16 byte loads
 #define QE_SIMPLE_SCAN_ROWS_PER_THREAD 8
@@ -1435,6 +1435,24 @@ qe_scan_int_leaf_words(U32* words, CQL_ColumnType type, U32 op, F64 target, U32 
   words[3] = lo;
   words[4] = span;
   words[5] = 0;
+}
+
+// tec: the 6 words of one comparison for scan_simple, with the column at full width. the streamed scan rewrites them for a narrow column
+internal void
+qe_simple_leaf_words(U32* words, U32 slot, CQL_ColumnType type, U32 op, F64 target)
+{
+  U64 target_bits = 0;
+  MemoryCopy(&target_bits, &target, sizeof(target_bits));
+  words[0] = slot;
+  words[1] = (U32)type;
+  words[2] = op;
+  words[3] = (U32)(target_bits & 0xffffffffull);
+  words[4] = (U32)(target_bits >> 32);
+  words[5] = 0;
+  if ((type == CQL_ColumnType_U32 || type == CQL_ColumnType_I32) && settings_u64(str8_lit("QE_SCAN_INT_COMPARE"), 1) != 0)
+  {
+    qe_scan_int_leaf_words(words, type, op, target, 0, 0);
+  }
 }
 
 //~ tec: narrow columns
@@ -2038,6 +2056,8 @@ struct QE_StreamedScanParams
   // tec: the comparisons of a scan_simple condition, as uploaded, and how many words they are. their column types can take the narrow encoding
   U32* simple_words;
   U64 simple_word_count;
+  // tec: bit s is set when a part of the kernel that is not a comparison reads column slot s, which must be held at full width
+  U32 wide_slot_mask;
   // tec: the comparisons the words were made from, in the same order
   QE_CpuScanLeaf* simple_leaves;
   B32 count_only;
@@ -2265,7 +2285,8 @@ qe_scan_filter_streamed(Arena* arena, QE_StreamedScanParams* params, QE_Streamed
   for (U32 index = 0; index < prog->binding_count; index++)
   {
     CQL_Column* column = prog->bindings[index].column;
-    encodings[index] = params->use_simple && params->simple_words ? qe_column_encoding(column, 1) : (QE_ColumnEncoding){ (U32)column->size, 0, 0 };
+    B32 must_stay_wide = ((params->wide_slot_mask >> prog->bindings[index].first_slot) & 1u) != 0;
+    encodings[index] = params->use_simple && params->simple_words && !must_stay_wide ? qe_column_encoding(column, 1) : (QE_ColumnEncoding){ (U32)column->size, 0, 0 };
     any_narrow = any_narrow || encodings[index].width < column->size || encodings[index].sequence;
   }
   U32* encoded_words = 0;
@@ -2499,18 +2520,8 @@ qe_scan_filter_selected(Arena* arena, CQL_Database* database, CQL_Table* table, 
     return qe_cpu_scan_filter(arena, table, where_clause, out_trace);
   }
   
-  if (stack_depth > QE_SCAN_MAX_STACK)
-  {
-    log_error("qe_scan_filter: WHERE clause needs operand-stack depth %u, exceeding scan_filter.comp's MAX_STACK (%u) - falling back to CPU scan to avoid a GPU stack overflow",
-              stack_depth, (U32)QE_SCAN_MAX_STACK);
-    if (out_trace)
-    {
-      out_trace->strategy = QE_TraceStrategy_CpuScan;
-      out_trace->strategy_reason = str8_lit("WHERE clause exceeds GPU operand-stack depth");
-    }
-    ProfEnd();
-    return qe_cpu_scan_filter(arena, table, where_clause, out_trace);
-  }
+  // tec: only the interpreter has an operand stack to overflow, a generated kernel does not, so this is checked once it is known which kernel runs
+  B32 stack_too_deep = stack_depth > QE_SCAN_MAX_STACK;
   
   // tec: numeric comparisons joined by AND run on scan_simple.comp, they go where the bytecode would, 6 words each behind a count
   U32 simple_words[1 + QE_SIMPLE_SCAN_MAX_LEAVES * 6] = {0};
@@ -2545,32 +2556,80 @@ qe_scan_filter_selected(Arena* arena, CQL_Database* database, CQL_Table* table, 
           break;
         }
         
-        U64 target_bits = 0;
-        MemoryCopy(&target_bits, &leaf->target, sizeof(target_bits));
-        simple_words[1 + l * 6 + 0] = binding->first_slot;
-        simple_words[1 + l * 6 + 1] = (U32)type;
-        simple_words[1 + l * 6 + 2] = leaf->op;
-        simple_words[1 + l * 6 + 3] = (U32)(target_bits & 0xffffffffull);
-        simple_words[1 + l * 6 + 4] = (U32)(target_bits >> 32);
-        if ((type == CQL_ColumnType_U32 || type == CQL_ColumnType_I32) && settings_u64(str8_lit("QE_SCAN_INT_COMPARE"), 1) != 0)
-        {
-          qe_scan_int_leaf_words(&simple_words[1 + l * 6], type, leaf->op, leaf->target, 0, 0);
-        }
+        qe_simple_leaf_words(&simple_words[1 + l * 6], binding->first_slot, type, leaf->op, leaf->target);
       }
     }
   }
   
-  GPU_Kernel* kernel = use_simple ? gpu_kernel_alloc(str8_lit("scan_simple")) : 0;
+  // tec: numeric comparisons joined by AND get a kernel with scan_simple's bindings, so they keep its narrow columns. every other filter gets one with the scan_filter bindings
+  GPU_Kernel* kernel = 0;
+  String8 generated_name = {0};
+  B32 use_generated = 0;
+  QK_HybridInfo hybrid_info = {0};
+  if (qk_enabled(table->row_count))
+  {
+    if (use_simple)
+    {
+      kernel = qk_simple_kernel(arena, simple_words, &generated_name);
+    }
+    else
+    {
+      // tec: AND terms that are plain comparisons can run on scan_simple's layout, with the other terms checked for the rows they leave
+      hybrid_info.allow = !prog->has_score_output && settings_u64(str8_lit("QE_SCAN_SIMPLE_KERNEL"), 1) != 0 && g_cql_state->zonemap_chunk_rows >= QE_SIMPLE_SCAN_ROWS_PER_THREAD;
+      kernel = qk_scan_kernel(arena, prog, &hybrid_info, &generated_name);
+      if (kernel && hybrid_info.is_hybrid)
+      {
+        use_simple = 1;
+        simple_words[0] = hybrid_info.leaf_count;
+        for (U32 l = 0; l < hybrid_info.leaf_count; l++)
+        {
+          QK_HybridLeaf* leaf = &hybrid_info.leaves[l];
+          CQL_Column* leaf_column = 0;
+          for (U32 b = 0; b < prog->binding_count; b++)
+          {
+            if (prog->bindings[b].first_slot == leaf->slot)
+            {
+              leaf_column = prog->bindings[b].column;
+            }
+          }
+          simple_leaves[l].column = leaf_column;
+          simple_leaves[l].op = leaf->op;
+          simple_leaves[l].target = leaf->target;
+          qe_simple_leaf_words(&simple_words[1 + l * 6], leaf->slot, (CQL_ColumnType)leaf->coltype, leaf->op, leaf->target);
+        }
+      }
+    }
+    use_generated = kernel != 0;
+  }
+  if (!kernel && use_simple)
+  {
+    kernel = gpu_kernel_alloc(str8_lit("scan_simple"));
+  }
   QE_TypedProgram typed_prog = {0};
   B32 use_typed = 0;
   if (!kernel)
   {
     use_simple = 0;
-    if (settings_u64(str8_lit("QE_SCAN_TYPED_INTERP"), 0) != 0 && qe_typed_program_from_bytecode(arena, prog, &typed_prog))
+    if (!stack_too_deep && settings_u64(str8_lit("QE_SCAN_TYPED_INTERP"), 0) != 0 && qe_typed_program_from_bytecode(arena, prog, &typed_prog))
     {
       kernel = gpu_kernel_alloc(str8_lit("scan_filter_typed"));
       use_typed = kernel != 0;
     }
+  }
+  if (!kernel && (stack_too_deep || settings_u64(str8_lit("QE_SCAN_INTERPRETER"), 1) == 0))
+  {
+    if (stack_too_deep)
+    {
+      log_error("qe_scan_filter: WHERE clause needs operand-stack depth %u, exceeding scan_filter.comp's MAX_STACK (%u) - falling back to CPU scan to avoid a GPU stack overflow",
+                stack_depth, (U32)QE_SCAN_MAX_STACK);
+    }
+    if (out_trace)
+    {
+      out_trace->strategy = QE_TraceStrategy_CpuScan;
+      out_trace->strategy_reason = stack_too_deep ? str8_lit("WHERE clause exceeds GPU operand-stack depth") : str8_lit("no generated kernel and the interpreter is disabled");
+    }
+    ProfEnd();
+    return qe_cpu_scan_filter(arena, table, where_clause, out_trace);
   }
   if (!kernel)
   {
@@ -2585,6 +2644,10 @@ qe_scan_filter_selected(Arena* arena, CQL_Database* database, CQL_Table* table, 
   if (out_trace && use_simple)
   {
     out_trace->strategy_reason = str8_lit("numeric comparisons only, scan_simple kernel");
+  }
+  if (out_trace && use_generated)
+  {
+    out_trace->strategy_reason = push_str8f(arena, "per query kernel %.*s", str8_varg(generated_name));
   }
   if (out_trace && use_typed)
   {
@@ -2725,6 +2788,7 @@ qe_scan_filter_selected(Arena* arena, CQL_Database* database, CQL_Table* table, 
     stream_params.filler_buffer = bytecode_buffer;
     stream_params.use_simple = use_simple;
     stream_params.simple_words = use_simple ? simple_words : 0;
+    stream_params.wide_slot_mask = hybrid_info.is_hybrid ? hybrid_info.wide_slot_mask : 0;
     stream_params.simple_leaves = simple_leaves;
     stream_params.simple_word_count = 1 + (U64)simple_words[0] * 6;
     stream_params.count_only = count_only;
@@ -14011,3 +14075,5 @@ qe_hash_join_impl(Arena* arena, PLAN_RowSet* left, CQL_Table* right_table, Strin
   ProfEnd();
   return result;
 }
+
+#include "query_kernel.c"

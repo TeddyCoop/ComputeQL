@@ -38,6 +38,8 @@ struct GPU_Backend
   void        (*buffer_read)(GPU_Buffer* buffer, void* data, U64 size);
   
   GPU_Kernel* (*kernel_alloc)(String8 name);
+  GPU_Kernel* (*kernel_alloc_from_spirv)(String8 name, String8 spirv);
+  void        (*generated_kernel_stats)(U64* out_compiles, U64* out_evictions);
   void        (*kernel_release)(GPU_Kernel* kernel);
   void        (*kernel_execute)(GPU_Kernel* kernel, U32 global_work_size, U32 local_work_size);
   void        (*kernel_set_arg_buffer)(GPU_Kernel* kernel, U32 index, GPU_Buffer* buffer);

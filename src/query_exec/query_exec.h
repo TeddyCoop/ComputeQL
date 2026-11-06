@@ -1170,4 +1170,6 @@ internal THREAD_POOL_TASK_FUNC(qe_cpu_scan_filter_task);
 global U64 g_qe_prepare_acquire_us = 0;
 global U64 g_qe_prepare_encode_us = 0;
 
+#include "query_kernel.h"
+
 #endif //QUERY_EXEC_H

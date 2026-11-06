@@ -116,6 +116,14 @@ struct GPU_VulkanState
   U32 kernel_cache_count;
   U32 kernel_cache_cap;
   
+  GPU_VulkanKernel** generated_kernels;
+  U64* generated_kernel_last_use;
+  U32 generated_kernel_count;
+  U32 generated_kernel_cap;
+  U64 generated_kernel_tick;
+  U64 generated_kernel_compiles;
+  U64 generated_kernel_evictions;
+  
   GPU_PooledBuffer* pooled_buffers;
   U32 pooled_buffer_count;
   U32 pooled_buffer_cap;

@@ -341,6 +341,21 @@ gpu_kernel_alloc(String8 name)
   return kernel;
 }
 
+internal GPU_Kernel*
+gpu_kernel_alloc_from_spirv(String8 name, String8 spirv)
+{
+  gpu_kernel_log_note(name);
+  GPU_Kernel* kernel = g_active_gpu_backend_reg->backend->kernel_alloc_from_spirv(name, spirv);
+  gpu_kernel_set_missing_arg(kernel, 0);
+  return kernel;
+}
+
+internal void
+gpu_generated_kernel_stats(U64* out_compiles, U64* out_evictions)
+{
+  g_active_gpu_backend_reg->backend->generated_kernel_stats(out_compiles, out_evictions);
+}
+
 internal void
 gpu_kernel_release(GPU_Kernel* kernel)
 {
