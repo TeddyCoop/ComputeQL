@@ -42,6 +42,7 @@ ComputeQL is a from-scratch, columnar SQL database written in C99 that executes 
 - Cached shader modules/pipelines/descriptor sets and a pooled GPU buffer allocator, so steady-state queries don't pay pipeline/allocation setup cost repeatedly
 - Bulk column materialization for `SELECT` output (one gather pass per column instead of a syscall per row/column)
 - Automatic chunking for tables that exceed the GPU's max buffer size
+- Optional per-query scan kernels (`QE_PERQUERY_KERNELS`): the WHERE clause is turned into GLSL for exactly that query shape and built with shaderc loaded at run time from `shaderc_shared.dll` (Vulkan SDK). Literal values stay in buffers, so queries that differ only in constants share a kernel. On by default for every filter, numeric AND filters keep narrow column reads (`QE_PERQUERY_KERNELS:0` is the old precompiled path). Without shaderc the precompiled `scan_simple` and the bytecode interpreter are the fallback, and it is the reference for tests. See `docs/per_query_kernels.md`
 
 **Platform**
 - Windows x64 (MSVC or Clang), Vulkan 1.x required. Linux/macOS are not currently supported.
