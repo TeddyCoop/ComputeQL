@@ -67,6 +67,8 @@ struct GPU_PendingRead
   U64 size;
 };
 
+#define GPU_VULKAN_PROFILE_DISPATCH_CAP 256
+
 typedef struct GPU_VulkanBatch GPU_VulkanBatch;
 struct GPU_VulkanBatch
 {
@@ -83,6 +85,10 @@ struct GPU_VulkanBatch
   GPU_PendingRead* pending_reads;
   U32 pending_read_count;
   U32 pending_read_cap;
+
+  // tec: the kernels of the dispatches that got a timestamp pair, see g_gpu_kernel_profile
+  U32 profile_count;
+  String8 profile_names[GPU_VULKAN_PROFILE_DISPATCH_CAP];
 };
 
 typedef struct GPU_VulkanState GPU_VulkanState;
@@ -123,6 +129,11 @@ struct GPU_VulkanState
   U64 generated_kernel_tick;
   U64 generated_kernel_compiles;
   U64 generated_kernel_evictions;
+  // tec: pipelines are kept between runs, the cache is read from and written to shaders/pipeline_cache.bin
+  VkPipelineCache pipeline_cache;
+  // tec: guards both kernel caches, the descriptor sets and push constants of a kernel are still one per kernel
+  OS_Handle kernel_lock;
+  B32 mem_block_full_logged;
   
   GPU_PooledBuffer* pooled_buffers;
   U32 pooled_buffer_count;
@@ -136,6 +147,7 @@ struct GPU_VulkanState
   U64 mem_block_size;
   
   VkQueryPool timestamp_query_pool;
+  VkQueryPool profile_query_pool;
   F32 timestamp_period_ns;
   
   VkFence submit_fence;

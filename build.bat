@@ -48,7 +48,7 @@ if not exist build\shaders mkdir build\shaders
 :: copy settings to build
 copy /y settings.cfg build\settings.cfg > NUL
 
-:: per query kernels load shaderc at run time, without it every scan keeps using the interpreter
+:: every kernel is built at run time, shaderc is required
 if exist "%VULKAN_SDK%\Bin\shaderc_shared.dll" copy /y "%VULKAN_SDK%\Bin\shaderc_shared.dll" build\shaderc_shared.dll > NUL
 
 :: build
@@ -56,7 +56,10 @@ pushd build
 %compile% ..\src\main.c %compile_link% %out%cql.exe|| exit /b 1
 popd
 
-:: compile compute shaders (GLSL -> SPIR-V), precompiled and never built at runtime
+:: kernels are built from these sources at run time by shaderc
+copy /y src\gpu\vulkan\shaders\*.comp build\shaders\ > NUL
+
+:: optional offline SPIR-V, only the kernels of tests that do not link the query executor still read these
 if %COMPILE_SHADERS% == 1 do (
 	for %%f in (src\gpu\vulkan\shaders\*.comp) do (
  	"%VULKAN_SDK%\Bin\glslc.exe" %%f -o build\shaders\%%~nf.spv || exit /b 1

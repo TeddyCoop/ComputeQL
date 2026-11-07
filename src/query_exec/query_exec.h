@@ -931,6 +931,7 @@ internal F64 qe_hll_estimate_cardinality(U32* registers, U64 num_registers);
 internal U64 qe_exactness_failure_count(void);
 internal PLAN_Materialized qe_aggregate(Arena* arena, CQL_Database* database, PLAN_RowSet* input, IR_Node* group_by_ir, IR_Node* column_list_ir, IR_Node* having_ir, QE_AggregateHints* hints, QE_AggregateTrace* out_trace);
 internal PLAN_Materialized qe_aggregate_impl(Arena* arena, CQL_Database* database, PLAN_RowSet* input, IR_Node* group_by_ir, IR_Node* column_list_ir, IR_Node* having_ir, QE_AggregateHints* hints, QE_AggregateTrace* out_trace, QE_DeviceRows* device, B32* out_needs_host_rows);
+internal B32 qe_fused_filter_aggregate(Arena* arena, CQL_Database* database, CQL_Table* table, String8 alias, IR_Node* where_clause, IR_Node* group_by_ir, IR_Node* column_list_ir, IR_Node* having_ir, QE_ScanTrace* scan_trace, QE_AggregateTrace* agg_trace, PLAN_Materialized* out_result);
 internal B32 qe_aggregate_device(Arena* arena, CQL_Database* database, QE_DeviceRows* device, IR_Node* group_by_ir, IR_Node* column_list_ir, IR_Node* having_ir, QE_AggregateHints* hints, QE_AggregateTrace* out_trace, PLAN_Materialized* out_result);
 //- tec: a HAVING made of numeric comparisons against literals, resolved once so the per group check is a compare
 typedef enum QE_HavingNodeKind

@@ -246,6 +246,7 @@ entry_point(CmdLine* cmdline)
   log_alloc();
   cql_init();
   gpu_init();
+  qk_init();
 
   if (cmd_line_has_argument(cmdline, str8_lit("rows")))
   {

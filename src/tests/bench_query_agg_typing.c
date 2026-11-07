@@ -154,6 +154,7 @@ entry_point(CmdLine* cmdline)
   log_alloc();
   cql_init();
   gpu_init();
+  qk_init();
 
   Arena* arena = arena_alloc(.reserve_size = MB(256), .commit_size = MB(16));
 

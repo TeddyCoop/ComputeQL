@@ -138,6 +138,7 @@ entry_point(CmdLine* cmdline)
       gpu_request_backend(gpu_backend_str);
     }
     gpu_init();
+    qk_init();
     
     log_info("total gpu memory: %llu (MB)", gpu_device_total_memory() >> 20);
     

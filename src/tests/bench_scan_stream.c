@@ -523,6 +523,7 @@ entry_point(CmdLine* cmdline)
 
   cql_init();
   gpu_init();
+  qk_init();
   if (cmd_line_has_flag(cmdline, str8_lit("no_import")))
   {
     g_vulkan_state->has_external_memory_host_ext = 0;

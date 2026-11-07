@@ -875,6 +875,7 @@ entry_point(CmdLine* cmdline)
   
   cql_init();
   gpu_init();
+  qk_init();
   
   U64 bandwidth_min_rows = SS_DEFAULT_BANDWIDTH_MIN_ROWS;
   if (cmd_line_has_argument(cmdline, str8_lit("bandwidth_min_rows")))

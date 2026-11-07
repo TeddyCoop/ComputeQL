@@ -70,6 +70,10 @@ struct QK_State
   U32 name_count;
   U32 name_next;
 
+  // tec: guards the compiler, the failed keys and the name table
+  OS_Handle lock;
+  U64 disk_cache_hits;
+
   U64 kernels_requested;
   U64 kernels_compiled;
   U64 compile_failures;
@@ -133,15 +137,68 @@ struct QK_HybridInfo
   U32 wide_slot_mask;
 };
 
+//~ tec: a global aggregate fused with the filter. the kernel evaluates the WHERE clause per row and folds the matching rows into partials, no row ids are made.
+// partials per workgroup: matching row count, then sum, min and max of each aggregate column. slot is the column's binding, as for the filter columns
+
+#define QK_FUSED_MAX_COLUMNS 4
+#define QK_GROUP_MAX_KEYS 3
+
+typedef struct QK_FusedAgg QK_FusedAgg;
+struct QK_FusedAgg
+{
+  U32 column_count;
+  U32 slots[QK_FUSED_MAX_COLUMNS];
+  U32 coltypes[QK_FUSED_MAX_COLUMNS];
+  // tec: GROUP BY whole number or dictionary coded columns whose ranges are small.
+  // the arguments are U32 or I32 columns. per group the output holds 2 + 4 * column_count words: row count, smallest row, then per argument the sum (low, high word), the minimum and the maximum.
+  // an I32 value is added and compared with its sign bit flipped, the host takes the bias out
+  B32 grouped;
+  // tec: up to 3 keys. a key's value minus its smallest value (push constant slot 7 low and high word, slot 6 high word) is below its range,
+  // the group is the keys combined as digits, group_count is the product of the ranges
+  U32 key_count;
+  U32 key_slots[QK_GROUP_MAX_KEYS];
+  U32 key_types[QK_GROUP_MAX_KEYS];
+  U32 key_ranges[QK_GROUP_MAX_KEYS];
+  U32 group_count;
+};
+
+#define QK_GROUP_WORDS(columns) (2 + 4 * (columns))
+
+internal void qk_init(void);
+internal String8 qk_library_spirv(Arena* arena, String8 name);
 internal String8 qk_kernel_name(U64 key);
 internal B32 qk_enabled(U64 row_count);
 internal B32 qk_compiler_available(void);
-internal B32 qk_scan_source_build(Arena* arena, QE_BytecodeProgram* prog, QK_HybridInfo* hybrid, String8* out_source);
+internal B32 qk_scan_source_build(Arena* arena, QE_BytecodeProgram* prog, QK_HybridInfo* hybrid, QK_FusedAgg* fuse, String8* out_source);
 internal String8 qk_spirv_compile(Arena* arena, String8 source);
 // tec: hybrid may be 0. when it is given with allow set and the filter has comparisons that qualify, the kernel takes scan_simple's bindings and hybrid says what to upload
 internal GPU_Kernel* qk_scan_kernel(Arena* arena, QE_BytecodeProgram* prog, QK_HybridInfo* hybrid, String8* out_name);
 // tec: scan_simple's bindings and leaf words with the column, type and operator of each comparison in the source. words is a count then 6 words per comparison
 internal GPU_Kernel* qk_simple_kernel(Arena* arena, U32* words, String8* out_name);
+internal GPU_Kernel* qk_fused_aggregate_kernel(Arena* arena, QE_BytecodeProgram* prog, QK_FusedAgg* fuse, String8* out_name);
+// tec: bitonic sort of up to 4 numeric keys, built for the key count, directions (bit k of dir_mask is key k descending) and key width.
+// binding 0 holds key_count keys per element, binding 1 the row each element came from. U64 push constant slots: 1 real count, 2 mode, 3 stage, 4 stride
+// mode 0 sorts every tile and numbers the rows itself, mode 1 is one pass of a stride at least a tile long, mode 2 finishes a stage inside the tiles
+internal U32 qk_sort_tile(U32 key_count, B32 narrow);
+internal GPU_Kernel* qk_sort_kernel(Arena* arena, U32 key_count, U32 dir_mask, B32 narrow, String8* out_name);
+// tec: hash join passes built for the key type (and, for the probe, for a left or anti join). same bindings and push constants as hash_join_build_count.comp and hash_join_probe.comp
+internal GPU_Kernel* qk_join_build_kernel(Arena* arena, B32 string_key, String8* out_name);
+internal GPU_Kernel* qk_join_probe_hash_kernel(Arena* arena, B32 string_key, B32 emit_unmatched, String8* out_name);
+// tec: the streamed fact table probe of join_probe_native.comp with the column widths, aggregate functions and their arguments fixed in the source
+internal GPU_Kernel* qk_join_probe_native_kernel(Arena* arena, U64 shader_widths, U32 arg_count, U32 num_exprs, U32 func_codes, U32 arg_index_codes, U32 arg_signed_bits, String8* out_name);
+// tec: a HAVING condition as one kernel, see qk_having_kernel in query_kernel.c for the bindings
+internal GPU_Kernel* qk_having_kernel(Arena* arena, String8 condition, String8* out_name);
+// tec: the group slot assignment of aggregate_assign.comp for a number of key columns of which some are strings. bindings and push constants as that kernel
+internal GPU_Kernel* qk_hash_assign_kernel(Arena* arena, U32 num_group_cols, U32 string_mask, String8* out_name);
+// tec: the atomic hash aggregation, F32 arguments (fixed 0) or F64 arguments scaled by powers of ten (fixed 1). bindings and push constants as aggregate_hash_reduce_f32.comp and _fixed.comp
+internal GPU_Kernel* qk_member_reduce_kernel(Arena* arena, B32 narrow, U32 num_exprs, U32 func_codes, String8* out_name);
+#define QK_COMPACT_BLOCK_SLOTS 1024
+internal GPU_Kernel* qk_compact_kernel(Arena* arena, String8* out_name);
+internal GPU_Kernel* qk_hash_reduce_kernel(Arena* arena, B32 fixed, U32 num_exprs, U32 func_codes, U32 scales, String8* out_name);
+// tec: selection_gather.comp for one mode (0 64 bit column, 1 32 bit column, 2 rows of positions, 3 resolve through a map, 4 resolve with an offset)
+internal GPU_Kernel* qk_gather_kernel(Arena* arena, U32 mode, String8* out_name);
+// tec: the window rank flags over keys sorted by qk_sort_kernel. bindings as window_rank_flags.comp, the key layout is the sort kernel's. push constant slot 0 is the row count
+internal GPU_Kernel* qk_window_flags_kernel(Arena* arena, U32 key_count, U32 partition_count, B32 narrow, String8* out_name);
 internal void qk_stats(U64* out_requested, U64* out_compiled, U64* out_failures, U64* out_compile_microseconds);
 
 #endif //QUERY_KERNEL_H

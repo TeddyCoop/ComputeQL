@@ -596,6 +596,32 @@ plan_execute_node(Arena* arena, CQL_Database* database, PLAN_Node* plan, IR_Node
       B32 identity_device = 0;
       if (plan_aggregate_reads_selection(plan))
       {
+        // tec: a global aggregate over a plain filter runs as one generated kernel, no row ids are made
+        IR_Node* fuse_having = ir_node_find_child(select_ir_node, IR_NodeType_Having);
+        if (!fuse_having)
+        {
+          QE_ScanTrace fused_scan_trace = {0};
+          QE_AggregateTrace fused_agg_trace = {0};
+          PLAN_Materialized fused = {0};
+          if (qe_fused_filter_aggregate(arena, database, plan->input->input->table, plan->input->input->alias, plan->input->condition, plan->group_by, plan->column_list, fuse_having,
+                                        &fused_scan_trace, &fused_agg_trace, &fused))
+          {
+            QE_NodeTrace* filter_trace = qe_trace_record_begin(trace, plan->input, PLAN_NodeType_Filter);
+            if (filter_trace)
+            {
+              filter_trace->scan = fused_scan_trace;
+            }
+            QE_NodeTrace* fused_trace = qe_trace_record_begin(trace, plan, PLAN_NodeType_Aggregate);
+            if (fused_trace)
+            {
+              fused_trace->aggregate = fused_agg_trace;
+            }
+            result.supported = 1;
+            result.is_materialized = 1;
+            result.materialized = fused;
+            break;
+          }
+        }
         // tec: a scan that does not leave its rows on the GPU can skip making them when all that is wanted is how many there are
         IR_Node* count_having = ir_node_find_child(select_ir_node, IR_NodeType_Having);
         selection.count_only_requested = !count_having && qe_aggregate_is_global_count(plan->group_by, plan->column_list);

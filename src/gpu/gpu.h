@@ -45,6 +45,23 @@ struct GPU_KernelLog
 };
 global GPU_KernelLog g_gpu_kernel_log = {0};
 
+// tec: GPU time per kernel name, for finding where a query spends its time. off unless enabled is set, then every dispatch of a batch gets a pair of timestamps
+// (the start waits for all earlier commands, so the time is that of the dispatch alone) and the batch adds them here when it ends
+#define GPU_KERNEL_PROFILE_CAP 96
+typedef struct GPU_KernelProfile GPU_KernelProfile;
+struct GPU_KernelProfile
+{
+  B32 enabled;
+  U32 count;
+  String8 names[GPU_KERNEL_PROFILE_CAP];
+  U64 total_ns[GPU_KERNEL_PROFILE_CAP];
+  U64 dispatches[GPU_KERNEL_PROFILE_CAP];
+};
+global GPU_KernelProfile g_gpu_kernel_profile = {0};
+
+internal void gpu_kernel_profile_reset(void);
+internal void gpu_kernel_profile_add(String8 name, U64 nanoseconds);
+
 internal void gpu_kernel_log_reset(void);
 internal void gpu_kernel_log_note(String8 name);
 
@@ -105,6 +122,9 @@ internal void gpu_buffer_release(GPU_Buffer* buffer);
 internal void gpu_buffer_write(GPU_Buffer* buffer, void* data, U64 size);
 internal void gpu_buffer_read(GPU_Buffer* buffer, void* data, U64 size);
 
+// tec: builds the SPIR-V of a named kernel at run time (from its GLSL source). when one is set, gpu_kernel_alloc asks it before looking for a precompiled .spv
+typedef String8 GPU_SpirvProviderProc(Arena* arena, String8 name);
+internal void gpu_set_spirv_provider(GPU_SpirvProviderProc* provider);
 internal GPU_Kernel* gpu_kernel_alloc(String8 name);
 // tec: a kernel from SPIR-V made at run time. `name` identifies it in the cache and has to outlive the kernel log. an empty `spirv` only looks the name up. returns 0 if there is no such kernel or the pipeline can not be built
 internal GPU_Kernel* gpu_kernel_alloc_from_spirv(String8 name, String8 spirv);

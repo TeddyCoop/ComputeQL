@@ -312,6 +312,36 @@ gpu_kernel_log_reset(void)
 }
 
 internal void
+gpu_kernel_profile_reset(void)
+{
+  B32 enabled = g_gpu_kernel_profile.enabled;
+  MemoryZeroStruct(&g_gpu_kernel_profile);
+  g_gpu_kernel_profile.enabled = enabled;
+}
+
+internal void
+gpu_kernel_profile_add(String8 name, U64 nanoseconds)
+{
+  GPU_KernelProfile* profile = &g_gpu_kernel_profile;
+  U32 slot = 0;
+  while (slot < profile->count && !str8_match(profile->names[slot], name, 0))
+  {
+    slot += 1;
+  }
+  if (slot == profile->count)
+  {
+    if (profile->count >= GPU_KERNEL_PROFILE_CAP)
+    {
+      return;
+    }
+    profile->names[slot] = name;
+    profile->count += 1;
+  }
+  profile->total_ns[slot] += nanoseconds;
+  profile->dispatches[slot] += 1;
+}
+
+internal void
 gpu_kernel_log_note(String8 name)
 {
   for (U32 i = 0; i < g_gpu_kernel_log.count; i++)

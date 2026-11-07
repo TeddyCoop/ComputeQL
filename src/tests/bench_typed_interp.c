@@ -86,6 +86,7 @@ entry_point(CmdLine* cmdline)
   log_alloc();
   cql_init();
   gpu_init();
+  qk_init();
   
   CQL_Database* database = cql_database_alloc(str8_lit("typed_db"));
   cql_add_database(database);
@@ -113,6 +114,8 @@ entry_point(CmdLine* cmdline)
     { "u < 2000000000 AND d > 10", 0 },
   };
   
+  // tec: this compares the two interpreters, so the kernels generated for the query are off
+  settings_load_from_string(str8_lit("QE_PERQUERY_KERNELS:0"));
   settings_load_from_string(str8_lit("QE_SCAN_SIMPLE_KERNEL:0"));
   U64 failures = 0;
   for (U64 c = 0; c < ArrayCount(cases); c++)
@@ -139,6 +142,7 @@ entry_point(CmdLine* cmdline)
     printf("%-4s %-40s double %20llu  typed %20llu  typed run: %.*s\n", ok ? "ok" : "FAIL", cases[c].where, checksums[0], checksums[1], str8_varg(kernels[1]));
     scratch_end(scratch);
   }
+  settings_load_from_string(str8_lit("QE_PERQUERY_KERNELS:1"));
   settings_load_from_string(str8_lit("QE_SCAN_SIMPLE_KERNEL:1"));
   settings_load_from_string(str8_lit("QE_SCAN_TYPED_INTERP:0"));
   printf("%llu of %llu filters failed\n", failures, (U64)ArrayCount(cases));

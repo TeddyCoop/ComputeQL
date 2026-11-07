@@ -616,6 +616,36 @@ gpu_vulkan_init(void)
     log_error("failed to create Vulkan pipeline layout");
     return;
   }
+
+  //- tec: pipelines built in an earlier run are reloaded, the driver ignores a cache that does not belong to this device
+  g_vulkan_state->kernel_lock = os_mutex_alloc();
+  {
+    Temp scratch = scratch_begin(0, 0);
+    String8 cache_path = push_str8f(scratch.arena, "%.*s/shaders/pipeline_cache.bin", str8_varg(os_get_process_info()->binary_path));
+    String8 cache_data = {0};
+    if (os_file_path_exists(cache_path))
+    {
+      OS_Handle cache_file = os_file_open(OS_AccessFlag_Read, cache_path);
+      U64 cache_size = os_properties_from_file(cache_file).size;
+      if (cache_size > 0)
+      {
+        cache_data = os_string_from_file_range(scratch.arena, cache_file, r1u64(0, cache_size));
+      }
+      os_file_close(cache_file);
+    }
+    VkPipelineCacheCreateInfo cache_info =
+    {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO,
+      .initialDataSize = cache_data.size,
+      .pInitialData = cache_data.str,
+    };
+    if (vkCreatePipelineCache(g_vulkan_state->device, &cache_info, 0, &g_vulkan_state->pipeline_cache) != VK_SUCCESS)
+    {
+      g_vulkan_state->pipeline_cache = 0;
+    }
+    scratch_end(scratch);
+  }
+
   
   //- tec: timestamp queries, used to time each kernel dispatch on the GPU
   VkQueryPoolCreateInfo query_pool_info =
@@ -631,6 +661,14 @@ gpu_vulkan_init(void)
     log_error("failed to create Vulkan timestamp query pool");
     return;
   }
+
+  query_pool_info.queryCount = GPU_VULKAN_PROFILE_DISPATCH_CAP * 2;
+  res = vkCreateQueryPool(g_vulkan_state->device, &query_pool_info, 0, &g_vulkan_state->profile_query_pool);
+  if (res != VK_SUCCESS)
+  {
+    log_error("failed to create Vulkan profile query pool");
+    return;
+  }
   
   //- tec: fence used to wait for a dispatch/transfer submitted on the single compute queue
   VkFenceCreateInfo fence_info = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
@@ -642,6 +680,28 @@ gpu_vulkan_init(void)
   }
   
   ProfEnd();
+}
+
+// tec: written after every new pipeline, so a run that ends without a clean release still leaves its pipelines behind
+internal void
+gpu_vulkan_save_pipeline_cache(void)
+{
+  if (!g_vulkan_state->pipeline_cache)
+  {
+    return;
+  }
+  U64 cache_size = 0;
+  if (vkGetPipelineCacheData(g_vulkan_state->device, g_vulkan_state->pipeline_cache, &cache_size, 0) == VK_SUCCESS && cache_size > 0)
+  {
+    Temp scratch = scratch_begin(0, 0);
+    U8* cache_bytes = push_array_no_zero(scratch.arena, U8, cache_size);
+    if (vkGetPipelineCacheData(g_vulkan_state->device, g_vulkan_state->pipeline_cache, &cache_size, cache_bytes) == VK_SUCCESS)
+    {
+      String8 cache_path = push_str8f(scratch.arena, "%.*s/shaders/pipeline_cache.bin", str8_varg(os_get_process_info()->binary_path));
+      os_write_data_to_file_path(cache_path, str8(cache_bytes, cache_size));
+    }
+    scratch_end(scratch);
+  }
 }
 
 internal void
@@ -685,8 +745,14 @@ gpu_vulkan_release(void)
     vkDestroyShaderModule(g_vulkan_state->device, kernel->shader, 0);
   }
   
+  if (g_vulkan_state->pipeline_cache)
+  {
+    gpu_vulkan_save_pipeline_cache();
+    vkDestroyPipelineCache(g_vulkan_state->device, g_vulkan_state->pipeline_cache, 0);
+  }
   vkDestroyFence(g_vulkan_state->device, g_vulkan_state->submit_fence, 0);
   vkDestroyQueryPool(g_vulkan_state->device, g_vulkan_state->timestamp_query_pool, 0);
+  vkDestroyQueryPool(g_vulkan_state->device, g_vulkan_state->profile_query_pool, 0);
   vkDestroyPipelineLayout(g_vulkan_state->device, g_vulkan_state->shared_pipeline_layout, 0);
   vkDestroyDescriptorSetLayout(g_vulkan_state->device, g_vulkan_state->shared_descriptor_set_layout, 0);
   vkDestroyDescriptorPool(g_vulkan_state->device, g_vulkan_state->descriptor_pool, 0);
@@ -1789,7 +1855,12 @@ gpu_vulkan_find_or_create_mem_block(U32 memory_type_index, B32 wants_mapped, U64
   
   if (g_vulkan_state->mem_block_count >= g_vulkan_state->mem_block_cap)
   {
-    log_error("gpu_vulkan: suballocation block table full (%u) - falling back to a dedicated allocation", g_vulkan_state->mem_block_cap);
+    if (!g_vulkan_state->mem_block_full_logged)
+    {
+      g_vulkan_state->mem_block_full_logged = 1;
+      log_info("gpu_vulkan: suballocation block table full (%u blocks of %llu bytes), further small buffers get dedicated allocations (GPU_VULKAN_MAX_MEM_BLOCKS raises the limit)",
+               g_vulkan_state->mem_block_cap, g_vulkan_state->mem_block_size);
+    }
     return 0;
   }
   
@@ -2351,6 +2422,14 @@ gpu_vulkan_buffer_read(GPU_Buffer* buffer_handle, void* data, U64 size)
   }
 }
 
+global GPU_SpirvProviderProc* g_gpu_spirv_provider = 0;
+
+internal void
+gpu_set_spirv_provider(GPU_SpirvProviderProc* provider)
+{
+  g_gpu_spirv_provider = provider;
+}
+
 // tec: precompiled shaders live next to the executable at shaders/<kernel_name>.spv
 internal String8
 gpu_vulkan_load_spirv_from_disk(Arena* arena, String8 kernel_name)
@@ -2362,6 +2441,16 @@ gpu_vulkan_load_spirv_from_disk(Arena* arena, String8 kernel_name)
   String8 path = push_str8f(scratch.arena, "%.*s/shaders/%.*s.spv", str8_varg(exe_dir), str8_varg(kernel_name));
   
   String8 result = {0};
+  if (g_gpu_spirv_provider)
+  {
+    result = g_gpu_spirv_provider(arena, kernel_name);
+    if (result.size > 0)
+    {
+      scratch_end(scratch);
+      ProfEnd();
+      return result;
+    }
+  }
   if (os_file_path_exists(path))
   {
     OS_Handle file = os_file_open(OS_AccessFlag_Read, path);
@@ -2415,7 +2504,7 @@ gpu_vulkan_kernel_create(Arena* arena, String8 name, String8 spirv_bin, GPU_Vulk
   };
   
   VkPipeline pipeline;
-  if (vkCreateComputePipelines(g_vulkan_state->device, 0, 1, &pipeline_info, 0, &pipeline) != VK_SUCCESS)
+  if (vkCreateComputePipelines(g_vulkan_state->device, g_vulkan_state->pipeline_cache, 1, &pipeline_info, 0, &pipeline) != VK_SUCCESS)
   {
     log_error("failed to create Vulkan compute pipeline for kernel '%.*s'", str8_varg(name));
     vkDestroyShaderModule(g_vulkan_state->device, shader, 0);
@@ -2439,6 +2528,7 @@ gpu_vulkan_kernel_create(Arena* arena, String8 name, String8 spirv_bin, GPU_Vulk
     return 0;
   }
   
+  gpu_vulkan_save_pipeline_cache();
   if (!kernel)
   {
     kernel = push_array(arena, GPU_VulkanKernel, 1);
@@ -2452,8 +2542,29 @@ gpu_vulkan_kernel_create(Arena* arena, String8 name, String8 spirv_bin, GPU_Vulk
   return kernel;
 }
 
+internal GPU_Kernel* gpu_vulkan_kernel_alloc_locked(String8 name);
+internal GPU_Kernel* gpu_vulkan_kernel_alloc_from_spirv_locked(String8 name, String8 spirv);
+
 internal GPU_Kernel*
 gpu_vulkan_kernel_alloc(String8 name)
+{
+  os_mutex_take(g_vulkan_state->kernel_lock);
+  GPU_Kernel* kernel = gpu_vulkan_kernel_alloc_locked(name);
+  os_mutex_drop(g_vulkan_state->kernel_lock);
+  return kernel;
+}
+
+internal GPU_Kernel*
+gpu_vulkan_kernel_alloc_from_spirv(String8 name, String8 spirv)
+{
+  os_mutex_take(g_vulkan_state->kernel_lock);
+  GPU_Kernel* kernel = gpu_vulkan_kernel_alloc_from_spirv_locked(name, spirv);
+  os_mutex_drop(g_vulkan_state->kernel_lock);
+  return kernel;
+}
+
+internal GPU_Kernel*
+gpu_vulkan_kernel_alloc_locked(String8 name)
 {
   ProfBeginFunction();
   
@@ -2497,7 +2608,7 @@ gpu_vulkan_kernel_alloc(String8 name)
 
 // tec: kernels built from SPIR-V made at run time, kept in a small least recently used cache keyed by the name the caller gives
 internal GPU_Kernel*
-gpu_vulkan_kernel_alloc_from_spirv(String8 name, String8 spirv)
+gpu_vulkan_kernel_alloc_from_spirv_locked(String8 name, String8 spirv)
 {
   ProfBeginFunction();
   GPU_VulkanState* state = g_vulkan_state;
@@ -2783,10 +2894,25 @@ gpu_vulkan_batch_kernel_execute(GPU_Batch* batch_handle, GPU_Kernel* kernel_hand
   vkCmdBindDescriptorSets(batch->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g_vulkan_state->shared_pipeline_layout, 0, 1, &kernel->descriptor_set, 0, 0);
   vkCmdPushConstants(batch->cmd, g_vulkan_state->shared_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(kernel->push_constants), kernel->push_constants);
   
+  B32 profiled = g_gpu_kernel_profile.enabled && batch->profile_count < GPU_VULKAN_PROFILE_DISPATCH_CAP;
+  U32 profile_query = batch->profile_count * 2;
+  if (profiled)
+  {
+    vkCmdResetQueryPool(batch->cmd, g_vulkan_state->profile_query_pool, profile_query, 2);
+    vkCmdWriteTimestamp(batch->cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, g_vulkan_state->profile_query_pool, profile_query);
+  }
+
   vkCmdDispatch(batch->cmd, group_count, 1, 1);
-  
+
+  if (profiled)
+  {
+    vkCmdWriteTimestamp(batch->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g_vulkan_state->profile_query_pool, profile_query + 1);
+    batch->profile_names[batch->profile_count] = kernel->name;
+    batch->profile_count += 1;
+  }
+
   vkCmdWriteTimestamp(batch->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g_vulkan_state->timestamp_query_pool, 1);
-  
+
   batch->dispatched_since_barrier = 1;
   batch->had_dispatch = 1;
   batch->has_commands = 1;
@@ -2863,6 +2989,21 @@ gpu_vulkan_batch_end(GPU_Batch* batch_handle)
       vkGetQueryPoolResults(g_vulkan_state->device, g_vulkan_state->timestamp_query_pool, 0, 2, sizeof(timestamps), timestamps, sizeof(U64), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
       F64 elapsed_ns = (F64)(timestamps[1] - timestamps[0]) * (F64)g_vulkan_state->timestamp_period_ns;
       g_vulkan_state->last_kernel_time_microseconds = (U64)(elapsed_ns / 1000.0);
+    }
+
+    if (ok && batch->profile_count > 0)
+    {
+      U64 profile_timestamps[GPU_VULKAN_PROFILE_DISPATCH_CAP * 2];
+      VkResult profile_res = vkGetQueryPoolResults(g_vulkan_state->device, g_vulkan_state->profile_query_pool, 0, batch->profile_count * 2,
+                                                   sizeof(profile_timestamps), profile_timestamps, sizeof(U64), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+      if (profile_res == VK_SUCCESS)
+      {
+        for (U32 i = 0; i < batch->profile_count; i++)
+        {
+          F64 elapsed_ns = (F64)(profile_timestamps[i * 2 + 1] - profile_timestamps[i * 2]) * (F64)g_vulkan_state->timestamp_period_ns;
+          gpu_kernel_profile_add(batch->profile_names[i], (U64)elapsed_ns);
+        }
+      }
     }
   }
   else

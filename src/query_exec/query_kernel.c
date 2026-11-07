@@ -194,8 +194,20 @@ global char* qk_glsl_edit_distance =
   ;
 
 
+internal String8 qk_kernel_name_locked(U64 key);
+
 internal String8
 qk_kernel_name(U64 key)
+{
+  QK_State* state = &g_qk_state;
+  os_mutex_take(state->lock);
+  String8 name = qk_kernel_name_locked(key);
+  os_mutex_drop(state->lock);
+  return name;
+}
+
+internal String8
+qk_kernel_name_locked(U64 key)
 {
   QK_State* state = &g_qk_state;
   for (U32 i = 0; i < state->name_count; i++)
@@ -273,7 +285,7 @@ qk_compiler_available(void)
 
   if (!state->library_loaded)
   {
-    log_info("per query kernels: shaderc_shared.dll was not found, scans keep using the interpreter");
+    log_error("per query kernels: shaderc_shared.dll was not found");
     return 0;
   }
 
@@ -309,6 +321,14 @@ qk_compiler_available(void)
   return 1;
 }
 
+// tec: compiled SPIR-V is kept in shaders/cache/<hash of the source>.spv, so a source that was built before is not built again after a restart
+internal String8
+qk_spirv_cache_path(Arena* arena, String8 source)
+{
+  U64 key = u64_hash_from_str8(source) ^ 0x5bd1e9955bd1e995ull;
+  return push_str8f(arena, "%.*s/shaders/cache/%016llx.spv", str8_varg(os_get_process_info()->binary_path), key);
+}
+
 internal String8
 qk_spirv_compile(Arena* arena, String8 source)
 {
@@ -318,18 +338,46 @@ qk_spirv_compile(Arena* arena, String8 source)
     return spirv;
   }
   QK_State* state = &g_qk_state;
+  B32 use_disk_cache = settings_u64(str8_lit("QE_SPIRV_DISK_CACHE"), 1) != 0;
+  Temp scratch = scratch_begin(&arena, 1);
+  String8 cache_path = use_disk_cache ? qk_spirv_cache_path(scratch.arena, source) : str8_zero();
+  if (use_disk_cache && os_file_path_exists(cache_path))
+  {
+    OS_Handle file = os_file_open(OS_AccessFlag_Read, cache_path);
+    U64 file_size = os_properties_from_file(file).size;
+    if (file_size >= 20 && (file_size & 3) == 0)
+    {
+      String8 data = os_string_from_file_range(arena, file, r1u64(0, file_size));
+      // tec: the SPIR-V magic number, anything else is a damaged file and is built again
+      if (data.size == file_size && *(U32*)data.str == 0x07230203u)
+      {
+        os_file_close(file);
+        os_mutex_take(state->lock);
+        state->disk_cache_hits += 1;
+        os_mutex_drop(state->lock);
+        scratch_end(scratch);
+        return data;
+      }
+    }
+    os_file_close(file);
+  }
+  os_mutex_take(state->lock);
   U64 start = os_now_microseconds();
   void* result = state->compile(state->compiler, (char*)source.str, source.size, shaderc_compute_shader, "per_query_scan.comp", "main", state->options);
   state->compile_microseconds += os_now_microseconds() - start;
   if (!result)
   {
+    os_mutex_drop(state->lock);
     log_error("per query kernels: shaderc returned no result");
+    scratch_end(scratch);
     return spirv;
   }
   if (state->result_status(result) != shaderc_compilation_status_success)
   {
     log_error("per query kernels: shader compile failed: %s", state->result_message(result));
     state->result_release(result);
+    os_mutex_drop(state->lock);
+    scratch_end(scratch);
     return spirv;
   }
   U64 length = state->result_length(result);
@@ -337,7 +385,56 @@ qk_spirv_compile(Arena* arena, String8 source)
   spirv.size = length;
   MemoryCopy(spirv.str, state->result_bytes(result), length);
   state->result_release(result);
+  os_mutex_drop(state->lock);
+  if (use_disk_cache)
+  {
+    os_make_directory(push_str8f(scratch.arena, "%.*s/shaders/cache", str8_varg(os_get_process_info()->binary_path)));
+    os_write_data_to_file_path(cache_path, spirv);
+  }
+  scratch_end(scratch);
   return spirv;
+}
+
+//~ tec: the kernel library
+// every named kernel (aggregates, joins, sorts, window ranks, gathers) is built at run time from shaders/<name>.comp, next to the executable
+// shaderc is required, there are no precompiled kernels to fall back on
+
+internal String8
+qk_library_spirv(Arena* arena, String8 name)
+{
+  String8 result = {0};
+  Temp scratch = scratch_begin(&arena, 1);
+  String8 exe_dir = os_get_process_info()->binary_path;
+  String8 path = push_str8f(scratch.arena, "%.*s/shaders/%.*s.comp", str8_varg(exe_dir), str8_varg(name));
+  if (os_file_path_exists(path))
+  {
+    OS_Handle file = os_file_open(OS_AccessFlag_Read, path);
+    U64 file_size = os_properties_from_file(file).size;
+    if (file_size > 0)
+    {
+      String8 source = os_string_from_file_range(scratch.arena, file, r1u64(0, file_size));
+      result = qk_spirv_compile(arena, source);
+    }
+    os_file_close(file);
+  }
+  scratch_end(scratch);
+  return result;
+}
+
+// tec: call once after gpu_init
+internal void
+qk_init(void)
+{
+  if (g_qk_state.lock.u64[0] == 0)
+  {
+    g_qk_state.lock = os_mutex_alloc();
+  }
+  if (!qk_compiler_available())
+  {
+    log_error("shaderc_shared.dll was not found. every GPU kernel is built at run time, put it next to the executable or set VULKAN_SDK");
+    os_abort(1);
+  }
+  gpu_set_spirv_provider(qk_library_spirv);
 }
 
 //~ tec: the numeric AND kernel
@@ -800,7 +897,7 @@ qk_value_terms(QK_Value* value, String8 bool_text, QK_Conj* storage, QK_Conj** o
 }
 
 internal B32
-qk_scan_source_build(Arena* arena, QE_BytecodeProgram* prog, QK_HybridInfo* hybrid, String8* out_source)
+qk_scan_source_build(Arena* arena, QE_BytecodeProgram* prog, QK_HybridInfo* hybrid, QK_FusedAgg* fuse, String8* out_source)
 {
   Temp scratch = scratch_begin(&arena, 1);
 
@@ -813,7 +910,7 @@ qk_scan_source_build(Arena* arena, QE_BytecodeProgram* prog, QK_HybridInfo* hybr
 
   QK_Candidate candidates[QK_MAX_CANDIDATES];
   U32 candidate_count = 0;
-  B32 hybrid_allowed = hybrid && hybrid->allow && !prog->has_score_output;
+  B32 hybrid_allowed = hybrid && hybrid->allow && !prog->has_score_output && !fuse;
   if (hybrid)
   {
     hybrid->is_hybrid = 0;
@@ -1012,6 +1109,39 @@ qk_scan_source_build(Arena* arena, QE_BytecodeProgram* prog, QK_HybridInfo* hybr
     return 0;
   }
 
+  // tec: the aggregate arguments are read by the same loaders as the filter columns
+  if (fuse)
+  {
+    for (U32 k = 0; k < fuse->column_count; k++)
+    {
+      if (fuse->slots[k] >= QE_MAX_COLUMN_BINDINGS || fuse->coltypes[k] >= 32)
+      {
+        scratch_end(scratch);
+        return 0;
+      }
+      slot_used[fuse->slots[k]] = 1;
+      loader_used[fuse->slots[k]] |= 1u << fuse->coltypes[k];
+    }
+    if (fuse->grouped)
+    {
+      if (fuse->key_count == 0 || fuse->key_count > QK_GROUP_MAX_KEYS || fuse->group_count == 0)
+      {
+        scratch_end(scratch);
+        return 0;
+      }
+      for (U32 i = 0; i < fuse->key_count; i++)
+      {
+        if (fuse->key_slots[i] >= QE_MAX_COLUMN_BINDINGS || fuse->key_types[i] >= 32 || fuse->key_ranges[i] == 0)
+        {
+          scratch_end(scratch);
+          return 0;
+        }
+        slot_used[fuse->key_slots[i]] = 1;
+        loader_used[fuse->key_slots[i]] |= 1u << fuse->key_types[i];
+      }
+    }
+  }
+
   String8 final_expression = str8_lit("false");
   // tec: the terms that are not comparisons for scan_simple's layout, and the columns they read
   String8 complex_expression = str8_lit("true");
@@ -1073,10 +1203,21 @@ qk_scan_source_build(Arena* arena, QE_BytecodeProgram* prog, QK_HybridInfo* hybr
                     "layout(local_size_x = 256) in;\n"
                     "#define QE_FUZZY_MAX_NEEDLE_LEN 64\n"
                     "#define MAX_SANE_STRING_LEN 1048576u\n");
-    str8_list_pushf(scratch.arena, &out,
-                    "layout(std430, binding = 3) buffer OutIndicesBuf { uint out_indices[]; };\n"
-                    "layout(std430, binding = 4) buffer OutCountBuf { uint out_count[]; };\n"
-                    "layout(std430, binding = 5) readonly buffer SkipBuf { uint skip_bits[]; };\n");
+    if (fuse && fuse->grouped)
+    {
+      str8_list_pushf(scratch.arena, &out, "layout(std430, binding = 3) buffer GroupsBuf { uint out_words[]; };\n");
+    }
+    else if (fuse)
+    {
+      str8_list_pushf(scratch.arena, &out, "layout(std430, binding = 3) buffer PartialsBuf { double partials[]; };\n");
+    }
+    else
+    {
+      str8_list_pushf(scratch.arena, &out,
+                      "layout(std430, binding = 3) buffer OutIndicesBuf { uint out_indices[]; };\n"
+                      "layout(std430, binding = 4) buffer OutCountBuf { uint out_count[]; };\n");
+    }
+    str8_list_pushf(scratch.arena, &out, "layout(std430, binding = 5) readonly buffer SkipBuf { uint skip_bits[]; };\n");
   }
   if (uses_num_consts)
   {
@@ -1211,6 +1352,192 @@ qk_scan_source_build(Arena* arena, QE_BytecodeProgram* prog, QK_HybridInfo* hybr
     return 1;
   }
 
+  if (fuse && fuse->grouped)
+  {
+    // tec: filter and GROUP BY in one pass. each workgroup counts its rows into shared memory with integer atomics, then merges its groups into the output once
+    U32 k_count = fuse->column_count;
+    U32 g_count = fuse->group_count;
+    U32 width = QK_GROUP_WORDS(k_count);
+    str8_list_pushf(scratch.arena, &out, "#define GROUPS %uu\n#define WIDTH %uu\nshared uint s_acc[%uu];\n", g_count, width, g_count * width);
+    str8_list_pushf(scratch.arena, &out,
+                    "void\nmain()\n{\n"
+                    "  uint row_count = pc.words[0];\n"
+                    "  uint group_count = pc.words[12];\n"
+                    "  uint tid = gl_LocalInvocationIndex;\n"
+                    "  uint stride = group_count * 256u;\n"
+                    "  for (uint i = tid; i < GROUPS * WIDTH; i += 256u)\n"
+                    "  {\n"
+                    "    uint field = i %% WIDTH;\n"
+                    "    bool is_min = field == 1u || (field >= 2u && ((field - 2u) %% 4u) == 2u);\n"
+                    "    s_acc[i] = is_min ? 0xffffffffu : 0u;\n"
+                    "  }\n"
+                    "  barrier();\n"
+                    "  for (uint row = gl_GlobalInvocationID.x; row < row_count; row += stride)\n"
+                    "  {\n"
+                    "    uint score_flags = pc.words[2];\n"
+                    "    bool has_aux_score = (score_flags & 1u) != 0u;\n"
+                    "    uint trigram_n = max(pc.words[4], 1u);\n"
+                    "    uint aux_score_bits = 0u;\n");
+    for (String8Node* node = statements.first; node; node = node->next)
+    {
+      str8_list_push(scratch.arena, &out, node->string);
+    }
+    str8_list_pushf(scratch.arena, &out,
+                    "    if (%.*s)\n"
+                    "    {\n"
+                    "      uint g = 0u;\n"
+                    "      bool key_ok = true;\n",
+                    str8_varg(final_expression));
+    // tec: the smallest values of the keys travel in the push constants, key 0 and 1 in the two words of slot 7, key 2 in the high word of slot 6
+    U32 min_words[QK_GROUP_MAX_KEYS] = { 14, 15, 13 };
+    for (U32 i = 0; i < fuse->key_count; i++)
+    {
+      str8_list_pushf(scratch.arena, &out,
+                      "      {\n"
+                      "        int part = int(ld%u_%u(row)) - int(pc.words[%uu]);\n"
+                      "        key_ok = key_ok && part >= 0 && uint(part) < %uu;\n"
+                      "        g = g * %uu + uint(part);\n"
+                      "      }\n",
+                      fuse->key_slots[i], fuse->key_types[i], min_words[i], fuse->key_ranges[i], fuse->key_ranges[i]);
+    }
+    str8_list_pushf(scratch.arena, &out,
+                    "      if (key_ok && g < GROUPS)\n"
+                    "      {\n"
+                    "        uint b = g * WIDTH;\n"
+                    "        atomicAdd(s_acc[b], 1u);\n"
+                    "        atomicMin(s_acc[b + 1u], row);\n");
+    for (U32 k = 0; k < k_count; k++)
+    {
+      B32 is_signed = fuse->coltypes[k] == 7;
+      str8_list_pushf(scratch.arena, &out,
+                      "        {\n"
+                      "          double vd = ld%u_%u(row);\n"
+                      "          uint u = %s;\n"
+                      "          uint old = atomicAdd(s_acc[b + %uu], u);\n"
+                      "          if (old + u < old)\n"
+                      "          {\n"
+                      "            atomicAdd(s_acc[b + %uu], 1u);\n"
+                      "          }\n"
+                      "          atomicMin(s_acc[b + %uu], u);\n"
+                      "          atomicMax(s_acc[b + %uu], u);\n"
+                      "        }\n",
+                      fuse->slots[k], fuse->coltypes[k], is_signed ? "uint(int(vd)) ^ 0x80000000u" : "uint(vd)", 2 + 4 * k, 3 + 4 * k, 4 + 4 * k, 5 + 4 * k);
+    }
+    str8_list_pushf(scratch.arena,
+                    &out,
+                    "      }\n"
+                    "    }\n"
+                    "  }\n"
+                    "  barrier();\n"
+                    "  for (uint g = tid; g < GROUPS; g += 256u)\n"
+                    "  {\n"
+                    "    uint b = g * WIDTH;\n"
+                    "    if (s_acc[b] == 0u)\n"
+                    "    {\n"
+                    "      continue;\n"
+                    "    }\n"
+                    "    atomicAdd(out_words[b], s_acc[b]);\n"
+                    "    atomicMin(out_words[b + 1u], s_acc[b + 1u]);\n");
+    for (U32 k = 0; k < k_count; k++)
+    {
+      str8_list_pushf(scratch.arena, &out,
+                      "    {\n"
+                      "      uint lo = s_acc[b + %uu];\n"
+                      "      uint old = atomicAdd(out_words[b + %uu], lo);\n"
+                      "      uint carry = (old + lo < old) ? 1u : 0u;\n"
+                      "      atomicAdd(out_words[b + %uu], s_acc[b + %uu] + carry);\n"
+                      "      atomicMin(out_words[b + %uu], s_acc[b + %uu]);\n"
+                      "      atomicMax(out_words[b + %uu], s_acc[b + %uu]);\n"
+                      "    }\n",
+                      2 + 4 * k, 2 + 4 * k, 3 + 4 * k, 3 + 4 * k, 4 + 4 * k, 4 + 4 * k, 5 + 4 * k, 5 + 4 * k);
+    }
+    str8_list_pushf(scratch.arena, &out, "  }\n}\n");
+    *out_source = str8_list_join(arena, &out, 0);
+    scratch_end(scratch);
+    return 1;
+  }
+
+  if (fuse)
+  {
+    // tec: the filter and the aggregate in one pass. a thread folds the matching rows of its share into registers, a workgroup reduces once
+    // partials per workgroup: matching row count, then sum, min and max of each aggregate column
+    U32 k_count = fuse->column_count;
+    str8_list_pushf(scratch.arena, &out, "shared double sh_reduce[256];\n");
+    str8_list_pushf(scratch.arena, &out,
+                    "void\nmain()\n{\n"
+                    "  uint row_count = pc.words[0];\n"
+                    "  uint group_count = pc.words[12];\n"
+                    "  uint tid = gl_LocalInvocationIndex;\n"
+                    "  uint stride = group_count * 256u;\n"
+                    "  double biggest = packDouble2x32(uvec2(0xffffffffu, 0x7fefffffu));\n"
+                    "  double cnt = 0.0LF;\n");
+    for (U32 k = 0; k < k_count; k++)
+    {
+      str8_list_pushf(scratch.arena, &out, "  double sum%u = 0.0LF;\n  double mn%u = biggest;\n  double mx%u = -biggest;\n", k, k, k);
+    }
+    str8_list_pushf(scratch.arena, &out,
+                    "  for (uint row = gl_GlobalInvocationID.x; row < row_count; row += stride)\n"
+                    "  {\n"
+                    "    uint score_flags = pc.words[2];\n"
+                    "    bool has_aux_score = (score_flags & 1u) != 0u;\n"
+                    "    uint trigram_n = max(pc.words[4], 1u);\n"
+                    "    uint aux_score_bits = 0u;\n");
+    for (String8Node* node = statements.first; node; node = node->next)
+    {
+      str8_list_push(scratch.arena, &out, node->string);
+    }
+    str8_list_pushf(scratch.arena, &out, "    if (%.*s)\n    {\n      cnt += 1.0LF;\n", str8_varg(final_expression));
+    for (U32 k = 0; k < k_count; k++)
+    {
+      str8_list_pushf(scratch.arena, &out,
+                      "      double v%u = ld%u_%u(row);\n"
+                      "      sum%u += v%u;\n"
+                      "      mn%u = min(mn%u, v%u);\n"
+                      "      mx%u = max(mx%u, v%u);\n",
+                      k, fuse->slots[k], fuse->coltypes[k], k, k, k, k, k, k, k, k);
+    }
+    str8_list_pushf(scratch.arena, &out, "    }\n  }\n");
+    U32 width = 1 + 3 * k_count;
+    for (U32 q = 0; q < width; q++)
+    {
+      char value[16];
+      char* combine = "sh_reduce[tid] += sh_reduce[tid + step];";
+      if (q == 0)
+      {
+        snprintf(value, sizeof(value), "cnt");
+      }
+      else
+      {
+        U32 k = (q - 1) / 3;
+        U32 part = (q - 1) % 3;
+        snprintf(value, sizeof(value), "%s%u", part == 0 ? "sum" : (part == 1 ? "mn" : "mx"), k);
+        if (part == 1) combine = "sh_reduce[tid] = min(sh_reduce[tid], sh_reduce[tid + step]);";
+        if (part == 2) combine = "sh_reduce[tid] = max(sh_reduce[tid], sh_reduce[tid + step]);";
+      }
+      str8_list_pushf(scratch.arena, &out,
+                      "  sh_reduce[tid] = %s;\n"
+                      "  barrier();\n"
+                      "  for (uint step = 128u; step > 0u; step >>= 1u)\n"
+                      "  {\n"
+                      "    if (tid < step)\n"
+                      "    {\n"
+                      "      %s\n"
+                      "    }\n"
+                      "    barrier();\n"
+                      "  }\n"
+                      "  if (tid == 0u)\n"
+                      "  {\n"
+                      "    partials[gl_WorkGroupID.x * %uu + %uu] = sh_reduce[0];\n"
+                      "  }\n"
+                      "  barrier();\n",
+                      value, combine, width, q);
+    }
+    str8_list_pushf(scratch.arena, &out, "}\n");
+    *out_source = str8_list_join(arena, &out, 0);
+    scratch_end(scratch);
+    return 1;
+  }
+
   str8_list_pushf(scratch.arena, &out,
                   "void\nmain()\n{\n"
                   "  uint row_count = pc.words[0];\n"
@@ -1271,13 +1598,16 @@ qk_kernel_from_source(Arena* arena, String8 source, String8* out_name)
 {
   QK_State* state = &g_qk_state;
   U64 key = u64_hash_from_str8(source);
+  os_mutex_take(state->lock);
   for (U32 i = 0; i < state->failed_key_count; i++)
   {
     if (state->failed_keys[i] == key)
     {
+      os_mutex_drop(state->lock);
       return 0;
     }
   }
+  os_mutex_drop(state->lock);
 
   String8 name = qk_kernel_name(key);
   GPU_Kernel* kernel = gpu_kernel_alloc_from_spirv(name, str8_zero());
@@ -1294,14 +1624,18 @@ qk_kernel_from_source(Arena* arena, String8 source, String8* out_name)
     }
     if (!kernel)
     {
+      os_mutex_take(state->lock);
       state->compile_failures += 1;
       if (state->failed_key_count < QK_FAILED_KEY_CAP)
       {
         state->failed_keys[state->failed_key_count++] = key;
       }
+      os_mutex_drop(state->lock);
       return 0;
     }
+    os_mutex_take(state->lock);
     state->kernels_compiled += 1;
+    os_mutex_drop(state->lock);
   }
   if (out_name)
   {
@@ -1337,11 +1671,931 @@ qk_scan_kernel(Arena* arena, QE_BytecodeProgram* prog, QK_HybridInfo* hybrid, St
   state->kernels_requested += 1;
 
   String8 source = {0};
-  if (!qk_scan_source_build(arena, prog, hybrid, &source))
+  if (!qk_scan_source_build(arena, prog, hybrid, 0, &source))
   {
     log_debug("per query kernels: the bytecode has an operator the generator does not handle, using the interpreter");
     return 0;
   }
+  return qk_kernel_from_source(arena, source, out_name);
+}
+
+internal GPU_Kernel*
+qk_fused_aggregate_kernel(Arena* arena, QE_BytecodeProgram* prog, QK_FusedAgg* fuse, String8* out_name)
+{
+  if (!qk_compiler_available())
+  {
+    return 0;
+  }
+  g_qk_state.kernels_requested += 1;
+  String8 source = {0};
+  if (!qk_scan_source_build(arena, prog, 0, fuse, &source))
+  {
+    return 0;
+  }
+  return qk_kernel_from_source(arena, source, out_name);
+}
+
+internal U32
+qk_sort_tile(U32 key_count, B32 narrow)
+{
+  // tec: a tile of keys and rows has to fit in 16 KB of shared memory, the least Vulkan guarantees
+  U32 tile = 1024;
+  U32 bytes_per_element = key_count * (narrow ? 4 : 8) + 4;
+  while (tile > 64 && tile * bytes_per_element > 16384)
+  {
+    tile >>= 1;
+  }
+  return tile;
+}
+
+internal B32
+qk_sort_source_build(Arena* arena, U32 key_count, U32 dir_mask, B32 narrow, String8* out_source)
+{
+  if (key_count == 0 || key_count > 4)
+  {
+    return 0;
+  }
+  Temp scratch = scratch_begin(&arena, 1);
+  String8List out = {0};
+  U32 tile = qk_sort_tile(key_count, narrow);
+  U32 log_tile = 0;
+  while ((1u << log_tile) < tile)
+  {
+    log_tile += 1;
+  }
+  char* type_name = narrow ? "float" : "double";
+
+  str8_list_pushf(scratch.arena, &out, "#version 450\n");
+  if (!narrow)
+  {
+    str8_list_pushf(scratch.arena, &out, "#extension GL_ARB_gpu_shader_fp64 : enable\n");
+  }
+  str8_list_pushf(scratch.arena, &out,
+                  "layout(local_size_x = %u) in;\n"
+                  "layout(std430, binding = 0) buffer KeyBuf { %s keys[]; };\n"
+                  "layout(std430, binding = 1) buffer RowBuf { uint rows[]; };\n"
+                  "layout(push_constant) uniform PushConstants { uint words[16]; } pc;\n"
+                  "#define KEYS %uu\n#define TILE %uu\n#define LOG_TILE %uu\n"
+                  "shared %s s_key[TILE * KEYS];\nshared uint s_row[TILE];\n",
+                  tile / 2, type_name, key_count, tile, log_tile, type_name);
+
+  // tec: true when a sorts after b. rows past the real count are padding and sort last, equal keys keep their input order
+  str8_list_pushf(scratch.arena, &out, "bool\ngreater(");
+  for (U32 k = 0; k < key_count; k++)
+  {
+    str8_list_pushf(scratch.arena, &out, "%s a%u, ", type_name, k);
+  }
+  str8_list_pushf(scratch.arena, &out, "uint a_row, ");
+  for (U32 k = 0; k < key_count; k++)
+  {
+    str8_list_pushf(scratch.arena, &out, "%s b%u, ", type_name, k);
+  }
+  str8_list_pushf(scratch.arena, &out,
+                  "uint b_row)\n{\n"
+                  "  bool a_valid = a_row < pc.words[2];\n"
+                  "  bool b_valid = b_row < pc.words[2];\n"
+                  "  if (a_valid != b_valid)\n  {\n    return !a_valid;\n  }\n");
+  for (U32 k = 0; k < key_count; k++)
+  {
+    B32 desc = (dir_mask >> k) & 1;
+    str8_list_pushf(scratch.arena, &out, "  if (a%u != b%u)\n  {\n    return a%u %s b%u;\n  }\n", k, k, k, desc ? "<" : ">", k);
+  }
+  str8_list_pushf(scratch.arena, &out, "  return a_row > b_row;\n}\n");
+
+  // tec: exchange_shared and exchange_global differ only in where the pair lives
+  char* spaces[2] = { "shared", "global" };
+  for (U32 which = 0; which < 2; which++)
+  {
+    str8_list_pushf(scratch.arena, &out, "void\nexchange_%s(uint position, uint stride, bool ascending)\n{\n  uint partner = position + stride;\n", spaces[which]);
+    char* array_name = which == 0 ? "s_key" : "keys";
+    char* row_name = which == 0 ? "s_row" : "rows";
+    for (U32 k = 0; k < key_count; k++)
+    {
+      str8_list_pushf(scratch.arena, &out, "  %s a%u = %s[position * KEYS + %uu];\n  %s b%u = %s[partner * KEYS + %uu];\n",
+                      type_name, k, array_name, k, type_name, k, array_name, k);
+    }
+    str8_list_pushf(scratch.arena, &out, "  uint a_row = %s[position];\n  uint b_row = %s[partner];\n  if (greater(", row_name, row_name);
+    for (U32 k = 0; k < key_count; k++)
+    {
+      str8_list_pushf(scratch.arena, &out, "a%u, ", k);
+    }
+    str8_list_pushf(scratch.arena, &out, "a_row, ");
+    for (U32 k = 0; k < key_count; k++)
+    {
+      str8_list_pushf(scratch.arena, &out, "b%u, ", k);
+    }
+    str8_list_pushf(scratch.arena, &out, "b_row) == ascending)\n  {\n");
+    for (U32 k = 0; k < key_count; k++)
+    {
+      str8_list_pushf(scratch.arena, &out, "    %s[position * KEYS + %uu] = b%u;\n    %s[partner * KEYS + %uu] = a%u;\n", array_name, k, k, array_name, k, k);
+    }
+    str8_list_pushf(scratch.arena, &out, "    %s[position] = b_row;\n    %s[partner] = a_row;\n  }\n}\n", row_name, row_name);
+  }
+
+  // tec: mode 0 sorts each tile from the input order, mode 1 is one pass over the whole array for strides longer than a tile, mode 2 finishes a stage inside the tiles
+  str8_list_pushf(scratch.arena, &out,
+                  "uint\npair_position(uint thread, uint stride)\n{\n"
+                  "  uint low = thread & (stride - 1u);\n"
+                  "  return ((thread - low) << 1u) + low;\n}\n"
+                  "void\nmain()\n{\n"
+                  "  uint mode = pc.words[4];\n"
+                  "  uint stage = pc.words[6];\n"
+                  "  uint stride = pc.words[8];\n"
+                  "  uint thread = gl_LocalInvocationID.x;\n"
+                  "  if (mode == 1u)\n  {\n"
+                  "    uint position = pair_position(gl_GlobalInvocationID.x, stride);\n"
+                  "    exchange_global(position, stride, (position & (1u << stage)) == 0u);\n"
+                  "    return;\n  }\n"
+                  "  uint base = gl_WorkGroupID.x * TILE;\n"
+                  "  for (uint half_index = 0u; half_index < 2u; half_index++)\n  {\n"
+                  "    uint at = thread + half_index * (TILE / 2u);\n");
+  str8_list_pushf(scratch.arena, &out, "    if (mode == 0u)\n    {\n      s_row[at] = base + at;\n    }\n    else\n    {\n      s_row[at] = rows[base + at];\n    }\n");
+  str8_list_pushf(scratch.arena, &out, "    for (uint k = 0u; k < KEYS; k++)\n    {\n      s_key[at * KEYS + k] = keys[(base + at) * KEYS + k];\n    }\n  }\n"
+                  "  barrier();\n");
+  str8_list_pushf(scratch.arena, &out,
+                  "  if (mode == 0u)\n  {\n"
+                  "    for (uint k = 1u; k <= LOG_TILE; k++)\n    {\n"
+                  "      for (uint j = 1u << (k - 1u); j > 0u; j >>= 1u)\n      {\n"
+                  "        uint position = pair_position(thread, j);\n"
+                  "        exchange_shared(position, j, ((base + position) & (1u << k)) == 0u);\n"
+                  "        barrier();\n      }\n    }\n  }\n"
+                  "  else\n  {\n"
+                  "    for (uint j = TILE / 2u; j > 0u; j >>= 1u)\n    {\n"
+                  "      uint position = pair_position(thread, j);\n"
+                  "      exchange_shared(position, j, ((base + position) & (1u << stage)) == 0u);\n"
+                  "      barrier();\n    }\n  }\n"
+                  "  for (uint half_index = 0u; half_index < 2u; half_index++)\n  {\n"
+                  "    uint at = thread + half_index * (TILE / 2u);\n"
+                  "    rows[base + at] = s_row[at];\n"
+                  "    for (uint k = 0u; k < KEYS; k++)\n    {\n      keys[(base + at) * KEYS + k] = s_key[at * KEYS + k];\n    }\n  }\n}\n");
+
+  *out_source = str8_list_join(arena, &out, 0);
+  scratch_end(scratch);
+  return 1;
+}
+
+internal GPU_Kernel*
+qk_sort_kernel(Arena* arena, U32 key_count, U32 dir_mask, B32 narrow, String8* out_name)
+{
+  if (!qk_compiler_available())
+  {
+    return 0;
+  }
+  g_qk_state.kernels_requested += 1;
+  String8 source = {0};
+  if (!qk_sort_source_build(arena, key_count, dir_mask, narrow, &source))
+  {
+    return 0;
+  }
+  return qk_kernel_from_source(arena, source, out_name);
+}
+
+internal void
+qk_join_hash_source(Arena* arena, String8List* out)
+{
+  str8_list_pushf(arena, out,
+                  "uint\nhash_u32(uint x)\n{\n"
+                  "  x ^= x >> 16u;\n  x *= 0x7feb352du;\n  x ^= x >> 15u;\n  x *= 0x846ca68bu;\n  x ^= x >> 16u;\n  return x;\n}\n");
+}
+
+// tec: the hash join's build pass for a string or a number key, same bindings and hash as hash_join_build_count.comp
+internal GPU_Kernel*
+qk_join_build_kernel(Arena* arena, B32 string_key, String8* out_name)
+{
+  if (!qk_compiler_available())
+  {
+    return 0;
+  }
+  g_qk_state.kernels_requested += 1;
+  Temp scratch = scratch_begin(&arena, 1);
+  String8List out = {0};
+  str8_list_pushf(scratch.arena, &out,
+                  "#version 450\n#extension GL_ARB_gpu_shader_fp64 : enable\n"
+                  "layout(local_size_x = 256) in;\n"
+                  "layout(std430, binding = 0) readonly buffer BuildDataBuf { uint build_data[]; };\n"
+                  "layout(std430, binding = 1) readonly buffer BuildOffBuf { uint build_off[]; };\n"
+                  "layout(std430, binding = 2) buffer BucketCountBuf { uint bucket_count[]; };\n"
+                  "layout(std430, binding = 3) buffer RowBucketBuf { uint row_bucket_out[]; };\n"
+                  "layout(push_constant) uniform PushConstants { uint words[16]; } pc;\n");
+  qk_join_hash_source(scratch.arena, &out);
+  str8_list_pushf(scratch.arena, &out, "void\nmain()\n{\n  uint row = gl_GlobalInvocationID.x;\n  if (row >= pc.words[0])\n  {\n    return;\n  }\n  uint h;\n");
+  if (string_key)
+  {
+    str8_list_pushf(scratch.arena, &out,
+                    "  uint start = build_off[row * 2u];\n  uint end = build_off[(row + 1u) * 2u];\n  h = 2166136261u;\n"
+                    "  for (uint i = start; i < end; i++)\n  {\n"
+                    "    h = (h ^ ((build_data[i / 4u] >> ((i %% 4u) * 8u)) & 0xffu)) * 16777619u;\n  }\n");
+  }
+  else
+  {
+    str8_list_pushf(scratch.arena, &out,
+                    "  uvec2 bits = uvec2(build_data[row * 2u + 0u], build_data[row * 2u + 1u]);\n  h = hash_u32(bits.x ^ hash_u32(bits.y));\n");
+  }
+  str8_list_pushf(scratch.arena, &out, "  uint bucket = h %% pc.words[2];\n  row_bucket_out[row] = bucket;\n  atomicAdd(bucket_count[bucket], 1u);\n}\n");
+  String8 source = str8_list_join(arena, &out, 0);
+  scratch_end(scratch);
+  return qk_kernel_from_source(arena, source, out_name);
+}
+
+// tec: the hash join's probe pass, same bindings and push constants as hash_join_probe.comp. a left or anti join emits the row that found nothing
+internal GPU_Kernel*
+qk_join_probe_hash_kernel(Arena* arena, B32 string_key, B32 emit_unmatched, String8* out_name)
+{
+  if (!qk_compiler_available())
+  {
+    return 0;
+  }
+  g_qk_state.kernels_requested += 1;
+  Temp scratch = scratch_begin(&arena, 1);
+  String8List out = {0};
+  str8_list_pushf(scratch.arena, &out,
+                  "#version 450\n#extension GL_ARB_gpu_shader_fp64 : enable\n"
+                  "layout(local_size_x = 256) in;\n"
+                  "layout(std430, binding = 0) readonly buffer BuildDataBuf { uint build_data[]; };\n"
+                  "layout(std430, binding = 1) readonly buffer BuildOffBuf { uint build_off[]; };\n"
+                  "layout(std430, binding = 2) readonly buffer BucketOffsetsBuf { uint bucket_offsets[]; };\n"
+                  "layout(std430, binding = 3) readonly buffer BucketRowsBuf { uint bucket_rows[]; };\n"
+                  "layout(std430, binding = 4) readonly buffer ProbeDataBuf { uint probe_data[]; };\n"
+                  "layout(std430, binding = 5) readonly buffer ProbeOffBuf { uint probe_off[]; };\n"
+                  "layout(std430, binding = 6) buffer OutPairsBuf { uint out_pairs[]; };\n"
+                  "layout(std430, binding = 7) buffer OutCountBuf { uint out_count[]; };\n"
+                  "layout(push_constant) uniform PushConstants { uint words[16]; } pc;\n"
+                  "#define BUILD_NULL 0xffffffffu\n");
+  qk_join_hash_source(scratch.arena, &out);
+  if (string_key)
+  {
+    str8_list_pushf(scratch.arena, &out,
+                    "uint build_byte(uint i) { return (build_data[i / 4u] >> ((i %% 4u) * 8u)) & 0xffu; }\n"
+                    "uint probe_byte(uint i) { return (probe_data[i / 4u] >> ((i %% 4u) * 8u)) & 0xffu; }\n"
+                    "bool\nkeys_equal(uint build_row, uint probe_row)\n{\n"
+                    "  uint bs = build_off[build_row * 2u];\n  uint blen = build_off[(build_row + 1u) * 2u] - bs;\n"
+                    "  uint ps = probe_off[probe_row * 2u];\n  uint plen = probe_off[(probe_row + 1u) * 2u] - ps;\n"
+                    "  if (blen != plen)\n  {\n    return false;\n  }\n"
+                    "  for (uint i = 0u; i < blen; i++)\n  {\n    if (build_byte(bs + i) != probe_byte(ps + i))\n    {\n      return false;\n    }\n  }\n  return true;\n}\n");
+  }
+  else
+  {
+    str8_list_pushf(scratch.arena, &out,
+                    "bool\nkeys_equal(uint build_row, uint probe_row)\n{\n"
+                    "  return packDouble2x32(uvec2(build_data[build_row * 2u], build_data[build_row * 2u + 1u])) == "
+                    "packDouble2x32(uvec2(probe_data[probe_row * 2u], probe_data[probe_row * 2u + 1u]));\n}\n");
+  }
+  str8_list_pushf(scratch.arena, &out,
+                  "void\nmain()\n{\n"
+                  "  uint probe_row = gl_GlobalInvocationID.x;\n"
+                  "  if (probe_row >= pc.words[0])\n  {\n    return;\n  }\n"
+                  "  uint out_capacity = pc.words[8];\n  uint h;\n");
+  if (string_key)
+  {
+    str8_list_pushf(scratch.arena, &out,
+                    "  uint start = probe_off[probe_row * 2u];\n  uint end = probe_off[(probe_row + 1u) * 2u];\n  h = 2166136261u;\n"
+                    "  for (uint i = start; i < end; i++)\n  {\n    h = (h ^ probe_byte(i)) * 16777619u;\n  }\n");
+  }
+  else
+  {
+    str8_list_pushf(scratch.arena, &out,
+                    "  uvec2 bits = uvec2(probe_data[probe_row * 2u], probe_data[probe_row * 2u + 1u]);\n  h = hash_u32(bits.x ^ hash_u32(bits.y));\n");
+  }
+  str8_list_pushf(scratch.arena, &out,
+                  "  uint bucket = h %% pc.words[2];\n"
+                  "  uint first = bucket_offsets[bucket];\n  uint last = bucket_offsets[bucket + 1u];\n"
+                  "  bool found_any = false;\n"
+                  "  for (uint m = first; m < last; m++)\n  {\n"
+                  "    uint build_row = bucket_rows[m];\n"
+                  "    if (keys_equal(build_row, probe_row))\n    {\n"
+                  "      found_any = true;\n"
+                  "      uint pos = atomicAdd(out_count[0], 1u);\n"
+                  "      if (pos < out_capacity)\n      {\n"
+                  "        out_pairs[pos * 4u + 0u] = probe_row;\n        out_pairs[pos * 4u + 1u] = 0u;\n"
+                  "        out_pairs[pos * 4u + 2u] = build_row;\n        out_pairs[pos * 4u + 3u] = 0u;\n      }\n    }\n  }\n");
+  if (emit_unmatched)
+  {
+    str8_list_pushf(scratch.arena, &out,
+                    "  if (!found_any)\n  {\n"
+                    "    uint pos = atomicAdd(out_count[0], 1u);\n"
+                    "    if (pos < out_capacity)\n    {\n"
+                    "      out_pairs[pos * 4u + 0u] = probe_row;\n      out_pairs[pos * 4u + 1u] = 0u;\n"
+                    "      out_pairs[pos * 4u + 2u] = BUILD_NULL;\n      out_pairs[pos * 4u + 3u] = BUILD_NULL;\n    }\n  }\n");
+  }
+  str8_list_pushf(scratch.arena, &out, "}\n");
+  String8 source = str8_list_join(arena, &out, 0);
+  scratch_end(scratch);
+  return qk_kernel_from_source(arena, source, out_name);
+}
+
+// tec: the streamed probe of a big table against a small one's hash table, fused with its aggregates, same bindings and push constants as join_probe_native.comp.
+// the encoding widths of the key and the argument columns, the aggregate functions, the argument of each and which arguments are signed are fixed in the source.
+// the encoding bases, the table size and the bloom filter size stay in push constants
+internal GPU_Kernel*
+qk_join_probe_native_kernel(Arena* arena, U64 shader_widths, U32 arg_count, U32 num_exprs, U32 func_codes, U32 arg_index_codes, U32 arg_signed_bits, String8* out_name)
+{
+  if (!qk_compiler_available() || num_exprs > 8 || arg_count > 4)
+  {
+    return 0;
+  }
+  g_qk_state.kernels_requested += 1;
+  Temp scratch = scratch_begin(&arena, 1);
+  String8List out = {0};
+  str8_list_pushf(scratch.arena, &out,
+                  "#version 450\n#extension GL_EXT_control_flow_attributes : enable\n"
+                  "layout(local_size_x = 256) in;\n"
+                  "layout(std430, binding = 0) readonly buffer KeyBuf { uint keys[]; };\n"
+                  "layout(std430, binding = 1) readonly buffer Arg0Buf { uint arg0[]; };\n"
+                  "layout(std430, binding = 2) readonly buffer Arg1Buf { uint arg1[]; };\n"
+                  "layout(std430, binding = 3) readonly buffer Arg2Buf { uint arg2[]; };\n"
+                  "layout(std430, binding = 4) readonly buffer Arg3Buf { uint arg3[]; };\n"
+                  "layout(std430, binding = 5) readonly buffer TableKeyBuf { uint table_keys[]; };\n"
+                  "layout(std430, binding = 6) readonly buffer TableRowBuf { uint table_rows[]; };\n"
+                  "layout(std430, binding = 7) buffer CountBuf { uint counts[]; };\n"
+                  "layout(std430, binding = 8) buffer SumBuf { uint sum_words[]; };\n"
+                  "layout(std430, binding = 9) buffer MinBuf { int min_out[]; };\n"
+                  "layout(std430, binding = 10) buffer MaxBuf { int max_out[]; };\n"
+                  "layout(std430, binding = 11) readonly buffer BloomBuf { uint bloom[]; };\n"
+                  "layout(push_constant) uniform PushConstants { uint words[16]; } pc;\n"
+                  "#define UNROLL 8u\n#define ROWS_PER_THREAD 32u\n#define EXPRS %uu\n", num_exprs);
+
+  // tec: one loader per column, the width is 1 (8 bit), 2 (16 bit) or anything else (32 bit)
+  U32 base_words[5] = { 10, 3, 5, 9, 11 };
+  char* names[5] = { "keys", "arg0", "arg1", "arg2", "arg3" };
+  for (U32 c = 0; c < 5; c++)
+  {
+    U32 width = (U32)((shader_widths >> (c == 0 ? 0 : 4 + 4 * (c - 1))) & 0xf);
+    if (c > 0 && c - 1 >= arg_count)
+    {
+      width = 0;
+    }
+    if (width == 1)
+    {
+      str8_list_pushf(scratch.arena, &out, "uint load_%u(uint row)\n{\n  return pc.words[%u] + ((%s[row >> 2u] >> ((row & 3u) * 8u)) & 0xffu);\n}\n", c, base_words[c], names[c]);
+    }
+    else if (width == 2)
+    {
+      str8_list_pushf(scratch.arena, &out, "uint load_%u(uint row)\n{\n  return pc.words[%u] + ((%s[row >> 1u] >> ((row & 1u) * 16u)) & 0xffffu);\n}\n", c, base_words[c], names[c]);
+    }
+    else
+    {
+      str8_list_pushf(scratch.arena, &out, "uint load_%u(uint row)\n{\n  return %s[row];\n}\n", c, names[c]);
+    }
+  }
+  str8_list_pushf(scratch.arena, &out,
+                  "bool\nbloom_maybe(uint key, uint bloom_log2)\n{\n"
+                  "  uint word = (key * 0x9E3779B1u) >> (32u - bloom_log2);\n"
+                  "  uint h2 = key * 0x85EBCA6Bu;\n"
+                  "  uint bits = (1u << ((h2 >> 27u) & 31u)) | (1u << ((h2 >> 22u) & 31u));\n"
+                  "  return (bloom[word] & bits) == bits;\n}\n"
+                  "uint\nlookup(uint key, uint mask, uint log2_size)\n{\n"
+                  "  uint slot = (key * 0x9E3779B1u) >> (32u - log2_size);\n"
+                  "  for (;;)\n  {\n"
+                  "    uint row_plus_one = table_rows[slot];\n"
+                  "    if (row_plus_one == 0u)\n    {\n      return 0u;\n    }\n"
+                  "    if (table_keys[slot] == key)\n    {\n      return row_plus_one;\n    }\n"
+                  "    slot = (slot + 1u) & mask;\n  }\n}\n"
+                  "void\nadd_match(uint dim_row, uint row)\n{\n  atomicAdd(counts[dim_row], 1u);\n");
+  for (U32 e = 0; e < num_exprs; e++)
+  {
+    U32 func = (func_codes >> (e * 4)) & 0xf;
+    U32 arg = (arg_index_codes >> (e * 4)) & 0xf;
+    if (func == 0)
+    {
+      continue;
+    }
+    if (arg >= arg_count)
+    {
+      scratch_end(scratch);
+      return 0;
+    }
+    B32 is_signed = (arg_signed_bits >> arg) & 1;
+    str8_list_pushf(scratch.arena, &out, "  {\n    uint word = load_%u(row);\n    uint index = dim_row * EXPRS + %uu;\n", arg + 1, e);
+    if (func == 1 || func == 2)
+    {
+      str8_list_pushf(scratch.arena, &out,
+                      "    uint before = atomicAdd(sum_words[index * 2u], word);\n"
+                      "    uint high_add = %s + ((before + word < before) ? 1u : 0u);\n"
+                      "    if (high_add != 0u)\n    {\n      atomicAdd(sum_words[index * 2u + 1u], high_add);\n    }\n",
+                      is_signed ? "((int(word) < 0) ? 0xffffffffu : 0u)" : "0u");
+    }
+    else if (func == 3)
+    {
+      str8_list_pushf(scratch.arena, &out, "    atomicMin(min_out[index], int(word));\n");
+    }
+    else if (func == 4)
+    {
+      str8_list_pushf(scratch.arena, &out, "    atomicMax(max_out[index], int(word));\n");
+    }
+    else
+    {
+      scratch_end(scratch);
+      return 0;
+    }
+    str8_list_pushf(scratch.arena, &out, "  }\n");
+  }
+  str8_list_pushf(scratch.arena, &out,
+                  "}\n"
+                  "void\nmain()\n{\n"
+                  "  uint row_count = pc.words[0];\n"
+                  "  uint mask = pc.words[8];\n  uint log2_size = pc.words[12];\n  uint bloom_log2 = pc.words[13];\n"
+                  "  uint first = gl_WorkGroupID.x * (256u * ROWS_PER_THREAD) + gl_LocalInvocationID.x;\n"
+                  "  uint last = min(gl_WorkGroupID.x * (256u * ROWS_PER_THREAD) + 256u * ROWS_PER_THREAD, row_count);\n"
+                  "  for (uint row = first; row < last; row += 256u * UNROLL)\n  {\n"
+                  "    uint keys_in_flight[UNROLL];\n"
+                  "    [[unroll]] for (uint u = 0u; u < UNROLL; u++)\n    {\n"
+                  "      uint at = row + u * 256u;\n      keys_in_flight[u] = (at < last) ? load_0(at) : 0u;\n    }\n"
+                  "    bool maybe[UNROLL];\n"
+                  "    [[unroll]] for (uint u = 0u; u < UNROLL; u++)\n    {\n"
+                  "      maybe[u] = (row + u * 256u < last) && bloom_maybe(keys_in_flight[u], bloom_log2);\n    }\n"
+                  "    [[unroll]] for (uint u = 0u; u < UNROLL; u++)\n    {\n"
+                  "      if (maybe[u])\n      {\n"
+                  "        uint found = lookup(keys_in_flight[u], mask, log2_size);\n"
+                  "        if (found != 0u)\n        {\n          add_match(found - 1u, row + u * 256u);\n        }\n      }\n    }\n  }\n}\n");
+  String8 source = str8_list_join(arena, &out, 0);
+  scratch_end(scratch);
+  return qk_kernel_from_source(arena, source, out_name);
+}
+
+// tec: a HAVING condition over the grouped result, evaluated for every group at once. keep[i] is 1 when group i passes. binding 0 keep, binding 1 the literals (doubles),
+// bindings 2 to 9 the result columns the condition compares (doubles). condition is a GLSL bool expression over v0..v7 (the column values of group i) and lit[0..15].
+// the literals are in a buffer so conditions that differ only in their constants share a kernel. push constant slot 0 is the group count
+internal GPU_Kernel*
+qk_having_kernel(Arena* arena, String8 condition, String8* out_name)
+{
+  if (!qk_compiler_available())
+  {
+    return 0;
+  }
+  g_qk_state.kernels_requested += 1;
+  Temp scratch = scratch_begin(&arena, 1);
+  String8List out = {0};
+  str8_list_pushf(scratch.arena, &out,
+                  "#version 450\n#extension GL_ARB_gpu_shader_fp64 : enable\n"
+                  "layout(local_size_x = 256) in;\n"
+                  "layout(std430, binding = 0) buffer KeepBuf { uint keep[]; };\n"
+                  "layout(std430, binding = 1) readonly buffer LitBuf { double lit[]; };\n");
+  for (U32 c = 0; c < 8; c++)
+  {
+    str8_list_pushf(scratch.arena, &out, "layout(std430, binding = %u) readonly buffer Col%uBuf { double col%u[]; };\n", 2 + c, c, c);
+  }
+  str8_list_pushf(scratch.arena, &out,
+                  "layout(push_constant) uniform PushConstants { uint words[16]; } pc;\n"
+                  "void\nmain()\n{\n"
+                  "  uint i = gl_GlobalInvocationID.x;\n"
+                  "  if (i >= pc.words[0])\n  {\n    return;\n  }\n");
+  for (U32 c = 0; c < 8; c++)
+  {
+    str8_list_pushf(scratch.arena, &out, "  double v%u = col%u[i];\n", c, c);
+  }
+  str8_list_pushf(scratch.arena, &out, "  keep[i] = (%.*s) ? 1u : 0u;\n}\n", str8_varg(condition));
+  String8 source = str8_list_join(arena, &out, 0);
+  scratch_end(scratch);
+  return qk_kernel_from_source(arena, source, out_name);
+}
+
+// tec: the group slot assignment of aggregate_assign.comp, an open addressed hash table of group keys claimed with compare and swap.
+// the number of key columns and which are strings are in the source, so the hash and the comparison of every column are straight code. same bindings and push constants
+internal GPU_Kernel*
+qk_hash_assign_kernel(Arena* arena, U32 num_group_cols, U32 string_mask, String8* out_name)
+{
+  if (!qk_compiler_available() || num_group_cols == 0 || num_group_cols > 4)
+  {
+    return 0;
+  }
+  g_qk_state.kernels_requested += 1;
+  Temp scratch = scratch_begin(&arena, 1);
+  String8List out = {0};
+  str8_list_pushf(scratch.arena, &out,
+                  "#version 450\n#extension GL_ARB_gpu_shader_fp64 : enable\n"
+                  "layout(local_size_x = 256) in;\n#define EMPTY 0xffffffffu\n"
+                  "layout(std430, binding = 0) buffer OwnerBuf { uint owner_row_index[]; };\n"
+                  "layout(std430, binding = 1) buffer CountBuf { uint slot_row_count[]; };\n"
+                  "layout(std430, binding = 2) buffer RowSlotBuf { uint row_slot_out[]; };\n"
+                  "layout(std430, binding = 3) buffer OverflowBuf { uint overflow_count[]; };\n");
+  for (U32 c = 0; c < 4; c++)
+  {
+    str8_list_pushf(scratch.arena, &out,
+                    "layout(std430, binding = %u) readonly buffer Col%uDataBuf { uint col%u_data[]; };\n"
+                    "layout(std430, binding = %u) readonly buffer Col%uOffBuf { uint col%u_off[]; };\n",
+                    4 + c * 2, c, c, 5 + c * 2, c, c);
+  }
+  str8_list_pushf(scratch.arena, &out,
+                  "layout(push_constant) uniform PushConstants { uint words[16]; } pc;\n"
+                  "uint\nhash_u32(uint x)\n{\n  x ^= x >> 16u;\n  x *= 0x7feb352du;\n  x ^= x >> 15u;\n  x *= 0x846ca68bu;\n  x ^= x >> 16u;\n  return x;\n}\n");
+  for (U32 c = 0; c < num_group_cols; c++)
+  {
+    if ((string_mask >> c) & 1)
+    {
+      str8_list_pushf(scratch.arena, &out,
+                      "uint byte_%u(uint i) { return (col%u_data[i / 4u] >> ((i %% 4u) * 8u)) & 0xffu; }\n"
+                      "uint hash_%u(uint row)\n{\n"
+                      "  uint start = col%u_off[row * 2u];\n  uint end = col%u_off[(row + 1u) * 2u];\n  uint hh = 2166136261u;\n"
+                      "  for (uint i = start; i < end; i++)\n  {\n    hh = (hh ^ byte_%u(i)) * 16777619u;\n  }\n  return hh;\n}\n"
+                      "bool equal_%u(uint a, uint b)\n{\n"
+                      "  uint start_a = col%u_off[a * 2u];\n  uint len_a = col%u_off[(a + 1u) * 2u] - start_a;\n"
+                      "  uint start_b = col%u_off[b * 2u];\n  uint len_b = col%u_off[(b + 1u) * 2u] - start_b;\n"
+                      "  if (len_a != len_b)\n  {\n    return false;\n  }\n"
+                      "  for (uint i = 0u; i < len_a; i++)\n  {\n    if (byte_%u(start_a + i) != byte_%u(start_b + i))\n    {\n      return false;\n    }\n  }\n  return true;\n}\n",
+                      c, c, c, c, c, c, c, c, c, c, c, c, c);
+    }
+    else
+    {
+      str8_list_pushf(scratch.arena, &out,
+                      "double num_%u(uint row) { return packDouble2x32(uvec2(col%u_data[row * 2u], col%u_data[row * 2u + 1u])); }\n"
+                      "uint hash_%u(uint row)\n{\n  uvec2 bits = unpackDouble2x32(num_%u(row));\n  return hash_u32(bits.x ^ hash_u32(bits.y));\n}\n"
+                      "bool equal_%u(uint a, uint b)\n{\n  return num_%u(a) == num_%u(b);\n}\n",
+                      c, c, c, c, c, c, c, c);
+    }
+  }
+  str8_list_pushf(scratch.arena, &out,
+                  "void\nmain()\n{\n"
+                  "  uint row = gl_GlobalInvocationID.x;\n"
+                  "  if (row >= pc.words[0])\n  {\n    return;\n  }\n"
+                  "  uint K = pc.words[4];\n  uint h = 2166136261u;\n");
+  for (U32 c = 0; c < num_group_cols; c++)
+  {
+    str8_list_pushf(scratch.arena, &out, "  h = hash_u32(h ^ hash_%u(row));\n", c);
+  }
+  str8_list_pushf(scratch.arena, &out,
+                  "  uint probe_start = (h %% pc.words[2]) * K;\n"
+                  "  uint claimed_slot = EMPTY;\n"
+                  "  for (uint p = 0u; p < K; p++)\n  {\n"
+                  "    uint slot = probe_start + p;\n"
+                  "    uint prev = atomicCompSwap(owner_row_index[slot], EMPTY, row);\n"
+                  "    if (prev == EMPTY)\n    {\n      claimed_slot = slot;\n      break;\n    }\n"
+                  "    bool same = true");
+  for (U32 c = 0; c < num_group_cols; c++)
+  {
+    str8_list_pushf(scratch.arena, &out, " && equal_%u(row, prev)", c);
+  }
+  str8_list_pushf(scratch.arena, &out,
+                  ";\n    if (same)\n    {\n      claimed_slot = slot;\n      break;\n    }\n  }\n"
+                  "  if (claimed_slot == EMPTY)\n  {\n    atomicAdd(overflow_count[0], 1u);\n    return;\n  }\n"
+                  "  row_slot_out[row] = claimed_slot;\n  atomicAdd(slot_row_count[claimed_slot], 1u);\n}\n");
+  String8 source = str8_list_join(arena, &out, 0);
+  scratch_end(scratch);
+  return qk_kernel_from_source(arena, source, out_name);
+}
+
+// tec: the atomic hash aggregation of aggregate_hash_reduce_f32.comp (fixed false, F32 arguments, float sums by compare and swap) and aggregate_hash_reduce_fixed.comp (fixed true,
+// F64 arguments scaled to whole numbers by their power of ten). same bindings and push constants. the expression count, the function of each, and for fixed the power of ten of each are in the source
+internal GPU_Kernel*
+qk_hash_reduce_kernel(Arena* arena, B32 fixed, U32 num_exprs, U32 func_codes, U32 scales, String8* out_name)
+{
+  if (!qk_compiler_available() || num_exprs == 0 || num_exprs > 8)
+  {
+    return 0;
+  }
+  g_qk_state.kernels_requested += 1;
+  Temp scratch = scratch_begin(&arena, 1);
+  String8List out = {0};
+  char* arg_type = fixed ? "double" : "float";
+  str8_list_pushf(scratch.arena, &out, "#version 450\n");
+  if (fixed)
+  {
+    str8_list_pushf(scratch.arena, &out, "#extension GL_ARB_gpu_shader_fp64 : enable\n");
+  }
+  str8_list_pushf(scratch.arena, &out,
+                  "layout(local_size_x = 256) in;\n"
+                  "#define EMPTY 0xffffffffu\n"
+                  "layout(std430, binding = 0) readonly buffer RowSlotBuf { uint row_slot[]; };\n"
+                  "layout(std430, binding = 1) readonly buffer SlotGroupBuf { uint slot_group[]; };\n"
+                  "layout(std430, binding = 2) buffer SumBuf { uint sum_words[]; };\n"
+                  "layout(std430, binding = 3) buffer CountBuf { uint count_out[]; };\n"
+                  "layout(std430, binding = 4) buffer MinBuf { %s min_out[]; };\n"
+                  "layout(std430, binding = 5) buffer MaxBuf { %s max_out[]; };\n",
+                  fixed ? "int" : "uint", fixed ? "int" : "uint");
+  for (U32 e = 0; e < 8; e++)
+  {
+    str8_list_pushf(scratch.arena, &out, "layout(std430, binding = %u) readonly buffer Arg%uBuf { %s arg%u[]; };\n", 6 + e, e, arg_type, e);
+  }
+  str8_list_pushf(scratch.arena, &out, "layout(push_constant) uniform PushConstants { uint words[16]; } pc;\n");
+  if (!fixed)
+  {
+    str8_list_pushf(scratch.arena, &out,
+                    "void\natomic_add_f32(uint index, float val)\n{\n"
+                    "  uint old = sum_words[index];\n  uint assumed;\n"
+                    "  do\n  {\n    assumed = old;\n    old = atomicCompSwap(sum_words[index], assumed, floatBitsToUint(uintBitsToFloat(assumed) + val));\n  } while (assumed != old);\n}\n"
+                    "void\natomic_min_f32(uint index, float val)\n{\n"
+                    "  uint old = min_out[index];\n  uint assumed;\n"
+                    "  do\n  {\n    if (val >= uintBitsToFloat(old))\n    {\n      return;\n    }\n    assumed = old;\n    old = atomicCompSwap(min_out[index], assumed, floatBitsToUint(val));\n  } while (assumed != old);\n}\n"
+                    "void\natomic_max_f32(uint index, float val)\n{\n"
+                    "  uint old = max_out[index];\n  uint assumed;\n"
+                    "  do\n  {\n    if (val <= uintBitsToFloat(old))\n    {\n      return;\n    }\n    assumed = old;\n    old = atomicCompSwap(max_out[index], assumed, floatBitsToUint(val));\n  } while (assumed != old);\n}\n");
+  }
+  str8_list_pushf(scratch.arena, &out,
+                  "void\nmain()\n{\n"
+                  "  uint row = gl_GlobalInvocationID.x;\n"
+                  "  if (row >= pc.words[0])\n  {\n    return;\n  }\n"
+                  "  uint slot = row_slot[row];\n"
+                  "  if (slot == EMPTY)\n  {\n    return;\n  }\n"
+                  "  uint g = slot_group[slot];\n"
+                  "  if (g == EMPTY)\n  {\n    return;\n  }\n");
+  for (U32 e = 0; e < num_exprs; e++)
+  {
+    U32 func = (func_codes >> (e * 4)) & 0xf;
+    if (func > 4)
+    {
+      scratch_end(scratch);
+      return 0;
+    }
+    str8_list_pushf(scratch.arena, &out, "  {\n    uint index = g * %uu + %uu;\n    atomicAdd(count_out[index], 1u);\n", num_exprs, e);
+    if (func == 1 || func == 2 || func == 3 || func == 4)
+    {
+      if (fixed)
+      {
+        U32 exponent = (scales >> (e * 4)) & 0xf;
+        if (exponent > 6)
+        {
+          scratch_end(scratch);
+          return 0;
+        }
+        F64 factor = 1.0;
+        for (U32 p = 0; p < exponent; p++)
+        {
+          factor *= 10.0;
+        }
+        str8_list_pushf(scratch.arena, &out, "    int q = int(floor(arg%u[row] * %.1flf + 0.5lf));\n", e, factor);
+        if (func == 1 || func == 2)
+        {
+          str8_list_pushf(scratch.arena, &out,
+                          "    uint low = uint(q);\n"
+                          "    uint before = atomicAdd(sum_words[index * 2u], low);\n"
+                          "    uint high_add = ((q < 0) ? 0xffffffffu : 0u) + ((before + low < before) ? 1u : 0u);\n"
+                          "    if (high_add != 0u)\n    {\n      atomicAdd(sum_words[index * 2u + 1u], high_add);\n    }\n");
+        }
+        else if (func == 3)
+        {
+          str8_list_pushf(scratch.arena, &out, "    atomicMin(min_out[index], q);\n");
+        }
+        else
+        {
+          str8_list_pushf(scratch.arena, &out, "    atomicMax(max_out[index], q);\n");
+        }
+      }
+      else
+      {
+        char* op = func == 3 ? "atomic_min_f32" : (func == 4 ? "atomic_max_f32" : "atomic_add_f32");
+        str8_list_pushf(scratch.arena, &out, "    %s(index, arg%u[row]);\n", op, e);
+      }
+    }
+    str8_list_pushf(scratch.arena, &out, "  }\n");
+  }
+  str8_list_pushf(scratch.arena, &out, "}\n");
+  String8 source = str8_list_join(arena, &out, 0);
+  scratch_end(scratch);
+  return qk_kernel_from_source(arena, source, out_name);
+}
+
+// tec: the member list reduce of aggregate_reduce.comp and aggregate_reduce_f32.comp (narrow) for chunks of a few rows. the precompiled kernel gives each chunk a workgroup of 256
+// threads and folds their partials through shared memory once per expression, which costs far more than the work when a group has a handful of rows. here one thread reduces a whole chunk
+// from registers. the bindings, push constants and the partials layout are the same, so the host dispatches total_chunks threads instead of total_chunks workgroups.
+// COUNT, SUM, AVG, MIN and MAX only, a group with the approximate functions keeps the precompiled kernel
+internal GPU_Kernel*
+qk_member_reduce_kernel(Arena* arena, B32 narrow, U32 num_exprs, U32 func_codes, String8* out_name)
+{
+  if (!qk_compiler_available() || num_exprs == 0 || num_exprs > 8)
+  {
+    return 0;
+  }
+  for (U32 e = 0; e < num_exprs; e++)
+  {
+    if (((func_codes >> (e * 4)) & 0xf) > 4)
+    {
+      return 0;
+    }
+  }
+  g_qk_state.kernels_requested += 1;
+  Temp scratch = scratch_begin(&arena, 1);
+  String8List out = {0};
+  str8_list_pushf(scratch.arena, &out,
+                  "#version 450\n"
+                  "#extension GL_ARB_gpu_shader_fp64 : enable\n"
+                  "layout(local_size_x = 256) in;\n"
+                  "layout(std430, binding = 0) readonly buffer MembersBuf { uint group_member_rows[]; };\n"
+                  "layout(std430, binding = 1) readonly buffer ChunkRangeBuf { uint chunk_range[]; };\n"
+                  "layout(std430, binding = 2) readonly buffer ChunkGroupBuf { uint chunk_group[]; };\n"
+                  "layout(std430, binding = 3) buffer ReprBuf { uint representative_row_out[]; };\n"
+                  "layout(std430, binding = 4) buffer PartialsBuf { double partials_out[]; };\n");
+  for (U32 e = 0; e < num_exprs; e++)
+  {
+    str8_list_pushf(scratch.arena, &out, "layout(std430, binding = %u) readonly buffer Arg%uBuf { %s arg%u[]; };\n", 5 + e, e, narrow ? "float" : "double", e);
+  }
+  str8_list_pushf(scratch.arena, &out,
+                  "layout(push_constant) uniform PushConstants { uint words[16]; } pc;\n"
+                  "void\nmain()\n{\n"
+                  "  uint chunk_id = gl_GlobalInvocationID.x;\n"
+                  "  if (chunk_id >= pc.words[0])\n  {\n    return;\n  }\n"
+                  "  uint start = chunk_range[chunk_id * 2u];\n"
+                  "  uint end = chunk_range[chunk_id * 2u + 1u];\n"
+                  "  representative_row_out[chunk_group[chunk_id]] = group_member_rows[start];\n");
+  for (U32 e = 0; e < num_exprs; e++)
+  {
+    str8_list_pushf(scratch.arena, &out, "  double acc%u = 0.0lf;\n  double mn%u = 1.0e300lf;\n  double mx%u = -1.0e300lf;\n", e, e, e);
+  }
+  str8_list_pushf(scratch.arena, &out, "  for (uint m = start; m < end; m++)\n  {\n    uint row = group_member_rows[m];\n");
+  for (U32 e = 0; e < num_exprs; e++)
+  {
+    U32 func = (func_codes >> (e * 4)) & 0xf;
+    if (func == 1 || func == 2)
+    {
+      str8_list_pushf(scratch.arena, &out, "    acc%u += double(arg%u[row]);\n", e, e);
+    }
+    else if (func == 3)
+    {
+      str8_list_pushf(scratch.arena, &out, "    mn%u = min(mn%u, double(arg%u[row]));\n", e, e, e);
+    }
+    else if (func == 4)
+    {
+      str8_list_pushf(scratch.arena, &out, "    mx%u = max(mx%u, double(arg%u[row]));\n", e, e, e);
+    }
+  }
+  str8_list_pushf(scratch.arena, &out, "  }\n  double count = double(end - start);\n");
+  for (U32 e = 0; e < num_exprs; e++)
+  {
+    str8_list_pushf(scratch.arena, &out,
+                    "  {\n    uint base = (chunk_id * %uu + %uu) * 4u;\n"
+                    "    partials_out[base] = acc%u;\n    partials_out[base + 1u] = count;\n    partials_out[base + 2u] = mn%u;\n    partials_out[base + 3u] = mx%u;\n  }\n",
+                    num_exprs, e, e, e, e);
+  }
+  str8_list_pushf(scratch.arena, &out, "}\n");
+  String8 source = str8_list_join(arena, &out, 0);
+  scratch_end(scratch);
+  return qk_kernel_from_source(arena, source, out_name);
+}
+
+// tec: the slot compaction of aggregate_compact.comp, same bindings, push constants and modes. each thread takes QK_COMPACT_PER_THREAD neighbouring slots instead of one, so a block of 256
+// threads covers QK_COMPACT_BLOCK slots, which divides the barriers and the block totals by that factor. the dense ids written are the same. the host dispatches one workgroup per block
+#define QK_COMPACT_PER_THREAD 4
+#define QK_COMPACT_BLOCK (256 * QK_COMPACT_PER_THREAD)
+internal GPU_Kernel*
+qk_compact_kernel(Arena* arena, String8* out_name)
+{
+  if (!qk_compiler_available())
+  {
+    return 0;
+  }
+  g_qk_state.kernels_requested += 1;
+  String8 source = push_str8f(arena,
+    "#version 450\n"
+    "layout(local_size_x = 256) in;\n"
+    "#define PER %u\n"
+    "#define BLOCK %u\n"
+    "layout(std430, binding = 0) readonly buffer CountBuf { uint slot_row_count[]; };\n"
+    "layout(std430, binding = 1) readonly buffer OwnerBuf { uint owner_row_index[]; };\n"
+    "layout(std430, binding = 2) buffer OffsetsBuf { uint offsets[]; };\n"
+    "layout(std430, binding = 3) buffer BlockSumBuf { uint block_sums[]; };\n"
+    "layout(std430, binding = 4) buffer OutOwnerBuf { uint out_owner[]; };\n"
+    "layout(std430, binding = 5) buffer OutCountBuf { uint out_count[]; };\n"
+    "layout(std430, binding = 6) buffer TotalBuf { uint total[]; };\n"
+    "layout(push_constant) uniform PushConstants { uint words[16]; } pc;\n"
+    "shared uint scan[256];\n"
+    "void\nscan_shared(uint thread)\n{\n"
+    "  for (uint stride = 1u; stride < 256u; stride <<= 1u)\n  {\n"
+    "    uint added = (thread >= stride) ? scan[thread - stride] : 0u;\n    barrier();\n"
+    "    scan[thread] += added;\n    barrier();\n  }\n}\n"
+    "void\nmain()\n{\n"
+    "  uint n = pc.words[0];\n"
+    "  uint mode = pc.words[2];\n"
+    "  uint thread = gl_LocalInvocationID.x;\n"
+    "  uint block_count = (n + BLOCK - 1u) / BLOCK;\n"
+    "  if (mode == 0u)\n  {\n"
+    "    if (gl_WorkGroupID.x >= block_count)\n    {\n      return;\n    }\n"
+    "    uint first = gl_WorkGroupID.x * BLOCK + thread * PER;\n"
+    "    uint flags[PER];\n    uint sum = 0u;\n"
+    "    for (uint i = 0u; i < PER; i++)\n    {\n"
+    "      uint index = first + i;\n"
+    "      flags[i] = (index < n && slot_row_count[index] != 0u) ? 1u : 0u;\n      sum += flags[i];\n    }\n"
+    "    scan[thread] = sum;\n    barrier();\n    scan_shared(thread);\n"
+    "    uint inclusive = scan[thread];\n"
+    "    uint running = inclusive - sum;\n"
+    "    for (uint i = 0u; i < PER; i++)\n    {\n"
+    "      uint index = first + i;\n"
+    "      if (index < n)\n      {\n        offsets[index] = running;\n      }\n"
+    "      running += flags[i];\n    }\n"
+    "    if (thread == 255u)\n    {\n      block_sums[gl_WorkGroupID.x] = inclusive;\n    }\n  }\n"
+    "  else if (mode == 1u)\n  {\n"
+    "    uint chunk = (block_count + 255u) / 256u;\n"
+    "    uint start = min(thread * chunk, block_count);\n"
+    "    uint end = min(start + chunk, block_count);\n"
+    "    uint sum = 0u;\n"
+    "    for (uint i = start; i < end; i++)\n    {\n      sum += block_sums[i];\n    }\n"
+    "    scan[thread] = sum;\n    barrier();\n    scan_shared(thread);\n"
+    "    uint inclusive = scan[thread];\n    uint running = inclusive - sum;\n"
+    "    for (uint i = start; i < end; i++)\n    {\n"
+    "      uint block_total = block_sums[i];\n      block_sums[i] = running;\n      running += block_total;\n    }\n"
+    "    if (thread == 255u)\n    {\n      offsets[n] = inclusive;\n      total[0] = inclusive;\n    }\n  }\n"
+    "  else\n  {\n"
+    "    if (gl_WorkGroupID.x >= block_count)\n    {\n      return;\n    }\n"
+    "    uint base = block_sums[gl_WorkGroupID.x];\n"
+    "    uint first = gl_WorkGroupID.x * BLOCK + thread * PER;\n"
+    "    for (uint i = 0u; i < PER; i++)\n    {\n"
+    "      uint index = first + i;\n"
+    "      if (index < n)\n      {\n"
+    "        uint id = offsets[index] + base;\n        offsets[index] = id;\n"
+    "        uint count = slot_row_count[index];\n"
+    "        if (count != 0u)\n        {\n          out_owner[id] = owner_row_index[index];\n          out_count[id] = count;\n        }\n"
+    "      }\n    }\n  }\n}\n",
+    (U32)QK_COMPACT_PER_THREAD, (U32)QK_COMPACT_BLOCK);
+  return qk_kernel_from_source(arena, source, out_name);
+}
+
+// tec: the device side column gathers of selection_gather.comp, one kernel per mode. mode 0 reads a 64 bit value per row, 1 a 32 bit one, 2 the rows of a few positions,
+// 3 resolves rows through a map and 4 adds an offset to rows. bindings and push constants as that kernel, the mode push constant is not read
+internal GPU_Kernel*
+qk_gather_kernel(Arena* arena, U32 mode, String8* out_name)
+{
+  if (!qk_compiler_available() || mode > 4)
+  {
+    return 0;
+  }
+  g_qk_state.kernels_requested += 1;
+  Temp scratch = scratch_begin(&arena, 1);
+  String8List out = {0};
+  str8_list_pushf(scratch.arena, &out,
+                  "#version 450\n"
+                  "layout(local_size_x = 256) in;\n"
+                  "#define NO_ROW 0xffffffffu\n"
+                  "layout(std430, binding = 0) readonly buffer RowsBuf { uint rows[]; };\n"
+                  "layout(std430, binding = 1) readonly buffer SourceBuf { uint source[]; };\n"
+                  "layout(std430, binding = 2) buffer DestBuf { uint dest[]; };\n"
+                  "layout(std430, binding = 3) readonly buffer PositionBuf { uint positions[]; };\n"
+                  "layout(push_constant) uniform PushConstants { uint words[16]; } pc;\n"
+                  "void\nmain()\n{\n"
+                  "  uint i = gl_GlobalInvocationID.x;\n"
+                  "  if (i >= pc.words[0])\n  {\n    return;\n  }\n"
+                  "  uint stride_words = pc.words[2];\n  uint row_offset = pc.words[4];\n  uint word_offset = pc.words[10];\n");
+  if (mode == 2)
+  {
+    str8_list_pushf(scratch.arena, &out,
+                    "  uint index = rows[positions[i] * stride_words + word_offset];\n"
+                    "  dest[i] = (index == NO_ROW) ? NO_ROW : (index + row_offset);\n");
+  }
+  else if (mode == 4)
+  {
+    str8_list_pushf(scratch.arena, &out,
+                    "  uint index = rows[i * stride_words + word_offset];\n"
+                    "  dest[i] = (index == NO_ROW) ? NO_ROW : (index + row_offset);\n");
+  }
+  else if (mode == 3)
+  {
+    str8_list_pushf(scratch.arena, &out,
+                    "  uint index = rows[i * stride_words + word_offset];\n"
+                    "  uint mapped = (index == NO_ROW) ? NO_ROW : source[index * pc.words[8]];\n"
+                    "  dest[i] = (mapped == NO_ROW) ? NO_ROW : (mapped + pc.words[12]);\n");
+  }
+  else if (mode == 0)
+  {
+    str8_list_pushf(scratch.arena, &out,
+                    "  uint index = rows[i * stride_words + word_offset];\n"
+                    "  bool has_row = index != NO_ROW;\n  uint row = index + row_offset;\n"
+                    "  dest[i * 2u + 0u] = has_row ? source[row * 2u + 0u] : 0u;\n"
+                    "  dest[i * 2u + 1u] = has_row ? source[row * 2u + 1u] : 0u;\n");
+  }
+  else
+  {
+    str8_list_pushf(scratch.arena, &out,
+                    "  uint index = rows[i * stride_words + word_offset];\n"
+                    "  dest[i] = (index != NO_ROW) ? source[index + row_offset] : 0u;\n");
+  }
+  str8_list_pushf(scratch.arena, &out, "}\n");
+  String8 source = str8_list_join(arena, &out, 0);
+  scratch_end(scratch);
+  return qk_kernel_from_source(arena, source, out_name);
+}
+
+internal GPU_Kernel*
+qk_window_flags_kernel(Arena* arena, U32 key_count, U32 partition_count, B32 narrow, String8* out_name)
+{
+  if (!qk_compiler_available() || key_count == 0 || key_count > 4 || partition_count > key_count)
+  {
+    return 0;
+  }
+  g_qk_state.kernels_requested += 1;
+  Temp scratch = scratch_begin(&arena, 1);
+  String8List out = {0};
+  char* type_name = narrow ? "float" : "double";
+  str8_list_pushf(scratch.arena, &out, "#version 450\n");
+  if (!narrow)
+  {
+    str8_list_pushf(scratch.arena, &out, "#extension GL_ARB_gpu_shader_fp64 : enable\n");
+  }
+  str8_list_pushf(scratch.arena, &out,
+                  "layout(local_size_x = 256) in;\n"
+                  "layout(std430, binding = 0) readonly buffer KeyBuf { %s keys[]; };\n"
+                  "layout(std430, binding = 1) buffer PartitionFlagBuf { uint partition_flag[]; };\n"
+                  "layout(std430, binding = 2) buffer PeerFlagBuf { uint peer_flag[]; };\n"
+                  "layout(push_constant) uniform PushConstants { uint words[16]; } pc;\n"
+                  "void\nmain()\n{\n"
+                  "  uint i = gl_GlobalInvocationID.x;\n"
+                  "  if (i >= pc.words[0])\n  {\n    return;\n  }\n"
+                  "  if (i == 0u)\n  {\n    partition_flag[i] = 1u;\n    peer_flag[i] = 1u;\n    return;\n  }\n"
+                  "  bool part_diff = false;\n  bool order_diff = false;\n",
+                  type_name);
+  for (U32 k = 0; k < key_count; k++)
+  {
+    str8_list_pushf(scratch.arena, &out, "  if (keys[i * %uu + %uu] != keys[(i - 1u) * %uu + %uu])\n  {\n    %s = true;\n  }\n",
+                    key_count, k, key_count, k, k < partition_count ? "part_diff" : "order_diff");
+  }
+  str8_list_pushf(scratch.arena, &out, "  partition_flag[i] = part_diff ? 1u : 0u;\n  peer_flag[i] = (part_diff || order_diff) ? 1u : 0u;\n}\n");
+  String8 source = str8_list_join(arena, &out, 0);
+  scratch_end(scratch);
   return qk_kernel_from_source(arena, source, out_name);
 }
 

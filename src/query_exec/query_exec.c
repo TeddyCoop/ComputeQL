@@ -4330,6 +4330,24 @@ qe_aggregate_full_column_f32(Arena* arena, CQL_Column* column, B32 dict_codes)
   return buffer;
 }
 
+// tec: selection_gather built for one mode, the precompiled kernel when that is not available
+internal GPU_Kernel*
+qe_gather_kernel(U32 mode)
+{
+  GPU_Kernel* kernel = 0;
+  if (settings_u64(str8_lit("QE_GENERATE_GATHER"), 1) != 0 && qk_enabled(max_U64))
+  {
+    Temp scratch = scratch_begin(0, 0);
+    kernel = qk_gather_kernel(scratch.arena, mode, 0);
+    scratch_end(scratch);
+  }
+  if (!kernel)
+  {
+    kernel = gpu_kernel_alloc(str8_lit("selection_gather"));
+  }
+  return kernel;
+}
+
 // tec: dest[i] = source[selection row i], one dispatch of its own since a kernel's arguments cannot change between dispatches of one batch
 internal GPU_Buffer*
 qe_selection_gather_column(QE_DeviceSelection* selection, GPU_Buffer* source, B32 as_f32, String8 dest_key)
@@ -4345,7 +4363,7 @@ qe_selection_gather_column(QE_DeviceSelection* selection, GPU_Buffer* source, B3
   }
   U64 element_size = as_f32 ? sizeof(F32) : sizeof(F64);
   GPU_Buffer* dest = gpu_buffer_alloc_pooled(dest_key, Max(selection->count, (U64)1) * element_size, GPU_BufferFlag_ReadWrite, 0);
-  GPU_Kernel* kernel = gpu_kernel_alloc(str8_lit("selection_gather"));
+  GPU_Kernel* kernel = qe_gather_kernel(as_f32 ? 1 : 0);
   if (!dest || !source || !kernel)
   {
     if (kernel)
@@ -4393,7 +4411,7 @@ qe_selection_rows_for_positions(QE_DeviceSelection* selection, U32* positions, U
   
   GPU_Buffer* position_buffer = gpu_buffer_alloc_pooled(str8_lit("agg_sel_positions"), count * sizeof(U32), GPU_BufferFlag_Write, 0);
   GPU_Buffer* dest = gpu_buffer_alloc_pooled(str8_lit("agg_sel_position_rows"), count * sizeof(U32), GPU_BufferFlag_ReadWrite, 0);
-  GPU_Kernel* kernel = gpu_kernel_alloc(str8_lit("selection_gather"));
+  GPU_Kernel* kernel = qe_gather_kernel(2);
   if (!position_buffer || !dest || !kernel)
   {
     if (kernel)
@@ -4440,7 +4458,7 @@ internal GPU_Buffer*
 qe_rows_resolve(GPU_Buffer* index_buffer, U32 index_stride, U32 index_word, GPU_Buffer* map_buffer, U32 map_stride, U64 offset, U64 count, String8 dest_key)
 {
   GPU_Buffer* dest = gpu_buffer_alloc_pooled(dest_key, Max(count, (U64)1) * sizeof(U32), GPU_BufferFlag_ReadWrite, 0);
-  GPU_Kernel* kernel = gpu_kernel_alloc(str8_lit("selection_gather"));
+  GPU_Kernel* kernel = qe_gather_kernel(map_buffer ? 3 : 4);
   if (!dest || !kernel)
   {
     if (kernel)
@@ -5601,6 +5619,125 @@ qe_sort_rows(Arena* arena, PLAN_RowSet* rows, IR_Node* order_by_ir, QE_SortHints
       if ((F64)(F32)v != v) { use_narrow_keys = 0; break; }
     }
   }
+  // tec: a sort kernel built for this key count, directions and key width. most passes run in shared memory and the rows are numbered on the GPU
+  if (settings_u64(str8_lit("QE_GENERATE_SORT"), 1) != 0 && qk_enabled(real_count) && real_count < (1ull << 31))
+  {
+    String8 sort_name = {0};
+    GPU_Kernel* generated = qk_sort_kernel(scratch.arena, num_keys, dir_mask, use_narrow_keys, &sort_name);
+    if (generated)
+    {
+      U32 tile = qk_sort_tile(num_keys, use_narrow_keys);
+      U32 log_tile = 0;
+      while ((1u << log_tile) < tile)
+      {
+        log_tile += 1;
+      }
+      U64 gen_padded = tile;
+      while (gen_padded < real_count)
+      {
+        gen_padded <<= 1;
+      }
+      U32 gen_stages = 0;
+      while ((1ull << gen_stages) < gen_padded)
+      {
+        gen_stages += 1;
+      }
+      U64 elem_size = use_narrow_keys ? sizeof(F32) : sizeof(F64);
+      U64 gen_key_bytes = gen_padded * num_keys * elem_size;
+      U8* gen_keys = push_array(scratch.arena, U8, gen_key_bytes);
+      for (U64 i = 0; i < gen_padded; i++)
+      {
+        for (U32 k = 0; k < num_keys; k++)
+        {
+          F64 v = i < real_count ? gathered[k][i] : 0.0;
+          if (use_narrow_keys)
+          {
+            ((F32*)gen_keys)[i * num_keys + k] = (F32)v;
+          }
+          else
+          {
+            ((F64*)gen_keys)[i * num_keys + k] = v;
+          }
+        }
+      }
+
+      GPU_Buffer* gen_keys_buf = gpu_buffer_alloc(gen_key_bytes, GPU_BufferFlag_ReadWrite, 0);
+      GPU_Buffer* gen_rows_buf = gpu_buffer_alloc(gen_padded * sizeof(U32), GPU_BufferFlag_ReadWrite, 0);
+      U32* gen_sorted = push_array(scratch.arena, U32, real_count);
+      B32 gen_ok = 0;
+      if (gen_keys_buf && gen_rows_buf)
+      {
+        gpu_kernel_set_arg_buffer(generated, 0, gen_keys_buf);
+        gpu_kernel_set_arg_buffer(generated, 1, gen_rows_buf);
+        gpu_kernel_set_arg_u64(generated, 1, real_count);
+
+        GPU_Batch* gen_batch = gpu_batch_begin(gen_key_bytes, real_count * sizeof(U32));
+        gpu_batch_buffer_write(gen_batch, gen_keys_buf, gen_keys, gen_key_bytes);
+        gpu_kernel_set_arg_u64(generated, 2, 0);
+        gpu_batch_kernel_execute(gen_batch, generated, (U32)(gen_padded / 2), tile / 2);
+        for (U32 stage = log_tile + 1; stage <= gen_stages; stage++)
+        {
+          for (U64 stride = 1ull << (stage - 1); stride >= tile; stride >>= 1)
+          {
+            gpu_kernel_set_arg_u64(generated, 2, 1);
+            gpu_kernel_set_arg_u64(generated, 3, stage);
+            gpu_kernel_set_arg_u64(generated, 4, stride);
+            gpu_batch_kernel_execute(gen_batch, generated, (U32)(gen_padded / 2), tile / 2);
+          }
+          gpu_kernel_set_arg_u64(generated, 2, 2);
+          gpu_kernel_set_arg_u64(generated, 3, stage);
+          gpu_batch_kernel_execute(gen_batch, generated, (U32)(gen_padded / 2), tile / 2);
+        }
+        gpu_batch_buffer_read(gen_batch, gen_rows_buf, gen_sorted, real_count * sizeof(U32));
+        gen_ok = gpu_batch_end(gen_batch);
+      }
+      if (gen_keys_buf)
+      {
+        gpu_buffer_release(gen_keys_buf);
+      }
+      if (gen_rows_buf)
+      {
+        gpu_buffer_release(gen_rows_buf);
+      }
+      gpu_kernel_release(generated);
+
+      if (gen_ok)
+      {
+        U64 gen_gpu_time_us = gpu_get_executed_kernel_time_microseconds();
+        log_debug("qe_sort_rows: generated sort %.*s (real_count=%llu, padded_count=%llu, tile=%u, keys=%s) GPU kernel time: %llu microseconds",
+                  str8_varg(sort_name), real_count, gen_padded, tile, use_narrow_keys ? "f32" : "f64", gen_gpu_time_us);
+        result.count = real_count;
+        result.row_indices = push_array(arena, U64*, rows->table_count);
+        for (U64 t = 0; t < rows->table_count; t++)
+        {
+          result.row_indices[t] = push_array(arena, U64, real_count);
+          for (U64 i = 0; i < real_count; i++)
+          {
+            result.row_indices[t][i] = rows->row_indices[t][gen_sorted[i]];
+          }
+        }
+        if (rows->scores)
+        {
+          F64* sorted_scores = push_array(arena, F64, real_count);
+          for (U64 i = 0; i < real_count; i++)
+          {
+            sorted_scores[i] = rows->scores[gen_sorted[i]];
+          }
+          result.scores = sorted_scores;
+        }
+        if (out_trace)
+        {
+          out_trace->row_count = real_count;
+          out_trace->kept_rows = real_count;
+          out_trace->gpu_time_us = gen_gpu_time_us;
+        }
+        scratch_end(scratch);
+        ProfEnd();
+        return result;
+      }
+    }
+  }
+
   U64 keys_elem_size = use_narrow_keys ? sizeof(F32) : sizeof(F64);
   void* keys = push_array(scratch.arena, U8, padded_count * QE_SORT_MAX_KEYS * keys_elem_size);
   U32* payload = push_array(scratch.arena, U32, padded_count * 9);
@@ -6089,9 +6226,84 @@ qe_window_rank_gpu(Arena* arena, F64** keys, B32* key_desc, U64 num_keys, U64 pa
   U32 dir_mask = 0;
   for (U32 k = 0; k < num_keys; k++) if (key_desc[k]) dir_mask |= (1u << k);
   
-  F64* sort_keys = push_array(scratch.arena, F64, padded_count * QE_SORT_MAX_KEYS);
-  U32* sort_payload = push_array(scratch.arena, U32, padded_count * 9);
-  for (U64 i = 0; i < padded_count; i++)
+  // tec: a sort kernel and a flags kernel built for these keys, the keys keep their own width and stride instead of 4 doubles
+  B32 use_gen = settings_u64(str8_lit("QE_GENERATE_SORT"), 1) != 0 && qk_enabled(real_count) && real_count < (1ull << 31);
+  GPU_Kernel* gen_sort = 0;
+  GPU_Kernel* gen_flags = 0;
+  B32 gen_narrow = 1;
+  U32 gen_tile = 0;
+  U32 gen_log_tile = 0;
+  U64 gen_elem_size = sizeof(F64);
+  if (use_gen)
+  {
+    for (U32 k = 0; k < num_keys && gen_narrow; k++)
+    {
+      for (U64 i = 0; i < real_count; i++)
+      {
+        F64 v = keys[k][i];
+        if ((F64)(F32)v != v)
+        {
+          gen_narrow = 0;
+          break;
+        }
+      }
+    }
+    gen_sort = qk_sort_kernel(scratch.arena, (U32)num_keys, dir_mask, gen_narrow, 0);
+    gen_flags = qk_window_flags_kernel(scratch.arena, (U32)num_keys, (U32)partition_key_count, gen_narrow, 0);
+    if (!gen_sort || !gen_flags)
+    {
+      if (gen_sort)
+      {
+        gpu_kernel_release(gen_sort);
+      }
+      if (gen_flags)
+      {
+        gpu_kernel_release(gen_flags);
+      }
+      gen_sort = 0;
+      gen_flags = 0;
+      use_gen = 0;
+    }
+    else
+    {
+      gen_tile = qk_sort_tile((U32)num_keys, gen_narrow);
+      while ((1u << gen_log_tile) < gen_tile)
+      {
+        gen_log_tile += 1;
+      }
+      gen_elem_size = gen_narrow ? sizeof(F32) : sizeof(F64);
+      padded_count = Max(padded_count, (U64)gen_tile);
+    }
+  }
+  
+  F64* sort_keys = 0;
+  U32* sort_payload = 0;
+  U8* gen_keys = 0;
+  if (use_gen)
+  {
+    gen_keys = push_array(scratch.arena, U8, padded_count * num_keys * gen_elem_size);
+    for (U64 i = 0; i < padded_count; i++)
+    {
+      for (U32 k = 0; k < num_keys; k++)
+      {
+        F64 v = i < real_count ? keys[k][i] : 0.0;
+        if (gen_narrow)
+        {
+          ((F32*)gen_keys)[i * num_keys + k] = (F32)v;
+        }
+        else
+        {
+          ((F64*)gen_keys)[i * num_keys + k] = v;
+        }
+      }
+    }
+  }
+  else
+  {
+    sort_keys = push_array(scratch.arena, F64, padded_count * QE_SORT_MAX_KEYS);
+    sort_payload = push_array(scratch.arena, U32, padded_count * 9);
+  }
+  for (U64 i = 0; !use_gen && i < padded_count; i++)
   {
     B32 is_real = i < real_count;
     for (U32 k = 0; k < QE_SORT_MAX_KEYS; k++)
@@ -6104,8 +6316,8 @@ qe_window_rank_gpu(Arena* arena, F64** keys, B32* key_desc, U64 num_keys, U64 pa
   }
   
   // tec: two kernel objects for the two prefix-sum rounds, rebinding one mid-batch would retarget its already recorded dispatches
-  GPU_Kernel* sort_kernel = gpu_kernel_alloc(str8_lit("bitonic_sort"));
-  GPU_Kernel* flags_kernel = gpu_kernel_alloc(str8_lit("window_rank_flags"));
+  GPU_Kernel* sort_kernel = use_gen ? gen_sort : gpu_kernel_alloc(str8_lit("bitonic_sort"));
+  GPU_Kernel* flags_kernel = use_gen ? gen_flags : gpu_kernel_alloc(str8_lit("window_rank_flags"));
   GPU_Kernel* prefix_kernel = gpu_kernel_alloc(str8_lit("prefix_sum"));
   GPU_Kernel* prefix_kernel2 = gpu_kernel_alloc(str8_lit("prefix_sum2"));
   GPU_Kernel* scatter_kernel = gpu_kernel_alloc(str8_lit("window_rank_scatter"));
@@ -6124,8 +6336,8 @@ qe_window_rank_gpu(Arena* arena, F64** keys, B32* key_desc, U64 num_keys, U64 pa
     return result;
   }
   
-  U64 keys_size = padded_count * QE_SORT_MAX_KEYS * sizeof(F64);
-  U64 payload_size = padded_count * 9 * sizeof(U32);
+  U64 keys_size = use_gen ? padded_count * num_keys * gen_elem_size : padded_count * QE_SORT_MAX_KEYS * sizeof(F64);
+  U64 payload_size = use_gen ? padded_count * sizeof(U32) : padded_count * 9 * sizeof(U32);
   U64 n4 = real_count * sizeof(U32);
   U32 prefix_blocks = (U32)((real_count + 255) / 256);
   U64 block_sum_size = ((U64)prefix_blocks + 1) * sizeof(U32);
@@ -6168,15 +6380,38 @@ qe_window_rank_gpu(Arena* arena, F64** keys, B32* key_desc, U64 num_keys, U64 pa
   
   U64 download_size = real_count * 9 * sizeof(U32) + n4 * 3;
   GPU_Batch* batch = gpu_batch_begin(keys_size + payload_size, download_size);
-  gpu_batch_buffer_write(batch, keys_buf, sort_keys, keys_size);
-  gpu_batch_buffer_write(batch, payload_buf, sort_payload, payload_size);
+  gpu_batch_buffer_write(batch, keys_buf, use_gen ? (void*)gen_keys : (void*)sort_keys, keys_size);
+  if (!use_gen)
+  {
+    gpu_batch_buffer_write(batch, payload_buf, sort_payload, payload_size);
+  }
   
   //- tec: stage 1 - bitonic sort by (partition keys, order keys)
   gpu_kernel_set_arg_buffer(sort_kernel, 0, keys_buf);
   gpu_kernel_set_arg_buffer(sort_kernel, 1, payload_buf);
   U32 num_stages = 0;
   while ((1ull << num_stages) < padded_count) num_stages++;
-  for (U32 stage = 0; stage < num_stages; stage++)
+  if (use_gen)
+  {
+    // tec: mode 0 sorts the tiles and numbers the rows, later stages run strides of a tile or more over the whole array, then finish inside the tiles
+    gpu_kernel_set_arg_u64(sort_kernel, 1, real_count);
+    gpu_kernel_set_arg_u64(sort_kernel, 2, 0);
+    gpu_batch_kernel_execute(batch, sort_kernel, (U32)(padded_count / 2), gen_tile / 2);
+    for (U32 stage = gen_log_tile + 1; stage <= num_stages; stage++)
+    {
+      for (U64 stride = 1ull << (stage - 1); stride >= gen_tile; stride >>= 1)
+      {
+        gpu_kernel_set_arg_u64(sort_kernel, 2, 1);
+        gpu_kernel_set_arg_u64(sort_kernel, 3, stage);
+        gpu_kernel_set_arg_u64(sort_kernel, 4, stride);
+        gpu_batch_kernel_execute(batch, sort_kernel, (U32)(padded_count / 2), gen_tile / 2);
+      }
+      gpu_kernel_set_arg_u64(sort_kernel, 2, 2);
+      gpu_kernel_set_arg_u64(sort_kernel, 3, stage);
+      gpu_batch_kernel_execute(batch, sort_kernel, (U32)(padded_count / 2), gen_tile / 2);
+    }
+  }
+  for (U32 stage = 0; !use_gen && stage < num_stages; stage++)
   {
     for (U32 pass_plus1 = stage + 1; pass_plus1 > 0; pass_plus1--)
     {
@@ -6251,7 +6486,7 @@ qe_window_rank_gpu(Arena* arena, F64** keys, B32* key_desc, U64 num_keys, U64 pa
   U32* row_number = push_array(arena, U32, real_count);
   U32* rank_out = push_array(arena, U32, real_count);
   U32* dense_rank = push_array(arena, U32, real_count);
-  gpu_batch_buffer_read(batch, payload_buf, sorted_payload, real_count * 9 * sizeof(U32));
+  gpu_batch_buffer_read(batch, payload_buf, sorted_payload, use_gen ? real_count * sizeof(U32) : real_count * 9 * sizeof(U32));
   gpu_batch_buffer_read(batch, row_number_buf, row_number, n4);
   gpu_batch_buffer_read(batch, rank_buf, rank_out, n4);
   gpu_batch_buffer_read(batch, dense_rank_buf, dense_rank, n4);
@@ -6271,7 +6506,7 @@ qe_window_rank_gpu(Arena* arena, F64** keys, B32* key_desc, U64 num_keys, U64 pa
   U32* orig_index = push_array(arena, U32, real_count);
   for (U64 i = 0; i < real_count; i++)
   {
-    orig_index[i] = sorted_payload[i * 9 + 0];
+    orig_index[i] = use_gen ? sorted_payload[i] : sorted_payload[i * 9 + 0];
   }
   
   result.ok = 1;
@@ -7978,7 +8213,15 @@ qe_join_probe_stream_core(Arena* arena, CQL_Column* fact_key, U64 row_count, CQL
   GPU_Buffer* max_buffer = gpu_buffer_alloc(mm_bytes, GPU_BufferFlag_ReadWrite, 0);
   GPU_Buffer* bloom_buffer = gpu_buffer_alloc(((U64)1 << bloom_log2) * sizeof(U32), GPU_BufferFlag_Write, bloom_words);
   GPU_Buffer* sequence_filler = gpu_buffer_alloc(256, GPU_BufferFlag_Write, 0);
-  GPU_Kernel* kernel = gpu_kernel_alloc(str8_lit("join_probe_native"));
+  GPU_Kernel* kernel = 0;
+  if (settings_u64(str8_lit("QE_GENERATE_JOIN"), 1) != 0 && qk_enabled(row_count))
+  {
+    kernel = qk_join_probe_native_kernel(arena, shader_widths, arg_count, num_exprs, func_codes, arg_index_codes, arg_signed_bits, 0);
+  }
+  if (!kernel)
+  {
+    kernel = gpu_kernel_alloc(str8_lit("join_probe_native"));
+  }
   B32 ok = bloom_buffer && table_key_buffer && table_row_buffer && count_buffer && sum_buffer && min_buffer && max_buffer && sequence_filler && kernel;
   if (ok)
   {
@@ -9175,6 +9418,774 @@ qe_aggregate_global_gpu(Arena* arena, PLAN_RowSet* input, IR_Node* column_list_i
   return 1;
 }
 
+//~ tec: GROUP BY one small range whole number column fused with the WHERE clause
+// the groups are counted in shared memory by the same kernel that evaluates the filter, see QK_FusedAgg. returns 0 with nothing done for anything it does not handle
+internal B32
+qe_fused_filter_group_aggregate(Arena* arena, CQL_Database* database, CQL_Table* table, String8 alias, IR_Node* where_clause, IR_Node* group_by_ir, IR_Node* column_list_ir,
+                                QE_ScanTrace* scan_trace, QE_AggregateTrace* agg_trace, PLAN_Materialized* out_result)
+{
+  ProfBeginFunction();
+  U64 row_count = table->row_count;
+  if (!group_by_ir->first || settings_u64(str8_lit("QE_FUSE_GROUP_BY"), 1) == 0)
+  {
+    ProfEnd();
+    return 0;
+  }
+
+  PLAN_RowSet stub = {0};
+  stub.table_count = 1;
+  stub.tables = push_array(arena, CQL_Table*, 1);
+  stub.aliases = push_array(arena, String8, 1);
+  stub.row_indices = push_array(arena, U64*, 1);
+  stub.tables[0] = table;
+  stub.aliases[0] = alias;
+  stub.count = row_count;
+
+  // tec: up to 3 keys, each a whole number column or a string column with a dictionary, combined as digits of one group number
+  CQL_Column* key_columns[QK_GROUP_MAX_KEYS] = {0};
+  B32 key_is_dict[QK_GROUP_MAX_KEYS] = {0};
+  S32 key_min[QK_GROUP_MAX_KEYS] = {0};
+  U32 key_range[QK_GROUP_MAX_KEYS] = {0};
+  U32 key_count = 0;
+  U64 group_total = 1;
+  for (IR_Node* key_node = group_by_ir->first; key_node; key_node = key_node->next)
+  {
+    if (key_count == QK_GROUP_MAX_KEYS)
+    {
+      ProfEnd();
+      return 0;
+    }
+    String8 bare_name = {0};
+    U64 key_table_slot = max_U64;
+    CQL_Table* key_table = qe_resolve_column_table(&stub, key_node->value, &bare_name, &key_table_slot);
+    CQL_Column* key_column = key_table == table ? cql_table_find_column(table, bare_name) : NULL;
+    if (!key_column || key_column->null_flags || key_column->is_disk_backed || key_column->row_count != row_count)
+    {
+      ProfEnd();
+      return 0;
+    }
+    U64 range = 0;
+    if (key_column->type == CQL_ColumnType_String8)
+    {
+      cql_column_ensure_string_dict(key_column);
+      if (!key_column->has_dict || !key_column->dict || !key_column->dict_codes)
+      {
+        ProfEnd();
+        return 0;
+      }
+      key_is_dict[key_count] = 1;
+      key_min[key_count] = 0;
+      range = key_column->dict->value_count;
+    }
+    else
+    {
+      F64 low = 0.0;
+      F64 high = 0.0;
+      if ((key_column->type != CQL_ColumnType_U32 && key_column->type != CQL_ColumnType_I32) || !qe_column_range_from_zone_map(key_column, &low, &high) ||
+          low < -2147483648.0 || high > 2147483647.0)
+      {
+        ProfEnd();
+        return 0;
+      }
+      key_min[key_count] = (S32)low;
+      range = (U64)(high - low) + 1;
+    }
+    group_total *= range;
+    if (range == 0 || group_total > 0xffffffffull)
+    {
+      ProfEnd();
+      return 0;
+    }
+    key_columns[key_count] = key_column;
+    key_range[key_count] = (U32)range;
+    key_count += 1;
+  }
+  if (key_count == 0)
+  {
+    ProfEnd();
+    return 0;
+  }
+
+  QE_AggExprInfo exprs[QE_AGG_MAX_EXPRS];
+  U32 num_exprs = 0;
+  if (!qe_aggregate_collect_exprs(arena, &stub, column_list_ir ? column_list_ir->first : NULL, exprs, &num_exprs) || num_exprs == 0)
+  {
+    ProfEnd();
+    return 0;
+  }
+  CQL_Column* agg_columns[QK_FUSED_MAX_COLUMNS] = {0};
+  U32 agg_column_count = 0;
+  U32 column_of_expr[QE_AGG_MAX_EXPRS] = {0};
+  for (U32 e = 0; e < num_exprs; e++)
+  {
+    U32 func = exprs[e].func_code;
+    if (func != QE_AGG_FUNC_COUNT && func != QE_AGG_FUNC_SUM && func != QE_AGG_FUNC_AVG && func != QE_AGG_FUNC_MIN && func != QE_AGG_FUNC_MAX)
+    {
+      ProfEnd();
+      return 0;
+    }
+    CQL_Column* column = exprs[e].arg_column;
+    if (!column)
+    {
+      if (func != QE_AGG_FUNC_COUNT)
+      {
+        ProfEnd();
+        return 0;
+      }
+      continue;
+    }
+    // tec: sums are exact only for whole numbers, so only U32 and I32 arguments
+    if ((column->type != CQL_ColumnType_U32 && column->type != CQL_ColumnType_I32) || column->row_count != row_count || column->null_flags || column->is_disk_backed || exprs[e].arg_table != table)
+    {
+      ProfEnd();
+      return 0;
+    }
+    U32 index = 0;
+    while (index < agg_column_count && agg_columns[index] != column)
+    {
+      index += 1;
+    }
+    if (index == agg_column_count)
+    {
+      if (agg_column_count == QK_FUSED_MAX_COLUMNS)
+      {
+        ProfEnd();
+        return 0;
+      }
+      agg_columns[agg_column_count++] = column;
+    }
+    column_of_expr[e] = index;
+  }
+
+  // tec: 16 KB of shared memory is what every Vulkan device offers
+  U32 words_per_group = QK_GROUP_WORDS(agg_column_count);
+  if (group_total * words_per_group > settings_u64(str8_lit("QE_FUSE_GROUP_SHARED_WORDS"), 4096))
+  {
+    ProfEnd();
+    return 0;
+  }
+  U32 group_total32 = (U32)group_total;
+
+  QE_BytecodeProgram* prog = push_array(arena, QE_BytecodeProgram, 1);
+  qe_bytecode_program_build(arena, prog, database, table, NULL, where_clause, scan_trace);
+  if (prog->requires_cpu_scan || prog->has_score_output)
+  {
+    ProfEnd();
+    return 0;
+  }
+  U64 gpu_max_buffer_size = settings_u64(str8_lit("GPU_MAX_BUFFER_SIZE"), GPU_MAX_BUFFER_SIZE);
+  for (U32 b = 0; b < prog->binding_count; b++)
+  {
+    QE_ColumnBinding* binding = &prog->bindings[b];
+    CQL_ColumnType type = binding->type;
+    B32 numeric = type == CQL_ColumnType_U32 || type == CQL_ColumnType_I32 || type == CQL_ColumnType_F32 || type == CQL_ColumnType_F64 ||
+      type == CQL_ColumnType_U64 || type == CQL_ColumnType_I64;
+    if (binding->use_dict_codes)
+    {
+      numeric = 1;
+    }
+    if (!numeric || binding->slot_count != 1 || binding->column->is_disk_backed || binding->column->row_count != row_count ||
+        (!binding->use_dict_codes && cql_column_get_total_size(binding->column) > gpu_max_buffer_size))
+    {
+      ProfEnd();
+      return 0;
+    }
+  }
+
+  // tec: the key and the arguments are bound next to the filter's columns, a column the filter already reads keeps its slot
+  QK_FusedAgg fuse = {0};
+  fuse.column_count = agg_column_count;
+  fuse.grouped = 1;
+  fuse.group_count = group_total32;
+  fuse.key_count = key_count;
+  CQL_Column* extra[QK_FUSED_MAX_COLUMNS + QK_GROUP_MAX_KEYS];
+  B32 extra_dict[QK_FUSED_MAX_COLUMNS + QK_GROUP_MAX_KEYS] = {0};
+  U32 extra_count = 0;
+  for (U32 c = 0; c < agg_column_count; c++)
+  {
+    extra[extra_count++] = agg_columns[c];
+  }
+  for (U32 i = 0; i < key_count; i++)
+  {
+    extra_dict[extra_count] = key_is_dict[i];
+    extra[extra_count++] = key_columns[i];
+  }
+  U32 extra_slot[QK_FUSED_MAX_COLUMNS + QK_GROUP_MAX_KEYS] = {0};
+  for (U32 c = 0; c < extra_count; c++)
+  {
+    if (!extra_dict[c] && cql_column_get_total_size(extra[c]) > gpu_max_buffer_size)
+    {
+      ProfEnd();
+      return 0;
+    }
+    B32 found = 0;
+    for (U32 b = 0; b < prog->binding_count; b++)
+    {
+      B32 same = prog->bindings[b].column == extra[c] && (extra_dict[c] ? prog->bindings[b].use_dict_codes : (!prog->bindings[b].use_dict_codes && prog->bindings[b].type == extra[c]->type));
+      if (same)
+      {
+        extra_slot[c] = prog->bindings[b].first_slot;
+        found = 1;
+        break;
+      }
+    }
+    if (!found)
+    {
+      if (prog->binding_count >= QE_MAX_COLUMN_BINDINGS || prog->next_slot >= QE_MAX_COLUMN_BINDINGS)
+      {
+        ProfEnd();
+        return 0;
+      }
+      QE_ColumnBinding* binding = &prog->bindings[prog->binding_count++];
+      MemoryZeroStruct(binding);
+      binding->name = extra_dict[c] ? push_str8f(arena, "%.*s$dict", str8_varg(extra[c]->name)) : extra[c]->name;
+      binding->column = extra[c];
+      binding->type = extra_dict[c] ? CQL_ColumnType_U32 : extra[c]->type;
+      binding->use_dict_codes = extra_dict[c];
+      binding->first_slot = prog->next_slot;
+      binding->slot_count = 1;
+      prog->next_slot += 1;
+      extra_slot[c] = binding->first_slot;
+    }
+  }
+  for (U32 c = 0; c < agg_column_count; c++)
+  {
+    fuse.slots[c] = extra_slot[c];
+    fuse.coltypes[c] = (U32)agg_columns[c]->type;
+  }
+  for (U32 i = 0; i < key_count; i++)
+  {
+    fuse.key_slots[i] = extra_slot[agg_column_count + i];
+    fuse.key_types[i] = key_is_dict[i] ? (U32)CQL_ColumnType_U32 : (U32)key_columns[i]->type;
+    fuse.key_ranges[i] = key_range[i];
+  }
+
+  String8 kernel_name = {0};
+  GPU_Kernel* kernel = qk_fused_aggregate_kernel(arena, prog, &fuse, &kernel_name);
+  if (!kernel)
+  {
+    ProfEnd();
+    return 0;
+  }
+
+  U64 const_words = prog->const_count * 2;
+  U64 output_words = (U64)group_total32 * words_per_group;
+  GPU_Buffer* filler_buffer = gpu_buffer_alloc_pooled(str8_lit("fused_agg_filler"), 16, GPU_BufferFlag_Write, 0);
+  GPU_Buffer* num_consts_buffer = gpu_buffer_alloc_pooled(str8_lit("fused_agg_num_consts"), Max(const_words, (U64)1) * sizeof(U32), GPU_BufferFlag_Write, 0);
+  GPU_Buffer* str_consts_buffer = gpu_buffer_alloc_pooled(str8_lit("fused_agg_str_consts"), Max(prog->str_const_pool_size, (U64)4), GPU_BufferFlag_Write, 0);
+  GPU_Buffer* output_buffer = gpu_buffer_alloc_pooled(str8_lit("fused_group_output"), output_words * sizeof(U32), GPU_BufferFlag_ReadWrite, 0);
+  if (!filler_buffer || !num_consts_buffer || !str_consts_buffer || !output_buffer)
+  {
+    ProfEnd();
+    return 0;
+  }
+
+  // tec: the output starts as the identity of every merge: counts and sums 0, smallest row and minimums all ones, maximums 0
+  U32* groups = push_array(arena, U32, output_words);
+  for (U64 g = 0; g < group_total32; g++)
+  {
+    U32* group = &groups[g * words_per_group];
+    group[1] = 0xffffffffu;
+    for (U32 k = 0; k < agg_column_count; k++)
+    {
+      group[4 + 4 * k] = 0xffffffffu;
+    }
+  }
+  {
+    GPU_Batch* batch = gpu_batch_begin(const_words * sizeof(U32) + prog->str_const_pool_size + output_words * sizeof(U32), 0);
+    if (const_words > 0)
+    {
+      gpu_batch_buffer_write(batch, num_consts_buffer, prog->consts, const_words * sizeof(U32));
+    }
+    if (prog->str_const_pool_size > 0)
+    {
+      gpu_batch_buffer_write(batch, str_consts_buffer, prog->str_const_pool, prog->str_const_pool_size);
+    }
+    gpu_batch_buffer_write(batch, output_buffer, groups, output_words * sizeof(U32));
+    gpu_batch_end(batch);
+  }
+
+  gpu_kernel_set_arg_buffer(kernel, QE_BINDING_BYTECODE, filler_buffer);
+  gpu_kernel_set_arg_buffer(kernel, QE_BINDING_NUM_CONSTS, num_consts_buffer);
+  gpu_kernel_set_arg_buffer(kernel, QE_BINDING_STR_CONSTS, str_consts_buffer);
+  gpu_kernel_set_arg_buffer(kernel, QE_BINDING_OUT_INDICES, output_buffer);
+  gpu_kernel_set_arg_buffer(kernel, QE_BINDING_OUT_COUNT, filler_buffer);
+  gpu_kernel_set_arg_buffer(kernel, QE_BINDING_SKIP, filler_buffer);
+
+  B32 slot_bound[QE_MAX_COLUMN_BINDINGS] = {0};
+  for (U32 b = 0; b < prog->binding_count; b++)
+  {
+    QE_ColumnBinding* binding = &prog->bindings[b];
+    CQL_Column* column = binding->column;
+    String8 key = push_str8f(gpu_scratch_arena(), "scan_col:%.*s.%.*s.whole", str8_varg(table->name), str8_varg(binding->name));
+    GPU_Buffer* data_buffer = 0;
+    if (binding->use_dict_codes)
+    {
+      // tec: the same pool key and generation as the scan's dictionary code buffers
+      if (column->gpu_upload_generation == column->write_generation && column->gpu_upload_data_size == row_count * sizeof(U32))
+      {
+        data_buffer = gpu_buffer_alloc_pooled(key, column->gpu_upload_data_size, GPU_BufferFlag_Write, 0);
+      }
+      else
+      {
+        data_buffer = gpu_buffer_alloc_pooled(key, row_count * sizeof(U32), GPU_BufferFlag_Write, column->dict_codes);
+        column->gpu_upload_generation = column->write_generation;
+        column->gpu_upload_data_size = row_count * sizeof(U32);
+      }
+    }
+    else if (column->gpu_upload_generation == column->write_generation)
+    {
+      data_buffer = gpu_buffer_alloc_pooled(key, column->gpu_upload_data_size, GPU_BufferFlag_Write, 0);
+    }
+    else
+    {
+      U64 size = 0;
+      void* data = cql_column_get_data_range(arena, column, r1u64(0, row_count), &size);
+      if (data)
+      {
+        data_buffer = gpu_buffer_alloc_pooled(key, size, GPU_BufferFlag_Write, data);
+        column->gpu_upload_generation = column->write_generation;
+        column->gpu_upload_data_size = size;
+      }
+    }
+    if (!data_buffer)
+    {
+      ProfEnd();
+      return 0;
+    }
+    gpu_kernel_set_arg_buffer(kernel, QE_BINDING_COLUMN_BASE + binding->first_slot, data_buffer);
+    slot_bound[binding->first_slot] = 1;
+  }
+  for (U32 slot = 0; slot < QE_MAX_COLUMN_BINDINGS; slot++)
+  {
+    if (!slot_bound[slot])
+    {
+      gpu_kernel_set_arg_buffer(kernel, QE_BINDING_COLUMN_BASE + slot, filler_buffer);
+    }
+  }
+  U64 group_workgroups = Max(Min(row_count / 131072, settings_u64(str8_lit("QE_FUSE_AGG_GROUPS"), 1024)), (U64)1);
+  gpu_kernel_set_arg_u64(kernel, QE_PUSH_CONSTANT_ROW_COUNT, row_count);
+  gpu_kernel_set_arg_u64(kernel, QE_PUSH_CONSTANT_SCORE_FLAGS, 0);
+  gpu_kernel_set_arg_u64(kernel, QE_PUSH_CONSTANT_TRIGRAM_N, settings_u64(str8_lit("QE_TRIGRAM_N"), 3));
+  gpu_kernel_set_arg_u64(kernel, QE_PUSH_CONSTANT_SKIP_SHIFT, 0);
+  gpu_kernel_set_arg_u64(kernel, QE_PUSH_CONSTANT_SKIP_ENABLED, 0);
+  gpu_kernel_set_arg_u64(kernel, 6, group_workgroups | ((U64)(U32)key_min[2] << 32));
+  gpu_kernel_set_arg_u64(kernel, 7, (U64)(U32)key_min[0] | ((U64)(U32)key_min[1] << 32));
+
+  U32* result_words = push_array(arena, U32, output_words);
+  U64 start = os_now_microseconds();
+  GPU_Batch* batch = gpu_batch_begin(0, output_words * sizeof(U32));
+  gpu_batch_kernel_execute(batch, kernel, (U32)(group_workgroups * QE_GPU_WORKGROUP_SIZE), QE_GPU_WORKGROUP_SIZE);
+  gpu_batch_buffer_read(batch, output_buffer, result_words, output_words * sizeof(U32));
+  B32 completed = gpu_batch_end(batch);
+  U64 elapsed = os_now_microseconds() - start;
+  gpu_kernel_release(kernel);
+  if (!completed)
+  {
+    log_error("qe_fused_filter_group_aggregate: the fused kernel did not complete, the query will run unfused");
+    ProfEnd();
+    return 0;
+  }
+
+  // tec: groups come out in key order, a group no row reached is left out
+  U64 num_groups = 0;
+  U64 matched = 0;
+  for (U64 g = 0; g < group_total32; g++)
+  {
+    if (result_words[g * words_per_group] != 0)
+    {
+      num_groups += 1;
+    }
+  }
+  U64* representatives = push_array(arena, U64, Max(num_groups, (U64)1));
+  F64* results = push_array(arena, F64, Max(num_groups * num_exprs, (U64)1));
+  U64 out_group = 0;
+  for (U64 g = 0; g < group_total32; g++)
+  {
+    U32* group = &result_words[g * words_per_group];
+    U32 count = group[0];
+    if (count == 0)
+    {
+      continue;
+    }
+    matched += count;
+    representatives[out_group] = group[1];
+    for (U32 e = 0; e < num_exprs; e++)
+    {
+      F64* slot = &results[out_group * num_exprs + e];
+      U32 func = exprs[e].func_code;
+      if (func == QE_AGG_FUNC_COUNT)
+      {
+        *slot = (F64)count;
+        continue;
+      }
+      U32 c = column_of_expr[e];
+      B32 is_signed = agg_columns[c]->type == CQL_ColumnType_I32;
+      U64 sum_bits = ((U64)group[3 + 4 * c] << 32) | group[2 + 4 * c];
+      S64 sum = (S64)sum_bits - (is_signed ? (S64)count * 2147483648LL : 0);
+      U32 low_word = group[4 + 4 * c];
+      U32 high_word = group[5 + 4 * c];
+      F64 minimum = is_signed ? (F64)(S32)(low_word ^ 0x80000000u) : (F64)low_word;
+      F64 maximum = is_signed ? (F64)(S32)(high_word ^ 0x80000000u) : (F64)high_word;
+      switch (func)
+      {
+        case QE_AGG_FUNC_SUM: { *slot = (F64)sum; } break;
+        case QE_AGG_FUNC_AVG: { *slot = (F64)sum / (F64)count; } break;
+        case QE_AGG_FUNC_MIN: { *slot = minimum; } break;
+        case QE_AGG_FUNC_MAX: { *slot = maximum; } break;
+      }
+    }
+    out_group += 1;
+  }
+  // tec: the key columns of the output are read from one row per group. the row set handed on is those rows, so group g is row g of it
+  U64* dense_representatives = push_array(arena, U64, Max(num_groups, (U64)1));
+  for (U64 g = 0; g < num_groups; g++)
+  {
+    dense_representatives[g] = g;
+  }
+  stub.row_indices[0] = representatives;
+  stub.count = num_groups;
+  *out_result = qe_aggregate_build_output(arena, &stub, column_list_ir, exprs, num_exprs, num_groups, dense_representatives, results);
+
+  if (scan_trace)
+  {
+    scan_trace->strategy = QE_TraceStrategy_GpuScan;
+    scan_trace->strategy_reason = push_str8f(arena, "fused with the GROUP BY, per query kernel %.*s", str8_varg(kernel_name));
+    scan_trace->rows_before = row_count;
+    scan_trace->rows_after = matched;
+    scan_trace->gpu_kernel_time_us = elapsed;
+  }
+  if (agg_trace)
+  {
+    agg_trace->input_row_count = matched;
+    agg_trace->group_count = num_groups;
+  }
+  ProfEnd();
+  return 1;
+}
+
+//~ tec: a global aggregate fused with its WHERE clause
+// the filter is generated into the aggregate kernel, so no row ids are made, read back or gathered. only whole in-memory numeric columns, anything else returns 0 with nothing done
+internal B32
+qe_fused_filter_aggregate(Arena* arena, CQL_Database* database, CQL_Table* table, String8 alias, IR_Node* where_clause, IR_Node* group_by_ir, IR_Node* column_list_ir, IR_Node* having_ir,
+                          QE_ScanTrace* scan_trace, QE_AggregateTrace* agg_trace, PLAN_Materialized* out_result)
+{
+  ProfBeginFunction();
+  if (having_ir || !table || table->row_count == 0 || settings_u64(str8_lit("QE_FUSE_AGGREGATE"), 1) == 0 ||
+      !qk_enabled(table->row_count) || cql_table_may_have_nulls(table) || gpu_device_lost())
+  {
+    ProfEnd();
+    return 0;
+  }
+  U64 row_count = table->row_count;
+  if (group_by_ir && group_by_ir->first)
+  {
+    B32 grouped = qe_fused_filter_group_aggregate(arena, database, table, alias, where_clause, group_by_ir, column_list_ir, scan_trace, agg_trace, out_result);
+    ProfEnd();
+    return grouped;
+  }
+
+  PLAN_RowSet stub = {0};
+  stub.table_count = 1;
+  stub.tables = push_array(arena, CQL_Table*, 1);
+  stub.aliases = push_array(arena, String8, 1);
+  stub.row_indices = push_array(arena, U64*, 1);
+  stub.tables[0] = table;
+  stub.aliases[0] = alias;
+  stub.count = row_count;
+
+  QE_AggExprInfo exprs[QE_AGG_MAX_EXPRS];
+  U32 num_exprs = 0;
+  if (!qe_aggregate_collect_exprs(arena, &stub, column_list_ir ? column_list_ir->first : NULL, exprs, &num_exprs) || num_exprs == 0)
+  {
+    ProfEnd();
+    return 0;
+  }
+
+  CQL_Column* agg_columns[QK_FUSED_MAX_COLUMNS] = {0};
+  U32 agg_column_count = 0;
+  U32 column_of_expr[QE_AGG_MAX_EXPRS] = {0};
+  for (U32 e = 0; e < num_exprs; e++)
+  {
+    U32 func = exprs[e].func_code;
+    if (func != QE_AGG_FUNC_COUNT && func != QE_AGG_FUNC_SUM && func != QE_AGG_FUNC_AVG && func != QE_AGG_FUNC_MIN && func != QE_AGG_FUNC_MAX)
+    {
+      ProfEnd();
+      return 0;
+    }
+    CQL_Column* column = exprs[e].arg_column;
+    if (!column)
+    {
+      if (func != QE_AGG_FUNC_COUNT)
+      {
+        ProfEnd();
+        return 0;
+      }
+      continue;
+    }
+    CQL_ColumnType type = column->type;
+    B32 numeric = type == CQL_ColumnType_U32 || type == CQL_ColumnType_I32 || type == CQL_ColumnType_F32 || type == CQL_ColumnType_F64;
+    if (!numeric || column->row_count != row_count || column->null_flags || column->is_disk_backed || exprs[e].arg_table != table)
+    {
+      ProfEnd();
+      return 0;
+    }
+    U32 index = 0;
+    while (index < agg_column_count && agg_columns[index] != column)
+    {
+      index += 1;
+    }
+    if (index == agg_column_count)
+    {
+      if (agg_column_count == QK_FUSED_MAX_COLUMNS)
+      {
+        ProfEnd();
+        return 0;
+      }
+      agg_columns[agg_column_count++] = column;
+    }
+    column_of_expr[e] = index;
+  }
+
+  QE_BytecodeProgram* prog = push_array(arena, QE_BytecodeProgram, 1);
+  qe_bytecode_program_build(arena, prog, database, table, NULL, where_clause, scan_trace);
+  if (prog->requires_cpu_scan || prog->has_score_output)
+  {
+    ProfEnd();
+    return 0;
+  }
+
+  // tec: every column the kernel reads is a whole numeric column held in memory, the upload of strings and dictionary codes is the scan's
+  U64 gpu_max_buffer_size = settings_u64(str8_lit("GPU_MAX_BUFFER_SIZE"), GPU_MAX_BUFFER_SIZE);
+  for (U32 b = 0; b < prog->binding_count; b++)
+  {
+    QE_ColumnBinding* binding = &prog->bindings[b];
+    CQL_ColumnType type = binding->type;
+    B32 numeric = type == CQL_ColumnType_U32 || type == CQL_ColumnType_I32 || type == CQL_ColumnType_F32 || type == CQL_ColumnType_F64 ||
+      type == CQL_ColumnType_U64 || type == CQL_ColumnType_I64;
+    if (binding->use_dict_codes)
+    {
+      numeric = 1;
+    }
+    if (!numeric || binding->slot_count != 1 || binding->column->is_disk_backed || binding->column->row_count != row_count ||
+        (!binding->use_dict_codes && cql_column_get_total_size(binding->column) > gpu_max_buffer_size))
+    {
+      ProfEnd();
+      return 0;
+    }
+  }
+
+  QK_FusedAgg fuse = {0};
+  fuse.column_count = agg_column_count;
+  U32 slot_of_agg_column[QK_FUSED_MAX_COLUMNS] = {0};
+  for (U32 c = 0; c < agg_column_count; c++)
+  {
+    if (cql_column_get_total_size(agg_columns[c]) > gpu_max_buffer_size)
+    {
+      ProfEnd();
+      return 0;
+    }
+    B32 found = 0;
+    for (U32 b = 0; b < prog->binding_count; b++)
+    {
+      QE_ColumnBinding* binding = &prog->bindings[b];
+      if (binding->column == agg_columns[c] && binding->type == agg_columns[c]->type)
+      {
+        slot_of_agg_column[c] = binding->first_slot;
+        found = 1;
+        break;
+      }
+    }
+    if (!found)
+    {
+      if (prog->binding_count >= QE_MAX_COLUMN_BINDINGS || prog->next_slot >= QE_MAX_COLUMN_BINDINGS)
+      {
+        ProfEnd();
+        return 0;
+      }
+      QE_ColumnBinding* binding = &prog->bindings[prog->binding_count++];
+      MemoryZeroStruct(binding);
+      binding->name = agg_columns[c]->name;
+      binding->column = agg_columns[c];
+      binding->type = agg_columns[c]->type;
+      binding->first_slot = prog->next_slot;
+      binding->slot_count = 1;
+      prog->next_slot += 1;
+      slot_of_agg_column[c] = binding->first_slot;
+    }
+    fuse.slots[c] = slot_of_agg_column[c];
+    fuse.coltypes[c] = (U32)agg_columns[c]->type;
+  }
+
+  String8 kernel_name = {0};
+  GPU_Kernel* kernel = qk_fused_aggregate_kernel(arena, prog, &fuse, &kernel_name);
+  if (!kernel)
+  {
+    ProfEnd();
+    return 0;
+  }
+
+  U64 const_words = prog->const_count * 2;
+  GPU_Buffer* filler_buffer = gpu_buffer_alloc_pooled(str8_lit("fused_agg_filler"), 16, GPU_BufferFlag_Write, 0);
+  GPU_Buffer* num_consts_buffer = gpu_buffer_alloc_pooled(str8_lit("fused_agg_num_consts"), Max(const_words, (U64)1) * sizeof(U32), GPU_BufferFlag_Write, 0);
+  GPU_Buffer* str_consts_buffer = gpu_buffer_alloc_pooled(str8_lit("fused_agg_str_consts"), Max(prog->str_const_pool_size, (U64)4), GPU_BufferFlag_Write, 0);
+  U64 group_count = Max(Min(row_count / 65536, settings_u64(str8_lit("QE_FUSE_AGG_GROUPS"), 2048)), (U64)1);
+  U64 width = 1 + 3 * (U64)agg_column_count;
+  U64 partial_count = group_count * width;
+  GPU_Buffer* partials_buffer = gpu_buffer_alloc_pooled(str8_lit("fused_agg_partials"), partial_count * sizeof(F64), GPU_BufferFlag_ReadWrite, 0);
+  if (!filler_buffer || !num_consts_buffer || !str_consts_buffer || !partials_buffer)
+  {
+    ProfEnd();
+    return 0;
+  }
+
+  {
+    GPU_Batch* batch = gpu_batch_begin(const_words * sizeof(U32) + prog->str_const_pool_size, 0);
+    if (const_words > 0)
+    {
+      gpu_batch_buffer_write(batch, num_consts_buffer, prog->consts, const_words * sizeof(U32));
+    }
+    if (prog->str_const_pool_size > 0)
+    {
+      gpu_batch_buffer_write(batch, str_consts_buffer, prog->str_const_pool, prog->str_const_pool_size);
+    }
+    gpu_batch_end(batch);
+  }
+
+  gpu_kernel_set_arg_buffer(kernel, QE_BINDING_BYTECODE, filler_buffer);
+  gpu_kernel_set_arg_buffer(kernel, QE_BINDING_NUM_CONSTS, num_consts_buffer);
+  gpu_kernel_set_arg_buffer(kernel, QE_BINDING_STR_CONSTS, str_consts_buffer);
+  gpu_kernel_set_arg_buffer(kernel, QE_BINDING_OUT_INDICES, partials_buffer);
+  gpu_kernel_set_arg_buffer(kernel, QE_BINDING_OUT_COUNT, filler_buffer);
+  gpu_kernel_set_arg_buffer(kernel, QE_BINDING_SKIP, filler_buffer);
+
+  B32 slot_bound[QE_MAX_COLUMN_BINDINGS] = {0};
+  for (U32 b = 0; b < prog->binding_count; b++)
+  {
+    QE_ColumnBinding* binding = &prog->bindings[b];
+    CQL_Column* column = binding->column;
+    String8 key = push_str8f(gpu_scratch_arena(), "scan_col:%.*s.%.*s.whole", str8_varg(table->name), str8_varg(binding->name));
+    GPU_Buffer* data_buffer = 0;
+    if (binding->use_dict_codes)
+    {
+      if (column->gpu_upload_generation == column->write_generation && column->gpu_upload_data_size == row_count * sizeof(U32))
+      {
+        data_buffer = gpu_buffer_alloc_pooled(key, column->gpu_upload_data_size, GPU_BufferFlag_Write, 0);
+      }
+      else
+      {
+        data_buffer = gpu_buffer_alloc_pooled(key, row_count * sizeof(U32), GPU_BufferFlag_Write, column->dict_codes);
+        column->gpu_upload_generation = column->write_generation;
+        column->gpu_upload_data_size = row_count * sizeof(U32);
+      }
+    }
+    else if (column->gpu_upload_generation == column->write_generation)
+    {
+      data_buffer = gpu_buffer_alloc_pooled(key, column->gpu_upload_data_size, GPU_BufferFlag_Write, 0);
+    }
+    else
+    {
+      U64 size = 0;
+      void* data = cql_column_get_data_range(arena, column, r1u64(0, row_count), &size);
+      if (data)
+      {
+        data_buffer = gpu_buffer_alloc_pooled(key, size, GPU_BufferFlag_Write, data);
+        column->gpu_upload_generation = column->write_generation;
+        column->gpu_upload_data_size = size;
+      }
+    }
+    if (!data_buffer)
+    {
+      ProfEnd();
+      return 0;
+    }
+    gpu_kernel_set_arg_buffer(kernel, QE_BINDING_COLUMN_BASE + binding->first_slot, data_buffer);
+    slot_bound[binding->first_slot] = 1;
+  }
+  for (U32 slot = 0; slot < QE_MAX_COLUMN_BINDINGS; slot++)
+  {
+    if (!slot_bound[slot])
+    {
+      gpu_kernel_set_arg_buffer(kernel, QE_BINDING_COLUMN_BASE + slot, filler_buffer);
+    }
+  }
+  gpu_kernel_set_arg_u64(kernel, QE_PUSH_CONSTANT_ROW_COUNT, row_count);
+  gpu_kernel_set_arg_u64(kernel, QE_PUSH_CONSTANT_SCORE_FLAGS, 0);
+  gpu_kernel_set_arg_u64(kernel, QE_PUSH_CONSTANT_TRIGRAM_N, settings_u64(str8_lit("QE_TRIGRAM_N"), 3));
+  gpu_kernel_set_arg_u64(kernel, QE_PUSH_CONSTANT_SKIP_SHIFT, 0);
+  gpu_kernel_set_arg_u64(kernel, QE_PUSH_CONSTANT_SKIP_ENABLED, 0);
+  gpu_kernel_set_arg_u64(kernel, 6, group_count);
+
+  F64* partials = push_array(arena, F64, partial_count);
+  U64 start = os_now_microseconds();
+  GPU_Batch* batch = gpu_batch_begin(0, partial_count * sizeof(F64));
+  gpu_batch_kernel_execute(batch, kernel, (U32)(group_count * QE_GPU_WORKGROUP_SIZE), QE_GPU_WORKGROUP_SIZE);
+  gpu_batch_buffer_read(batch, partials_buffer, partials, partial_count * sizeof(F64));
+  B32 completed = gpu_batch_end(batch);
+  U64 elapsed = os_now_microseconds() - start;
+  gpu_kernel_release(kernel);
+  if (!completed)
+  {
+    log_error("qe_fused_filter_aggregate: the fused kernel did not complete, the query will run unfused");
+    ProfEnd();
+    return 0;
+  }
+
+  // tec: combined in workgroup order, so the result does not depend on how the GPU scheduled them
+  F64 matched = 0.0;
+  F64 column_sum[QK_FUSED_MAX_COLUMNS] = {0};
+  F64 column_min[QK_FUSED_MAX_COLUMNS] = {0};
+  F64 column_max[QK_FUSED_MAX_COLUMNS] = {0};
+  for (U32 c = 0; c < agg_column_count; c++)
+  {
+    column_min[c] = QE_F64_MAX;
+    column_max[c] = -QE_F64_MAX;
+  }
+  for (U64 g = 0; g < group_count; g++)
+  {
+    F64* row = &partials[g * width];
+    matched += row[0];
+    for (U32 c = 0; c < agg_column_count; c++)
+    {
+      column_sum[c] += row[1 + c * 3 + 0];
+      column_min[c] = Min(column_min[c], row[1 + c * 3 + 1]);
+      column_max[c] = Max(column_max[c], row[1 + c * 3 + 2]);
+    }
+  }
+
+  F64* results = push_array(arena, F64, Max((U64)num_exprs, (U64)1));
+  for (U32 e = 0; e < num_exprs && matched > 0.0; e++)
+  {
+    U32 c = column_of_expr[e];
+    switch (exprs[e].func_code)
+    {
+      case QE_AGG_FUNC_COUNT: { results[e] = matched; } break;
+      case QE_AGG_FUNC_SUM:   { results[e] = column_sum[c]; } break;
+      case QE_AGG_FUNC_AVG:   { results[e] = column_sum[c] / matched; } break;
+      case QE_AGG_FUNC_MIN:   { results[e] = column_min[c]; } break;
+      case QE_AGG_FUNC_MAX:   { results[e] = column_max[c]; } break;
+    }
+  }
+  U64 representative = max_U64;
+  *out_result = qe_aggregate_build_output(arena, &stub, column_list_ir, exprs, num_exprs, 1, &representative, results);
+
+  if (scan_trace)
+  {
+    scan_trace->strategy = QE_TraceStrategy_GpuScan;
+    scan_trace->strategy_reason = push_str8f(arena, "fused with the aggregate, per query kernel %.*s", str8_varg(kernel_name));
+    scan_trace->rows_before = row_count;
+    scan_trace->rows_after = (U64)matched;
+    scan_trace->gpu_kernel_time_us = elapsed;
+  }
+  if (agg_trace)
+  {
+    agg_trace->input_row_count = (U64)matched;
+    agg_trace->group_count = 1;
+  }
+  ProfEnd();
+  return 1;
+}
+
 // tec: with a device selection, input only stands in for the table and the row count, the rows themselves stay on the GPU.
 // out_needs_host_rows is set, before any result exists, when the query has to run on host row ids instead
 internal PLAN_Materialized
@@ -9747,7 +10758,15 @@ qe_aggregate_impl(Arena* arena, CQL_Database* database, PLAN_RowSet* input, IR_N
   
   Temp scratch = scratch_begin(&arena, 1);
   
-  GPU_Kernel* assign_kernel = gpu_kernel_alloc(str8_lit("aggregate_assign"));
+  GPU_Kernel* assign_kernel = 0;
+  if (num_group_cols > 0 && settings_u64(str8_lit("QE_GENERATE_HASH_REDUCE"), 1) != 0 && qk_enabled(row_count))
+  {
+    assign_kernel = qk_hash_assign_kernel(scratch.arena, (U32)num_group_cols, (U32)group_string_mask, 0);
+  }
+  if (!assign_kernel)
+  {
+    assign_kernel = gpu_kernel_alloc(str8_lit("aggregate_assign"));
+  }
   if (!assign_kernel)
   {
     log_error("qe_aggregate: failed to alloc 'aggregate_assign' kernel");
@@ -10180,8 +11199,18 @@ qe_aggregate_impl(Arena* arena, CQL_Database* database, PLAN_RowSet* input, IR_N
     GPU_Buffer* out_owner_buf = gpu_buffer_alloc_pooled(str8_lit("agg_compact_owner_buf"), compact_max_groups * sizeof(U32), GPU_BufferFlag_ReadWrite, 0);
     GPU_Buffer* out_count_buf = gpu_buffer_alloc_pooled(str8_lit("agg_compact_count_buf"), compact_max_groups * sizeof(U32), GPU_BufferFlag_ReadWrite, 0);
     GPU_Buffer* total_buf = gpu_buffer_alloc_pooled(str8_lit("agg_compact_total_buf"), sizeof(U32), GPU_BufferFlag_ReadWrite, 0);
-    GPU_Kernel* compact_kernel = gpu_kernel_alloc(str8_lit("aggregate_compact"));
-    
+    GPU_Kernel* compact_kernel = 0;
+    U64 compact_work_blocks = compact_blocks;
+    if (settings_u64(str8_lit("QE_GENERATE_COMPACT"), 1) != 0 && qk_enabled(row_count))
+    {
+      compact_kernel = qk_compact_kernel(scratch.arena, 0);
+      compact_work_blocks = (num_slots + QK_COMPACT_BLOCK_SLOTS - 1) / QK_COMPACT_BLOCK_SLOTS;
+    }
+    if (!compact_kernel)
+    {
+      compact_kernel = gpu_kernel_alloc(str8_lit("aggregate_compact"));
+    }
+
     B32 have_groups = 0;
     if (compact_offsets_buf && block_sum_buf && out_owner_buf && out_count_buf && total_buf && compact_kernel)
     {
@@ -10197,11 +11226,11 @@ qe_aggregate_impl(Arena* arena, CQL_Database* database, PLAN_RowSet* input, IR_N
       U32 total_readback = 0;
       GPU_Batch* compact_batch = gpu_batch_begin(0, sizeof(U32));
       gpu_kernel_set_arg_u64(compact_kernel, 1, 0);
-      gpu_batch_kernel_execute(compact_batch, compact_kernel, (U32)(compact_blocks * 256), 256);
+      gpu_batch_kernel_execute(compact_batch, compact_kernel, (U32)(compact_work_blocks * 256), 256);
       gpu_kernel_set_arg_u64(compact_kernel, 1, 1);
       gpu_batch_kernel_execute(compact_batch, compact_kernel, 256, 256);
       gpu_kernel_set_arg_u64(compact_kernel, 1, 2);
-      gpu_batch_kernel_execute(compact_batch, compact_kernel, (U32)(compact_blocks * 256), 256);
+      gpu_batch_kernel_execute(compact_batch, compact_kernel, (U32)(compact_work_blocks * 256), 256);
       gpu_batch_buffer_read(compact_batch, total_buf, &total_readback, sizeof(U32));
       have_groups = gpu_batch_end(compact_batch);
       num_groups = total_readback;
@@ -10560,7 +11589,15 @@ qe_aggregate_impl(Arena* arena, CQL_Database* database, PLAN_RowSet* input, IR_N
     GPU_Buffer* hcount_buf = gpu_buffer_alloc_pooled(str8_lit("agg_hash_count_buf"), sums_size, GPU_BufferFlag_ReadWrite, 0);
     GPU_Buffer* hmin_buf = gpu_buffer_alloc_pooled(str8_lit("agg_hash_min_buf"), sums_size, GPU_BufferFlag_ReadWrite, 0);
     GPU_Buffer* hmax_buf = gpu_buffer_alloc_pooled(str8_lit("agg_hash_max_buf"), sums_size, GPU_BufferFlag_ReadWrite, 0);
-    GPU_Kernel* hash_kernel = gpu_kernel_alloc(fixed_ok ? str8_lit("aggregate_hash_reduce_fixed") : str8_lit("aggregate_hash_reduce_f32"));
+    GPU_Kernel* hash_kernel = 0;
+    if (settings_u64(str8_lit("QE_GENERATE_HASH_REDUCE"), 1) != 0 && qk_enabled(row_count))
+    {
+      hash_kernel = qk_hash_reduce_kernel(scratch.arena, fixed_ok ? 1 : 0, num_exprs, hash_func_codes, (U32)fixed_scales, 0);
+    }
+    if (!hash_kernel)
+    {
+      hash_kernel = gpu_kernel_alloc(fixed_ok ? str8_lit("aggregate_hash_reduce_fixed") : str8_lit("aggregate_hash_reduce_f32"));
+    }
     
     if (slot_group_buf && sum_buf && hcount_buf && hmin_buf && hmax_buf && hash_kernel)
     {
@@ -10724,14 +11761,9 @@ qe_aggregate_impl(Arena* arena, CQL_Database* database, PLAN_RowSet* input, IR_N
   // tec: a table with few slots would queue every row's cursor atomic on a few cache lines, so it counts per tile in shared memory instead
   B32 tiled_scatter = num_group_cols > 0 && num_slots <= QE_AGG_TILED_SCATTER_MAX_SLOTS;
   GPU_Kernel* scatter_kernel = gpu_kernel_alloc(tiled_scatter ? str8_lit("csr_scatter_tiled") : str8_lit("csr_scatter"));
-  GPU_Kernel* reduce_kernel = gpu_kernel_alloc(arg_narrow ? str8_lit("aggregate_reduce_f32") : str8_lit("aggregate_reduce"));
-  if (!scatter_kernel || !reduce_kernel)
-  {
-    log_error("qe_aggregate: failed to alloc '%s' kernel", scatter_kernel ? "aggregate_reduce" : "csr_scatter");
-    scratch_end(scratch);
-    ProfEnd();
-    return result;
-  }
+  GPU_Kernel* reduce_kernel = 0;
+  // tec: set below when the generated one thread per chunk reduce is used
+  B32 thread_reduce = 0;
   
   // tec: split each group's CSR range into ceil(member_count / agg_rows_per_chunk) chunks,
   // each getting its own reduce kernel workgroup
@@ -10768,6 +11800,42 @@ qe_aggregate_impl(Arena* arena, CQL_Database* database, PLAN_RowSet* input, IR_N
     }
   }
   
+  // tec: chunks of a few rows are reduced by one thread each, a workgroup per chunk spends its time on the shared memory folds
+  {
+    U32 longest_chunk = 0;
+    B32 simple_funcs = 1;
+    U32 thread_func_codes = 0;
+    for (U32 e = 0; e < num_exprs; e++)
+    {
+      thread_func_codes |= ((U32)exprs[e].func_code & 0xfu) << (e * 4u);
+      if (exprs[e].func_code > QE_AGG_FUNC_MAX)
+      {
+        simple_funcs = 0;
+      }
+    }
+    for (U64 k = 0; k < total_chunks; k++)
+    {
+      longest_chunk = Max(longest_chunk, chunk_range[k * 2 + 1] - chunk_range[k * 2]);
+    }
+    if (num_group_cols > 0 && simple_funcs && longest_chunk <= settings_u64(str8_lit("QE_GENERATE_MEMBER_REDUCE_MAX_ROWS"), 64) &&
+        settings_u64(str8_lit("QE_GENERATE_MEMBER_REDUCE"), 1) != 0 && qk_enabled(row_count))
+    {
+      reduce_kernel = qk_member_reduce_kernel(scratch.arena, arg_narrow, num_exprs, thread_func_codes, 0);
+      thread_reduce = reduce_kernel != 0;
+    }
+    if (!reduce_kernel)
+    {
+      reduce_kernel = gpu_kernel_alloc(arg_narrow ? str8_lit("aggregate_reduce_f32") : str8_lit("aggregate_reduce"));
+    }
+    if (!scatter_kernel || !reduce_kernel)
+    {
+      log_error("qe_aggregate: failed to alloc '%s' kernel", scatter_kernel ? "aggregate_reduce" : "csr_scatter");
+      scratch_end(scratch);
+      ProfEnd();
+      return result;
+    }
+  }
+
   // tec: no GROUP BY. chunk_range already is a partition of raw row indices [0,row_count),
   // so the reduce kernel can read rows directly instead of indirecting through group_member_rows,
   // and members_buf (a full row_count-sized scatter target) is never touched
@@ -11027,7 +12095,7 @@ qe_aggregate_impl(Arena* arena, CQL_Database* database, PLAN_RowSet* input, IR_N
     gpu_batch_buffer_zero(reduce_batch, sketch_buf, sketch_size);
   }
   // tec: one workgroup per chunk (a group with many rows spans many chunks/workgroups)
-  gpu_batch_kernel_execute(reduce_batch, reduce_kernel, (U32)Max(total_chunks, 1) * QE_GPU_WORKGROUP_SIZE, QE_GPU_WORKGROUP_SIZE);
+  gpu_batch_kernel_execute(reduce_batch, reduce_kernel, thread_reduce ? (U32)Max(total_chunks, 1) : (U32)Max(total_chunks, 1) * QE_GPU_WORKGROUP_SIZE, QE_GPU_WORKGROUP_SIZE);
   gpu_batch_buffer_read(reduce_batch, repr_buf, repr32, repr_size);
   gpu_batch_buffer_read(reduce_batch, partials_buf, partials_readback, partials_size);
   if (num_hll_exprs > 0)
@@ -11564,6 +12632,140 @@ qe_having_node_eval(QE_HavingNode* node, U64 row)
   return 1;
 }
 
+#define QE_HAVING_GPU_MAX_COLUMNS 8
+#define QE_HAVING_GPU_MAX_LITERALS 16
+
+typedef struct QE_HavingGpu QE_HavingGpu;
+struct QE_HavingGpu
+{
+  F64* columns[QE_HAVING_GPU_MAX_COLUMNS];
+  U32 column_count;
+  F64 literals[QE_HAVING_GPU_MAX_LITERALS];
+  U32 literal_count;
+};
+
+// tec: the GLSL condition of a compiled HAVING tree, an empty string when it has too many columns or constants
+internal String8
+qe_having_gpu_expression(Arena* arena, QE_HavingNode* node, QE_HavingGpu* gpu)
+{
+  if (node->kind == QE_HavingNodeKind_And || node->kind == QE_HavingNodeKind_Or)
+  {
+    String8 left = qe_having_gpu_expression(arena, node->left, gpu);
+    String8 right = left.size ? qe_having_gpu_expression(arena, node->right, gpu) : str8_zero();
+    if (!left.size || !right.size)
+    {
+      return str8_zero();
+    }
+    return push_str8f(arena, "(%.*s %s %.*s)", str8_varg(left), node->kind == QE_HavingNodeKind_And ? "&&" : "||", str8_varg(right));
+  }
+  U32 column = 0;
+  while (column < gpu->column_count && gpu->columns[column] != node->values)
+  {
+    column += 1;
+  }
+  if (column == gpu->column_count)
+  {
+    if (column == QE_HAVING_GPU_MAX_COLUMNS)
+    {
+      return str8_zero();
+    }
+    gpu->columns[column] = node->values;
+    gpu->column_count += 1;
+  }
+  if (gpu->literal_count == QE_HAVING_GPU_MAX_LITERALS)
+  {
+    return str8_zero();
+  }
+  U32 literal = gpu->literal_count;
+  gpu->literals[gpu->literal_count++] = node->literal;
+  char* op = "==";
+  switch (node->compare)
+  {
+    case QE_HavingCompare_Equal: op = "=="; break;
+    case QE_HavingCompare_NotEqual: op = "!="; break;
+    case QE_HavingCompare_Less: op = "<"; break;
+    case QE_HavingCompare_LessEqual: op = "<="; break;
+    case QE_HavingCompare_Greater: op = ">"; break;
+    case QE_HavingCompare_GreaterEqual: op = ">="; break;
+  }
+  return push_str8f(arena, "(v%u %s lit[%u])", column, op, literal);
+}
+
+// tec: the condition for every group in one dispatch. false when no kernel could be made, the caller evaluates on the CPU
+internal B32
+qe_having_gpu(Arena* arena, QE_HavingNode* compiled, U64 count, U8* out_keep)
+{
+  if (count == 0 || count >= max_U32 || settings_u64(str8_lit("QE_GENERATE_HAVING"), 1) == 0 ||
+      count < settings_u64(str8_lit("QE_GENERATE_HAVING_MIN_GROUPS"), 33554432) || !qk_enabled(count))
+  {
+    return 0;
+  }
+  Temp scratch = scratch_begin(&arena, 1);
+  QE_HavingGpu gpu = {0};
+  String8 condition = qe_having_gpu_expression(scratch.arena, compiled, &gpu);
+  GPU_Kernel* kernel = condition.size ? qk_having_kernel(scratch.arena, condition, 0) : 0;
+  if (!kernel)
+  {
+    scratch_end(scratch);
+    return 0;
+  }
+
+  GPU_Buffer* keep_buffer = gpu_buffer_alloc(count * sizeof(U32), GPU_BufferFlag_ReadWrite, 0);
+  GPU_Buffer* literal_buffer = gpu_buffer_alloc(QE_HAVING_GPU_MAX_LITERALS * sizeof(F64), GPU_BufferFlag_Write, 0);
+  GPU_Buffer* column_buffers[QE_HAVING_GPU_MAX_COLUMNS] = {0};
+  B32 ok = keep_buffer && literal_buffer;
+  for (U32 c = 0; c < gpu.column_count && ok; c++)
+  {
+    column_buffers[c] = gpu_buffer_alloc(count * sizeof(F64), GPU_BufferFlag_Write, 0);
+    ok = column_buffers[c] != 0;
+  }
+  U32* keep_words = push_array(scratch.arena, U32, count);
+  if (ok)
+  {
+    gpu_kernel_set_arg_buffer(kernel, 0, keep_buffer);
+    gpu_kernel_set_arg_buffer(kernel, 1, literal_buffer);
+    for (U32 c = 0; c < QE_HAVING_GPU_MAX_COLUMNS; c++)
+    {
+      gpu_kernel_set_arg_buffer(kernel, 2 + c, column_buffers[c] ? column_buffers[c] : keep_buffer);
+    }
+    gpu_kernel_set_arg_u64(kernel, 0, count);
+    GPU_Batch* batch = gpu_batch_begin(gpu.column_count * count * sizeof(F64) + sizeof(gpu.literals), count * sizeof(U32));
+    gpu_batch_buffer_write(batch, literal_buffer, gpu.literals, sizeof(gpu.literals));
+    for (U32 c = 0; c < gpu.column_count; c++)
+    {
+      gpu_batch_buffer_write(batch, column_buffers[c], gpu.columns[c], count * sizeof(F64));
+    }
+    gpu_batch_kernel_execute(batch, kernel, (U32)count, QE_GPU_WORKGROUP_SIZE);
+    gpu_batch_buffer_read(batch, keep_buffer, keep_words, count * sizeof(U32));
+    ok = gpu_batch_end(batch);
+  }
+  gpu_kernel_release(kernel);
+  if (keep_buffer)
+  {
+    gpu_buffer_release(keep_buffer);
+  }
+  if (literal_buffer)
+  {
+    gpu_buffer_release(literal_buffer);
+  }
+  for (U32 c = 0; c < QE_HAVING_GPU_MAX_COLUMNS; c++)
+  {
+    if (column_buffers[c])
+    {
+      gpu_buffer_release(column_buffers[c]);
+    }
+  }
+  if (ok)
+  {
+    for (U64 i = 0; i < count; i++)
+    {
+      out_keep[i] = keep_words[i] ? 1 : 0;
+    }
+  }
+  scratch_end(scratch);
+  return ok;
+}
+
 internal PLAN_Materialized
 qe_apply_having(Arena* arena, PLAN_Materialized* m, IR_Node* having_ir)
 {
@@ -11576,9 +12778,11 @@ qe_apply_having(Arena* arena, PLAN_Materialized* m, IR_Node* having_ir)
   
   // tec: the general evaluation looks every operand up by name for every group, which adds up over a million groups
   QE_HavingNode* compiled = qe_having_compile(scratch.arena, m, condition);
+  U8* gpu_keep = compiled ? push_array(scratch.arena, U8, Max(m->count, 1)) : 0;
+  B32 on_gpu = compiled && qe_having_gpu(scratch.arena, compiled, m->count, gpu_keep);
   for (U64 i = 0; i < m->count; i++)
   {
-    B32 kept = compiled ? qe_having_node_eval(compiled, i) : qe_having_eval(m, condition, i);
+    B32 kept = on_gpu ? gpu_keep[i] : (compiled ? qe_having_node_eval(compiled, i) : qe_having_eval(m, condition, i));
     if (kept) keep[keep_count++] = i;
   }
   
@@ -13602,7 +14806,12 @@ qe_hash_join_impl(Arena* arena, PLAN_RowSet* left, CQL_Table* right_table, Strin
   
   //- tec: pass 1/2
   // hash the build side into a bucket histogram. upload the build key data/offsets, dispatch, and read the bucket histogram back
-  GPU_Kernel* build_kernel = gpu_kernel_alloc(str8_lit("hash_join_build_count"));
+  B32 generate_join = settings_u64(str8_lit("QE_GENERATE_JOIN"), 1) != 0 && qk_enabled(probe_row_count);
+  GPU_Kernel* build_kernel = generate_join ? qk_join_build_kernel(scratch.arena, is_string_key ? 1 : 0, 0) : 0;
+  if (!build_kernel)
+  {
+    build_kernel = gpu_kernel_alloc(str8_lit("hash_join_build_count"));
+  }
   if (!build_kernel)
   {
     log_error("qe_hash_join: failed to alloc 'hash_join_build_count' kernel");
@@ -13709,7 +14918,11 @@ qe_hash_join_impl(Arena* arena, PLAN_RowSet* left, CQL_Table* right_table, Strin
               "allocating it as a single large buffer rather than chunking", out_capacity * 4 * sizeof(U32), out_capacity);
   }
   
-  GPU_Kernel* probe_kernel = gpu_kernel_alloc(str8_lit("hash_join_probe"));
+  GPU_Kernel* probe_kernel = generate_join ? qk_join_probe_hash_kernel(scratch.arena, is_string_key ? 1 : 0, (is_left_join || is_anti_join) ? 1 : 0, 0) : 0;
+  if (!probe_kernel)
+  {
+    probe_kernel = gpu_kernel_alloc(str8_lit("hash_join_probe"));
+  }
   if (!probe_kernel)
   {
     log_error("qe_hash_join: failed to alloc 'hash_join_probe' kernel");

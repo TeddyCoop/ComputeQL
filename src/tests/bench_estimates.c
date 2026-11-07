@@ -289,6 +289,7 @@ entry_point(CmdLine* cmdline)
   g_query_exec_mutex = os_mutex_alloc();
   cql_init();
   gpu_init();
+  qk_init();
   
   Arena* arena = arena_alloc(.reserve_size = GB(1), .commit_size = MB(64));
   Bench_Report* report = bench_report_alloc(arena, "compute_ql cardinality estimates");

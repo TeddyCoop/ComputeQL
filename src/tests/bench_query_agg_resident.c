@@ -269,6 +269,7 @@ entry_point(CmdLine* cmdline)
   
   cql_init();
   gpu_init();
+  qk_init();
   
   Arena* arena = arena_alloc(.reserve_size = GB(1), .commit_size = MB(64));
   Bench_Report* report = bench_report_alloc(arena, "compute_ql GROUP BY over GPU resident columns correctness");

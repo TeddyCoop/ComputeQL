@@ -3,11 +3,11 @@
 //   default:   scan_simple where it applies, interpreter otherwise (QE_PERQUERY_KERNELS:0)
 //   compiled:  a kernel generated for the query (QE_PERQUERY_KERNELS:2)
 // --rows=N sets the table size, --samples prints every timed run, --setting=A:1,B:2 applies extra settings
-// --narrow gives columns a and b small value ranges. run it with --setting=GPU_MAX_BUFFER_SIZE:1000000 so the numeric filters stream and hold those columns at 1 and 2 bytes
+// --narrow gives columns a and b small value ranges. run it with --setting=GPU_MAX_BUFFER_SIZE:4000000 so the numeric filters stream and hold those columns at 1 and 2 bytes
 // the mixed cases (24 on) put plain comparisons next to terms that are not, which run on one kernel with scan_simple's layout. configurations to run
 //   bench_query_perquery
 //   bench_query_perquery --setting=GPU_MAX_BUFFER_SIZE:4000000
-//   bench_query_perquery --narrow --setting=GPU_MAX_BUFFER_SIZE:1000000
+//   bench_query_perquery --narrow --setting=GPU_MAX_BUFFER_SIZE:4000000
 #define BUILD_ENTRY_DEFINING_UNIT 1
 #define BUILD_CONSOLE_INTERFACE 1
 #define PROFILE_CUSTOM 1
@@ -170,6 +170,7 @@ entry_point(CmdLine* cmdline)
 
   cql_init();
   gpu_init();
+  qk_init();
 
   Arena* arena = arena_alloc(.reserve_size = GB(2), .commit_size = MB(64));
   Bench_Report* report = bench_report_alloc(arena, "compute_ql per query kernels against the interpreter");

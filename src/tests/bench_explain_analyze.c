@@ -272,6 +272,7 @@ entry_point(CmdLine* cmdline)
   g_query_exec_mutex = os_mutex_alloc();
   cql_init();
   gpu_init();
+  qk_init();
   
   Arena* arena = arena_alloc(.reserve_size = MB(256), .commit_size = MB(16));
   

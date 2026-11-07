@@ -520,6 +520,7 @@ entry_point(CmdLine* cmdline)
   U64 t0 = os_now_microseconds();
   cql_init();
   gpu_init();
+  qk_init();
   U64 t1 = os_now_microseconds();
   printf("engine startup (cql_init + gpu_init, one-time): %.4f ms\n", (F64)(t1 - t0) / 1000.0);
   printf("GPU_MAX_BUFFER_SIZE = %llu bytes (deliberately lowered for this test - see file header)\n", (U64)GPU_MAX_BUFFER_SIZE);

@@ -176,6 +176,7 @@ entry_point(CmdLine* cmdline)
   settings_load_from_string(str8_lit("GPU_VULKAN_SHADER_INFO:1"));
   cql_init();
   gpu_init();
+  qk_init();
 
   printf("shader info extension: %s\n", g_vulkan_state->has_shader_info_ext ? "yes" : "no");
   printf("| kernel | SPIR-V bytes | first build in process (ms) | cold build, median of %d (ms) | same SPIR-V again, no cache (ms) | warm from VkPipelineCache (ms) | "

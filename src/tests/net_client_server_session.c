@@ -91,6 +91,7 @@ entry_point(CmdLine *cmdline)
 
   cql_init();
   gpu_init();
+  qk_init();
 
   if (!os_net_init())
   {
