@@ -8,7 +8,7 @@ set COMPILE_SHADERS=0
 
 :: compile defintions
 set cl_common=     /I..\src\ /I..\src\third_party\vulkan\ /nologo /FC /Z7
-set clang_common=  -I..\src\ -gcodeview -fdiagnostics-absolute-paths -Wall -Wno-unknown-warning-option -Wno-missing-braces -Wno-unused-function -Wno-writable-strings -Wno-unused-value -Wno-unused-variable -Wno-unused-local-typedef -Wno-deprecated-register -Wno-deprecated-declarations -Wno-unused-but-set-variable -Wno-single-bit-bitfield-constant-conversion -Xclang -flto-visibility-public-std -D_USE_MATH_DEFINES -Dstrdup=_strdup -Dgnu_printf=printf
+set clang_common=  -I..\src\ -I..\src\third_party\vulkan\ -mpopcnt -gcodeview -fdiagnostics-absolute-paths -Wall -Wno-unknown-warning-option -Wno-missing-braces -Wno-unused-function -Wno-writable-strings -Wno-unused-value -Wno-unused-variable -Wno-unused-local-typedef -Wno-deprecated-register -Wno-deprecated-declarations -Wno-unused-but-set-variable -Wno-single-bit-bitfield-constant-conversion -Xclang -flto-visibility-public-std -D_USE_MATH_DEFINES -Dstrdup=_strdup -Dgnu_printf=printf
 set cl_debug=      call cl /Od %cl_common% %auto_compile_flags%
 set cl_release=    call cl /O2 /DNDEBUG %cl_common% %auto_compile_flags%
 set clang_debug=   call clang -g -O0 %clang_common% %auto_compile_flags%
@@ -16,7 +16,7 @@ set clang_release= call clang -g -O3 -DNDEBUG %clang_common% %auto_compile_flags
 :: /natvis:"%~dp0\src\natvis\base.natvis"
 set cl_link=       /link ..\src\third_party\vulkan\vulkan-1.lib
 ::/MANIFEST:EMBED /INCREMENTAL:NO  logo.res
-set clang_link=    -fuse-ld=lld -Xlinker
+set clang_link=    -fuse-ld=lld ..\src\third_party\vulkan\vulkan-1.lib
 ::/MANIFEST:EMBED -Xlinker /natvis:"%~dp0\src\natvis\base.natvis" logo.res
 set cl_out=        /out:
 set clang_out=     -o
@@ -29,15 +29,21 @@ if %CLANG%==1  set only_compile=-c
 if %CLANG%==1  set EHsc=
 if %CLANG%==1  set rc=llvm-rc.exe
 
+:: command line: build.bat [clang] [debug]
+for %%a in (%*) do (
+  if /i "%%a"=="clang" (set MSVC=0& set CLANG=1)
+  if /i "%%a"=="debug" (set DEBUG=1& set RELEASE=0)
+)
+
 :: choose compile lines
 if %MSVC%==1      set compile_debug=%cl_debug%
 if %MSVC%==1      set compile_release=%cl_release%
 if %MSVC%==1      set compile_link=%cl_link%
 if %MSVC%==1      set out=%cl_out%
-if %CLANG%==1      set compile_debug=%cl_debug%
-if %CLANG%==1      set compile_release=%cl_release%
-if %CLANG%==1      set compile_link=%cl_link%
-if %CLANG%==1      set out=%cl_out%
+if %CLANG%==1      set compile_debug=%clang_debug%
+if %CLANG%==1      set compile_release=%clang_release%
+if %CLANG%==1      set compile_link=%clang_link%
+if %CLANG%==1      set out=%clang_out%
 if %DEBUG%==1     set compile=%compile_debug%
 if %RELEASE%==1   set compile=%compile_release%
 

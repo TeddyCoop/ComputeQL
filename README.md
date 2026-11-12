@@ -1,104 +1,227 @@
-# ComputeQL - A GPU-Accelerated SQL Database
+# ComputeQL — a GPU-accelerated SQL database
 
-ComputeQL is a from-scratch, columnar SQL database written in C99 that executes queries as **GPU compute kernels** instead of on the CPU. Rather than compiling a bespoke shader per query, it interprets a compact **bytecode VM** inside a small library of precompiled Vulkan compute shaders - so arbitrary WHERE-clause expressions can be evaluated on the GPU without any runtime shader compilation.
+ComputeQL is a from-scratch, columnar SQL database written in C99 that runs queries on the **GPU** through [Vulkan](https://en.wikipedia.org/wiki/Vulkan_(API)) compute shaders. You write ordinary SQL (`SELECT ... JOIN ... WHERE ... GROUP BY ...`); the engine parses it, plans and optimizes it, generates a small compute kernel for the query's filter, and runs scans, joins, aggregates and sorts across thousands of GPU threads. It works on any Vulkan 1.x GPU (NVIDIA, AMD, Intel), not just CUDA hardware, and in server mode it speaks the PostgreSQL wire protocol, so `psql` and standard Postgres drivers can connect to it.
 
-## How it works
-
-1. **Storage** - Data lives in a hand-rolled columnar format (`GDB_Database` -> `GDB_Table` -> `GDB_Column`), one file per column, memory-mapped on load. Small columns are loaded fully into memory; columns past a size threshold are streamed/disk-backed automatically.
-2. **Parsing** - A hand-rolled recursive-descent SQL tokenizer/parser turns query text into an AST, with position-aware syntax error reporting (line, column, and a caret pointing at the offending token).
-3. **IR lowering** - The AST is lowered into an intermediate representation (IR) tree that the execution layer walks directly.
-4. **Planning** - The IR for a `SELECT` is lowered into a plan tree (`Limit(Sort(Project(Having(Aggregate(Filter(Join-tree))))))`) that composes fixed physical operators - there's no cost-based optimizer yet (no join reordering or predicate pushdown), so today there's exactly one plan per query.
-5. **GPU execution** - Each physical operator (scan+filter, hash join, bitonic sort, group-by/aggregate) is backed by a Vulkan compute shader. WHERE/ON/HAVING-style expressions are compiled to a small stack-based bytecode ISA and interpreted per-row/per-group on the GPU; the CPU uploads column data and the bytecode program to fixed descriptor bindings, dispatches, and reads back results. Tables larger than the configured GPU buffer size are automatically chunked across multiple dispatches. An equality/range predicate on an indexed column can instead be served by a CPU-side binary search over that column, skipping the GPU dispatch entirely.
-
-## Current capabilities
-
-**Storage engine**
-- Columnar on-disk format with binary metadata + one data file per column
-- Supported column types: `u32`, `u64`, `f32`, `f64`, `string8`
-- Automatic in-memory vs. disk-backed storage depending on column size
-- CSV import (streaming, for datasets larger than memory) and CSV export
-- Per-column NULL tracking
-- Single-column constraints: `NOT NULL`, `UNIQUE`, `PRIMARY KEY`, `FOREIGN KEY ... REFERENCES table(column)`, `CHECK(...)` - enforced on `INSERT`
-- Single Column Index
-- A reserved `column_catalog` system table exposing per-column metadata (type, constraints, index membership), queryable like any other table, plus `DESCRIBE <table>`
-
-**SQL support**
-- `USE`, `CREATE DATABASE`, `CREATE TABLE` (with column constraints), `CREATE INDEX`, `ALTER TABLE` (add/drop column, rename), `DROP INDEX`
-- `INSERT INTO ... (columns) VALUES (...), (...), ...` (multi-row), constraint-checked against `NOT NULL`/`UNIQUE`/`PRIMARY KEY`/`FOREIGN KEY`/`CHECK`
-- `IMPORT INTO <table> FROM '<csv path>'`
-- `SELECT` with:
-  - Multi-table `FROM t1, t2` and explicit `INNER JOIN` / `LEFT [OUTER] JOIN ... ON` (equi-joins, numeric or string keys)
-  - Qualified column references (`table.column`) and `AS` aliases on tables and columns
-  - `WHERE`/`ON`/`HAVING` with full operator precedence: `AND`/`OR` (correct binding, parenthesized sub-expressions), comparisons (`=`, `==`, `!=`, `<`, `>`, `<=`, `>=`), `IS [NOT] NULL`, and string `contains`/`equals`
-  - `GROUP BY`, `HAVING`, and aggregate calls (`COUNT(*)`, `SUM`, `AVG`, `MIN`, `MAX`) in both the SELECT list and HAVING expressions
-  - `ORDER BY` (`ASC`/`DESC`, up to 4 numeric columns), `LIMIT`, `OFFSET`
-  - `DESCRIBE <table>`
-- `EXPLAIN <select>` - prints the query planner's plan tree without executing the query
-- Real syntax error messages with source position (line/column + caret)
-
-**GPU execution**
-- Vulkan compute backend with double-precision (`shaderFloat64`) comparisons for exact numeric semantics
-- A reusable bytecode VM (comparisons, boolean logic, string equality/`contains`) shared across operators, interpreted by dedicated compute shaders for scan+filter, hash join (build/probe), bitonic sort, and group-by/aggregate (hash + CSR scatter + per-group reduction)
-- Cached shader modules/pipelines/descriptor sets and a pooled GPU buffer allocator, so steady-state queries don't pay pipeline/allocation setup cost repeatedly
-- Bulk column materialization for `SELECT` output (one gather pass per column instead of a syscall per row/column)
-- Automatic chunking for tables that exceed the GPU's max buffer size
-- Optional per-query scan kernels (`QE_PERQUERY_KERNELS`): the WHERE clause is turned into GLSL for exactly that query shape and built with shaderc loaded at run time from `shaderc_shared.dll` (Vulkan SDK). Literal values stay in buffers, so queries that differ only in constants share a kernel. On by default for every filter, numeric AND filters keep narrow column reads (`QE_PERQUERY_KERNELS:0` is the old precompiled path). Without shaderc the precompiled `scan_simple` and the bytecode interpreter are the fallback, and it is the reference for tests. See `docs/per_query_kernels.md`
-
-**Platform**
-- Windows x64 (MSVC or Clang), Vulkan 1.x required. Linux/macOS are not currently supported.
+The goal is large data: scans, joins and aggregates over tens of millions to billions of rows, where GPU memory bandwidth beats a CPU. It is an early, single-developer project (see [Limitations](#limitations)).
 
 ## Performance
 
-TODO
+Measured on a Ryzen 5 5600X (6 cores / 12 threads), 32 GB RAM, **AMD Radeon RX 6700 XT** (12 GB), Windows 11. All numbers are medians of the harness's timed runs, end to end (prepare + execute + fetch), against DuckDB (C API, all threads) on the same machine, with result checksums compared between engines.
 
-## Roadmap
+"Warm" means the touched columns are already resident in VRAM, which is the steady state for repeated queries on a table that fits. A cold first query pays the host-to-GPU copy once: at 1B rows, 440–700 ms for 1.9–3.8 GB of columns.
 
-Ordered from "next" to "later":
-- [ ] **Cross-engine benchmarking against more engines** - extend to ClickHouse/Postgres (client-server engines, needing a running server + client library) and publish results.
-- [ ] **Users & access control** - accounts and authentication for network connections, plus a role/permission model (`GRANT`/`REVOKE`) scoped to databases and tables, so a shared server isn't all-or-nothing access.
-- [ ] **Multi-GPU support**
-- [ ] **Additional GPU backends** (e.g. HIP / ROCm, DirectX12 Compute, CUDA) alongside Vulkan
-- [ ] **Cross-platform support** (Linux/macOS)
-- [ ] **Additional query languages** on top of the same execution engine
-- [ ] **GPU projection kernel** - move column projection for `SELECT` off the CPU and into the GPU operator pipeline.
+### 1 billion rows (4 × u32 columns, 14.9 GB)
 
-## Building from source
+| query | ComputeQL | DuckDB | speedup |
+|---|---:|---:|---:|
+| `SUM`, `MIN`, `MAX` | 8.5 ms | 467 ms | 55× |
+| filter + count (2% selective) | 6.3 ms | 247 ms | 39× |
+| `GROUP BY` region (50 groups) | 20 ms | 628 ms | 31× |
+| join 50-row table, filtered | 19 ms | 609 ms | 32× |
+| find one row by key | 17 ms | 282 ms | 16× |
+| `GROUP BY` amount (10k groups) | 120 ms | 1,697 ms | 14× |
+| join 1M-row table | 129 ms | 1,593 ms | 12× |
 
-*Currently, only Windows x64 is supported.*
+### 100 million rows
+
+| query | ComputeQL | DuckDB | speedup |
+|---|---:|---:|---:|
+| `SUM`, `MIN`, `MAX` | 1.3 ms | 41 ms | 32× |
+| `GROUP BY` region (50 groups) | 3.4 ms | 61 ms | 18× |
+| `GROUP BY` amount (10k groups) | 14.5 ms | 179 ms | 12× |
+| join 1M-row table | 28 ms | 175 ms | 6× |
+
+### 10 million rows, 30-column event table (37 queries)
+
+ComputeQL was faster on 36 of 37 queries. A selection:
+
+| query | ComputeQL | DuckDB | speedup |
+|---|---:|---:|---:|
+| group by dict string (200 groups) | 0.43 ms | 39.8 ms | 93× |
+| group by status (5 groups), f64 measures | 0.79 ms | 62.2 ms | 79× |
+| filter on dictionary string equality | 0.31 ms | 8.2 ms | 27× |
+| group by region (50), 5 aggregates | 1.0 ms | 21.6 ms | 22× |
+| three-predicate filter | 1.1 ms | 13.0 ms | 12× |
+| join users (1M), group by segment | 10.5 ms | 69.6 ms | 6.6× |
+| group by user (1M groups) | 56 ms | 219 ms | 3.9× |
+| sort 200k rows | 9.5 ms | 17.9 ms | 1.9× |
+
+Where DuckDB still wins or ties: `COUNT(DISTINCT)` over 4M sessions (0.8×), window `top 3 per region` (1.1×, windows run on the CPU), and materializing 30 columns of a 1% filter (1.6×).
+
+### Per-query kernels
+
+The `WHERE` clause is compiled to GLSL for exactly that query shape (shaderc loaded at run time), instead of being interpreted as bytecode. Constants stay in buffers, so queries that differ only in literals share a kernel. On a 3M-row table this is 1.4–7× faster than the interpreter across 29 filter shapes, and an expression that the interpreter cannot run at all (stack depth 12 `OR` chain) drops from 749 ms to 0.9 ms.
+
+To reproduce, see [Tests and benchmarks](#tests-and-benchmarks)
+
+## How a query runs
+
+```
+  SQL text
+     |
+     v
+  +--------------------+
+  | Parser             |  recursive descent, AST, positioned errors
+  +--------------------+
+     |
+     v
+  +--------------------+
+  | IR lowering        |
+  +--------------------+
+     |
+     v
+  +--------------------+
+  | Planner            |  plan tree
+  +--------------------+
+     |
+     v
+  +--------------------+
+  | Optimizer          |  column stats + calibrated cost model
+  +--------------------+
+     |
+     v
+  +--------------------+      +------------------------------+
+  | Query executor     |<-----| Columnar storage             |
+  | bytecode / GLSL    |      | zonemaps, dictionaries,      |
+  +--------------------+      | indexes, disk streaming      |
+     |                        +------------------------------+
+     v
+  +--------------------+
+  | Vulkan backend     |  compute shaders on the GPU
+  +--------------------+
+     |
+     v
+  Result rows --> CLI / REPL, or Postgres wire server
+```
+
+1. **Storage** (`src/cql`): one file per column, memory-mapped, with per-8192-row zonemaps (min/max, used to skip chunks), dictionary encoding for low-cardinality strings, NULL tracking, constraints and single-column indexes. Columns larger than a threshold stream from disk, and tables larger than GPU memory are processed in chunks.
+2. **Parse and lower** (`src/ir_gen`): a hand-written parser produces an AST with line/column/caret syntax errors, then lowers it to an IR.
+3. **Plan and optimize** (`src/planner`, `src/optimizer`): the IR becomes a `Limit(Sort(Project(Having(Aggregate(Filter(Join)))))))` tree. A cost-based pass (per-column statistics, a cost model calibrated on the local machine) pushes predicates down, inlines CTEs and derived tables, reorders inner joins, picks CPU/GPU/index strategies per operator and sizes buffers. Every rule can be switched off in `settings.cfg`.
+4. **Execute** (`src/query_exec`, `src/gpu`): filters are turned into per-query GLSL kernels (or a stack-bytecode interpreter as a fallback), then run as Vulkan compute shaders for scan+filter, hash join, bitonic sort, and hash group-by/aggregate (including HyperLogLog and t-digest sketches for `APPROX_COUNT_DISTINCT` and `APPROX_PERCENTILE`). Fuzzy matching (`SIMILARITY`, `EDIT_DISTANCE`) runs on the GPU as well.
+
+## SQL and features
+
+- DDL/DML: `CREATE DATABASE/TABLE/INDEX`, `ALTER TABLE`, `DROP INDEX`, multi-row `INSERT`, `IMPORT INTO ... FROM 'file.csv'` (streaming), CSV export, `DESCRIBE`.
+- Types: `u32`, `u64`, `i32`, `f32`, `f64`, `string8`, `enum`. Constraints: `NOT NULL`, `UNIQUE`, `PRIMARY KEY`, `FOREIGN KEY`, `CHECK`.
+- `SELECT`: inner/left joins (GPU hash join, numeric or string keys), `WHERE`/`HAVING` with full boolean precedence, `GROUP BY`, aggregates (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `APPROX_COUNT_DISTINCT`, `APPROX_PERCENTILE`), `ORDER BY`, `LIMIT`/`OFFSET`, CTEs, subqueries, window functions (CPU).
+- `EXPLAIN` and `EXPLAIN ANALYZE` (zonemap pruning, dictionary hits, GPU cache hits, per-stage timing, estimated vs actual rows).
+- One-shot CLI, interactive REPL, or a server (`--serve` for the native protocol, `--serve-pg` for the PostgreSQL protocol) with matching network clients.
+
+## Project structure
+
+```
+compute_ql/
+├── build.bat                 build the engine (MSVC or Clang)
+├── run.bat / test.bat        launch cql.exe / run a sample query
+├── build_and_run_tests.bat   build and run every bench_*.c and net_*.c test
+├── run_all_reports.bat       run every suite that writes a report
+├── run_scale_bench.bat       10M-row suite vs SQLite and DuckDB
+├── run_select_scale.bat      10M / 100M / 1B row select suite
+├── settings.cfg              runtime settings (copied next to cql.exe)
+├── docs/                     design notes, perf handoffs, paper runs
+├── src/
+│   ├── main.c                unityentry point (includes every .c)
+│   ├── application.c/h       top-level statement dispatch
+│   ├── base/                 arenas, strings, threads, logging, command line
+│   ├── os/                   OS layer (Win32 core, networking)
+│   ├── thread_pool/          worker pool
+│   ├── settings/             settings.cfg loader
+│   ├── cql/                  columnar storage engine and statistics
+│   ├── ir_gen/               SQL tokenizer, parser, AST -> IR
+│   ├── planner/              IR -> plan tree
+│   ├── optimizer/            cost model, join ordering, rewrites
+│   ├── query_exec/           bytecode + GLSL kernel generation, GPU orchestration
+│   ├── gpu/
+│   │   ├── gpu.h             backend-neutral GPU interface
+│   │   └── vulkan/           Vulkan backend and shaders/*.comp
+│   ├── server/               native and PostgreSQL-protocol servers
+│   ├── client/               one-shot and interactive network clients
+│   ├── tests/                correctness + benchmark suites (SQLite/DuckDB), scale/ for 1B rows
+│   └── third_party/          Vulkan headers/loader lib, shaderc/glslang headers, SQLite, DuckDB, stb
+└── build/                    output (cql.exe, shaders/, shaderc_shared.dll, bench_reports/)
+```
+
+## Building
+
+Windows x64 only today.
 
 ### Prerequisites
 
-- **MSVC Build Tools** (Visual Studio 2017 "Microsoft C/C++ Build Tools" or later), for the Windows SDK plus the `cl`/`link` toolchain. Building with Clang is possible if the Windows SDK is present but is untested. Compiler must be on the PATH variable.
-- **Vulkan SDK**, with `%VULKAN_SDK%\Bin\glslc.exe` available - `build.bat` uses `glslc` to precompile the GPU compute shaders (`.comp` -> SPIR-V `.spv`) at build time. Get it from [vulkan.lunarg.com](https://vulkan.lunarg.com/).
+- **A C compiler**: MSVC (Visual Studio 2017+ or Build Tools, with the Windows SDK) **or** Clang/LLVM 14+ with `lld` (the LLVM installer, or Visual Studio's "C++ Clang tools"). The compiler must be on `PATH`; with MSVC, build from an "x64 Native Tools Command Prompt".
+- **[Vulkan SDK](https://vulkan.lunarg.com/)** (`VULKAN_SDK` set). The build copies `shaderc_shared.dll` from it next to `cql.exe`; kernels are compiled from GLSL with shaderc at run time. The Vulkan headers and `vulkan-1.lib` are vendored in `src/third_party/vulkan`.
+- A GPU with a Vulkan driver supporting `shaderFloat64`.
 
 ### Build
 
-From the repository root:
+From the repository root, in a prompt where the compiler is available:
+
+```bat
+build.bat            :: MSVC, release (default)
+build.bat clang      :: Clang + lld, release
+build.bat debug      :: MSVC, debug
+build.bat clang debug
+```
+
+This produces `build\cql.exe`, `build\settings.cfg`, `build\shaders\*.comp` and `build\shaderc_shared.dll`. The MSVC path is the one used day to day; the Clang path (`-fuse-ld=lld`, `-mpopcnt`) was added recently and has not been verified against a real toolchain yet, so report anything that fails.
+
+## Running
+
+Run from `build\` (shaders and settings are found relative to the exe).
 
 ```
-build.bat
+cd build
+
+:: one-shot query
+cql.exe --query="CREATE DATABASE shop; USE shop; CREATE TABLE products (id u32, price f64, name string8); INSERT INTO products (id, price, name) VALUES (1, 9.99, 'widget'), (2, 19.99, 'gadget'), (3, 4.50, 'gizmo');"
+cql.exe --query="USE shop; SELECT id, name, price FROM products WHERE price > 5.00;"
+
+:: interactive REPL (no --query)
+cql.exe
+
+:: load a CSV
+cql.exe --query="USE shop; IMPORT INTO products FROM 'products.csv';"
+
+:: see what the engine did
+cql.exe --query="USE shop; EXPLAIN ANALYZE SELECT name FROM products WHERE price > 5.00;"
+
+:: server, then a client
+cql.exe --serve=5433
+cql.exe --connect=127.0.0.1:5433 --query="USE shop; SELECT * FROM products;"
+
+:: PostgreSQL protocol, usable from psql and Postgres drivers
+cql.exe --serve-pg=5432
 ```
 
-On success, `build\gdb.exe` is produced, along with compiled shaders under `build\shaders\`.
+Other flags: `--gpu=vulkan`, `--settings=<path>`, `--log-level=error|warn|info|verbose`.
+### Tests and benchmarks
 
-## Project layout
+The suites compare against SQLite and DuckDB, which are not bundled. Download the [SQLite amalgamation](https://sqlite.org/download.html) (`sqlite3.c`, `sqlite3.h`) into `src/third_party/sqlite/` and the [DuckDB C library](https://github.com/duckdb/duckdb/releases) (`libduckdb-windows-amd64.zip`: `duckdb.h`, `duckdb.lib`, `duckdb.dll`) into `src/third_party/duckdb/`. The test scripts build with MSVC.
 
+```bat
+build_and_run_tests.bat    :: every bench_*.c / net_*.c test -> build\bench_reports\*.md
+run_scale_bench.bat        :: 10M-row suite (--no_duckdb, --no_sqlite, --only=<label>)
+run_select_scale.bat       :: 10M / 100M / 1B rows (--no_duckdb, --rows=N)
+run_all_reports.bat        :: everything above plus the transfer benchmark
 ```
-src/
-  main.c              - unity build entry point (includes every .c in dependency order)
-  application.c/h     - top-level query execution loop, dispatches parsed statements
-  gdb/                - columnar storage engine (databases, tables, columns, disk I/O, CSV, constraints, indexes)
-  ir_gen/
-    sql_parser.c/h    - SQL tokenizer + recursive-descent parser -> AST
-    ir_gen.c/h        - AST -> IR lowering
-  planner/            - IR -> physical plan tree (join/filter/aggregate/having/project/sort/limit)
-  query_exec/         - bytecode compiler (IR -> GPU bytecode) + per-operator GPU dispatch orchestration
-  gpu/
-    vulkan/           - Vulkan backend + compute shaders (GLSL, compiled to SPIR-V at build time)
-  server/             - client-server mode: long-running server, one thread + session per connection
-    pg_protocol.c/h   - Postgres wire protocol (v3) message framing/encoding, OID mapping
-    pg_server.c/h     - Postgres wire protocol server: startup handshake, simple query loop, extended query protocol (prepared statements/portals per connection)
-  client/             - client-server mode: one-shot and interactive (--connect) network clients
-  os/                 - OS abstraction layer (Windows only today), including os/net for TCP sockets
-  tests/              - benchmark harness comparing against SQLite/DuckDB, plus client-server smoke tests (build_and_run_tests.bat)
-```
+
+The 1B-row suite needs about 15 GB of RAM for ComputeQL alone, and more if DuckDB loads its own copy (pass `--duckdb_max_rows=100000000` to skip it at 1B).
+
+## Limitations
+
+- **Small queries.** A GPU dispatch has fixed submit/wait cost; for small tables SQLite or DuckDB will be faster. Tuning targets 10M+ rows.
+- **No durability story.** No transactions, WAL, crash recovery, concurrent writers, or authentication
+- **SQL coverage.** No recursive CTEs or `UNION`/`INTERSECT`/`EXCEPT`; window functions run on the CPU; the optimizer reorders only the inner joins before the first `LEFT JOIN` and does not search whole plan alternatives.
+- **Platform.** Windows only, and needs a working Vulkan driver.
+- **Hardware coverage.** All numbers come from a single GPU (RX 6700 XT).
+
+## Future work
+
+- **More GPUs.** Run the full correctness and benchmark suites on NVIDIA and Intel hardware, integrated GPUs, and other AMD generations; calibrate the optimizer cost model per device and check driver differences (subgroup sizes, `shaderFloat64` performance, buffer limits).
+- **Multi-GPU support**: partition tables across devices, with a merge step for aggregates and sorts.
+- **Linux and macOS** (Vulkan and MoltenVK), which also means finishing the OS layer outside Win32.
+- **Other GPU backends** (CUDA, HIP/ROCm, DirectX 12 compute) behind the existing backend interface.
+- **Users and access control**: authentication for network connections, `GRANT`/`REVOKE`.
+- **Transactions, WAL and recovery.**
+- **Wider SQL**: recursive CTEs, set operations, GPU window functions, a GPU projection kernel for `SELECT` output.
+- **Benchmarks against more engines** (ClickHouse, PostgreSQL) and standard suites such as TPC-H and ClickBench.
+- **Additional query languages** on the same execution engine.
