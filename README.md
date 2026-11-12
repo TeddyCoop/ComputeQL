@@ -162,7 +162,7 @@ build.bat debug      :: MSVC, debug
 build.bat clang debug
 ```
 
-This produces `build\cql.exe`, `build\settings.cfg`, `build\shaders\*.comp` and `build\shaderc_shared.dll`. The MSVC path is the one used day to day; the Clang path (`-fuse-ld=lld`, `-mpopcnt`) was added recently and has not been verified against a real toolchain yet, so report anything that fails.
+This produces `build\cql.exe`, `build\settings.cfg`, `build\shaders\*.comp` and `build\shaderc_shared.dll`. Both compilers need the Windows SDK, so use a Visual Studio developer prompt for either.
 
 ## Running
 
