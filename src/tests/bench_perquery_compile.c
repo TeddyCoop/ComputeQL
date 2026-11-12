@@ -302,6 +302,7 @@ entry_point(CmdLine* cmdline)
   bench_report_cellf(report, "comparisons");
   bench_report_cellf(report, "rows");
   bench_report_cellf(report, "interpreter (ms)");
+  bench_report_cellf(report, "precompiled (ms)");
   bench_report_cellf(report, "generated steady (ms)");
   bench_report_cellf(report, "cold first run (ms)");
   bench_report_cellf(report, "shaderc (ms)");
@@ -334,6 +335,11 @@ entry_point(CmdLine* cmdline)
     U64 interp_rows = 0, interp_checksum = 0;
     F64 interp_ms = pc_steady(database, sql, &interp_rows, &interp_checksum);
 
+    // tec: the precompiled path: scan_simple where the WHERE clause is an AND of plain comparisons, the interpreter otherwise
+    settings_load_from_string(str8_lit("QE_SCAN_SIMPLE_KERNEL:1"));
+    U64 pre_rows = 0, pre_checksum = 0;
+    F64 pre_ms = pc_steady(database, sql, &pre_rows, &pre_checksum);
+
     settings_load_from_string(str8_lit("QE_PERQUERY_KERNELS:2"));
     U64 requested_before = 0, compiled_before = 0, failed_before = 0, us_before = 0;
     qk_stats(&requested_before, &compiled_before, &failed_before, &us_before);
@@ -357,6 +363,11 @@ entry_point(CmdLine* cmdline)
     U64 steady_rows = 0, steady_checksum = 0;
     F64 steady_ms = pc_steady(database, sql, &steady_rows, &steady_checksum);
 
+    if (pre_rows != interp_rows || pre_checksum != interp_checksum)
+    {
+      failures += 1;
+      bench_report_warn(report, "shape %llu: precompiled %llu rows checksum %llu differs from the interpreter", s, pre_rows, pre_checksum);
+    }
     if (steady_rows != interp_rows || steady_checksum != interp_checksum || rows != interp_rows || checksum != interp_checksum)
     {
       failures += 1;
@@ -373,8 +384,8 @@ entry_point(CmdLine* cmdline)
     }
     F64 shaderc_ms = (F64)(us_after - us_before) / 1000.0;
     F64 pipeline_ms = cold_ms - steady_ms - shaderc_ms;
-    printf("shape %2llu  %u comparisons  %9llu rows  interpreter %8.3f ms  generated %8.3f ms  cold %8.3f ms (shaderc %7.3f ms)  other literals %8.3f ms%s\n",
-           s, shape.leaf_count, rows, interp_ms, steady_ms, cold_ms, shaderc_ms, variant_ms, built ? "" : "  [kernel already cached]");
+    printf("shape %2llu  %u comparisons  %9llu rows  interpreter %8.3f ms  precompiled %8.3f ms  generated %8.3f ms  cold %8.3f ms (shaderc %7.3f ms)  other literals %8.3f ms%s\n",
+           s, shape.leaf_count, rows, interp_ms, pre_ms, steady_ms, cold_ms, shaderc_ms, variant_ms, built ? "" : "  [kernel already cached]");
     fflush(stdout);
 
     bench_report_row_begin(report);
@@ -382,6 +393,7 @@ entry_point(CmdLine* cmdline)
     bench_report_cellf(report, "%u", shape.leaf_count);
     bench_report_cellf(report, "%llu", rows);
     bench_report_cellf(report, "%.3f", interp_ms);
+    bench_report_cellf(report, "%.3f", pre_ms);
     bench_report_cellf(report, "%.3f", steady_ms);
     bench_report_cellf(report, "%.3f", cold_ms);
     bench_report_cellf(report, "%.3f", shaderc_ms);
