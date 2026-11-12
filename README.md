@@ -1,4 +1,4 @@
-# ComputeQL — a GPU-accelerated SQL database
+# ComputeQL - a GPU-accelerated SQL database
 
 ComputeQL is a from-scratch, columnar SQL database written in C99 that runs queries on the **GPU** through [Vulkan](https://en.wikipedia.org/wiki/Vulkan_(API)) compute shaders. You write ordinary SQL (`SELECT ... JOIN ... WHERE ... GROUP BY ...`); the engine parses it, plans and optimizes it, generates a small compute kernel for the query's filter, and runs scans, joins, aggregates and sorts across thousands of GPU threads. It works on any Vulkan 1.x GPU (NVIDIA, AMD, Intel), not just CUDA hardware, and in server mode it speaks the PostgreSQL wire protocol, so `psql` and standard Postgres drivers can connect to it.
 
@@ -95,7 +95,7 @@ To reproduce, see [Tests and benchmarks](#tests-and-benchmarks)
 ```
 
 1. **Storage** (`src/cql`): one file per column, memory-mapped, with per-8192-row zonemaps (min/max, used to skip chunks), dictionary encoding for low-cardinality strings, NULL tracking, constraints and single-column indexes. Columns larger than a threshold stream from disk, and tables larger than GPU memory are processed in chunks.
-2. **Parse and lower** (`src/ir_gen`): a hand-written parser produces an AST with line/column/caret syntax errors, then lowers it to an IR.
+2. **Parse and lower** (`src/ir_gen`): a hand written parser produces an AST with line/column/caret syntax errors, then lowers it to an IR.
 3. **Plan and optimize** (`src/planner`, `src/optimizer`): the IR becomes a `Limit(Sort(Project(Having(Aggregate(Filter(Join)))))))` tree. A cost-based pass (per-column statistics, a cost model calibrated on the local machine) pushes predicates down, inlines CTEs and derived tables, reorders inner joins, picks CPU/GPU/index strategies per operator and sizes buffers. Every rule can be switched off in `settings.cfg`.
 4. **Execute** (`src/query_exec`, `src/gpu`): filters are turned into per-query GLSL kernels (or a stack-bytecode interpreter as a fallback), then run as Vulkan compute shaders for scan+filter, hash join, bitonic sort, and hash group-by/aggregate (including HyperLogLog and t-digest sketches for `APPROX_COUNT_DISTINCT` and `APPROX_PERCENTILE`). Fuzzy matching (`SIMILARITY`, `EDIT_DISTANCE`) runs on the GPU as well.
 
@@ -111,34 +111,34 @@ To reproduce, see [Tests and benchmarks](#tests-and-benchmarks)
 
 ```
 compute_ql/
-├── build.bat                 build the engine (MSVC or Clang)
-├── run.bat / test.bat        launch cql.exe / run a sample query
-├── build_and_run_tests.bat   build and run every bench_*.c and net_*.c test
-├── run_all_reports.bat       run every suite that writes a report
-├── run_scale_bench.bat       10M-row suite vs SQLite and DuckDB
-├── run_select_scale.bat      10M / 100M / 1B row select suite
-├── settings.cfg              runtime settings (copied next to cql.exe)
-├── docs/                     design notes, perf handoffs, paper runs
-├── src/
-│   ├── main.c                unityentry point (includes every .c)
-│   ├── application.c/h       top-level statement dispatch
-│   ├── base/                 arenas, strings, threads, logging, command line
-│   ├── os/                   OS layer (Win32 core, networking)
-│   ├── thread_pool/          worker pool
-│   ├── settings/             settings.cfg loader
-│   ├── cql/                  columnar storage engine and statistics
-│   ├── ir_gen/               SQL tokenizer, parser, AST -> IR
-│   ├── planner/              IR -> plan tree
-│   ├── optimizer/            cost model, join ordering, rewrites
-│   ├── query_exec/           bytecode + GLSL kernel generation, GPU orchestration
-│   ├── gpu/
-│   │   ├── gpu.h             backend-neutral GPU interface
-│   │   └── vulkan/           Vulkan backend and shaders/*.comp
-│   ├── server/               native and PostgreSQL-protocol servers
-│   ├── client/               one-shot and interactive network clients
-│   ├── tests/                correctness + benchmark suites (SQLite/DuckDB), scale/ for 1B rows
-│   └── third_party/          Vulkan headers/loader lib, shaderc/glslang headers, SQLite, DuckDB, stb
-└── build/                    output (cql.exe, shaders/, shaderc_shared.dll, bench_reports/)
+|-- build.bat                 build the engine (MSVC or Clang)
+|-- run.bat / test.bat        launch cql.exe / run a sample query
+|-- build_and_run_tests.bat   build and run every bench_*.c and net_*.c test
+|-- run_all_reports.bat       run every suite that writes a report
+|-- run_scale_bench.bat       10M-row suite vs SQLite and DuckDB
+|-- run_select_scale.bat      10M / 100M / 1B row select suite
+|-- settings.cfg              runtime settings (copied next to cql.exe)
+|-- docs/                     design notes, perf handoffs, paper runs
+|-- src/
+|   |-- main.c                unityentry point (includes every .c)
+|   |-- application.c/h       top-level statement dispatch
+|   |-- base/                 arenas, strings, threads, logging, command line
+|   |-- os/                   OS layer (Win32 core, networking)
+|   |-- thread_pool/          worker pool
+|   |-- settings/             settings.cfg loader
+|   |-- cql/                  columnar storage engine and statistics
+|   |-- ir_gen/               SQL tokenizer, parser, AST -> IR
+|   |-- planner/              IR -> plan tree
+|   |-- optimizer/            cost model, join ordering, rewrites
+|   |-- query_exec/           bytecode + GLSL kernel generation, GPU orchestration
+|   |-- gpu/
+|   |   |-- gpu.h             backend-neutral GPU interface
+|   |   |-- vulkan/           Vulkan backend and shaders/*.comp
+|   |-- server/               native and PostgreSQL-protocol servers
+|   |-- client/               one-shot and interactive network clients
+|   |-- tests/                correctness + benchmark suites (SQLite/DuckDB), scale/ for 1B rows
+|   |-- third_party/          Vulkan headers/loader lib, shaderc/glslang headers, SQLite, DuckDB, stb
+|-- build/                    output (cql.exe, shaders/, shaderc_shared.dll, bench_reports/)
 ```
 
 ## Building
