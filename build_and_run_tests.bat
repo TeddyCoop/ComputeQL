@@ -29,17 +29,15 @@ exit /b 1
 :have_duckdb
 
 :: tec: build the main engine first
-call .\build.bat || exit /b 1
+:: tec: cl by default, set CQL_CLANG=1 to build everything with clang instead
+call .\bench_cc.bat
+call .\build.bat %cc_build_args% || exit /b 1
 
-set test_cl_common=  /I..\src\ /I..\src\third_party\vulkan\ /nologo /FC /Z7
-set test_cl_compile= call cl /O2 /DNDEBUG %test_cl_common%
-set test_cl_link=    /link ..\src\third_party\vulkan\vulkan-1.lib ..\src\third_party\duckdb\duckdb.lib
-
-if not exist build\sqlite3.obj (
+if not exist build\%cc_sqlite_obj% (
   echo.
-  echo === compiling sqlite3.c (one-time, cached as build\sqlite3.obj) ===
+  echo === compiling sqlite3.c (one-time, cached as build\%cc_sqlite_obj%) ===
   pushd build
-  %test_cl_compile% /c ..\src\third_party\sqlite\sqlite3.c /Fosqlite3.obj || exit /b 1
+  %cc_compile% %cc_c_only% ..\src\third_party\sqlite\sqlite3.c %cc_obj_out%%cc_sqlite_obj% || exit /b 1
   popd
 )
 
@@ -56,7 +54,7 @@ for %%f in (src\tests\bench_*.c src\tests\net_*.c) do (
   if errorlevel 1 (
     echo compiling %%f
     pushd build
-    %test_cl_compile% ..\%%f sqlite3.obj %test_cl_link% /out:%%~nf.exe || exit /b 1
+    %cc_compile% ..\%%f %cc_sqlite_obj% %cc_link_vk_duck% %cc_exe_out%%%~nf.exe || exit /b 1
     popd
   ) else (
     echo skipping %%f

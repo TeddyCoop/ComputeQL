@@ -1685,10 +1685,11 @@ app_execute_query_capture(Arena* arena, String8 sql_query, CQL_Database** io_dat
         
         ProfEnd();
       } break;
-      
+
+      default: break;
     }
   }
-  
+
   done:;
   if (database)
   {

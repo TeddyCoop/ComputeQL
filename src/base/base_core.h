@@ -67,7 +67,7 @@
 #define TB(n)  (((U64)(n)) << 40)
 #define Thousand(n)   ((n)*1000)
 #define Million(n)    ((n)*1000000)
-#define Billion(n)    ((n)*1000000000)
+#define Billion(n)    ((n)*1000000000ULL)
 
 ////////////////////////////////
 //~ tec: Branch Predictor Hints

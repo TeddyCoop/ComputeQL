@@ -220,8 +220,9 @@ sql_tokens_print(SQL_TokenizeResult tokens)
       case SQL_TokenType_Symbol: token_type = str8_lit("SQL_TokenType_Symbol"); break;
       case SQL_TokenType_Number: token_type = str8_lit("SQL_TokenType_Number"); break;
       case SQL_TokenType_String: token_type = str8_lit("SQL_TokenType_String"); break;
+      case SQL_TokenType_EOF: token_type = str8_lit("SQL_TokenType_EOF"); break;
     }
-    
+
     printf("\'%.*s\' : index=%llu : type=%.*s\n", (int)token->value.size, token->value.str,
            i, (int)token_type.size, token_type.str);
   }

@@ -4,8 +4,10 @@ setlocal
 :: tec: runs bench_query_xlarge with QE_OPT_FUSE off and on at each row count, one process per run, and keeps a copy of each report in build\bench_reports\fusion_ablation
 :: usage: run_fusion_ablation.bat [rows ...]   default rows are 20000 2000000 10000000
 :: the on/off reports of a row count are the ones to compare, rerun the pair a few times to see the run to run noise
-if not exist build\sqlite3.obj (
-  echo ERROR: build\sqlite3.obj missing, run build_and_run_tests.bat once first.
+:: tec: cl by default, set CQL_CLANG=1 to use clang
+call .\bench_cc.bat
+if not exist build\%cc_sqlite_obj% (
+  echo ERROR: build\%cc_sqlite_obj% missing, run build_and_run_tests.bat once first.
   exit /b 1
 )
 
@@ -15,7 +17,7 @@ if "%rows_list%"=="" set rows_list=20000 2000000 10000000
 copy /y src\third_party\duckdb\duckdb.dll build\duckdb.dll >nul
 
 pushd build
-call cl /O2 /DNDEBUG /I..\src\ /I..\src\third_party\vulkan\ /nologo /FC /Z7 ..\src\tests\scale\bench_query_xlarge.c sqlite3.obj /link ..\src\third_party\vulkan\vulkan-1.lib ..\src\third_party\duckdb\duckdb.lib /out:bench_query_xlarge.exe || (popd & exit /b 1)
+%cc_compile% ..\src\tests\scale\bench_query_xlarge.c %cc_sqlite_obj% %cc_link_vk_duck% %cc_exe_out%bench_query_xlarge.exe || (popd & exit /b 1)
 if not exist bench_reports\fusion_ablation mkdir bench_reports\fusion_ablation
 
 set overall=0

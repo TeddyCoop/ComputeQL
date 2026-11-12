@@ -195,7 +195,7 @@ cql.exe --serve-pg=5432
 Other flags: `--gpu=vulkan`, `--settings=<path>`, `--log-level=error|warn|info|verbose`.
 ### Tests and benchmarks
 
-The suites compare against SQLite and DuckDB, which are not bundled. Download the [SQLite amalgamation](https://sqlite.org/download.html) (`sqlite3.c`, `sqlite3.h`) into `src/third_party/sqlite/` and the [DuckDB C library](https://github.com/duckdb/duckdb/releases) (`libduckdb-windows-amd64.zip`: `duckdb.h`, `duckdb.lib`, `duckdb.dll`) into `src/third_party/duckdb/`. The test scripts build with MSVC.
+The suites compare against SQLite and DuckDB, which are not bundled. Download the [SQLite amalgamation](https://sqlite.org/download.html) (`sqlite3.c`, `sqlite3.h`) into `src/third_party/sqlite/` and the [DuckDB C library](https://github.com/duckdb/duckdb/releases) (`libduckdb-windows-amd64.zip`: `duckdb.h`, `duckdb.lib`, `duckdb.dll`) into `src/third_party/duckdb/`. The test scripts build with MSVC by default. Run `set CQL_CLANG=1` first to build them (and `cql.exe`) with Clang instead. Clang builds keep a separate cached SQLite object (`sqlite3_clang.obj`).
 
 ```bat
 build_and_run_tests.bat    :: every bench_*.c / net_*.c test -> build\bench_reports\*.md

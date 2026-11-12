@@ -73,7 +73,7 @@ log_logf(LogLevel level, const char *file, int line, const char* fmt, ...)
 {
   OS_MutexScopeW(g_log->lock_mutex)
   {
-    U8 buffer[2048];
+    char buffer[2048];
 
     DateTime time = os_now_universal_time();
 
