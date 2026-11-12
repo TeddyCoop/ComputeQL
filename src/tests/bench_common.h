@@ -496,6 +496,96 @@ bench_run_cql_query(CQL_Database* database, String8 sql_text, U64* out_row_count
   return stats;
 }
 
+//~ tec: first execution of a query
+// the cold run is a single execution timed like a timed run (prep, exec, fetch) with no warm-up before it.
+// for compute_ql, clear_resident empties the chunks resident in VRAM first, so the run pays the copy as well as the generation
+// of the kernel and the creation of its pipeline when the process has not seen the query shape before
+
+typedef struct Bench_ColdRun Bench_ColdRun;
+struct Bench_ColdRun
+{
+  F64 prepare_ms;
+  F64 execute_ms;
+  F64 fetch_ms;
+  F64 total_ms;
+  U64 row_count;
+  U64 checksum;
+  U64 copied_bytes;
+};
+
+// tec: forgets which column data is on the device, so the next query uploads what it reads again. covers whole column buffers, string buffers and the dense aggregate copies
+internal void
+bench_drop_device_copies(CQL_Database* database)
+{
+  for (U64 t = 0; t < database->table_count; t++)
+  {
+    CQL_Table* table = database->tables[t];
+    for (U64 c = 0; c < table->column_count; c++)
+    {
+      CQL_Column* column = table->columns[c];
+      column->gpu_upload_generation = 0;
+      column->gpu_str_upload_generation = 0;
+      column->agg_f64_generation = 0;
+      column->agg_f32_generation = 0;
+      column->agg_narrow_generation = 0;
+      column->agg_fixed_generation = 0;
+      column->agg_key_generation = 0;
+      column->agg_str_generation = 0;
+      column->agg_f64_buffer = 0;
+      column->agg_f32_buffer = 0;
+    }
+  }
+}
+
+internal Bench_ColdRun
+bench_cql_cold_run(CQL_Database* database, String8 sql_text, B32 clear_resident)
+{
+  Bench_ColdRun out = {0};
+  if (clear_resident)
+  {
+    qe_resident_clear();
+    bench_drop_device_copies(database);
+  }
+  QE_ResidentStats before = qe_resident_stats();
+  Temp scratch = scratch_begin(0, 0);
+  Arena* arena = scratch.arena;
+
+  U64 t0 = os_now_microseconds();
+  SQL_TokenizeResult tok = sql_tokenize_from_text(arena, sql_text);
+  SQL_Node* ast = sql_parse(arena, tok.tokens, tok.count, sql_text);
+  IR_Query* ir_query = ir_generate_from_ast(arena, ast);
+  IR_Node* select_node = ir_query->execution_nodes;
+  U64 t1 = os_now_microseconds();
+  U64 temp_mark = database->temp_table_count;
+  PLAN_ExecResult result = plan_run_select(arena, database, select_node, NULL);
+  U64 t2 = os_now_microseconds();
+  out.checksum = bench_cql_consume_result(&result, select_node, &out.row_count);
+  cql_database_release_temp_tables_from(database, temp_mark);
+  U64 t3 = os_now_microseconds();
+
+  out.prepare_ms = (F64)(t1 - t0) / 1000.0;
+  out.execute_ms = (F64)(t2 - t1) / 1000.0;
+  out.fetch_ms = (F64)(t3 - t2) / 1000.0;
+  out.total_ms = (F64)(t3 - t0) / 1000.0;
+  out.copied_bytes = qe_resident_stats().miss_bytes - before.miss_bytes;
+  scratch_end(scratch);
+  return out;
+}
+
+// tec: one line per query on stdout, "cold run, <label>: cql total ..., duckdb total ...", which the log keeps next to the warm table.
+// not written into the report, text between the rows of a markdown table ends the table
+internal void
+bench_print_cold_pair(String8 label, Bench_ColdRun* cql, Bench_ColdRun* duckdb)
+{
+  printf("cold run, %.*s: cql total %.3f ms (prep %.3f exec %.3f fetch %.3f, copied %.1f MB)", str8_varg(label), cql->total_ms, cql->prepare_ms, cql->execute_ms, cql->fetch_ms,
+         (F64)cql->copied_bytes / (1024 * 1024));
+  if (duckdb)
+  {
+    printf(", duckdb total %.3f ms (prep %.3f exec %.3f fetch %.3f)", duckdb->total_ms, duckdb->prepare_ms, duckdb->execute_ms, duckdb->fetch_ms);
+  }
+  printf("\n");
+}
+
 //~ tec: sqlite query runner
 // sqlite3_prepare_v2 is timed as 'prepare', 
 // the sqlite3_step loop (reading every column, same as compute_ql's materialization loop) is timed as 'execute'
@@ -768,6 +858,31 @@ bench_duckdb_consume_result_by_value(duckdb_result* result, U64* out_row_count)
   
   *out_row_count = row_count;
   return checksum;
+}
+
+internal Bench_ColdRun
+bench_duckdb_cold_run(duckdb_connection conn, String8 sql_text)
+{
+  Bench_ColdRun out = {0};
+  U64 t0 = os_now_microseconds();
+  duckdb_prepared_statement stmt = NULL;
+  duckdb_state rc = duckdb_prepare(conn, (const char*)sql_text.str, &stmt);
+  U64 t1 = os_now_microseconds();
+  duckdb_result result = {0};
+  B32 executed = rc == DuckDBSuccess && duckdb_execute_prepared(stmt, &result) == DuckDBSuccess;
+  U64 t2 = os_now_microseconds();
+  if (executed)
+  {
+    out.checksum = bench_duckdb_consume_result(&result, &out.row_count);
+  }
+  U64 t3 = os_now_microseconds();
+  duckdb_destroy_result(&result);
+  duckdb_destroy_prepare(&stmt);
+  out.prepare_ms = (F64)(t1 - t0) / 1000.0;
+  out.execute_ms = (F64)(t2 - t1) / 1000.0;
+  out.fetch_ms = (F64)(t3 - t2) / 1000.0;
+  out.total_ms = (F64)(t3 - t0) / 1000.0;
+  return out;
 }
 
 internal Bench_Stats

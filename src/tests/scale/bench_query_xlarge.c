@@ -425,6 +425,60 @@ xl_load_duckdb(duckdb_connection conn, XL_TableSpec* spec)
   scratch_end(scratch);
 }
 
+// tec: one line per column and compression of a duckdb table, the way bench_select_scale prints scale_events
+internal void
+xl_print_duckdb_storage(Bench_Report* report, duckdb_connection conn, char* table_name, char* label)
+{
+  char sql[512];
+  snprintf(sql, sizeof(sql),
+           "SELECT compression, count(DISTINCT column_name), count(*), sum(count) FROM pragma_storage_info('%s') "
+           "WHERE segment_type <> 'VALIDITY' GROUP BY ALL ORDER BY ALL;", table_name);
+  duckdb_result result = {0};
+  if (duckdb_query(conn, sql, &result) != DuckDBSuccess)
+  {
+    log_error("duckdb storage_info failed: %s", duckdb_result_error(&result));
+    duckdb_destroy_result(&result);
+    return;
+  }
+  printf("duckdb storage of %s, %s:\n", table_name, label);
+  bench_report_text(report, "duckdb storage of %s, %s:", table_name, label);
+  idx_t rows = duckdb_row_count(&result);
+  for (idx_t row = 0; row < rows; row++)
+  {
+    char* compression = duckdb_value_varchar(&result, 0, row);
+    printf("  %-14s %4llu columns %8llu segments %14llu rows\n", compression, (U64)duckdb_value_int64(&result, 1, row),
+           (U64)duckdb_value_int64(&result, 2, row), (U64)duckdb_value_int64(&result, 3, row));
+    bench_report_text(report, "  %s: %llu columns, %llu segments, %llu rows", compression, (U64)duckdb_value_int64(&result, 1, row),
+                      (U64)duckdb_value_int64(&result, 2, row), (U64)duckdb_value_int64(&result, 3, row));
+    duckdb_free(compression);
+  }
+  duckdb_destroy_result(&result);
+}
+
+// tec: a table built through the appender in an in-memory database is not compressed until a checkpoint
+internal void
+xl_duckdb_checkpoint(Bench_Report* report, duckdb_connection conn, XL_TableSpec* specs, U64 spec_count)
+{
+  for (U64 s = 0; s < spec_count; s++)
+  {
+    xl_print_duckdb_storage(report, conn, specs[s].name, "as loaded");
+  }
+  U64 start = os_now_microseconds();
+  duckdb_result result = {0};
+  if (duckdb_query(conn, "CHECKPOINT;", &result) != DuckDBSuccess)
+  {
+    log_error("duckdb CHECKPOINT failed: %s", duckdb_result_error(&result));
+  }
+  duckdb_destroy_result(&result);
+  F64 seconds = (F64)(os_now_microseconds() - start) / 1000000.0;
+  printf("duckdb checkpoint %8.2f s\n", seconds);
+  bench_report_text(report, "duckdb tables checkpointed before the timed queries (--duckdb_checkpoint), %.2f s", seconds);
+  for (U64 s = 0; s < spec_count; s++)
+  {
+    xl_print_duckdb_storage(report, conn, specs[s].name, "after CHECKPOINT");
+  }
+}
+
 //~ tec: query cases
 
 typedef struct XL_Case XL_Case;
@@ -659,6 +713,11 @@ entry_point(CmdLine* cmdline)
   }
   B32 run_sqlite = !cmd_line_has_flag(cmdline, str8_lit("no_sqlite"));
   B32 run_duckdb = !cmd_line_has_flag(cmdline, str8_lit("no_duckdb"));
+  U64 duckdb_threads = 0;
+  if (cmd_line_has_argument(cmdline, str8_lit("duckdb_threads")))
+  {
+    duckdb_threads = u64_from_str8(cmd_line_string(cmdline, str8_lit("duckdb_threads")), 10);
+  }
   String8 only = cmd_line_string(cmdline, str8_lit("only"));
   B32 explain = cmd_line_has_flag(cmdline, str8_lit("explain"));
   g_bench_print_samples = cmd_line_has_flag(cmdline, str8_lit("samples"));
@@ -750,6 +809,22 @@ entry_point(CmdLine* cmdline)
       xl_load_duckdb(duckdb_conn, &specs[s]);
       xl_print_load(report, "duckdb", specs[s].name, specs[s].row_count, start);
     }
+    if (duckdb_threads > 0)
+    {
+      char threads_sql[64];
+      snprintf(threads_sql, sizeof(threads_sql), "SET threads = %llu;", duckdb_threads);
+      duckdb_result threads_result = {0};
+      if (duckdb_query(duckdb_conn, threads_sql, &threads_result) != DuckDBSuccess)
+      {
+        log_error("duckdb '%s' failed: %s", threads_sql, duckdb_result_error(&threads_result));
+      }
+      duckdb_destroy_result(&threads_result);
+      bench_report_text(report, "duckdb runs with %llu threads (--duckdb_threads)", duckdb_threads);
+    }
+    if (cmd_line_has_flag(cmdline, str8_lit("duckdb_checkpoint")))
+    {
+      xl_duckdb_checkpoint(report, duckdb_conn, specs, ArrayCount(specs));
+    }
   }
   
   bench_report_section(report, "large scale queries (%llu event rows)", event_rows);
@@ -766,6 +841,8 @@ entry_point(CmdLine* cmdline)
     String8 cql_sql = str8_cstring(test_case->cql_sql);
     String8 other_sql = str8_cstring(test_case->other_sql ? test_case->other_sql : test_case->cql_sql);
     
+    // tec: the first execution, with the resident chunks cleared, before any warm-up of this query
+    Bench_ColdRun cql_cold = bench_cql_cold_run(database, cql_sql, 1);
     U64 cql_rows = 0, cql_checksum = 0;
     gpu_kernel_log_reset();
     Bench_Stats cql_stats = bench_run_cql_query(database, cql_sql, &cql_rows, &cql_checksum);
@@ -798,6 +875,8 @@ entry_point(CmdLine* cmdline)
     if (run_duckdb)
     {
       U64 rows = 0, checksum = 0;
+      Bench_ColdRun duckdb_cold = bench_duckdb_cold_run(duckdb_conn, other_sql);
+      bench_print_cold_pair(label, &cql_cold, &duckdb_cold);
       Bench_Stats stats = bench_run_duckdb_query(duckdb_conn, other_sql, &rows, &checksum);
       bench_print_table_row(report, label, "duckdb", rows, checksum, &stats);
       bench_check_match(report, label, "cql", cql_rows, cql_checksum, "duckdb", rows, checksum);

@@ -1056,6 +1056,17 @@ entry_point(CmdLine* cmdline)
         else
         {
           bench_report_text(report, "duckdb runs on region_id as TINYINT and amount as SMALLINT (--duckdb_narrow_only), needle_key and id stay INTEGER");
+          // tec: the narrow copy is built after the first checkpoint, so it is uncompressed until this one
+          if (cmd_line_has_flag(cmdline, str8_lit("duckdb_checkpoint")))
+          {
+            duckdb_result narrow_checkpoint = {0};
+            if (duckdb_query(duckdb_conn, "CHECKPOINT;", &narrow_checkpoint) != DuckDBSuccess)
+            {
+              log_error("duckdb CHECKPOINT after the narrow swap failed: %s", duckdb_result_error(&narrow_checkpoint));
+            }
+            duckdb_destroy_result(&narrow_checkpoint);
+            ss_print_duckdb_storage(duckdb_conn, "narrow table after CHECKPOINT");
+          }
         }
         duckdb_destroy_result(&swap_result);
         run_duckdb_narrow = 0;
@@ -1193,9 +1204,9 @@ entry_point(CmdLine* cmdline)
     qe_resident_clear();
     QE_ResidentStats resident_before = qe_resident_stats();
     gpu_kernel_log_reset();
-    U64 cold_start = os_now_microseconds();
+    Bench_ColdRun cql_cold = bench_cql_cold_run(database, sql, 1);
+    F64 cold_ms = cql_cold.total_ms;
     SS_Result verified = ss_run_cql_once(database, sql);
-    F64 cold_ms = (F64)(os_now_microseconds() - cold_start) / 1000.0;
     {
       Temp kernel_scratch = scratch_begin(0, 0);
       String8 kernels = bench_kernel_log_string(kernel_scratch.arena);
@@ -1240,6 +1251,8 @@ entry_point(CmdLine* cmdline)
     if (run_duckdb)
     {
       U64 rows = 0, checksum = 0;
+      Bench_ColdRun duckdb_cold = bench_duckdb_cold_run(duckdb_conn, sql);
+      bench_print_cold_pair(label, &cql_cold, &duckdb_cold);
       Bench_Stats stats = bench_run_duckdb_query(duckdb_conn, sql, &rows, &checksum);
       bench_print_table_row(report, label, "duckdb", rows, checksum, &stats);
       if (report_bandwidth && test_case->scan_bytes > 0 && bandwidth_sample_count < SS_MAX_BANDWIDTH_SAMPLES)
