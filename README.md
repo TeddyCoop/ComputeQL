@@ -1,12 +1,12 @@
 # ComputeQL - a GPU-accelerated SQL database
 
-ComputeQL is a from-scratch, columnar SQL database written in C99 that runs queries on the **GPU** through [Vulkan](https://en.wikipedia.org/wiki/Vulkan_(API)) compute shaders. You write ordinary SQL (`SELECT ... JOIN ... WHERE ... GROUP BY ...`); the engine parses it, plans and optimizes it, generates a small compute kernel for the query's filter, and runs scans, joins, aggregates and sorts across thousands of GPU threads. It works on any Vulkan 1.x GPU (NVIDIA, AMD, Intel), not just CUDA hardware, and in server mode it speaks the PostgreSQL wire protocol, so `psql` and standard Postgres drivers can connect to it.
+ComputeQL is a from-scratch, columnar SQL database written in C99 that runs queries on the GPU through [Vulkan](https://en.wikipedia.org/wiki/Vulkan_(API)) compute shaders. You write ordinary SQL (`SELECT ... JOIN ... WHERE ... GROUP BY ...`); the engine parses it, plans and optimizes it, generates a small compute kernel for the query's filter, and runs scans, joins, aggregates and sorts across thousands of GPU threads. It works on any Vulkan 1.x GPU (NVIDIA, AMD, Intel), not just CUDA hardware, and in server mode it speaks the PostgreSQL wire protocol, so `psql` and standard Postgres drivers can connect to it.
 
-The goal is large data: scans, joins and aggregates over tens of millions to billions of rows, where GPU memory bandwidth beats a CPU. It is an early, single-developer project (see [Limitations](#limitations)).
+The goal is large data: scans, joins and aggregates over tens of millions to billions of rows, where GPU memory bandwidth beats a CPU. (see [Limitations](#limitations)).
 
 ## Performance
 
-Measured on a Ryzen 5 5600X (6 cores / 12 threads), 32 GB RAM, **AMD Radeon RX 6700 XT** (12 GB), Windows 11. All numbers are medians of the harness's timed runs, end to end (prepare + execute + fetch), against DuckDB (C API, all threads) on the same machine, with result checksums compared between engines.
+Measured on a Ryzen 5 5600X (6 cores / 12 threads), 32 GB RAM, AMD Radeon RX 6700 XT (12 GB), Windows 11. All numbers are medians of the harness's timed runs, end to end (prepare + execute + fetch), against DuckDB (C API, all threads) on the same machine, with result checksums compared between engines.
 
 "Warm" means the touched columns are already resident in VRAM, which is the steady state for repeated queries on a table that fits. A cold first query pays the host-to-GPU copy once: at 1B rows, 440–700 ms for 1.9–3.8 GB of columns.
 
@@ -46,11 +46,11 @@ ComputeQL was faster on 36 of 37 queries. A selection:
 | group by user (1M groups) | 56 ms | 219 ms | 3.9× |
 | sort 200k rows | 9.5 ms | 17.9 ms | 1.9× |
 
-Where DuckDB still wins or ties: `COUNT(DISTINCT)` over 4M sessions (0.8×), window `top 3 per region` (1.1×, windows run on the CPU), and materializing 30 columns of a 1% filter (1.6×).
+DuckDB still wins or ties: `COUNT(DISTINCT)` over 4M sessions (0.8×), window `top 3 per region` (1.1×, windows run on the CPU), and materializing 30 columns of a 1% filter (1.6×).
 
 ### Per-query kernels
 
-The `WHERE` clause is compiled to GLSL for exactly that query shape (shaderc loaded at run time), instead of being interpreted as bytecode. Constants stay in buffers, so queries that differ only in literals share a kernel. On a 3M-row table this is 1.4–7× faster than the interpreter across 29 filter shapes, and an expression that the interpreter cannot run at all (stack depth 12 `OR` chain) drops from 749 ms to 0.9 ms.
+The `WHERE` clause is compiled to GLSL for exactly that query shape (shaderc loaded at run time), instead of being interpreted as bytecode. Constants stay in buffers, so queries that differ only in literals share a kernel. On a 3M-row table this is 1.4-7× faster than the interpreter across 29 filter shapes, and an expression that the interpreter cannot run at all (stack depth 12 `OR` chain) drops from 749 ms to 0.9 ms.
 
 To reproduce, see [Tests and benchmarks](#tests-and-benchmarks)
 
@@ -111,34 +111,37 @@ To reproduce, see [Tests and benchmarks](#tests-and-benchmarks)
 
 ```
 compute_ql/
-|-- build.bat                 build the engine (MSVC or Clang)
-|-- run.bat / test.bat        launch cql.exe / run a sample query
-|-- build_and_run_tests.bat   build and run every bench_*.c and net_*.c test
-|-- run_all_reports.bat       run every suite that writes a report
-|-- run_scale_bench.bat       10M-row suite vs SQLite and DuckDB
-|-- run_select_scale.bat      10M / 100M / 1B row select suite
-|-- settings.cfg              runtime settings (copied next to cql.exe)
-|-- docs/                     design notes, perf handoffs, paper runs
-|-- src/
-|   |-- main.c                unityentry point (includes every .c)
-|   |-- application.c/h       top-level statement dispatch
-|   |-- base/                 arenas, strings, threads, logging, command line
-|   |-- os/                   OS layer (Win32 core, networking)
-|   |-- thread_pool/          worker pool
-|   |-- settings/             settings.cfg loader
-|   |-- cql/                  columnar storage engine and statistics
-|   |-- ir_gen/               SQL tokenizer, parser, AST -> IR
-|   |-- planner/              IR -> plan tree
-|   |-- optimizer/            cost model, join ordering, rewrites
-|   |-- query_exec/           bytecode + GLSL kernel generation, GPU orchestration
-|   |-- gpu/
-|   |   |-- gpu.h             backend-neutral GPU interface
-|   |   |-- vulkan/           Vulkan backend and shaders/*.comp
-|   |-- server/               native and PostgreSQL-protocol servers
-|   |-- client/               one-shot and interactive network clients
-|   |-- tests/                correctness + benchmark suites (SQLite/DuckDB), scale/ for 1B rows
-|   |-- third_party/          Vulkan headers/loader lib, shaderc/glslang headers, SQLite, DuckDB, stb
-|-- build/                    output (cql.exe, shaders/, shaderc_shared.dll, bench_reports/)
+├── build.bat                 build the engine (MSVC or Clang)
+├── run.bat / test.bat        launch cql.exe / run a sample query
+├── bench_cc.bat              picks cl or clang for the bench scripts (CQL_CLANG)
+├── build_and_run_tests.bat   build and run every bench_*.c and net_*.c test
+├── run_all_reports.bat       run every suite that writes a report
+├── run_scale_bench.bat       10M-row suite vs SQLite and DuckDB
+├── run_select_scale.bat      10M / 100M / 1B row select suite
+├── run_gpu_transfer.bat      host to VRAM transfer benchmark
+├── run_paper_benchmarks.bat  every experiment of the paper (arg: clear)
+├── settings.cfg              runtime settings (copied next to cql.exe)
+├── docs/                     design notes, perf handoffs, paper runs
+├── src/
+│   ├── main.c                unity entry point (includes every .c)
+│   ├── application.c/h       top-level statement dispatch
+│   ├── base/                 arenas, strings, threads, logging, command line
+│   ├── os/                   OS layer (Win32 core, networking)
+│   ├── thread_pool/          worker pool
+│   ├── settings/             settings.cfg loader
+│   ├── cql/                  columnar storage engine and statistics
+│   ├── ir_gen/               SQL tokenizer, parser, AST -> IR
+│   ├── planner/              IR -> plan tree
+│   ├── optimizer/            cost model, join ordering, rewrites
+│   ├── query_exec/           bytecode + GLSL kernel generation, GPU orchestration
+│   ├── gpu/
+│   │   ├── gpu.h             backend-neutral GPU interface
+│   │   └── vulkan/           Vulkan backend and shaders/*.comp
+│   ├── server/               native and PostgreSQL-protocol servers
+│   ├── client/               one-shot and interactive network clients
+│   ├── tests/                correctness + benchmark suites (SQLite/DuckDB), scale/ for 1B rows
+│   └── third_party/          Vulkan headers/loader lib, shaderc/glslang headers, SQLite, DuckDB, stb
+└── build/                    output (cql.exe, shaders/, shaderc_shared.dll, bench_reports/, paper_runs/)
 ```
 
 ## Building
