@@ -22,6 +22,10 @@ set "only_router=0"
 set "only_routerfilled=0"
 set "only_interleaved=0"
 set "only_profile=0"
+set "only_sweep=0"
+if /i "%~1"=="sweep" (
+  set "only_sweep=1"
+)
 if /i "%~1"=="interleaved" (
   set "only_interleaved=1"
 )
@@ -115,6 +119,11 @@ if "%only_routerfilled%"=="1" (
 
 if "%only_interleaved%"=="1" (
   call :interleaved
+  goto :finish
+)
+
+if "%only_sweep%"=="1" (
+  call :sweep
   goto :finish
 )
 
@@ -321,6 +330,17 @@ for %%n in (10000000 100000000) do (
   for /l %%i in (1,1,3) do (
     call :run profile idrange_%%n_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=%%n --idrange --seed=%SEED% --setting=QE_SPIRV_DISK_CACHE:0,GPU_VULKAN_SHADER_INFO:1"
     call :run profile idrange_noseq_%%n_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=%%n --idrange --seed=%SEED% --setting=QE_SPIRV_DISK_CACHE:0,GPU_VULKAN_SHADER_INFO:1,QE_ENCODE_SEQUENCE:0"
+  )
+)
+exit /b 0
+
+
+::~
+:: selectivity sweep of fixed numeric shapes and string and dictionary shapes, each as SELECT COUNT(*): interpreter, precompiled and generated steady times, three processes at each size
+:sweep
+for %%n in (10000000 50000000) do (
+  for /l %%i in (1,1,3) do (
+    call :run sweep sweep_%%n_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=%%n --sweep --seed=%SEED% --setting=QE_SPIRV_DISK_CACHE:0,GPU_VULKAN_SHADER_INFO:1"
   )
 )
 exit /b 0

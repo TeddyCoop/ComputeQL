@@ -5,6 +5,8 @@
 //   --route:  the router policy (QE_ROUTE_CONJUNCTIONS:1). a conjunction of plain comparisons runs on the precompiled path the first time, so its cold column is that run, and
 //             the generation happens on the second run ("second run" column), where shaderc and pipeline creation are counted. other shapes behave as without --route
 //   --idrange: instead of random shapes, the one query "SELECT COUNT(*) FROM pq WHERE id > 1000 AND id <= 900000000" of the scale test (a range on the row number), with the same columns of the report: the steady times on the interpreter, the precompiled path and the generated kernel, and the size, registers and instruction lines of the generated pipeline
+//   --sweep:  instead of random shapes, a few fixed shapes at selectivities from 0.1% to 50% (numeric single, AND of two, AND of four and OR of two comparisons) and string and dictionary shapes, each as SELECT COUNT(*),
+//             with the steady times on the interpreter, the precompiled path and the generated kernel, and the cold first run and size of the generated pipeline of the first literals of each shape
 //   interp:   the same query on the bytecode interpreter (QE_PERQUERY_KERNELS:0, QE_SCAN_SIMPLE_KERNEL:0), row count and checksum must match
 // shaderc time comes from the generator's own counter, the rest of cold minus steady is pipeline creation and first use.
 // --rows=N table size, --shapes=N number of shapes, --seed=N shape seed (default: the clock, so the shapes are new to the driver's shader cache; rerun with the same seed for the driver cache hit case)
@@ -58,15 +60,21 @@ struct PC_Table
   U64* c;
   F32* d;
   F64* e;
+  String8* name;
+  String8* tag;
 };
 
+global char* g_pc_tags[] = { "alpha", "bravo", "charlie", "delta", "echo", "foxtrot" };
+
+// tec: with strings the table also has name (a word and a 6 digit number) and tag (6 values), generated as in bench_query_perquery
 internal void
-pc_load_table(CQL_Database* database, PC_Table* data, U64 row_count)
+pc_load_table(Arena* arena, CQL_Database* database, PC_Table* data, U64 row_count, B32 strings)
 {
   CQL_Table* table = cql_table_alloc(str8_lit("pq"));
-  char* names[] = { "id", "a", "b", "c", "d", "e" };
-  CQL_ColumnType types[] = { CQL_ColumnType_U32, CQL_ColumnType_U32, CQL_ColumnType_I32, CQL_ColumnType_U64, CQL_ColumnType_F32, CQL_ColumnType_F64 };
-  for (U32 c = 0; c < ArrayCount(names); c++)
+  char* names[] = { "id", "a", "b", "c", "d", "e", "name", "tag" };
+  CQL_ColumnType types[] = { CQL_ColumnType_U32, CQL_ColumnType_U32, CQL_ColumnType_I32, CQL_ColumnType_U64, CQL_ColumnType_F32, CQL_ColumnType_F64, CQL_ColumnType_String8, CQL_ColumnType_String8 };
+  U32 column_count = strings ? ArrayCount(names) : 6;
+  for (U32 c = 0; c < column_count; c++)
   {
     cql_table_add_column(table, cql_column_schema_create(str8_cstring(names[c]), types[c]));
   }
@@ -78,6 +86,11 @@ pc_load_table(CQL_Database* database, PC_Table* data, U64 row_count)
   data->c = (U64*)cql_column_alloc_fixed_rows(table->columns[3], row_count);
   data->d = (F32*)cql_column_alloc_fixed_rows(table->columns[4], row_count);
   data->e = (F64*)cql_column_alloc_fixed_rows(table->columns[5], row_count);
+  if (strings)
+  {
+    data->name = push_array(arena, String8, row_count);
+    data->tag = push_array(arena, String8, row_count);
+  }
 
   Bench_Rng rng = { 0x9E3779B97F4A7C15ULL };
   for (U64 row = 0; row < row_count; row++)
@@ -91,6 +104,17 @@ pc_load_table(CQL_Database* database, PC_Table* data, U64 row_count)
     data->c[row] = r1 % 1000000000000ULL;
     data->d[row] = (F32)((r1 >> 40) % 1000u) / 1000.0f;
     data->e[row] = (F64)(r2 % 100000u) / 100.0;
+    if (strings)
+    {
+      U64 w = (r2 >> 20) % ArrayCount(g_bench_words);
+      data->name[row] = push_str8f(arena, "%s_%06llu", g_bench_words[w], (r2 >> 32) % 1000000ull);
+      data->tag[row] = str8_cstring(g_pc_tags[(r2 >> 50) % ArrayCount(g_pc_tags)]);
+    }
+  }
+  if (strings)
+  {
+    cql_column_fill_from_strings(table->columns[6], data->name, 0, row_count);
+    cql_column_fill_from_strings(table->columns[7], data->tag, 0, row_count);
   }
   table->row_count = row_count;
 }
@@ -199,6 +223,9 @@ pc_where(Arena* arena, PC_Shape* shape, U64 variant)
 }
 
 // tec: one execution, planning to the last fetched value, in milliseconds
+// tec: the first value of the result of the last run, the count of a SELECT COUNT(*)
+global U64 g_pc_last_value = 0;
+
 internal F64
 pc_run_once(CQL_Database* database, String8 sql, U64* out_rows, U64* out_checksum)
 {
@@ -213,6 +240,7 @@ pc_run_once(CQL_Database* database, String8 sql, U64* out_rows, U64* out_checksu
   PLAN_ExecResult result = plan_run_select(arena, database, select_node, NULL);
   U64 rows = 0;
   U64 checksum = bench_cql_consume_result(&result, select_node, &rows);
+  g_pc_last_value = (result.is_materialized && result.materialized.count > 0 && result.materialized.column_count > 0) ? (U64)result.materialized.columns[0].numeric_values[0] : 0;
   cql_database_release_temp_tables_from(database, temp_mark);
   U64 t1 = os_now_microseconds();
   scratch_end(scratch);
@@ -253,6 +281,231 @@ pc_steady(CQL_Database* database, String8 sql, U64* out_rows, U64* out_checksum)
   return pc_median(samples, BENCH_TIMED_RUNS);
 }
 
+
+#define PC_SWEEP_STEPS 6
+global F64 g_pc_sweep_target[PC_SWEEP_STEPS] = { 0.001, 0.01, 0.05, 0.1, 0.25, 0.5 };
+// tec: the selectivity of one comparison that makes k independent comparisons joined by AND pass the target together (the k-th root of the target), and for the OR of two, half of it
+global F64 g_pc_sweep_and2[PC_SWEEP_STEPS] = { 0.0316, 0.1, 0.2236, 0.3162, 0.5, 0.7071 };
+global F64 g_pc_sweep_and4[PC_SWEEP_STEPS] = { 0.1778, 0.3162, 0.4729, 0.5623, 0.7071, 0.8409 };
+
+internal String8
+pc_sweep_leaf(Arena* arena, U32 column, F64 p)
+{
+  switch (column)
+  {
+    case 0:
+    {
+      return push_str8f(arena, "a < %llu", (U64)(p * 2000000.0));
+    }
+    case 1:
+    {
+      S64 value = -2147483648LL + (S64)(p * 4294967296.0);
+      return push_str8f(arena, "b < %lld", value);
+    }
+    case 3:
+    {
+      return push_str8f(arena, "d < %.3f", (F64)(U64)(p * 1000.0) / 1000.0);
+    }
+    default:
+    {
+      return push_str8f(arena, "e < %.2f", p * 1000.0);
+    }
+  }
+}
+
+internal String8
+pc_sweep_where(Arena* arena, U32 shape, U32 step)
+{
+  switch (shape)
+  {
+    case 0:
+    {
+      return pc_sweep_leaf(arena, 0, g_pc_sweep_target[step]);
+    }
+    case 1:
+    {
+      return push_str8f(arena, "%.*s AND %.*s", str8_varg(pc_sweep_leaf(arena, 0, g_pc_sweep_and2[step])), str8_varg(pc_sweep_leaf(arena, 1, g_pc_sweep_and2[step])));
+    }
+    case 2:
+    {
+      return push_str8f(arena, "%.*s AND %.*s AND %.*s AND %.*s", str8_varg(pc_sweep_leaf(arena, 0, g_pc_sweep_and4[step])), str8_varg(pc_sweep_leaf(arena, 1, g_pc_sweep_and4[step])),
+                        str8_varg(pc_sweep_leaf(arena, 3, g_pc_sweep_and4[step])), str8_varg(pc_sweep_leaf(arena, 4, g_pc_sweep_and4[step])));
+    }
+    default:
+    {
+      return push_str8f(arena, "%.*s OR %.*s", str8_varg(pc_sweep_leaf(arena, 0, g_pc_sweep_target[step] / 2.0)), str8_varg(pc_sweep_leaf(arena, 1, g_pc_sweep_target[step] / 2.0)));
+    }
+  }
+}
+
+typedef struct PC_SweepShape PC_SweepShape;
+struct PC_SweepShape
+{
+  char* group;
+  char* label;
+  U32 where_count;
+  String8 where[PC_SWEEP_STEPS];
+  F64 target[PC_SWEEP_STEPS];
+};
+
+internal void
+pc_run_sweep(Arena* arena, CQL_Database* database, PC_Table* data, Bench_Report* report, U64 row_count, U64* failures)
+{
+  PC_SweepShape shapes[16] = {0};
+  U32 shape_count = 0;
+  char* numeric_labels[] = { "one comparison", "AND of 2 comparisons", "AND of 4 comparisons", "OR of 2 comparisons" };
+  for (U32 n = 0; n < 4; n++)
+  {
+    PC_SweepShape* shape = &shapes[shape_count];
+    shape_count += 1;
+    shape->group = "numeric";
+    shape->label = numeric_labels[n];
+    shape->where_count = PC_SWEEP_STEPS;
+    for (U32 step = 0; step < PC_SWEEP_STEPS; step++)
+    {
+      shape->where[step] = pc_sweep_where(arena, n, step);
+      shape->target[step] = g_pc_sweep_target[step];
+    }
+  }
+  String8 sample_name = data->name[row_count / 2];
+  struct { char* label; String8 where; } text_cases[] =
+  {
+    { "dictionary equality", str8_lit("tag = 'alpha'") },
+    { "dictionary equality AND numeric", str8_lit("tag = 'alpha' AND a < 200000") },
+    { "dictionary not equal AND numeric", str8_lit("tag != 'alpha' AND a < 200000") },
+    { "dictionary OR numeric", str8_lit("tag = 'echo' OR a < 20000") },
+    { "string contains, rare", str8_lit("name contains 'delta_12'") },
+    { "string contains, common", str8_lit("name contains 'o_5'") },
+    { "string equality, one row", {0} },
+    { "string range", str8_lit("name >= 'kilo_5' AND name <= 'kilo_6'") },
+    { "numeric AND string range AND dictionary", str8_lit("a < 1500000 AND name >= 'kilo_5' AND tag = 'alpha'") },
+    { "similarity", str8_lit("SIMILARITY(name, 'delta_123456') > 0.45") },
+  };
+  for (U32 t = 0; t < ArrayCount(text_cases); t++)
+  {
+    PC_SweepShape* shape = &shapes[shape_count];
+    shape_count += 1;
+    shape->group = "string";
+    shape->label = text_cases[t].label;
+    shape->where_count = 1;
+    shape->where[0] = text_cases[t].where.size > 0 ? text_cases[t].where : push_str8f(arena, "name = '%.*s'", str8_varg(sample_name));
+    shape->target[0] = 0.0;
+  }
+
+  bench_report_section(report, "selectivity sweep and string shapes (%llu rows, SELECT COUNT(*))", row_count);
+  bench_report_row_begin(report);
+  bench_report_cellf(report, "group");
+  bench_report_cellf(report, "shape");
+  bench_report_cellf(report, "target (%%)");
+  bench_report_cellf(report, "rows");
+  bench_report_cellf(report, "selectivity (%%)");
+  bench_report_cellf(report, "interpreter (ms)");
+  bench_report_cellf(report, "precompiled (ms)");
+  bench_report_cellf(report, "generated steady (ms)");
+  bench_report_cellf(report, "generated / precompiled");
+  bench_report_cellf(report, "cold first run (ms)");
+  bench_report_cellf(report, "shaderc (ms)");
+  bench_report_cellf(report, "glsl (bytes)");
+  bench_report_cellf(report, "vgprs");
+  bench_report_cellf(report, "isa lines");
+  bench_report_cellf(report, "where");
+  bench_report_table_header_end(report);
+
+  for (U32 sh = 0; sh < shape_count; sh++)
+  {
+    PC_SweepShape* shape = &shapes[sh];
+    F64 interp_ms[PC_SWEEP_STEPS] = {0};
+    F64 pre_ms[PC_SWEEP_STEPS] = {0};
+    F64 gen_ms[PC_SWEEP_STEPS] = {0};
+    U64 counts[PC_SWEEP_STEPS] = {0};
+    U64 checksums[PC_SWEEP_STEPS] = {0};
+    String8 sql[PC_SWEEP_STEPS] = {0};
+
+    // tec: the interpreter and the precompiled path first, so they do not warm the generated kernel
+    for (U32 step = 0; step < shape->where_count; step++)
+    {
+      sql[step] = push_str8f(arena, "SELECT COUNT(*) FROM pq WHERE %.*s;", str8_varg(shape->where[step]));
+      settings_load_from_string(str8_lit("QE_PERQUERY_KERNELS:0"));
+      settings_load_from_string(str8_lit("QE_SCAN_SIMPLE_KERNEL:0"));
+      U64 interp_rows = 0, interp_checksum = 0;
+      interp_ms[step] = pc_steady(database, sql[step], &interp_rows, &interp_checksum);
+      U64 interp_count = g_pc_last_value;
+      settings_load_from_string(str8_lit("QE_SCAN_SIMPLE_KERNEL:1"));
+      U64 pre_rows = 0, pre_checksum = 0;
+      pre_ms[step] = pc_steady(database, sql[step], &pre_rows, &pre_checksum);
+      counts[step] = interp_count;
+      checksums[step] = interp_checksum;
+      if (pre_rows != interp_rows || pre_checksum != interp_checksum || g_pc_last_value != interp_count)
+      {
+        *failures += 1;
+        bench_report_warn(report, "%s: precompiled %llu rows checksum %llu differs from the interpreter (%llu, %llu)", shape->label, pre_rows, pre_checksum, interp_rows, interp_checksum);
+      }
+    }
+
+    settings_load_from_string(str8_lit("QE_PERQUERY_KERNELS:2"));
+    U64 requested_before = 0, compiled_before = 0, failed_before = 0, us_before = 0;
+    qk_stats(&requested_before, &compiled_before, &failed_before, &us_before);
+    U64 gpu_before = 0, evicted_before = 0;
+    gpu_generated_kernel_stats(&gpu_before, &evicted_before);
+    U64 cold_rows = 0, cold_checksum = 0;
+    F64 cold_ms = pc_run_once(database, sql[0], &cold_rows, &cold_checksum);
+    U64 requested_after = 0, compiled_after = 0, failed_after = 0, us_after = 0;
+    qk_stats(&requested_after, &compiled_after, &failed_after, &us_after);
+    U64 gpu_after = 0, evicted_after = 0;
+    gpu_generated_kernel_stats(&gpu_after, &evicted_after);
+    B32 built = gpu_after > gpu_before;
+    U64 glsl_bytes = 0, spirv_bytes = 0;
+    qk_last_sizes(&glsl_bytes, &spirv_bytes);
+    B32 stats_valid = g_vulkan_state->last_stats_valid;
+    U32 vgprs = g_vulkan_state->last_vgprs;
+    U64 isa_lines = g_vulkan_state->last_isa_lines;
+    F64 shaderc_ms = (F64)(us_after - us_before) / 1000.0;
+    if (cold_rows != 1 || g_pc_last_value != counts[0] || cold_checksum != checksums[0])
+    {
+      *failures += 1;
+      bench_report_warn(report, "%s: generated first run %llu rows checksum %llu differs from the interpreter", shape->label, cold_rows, cold_checksum);
+    }
+
+    for (U32 step = 0; step < shape->where_count; step++)
+    {
+      U64 rows = 0, checksum = 0;
+      gen_ms[step] = pc_steady(database, sql[step], &rows, &checksum);
+      if (g_pc_last_value != counts[step] || checksum != checksums[step])
+      {
+        *failures += 1;
+        bench_report_warn(report, "%s: generated %llu rows checksum %llu differs from the interpreter (%llu, %llu)", shape->label, rows, checksum, counts[step], checksums[step]);
+      }
+    }
+    settings_load_from_string(str8_lit("QE_PERQUERY_KERNELS:0"));
+    settings_load_from_string(str8_lit("QE_SCAN_SIMPLE_KERNEL:1"));
+
+    for (U32 step = 0; step < shape->where_count; step++)
+    {
+      F64 selectivity = 100.0 * (F64)counts[step] / (F64)row_count;
+      printf("%s: %-40s target %5.1f%%  selectivity %6.2f%%  interpreter %8.3f ms  precompiled %8.3f ms  generated %8.3f ms%s\n",
+             shape->group, shape->label, 100.0 * shape->target[step], selectivity, interp_ms[step], pre_ms[step], gen_ms[step], step == 0 ? (built ? "" : "  [kernel already cached]") : "");
+      fflush(stdout);
+      bench_report_row_begin(report);
+      bench_report_cellf(report, "%s", shape->group);
+      bench_report_cellf(report, "%s", shape->label);
+      bench_report_cellf(report, "%.1f", 100.0 * shape->target[step]);
+      bench_report_cellf(report, "%llu", counts[step]);
+      bench_report_cellf(report, "%.3f", selectivity);
+      bench_report_cellf(report, "%.3f", interp_ms[step]);
+      bench_report_cellf(report, "%.3f", pre_ms[step]);
+      bench_report_cellf(report, "%.3f", gen_ms[step]);
+      bench_report_cellf(report, "%.2f", pre_ms[step] > 0.0 ? gen_ms[step] / pre_ms[step] : 0.0);
+      bench_report_cellf(report, "%.3f", step == 0 ? cold_ms : 0.0);
+      bench_report_cellf(report, "%.3f", step == 0 ? shaderc_ms : 0.0);
+      bench_report_cellf(report, "%llu", step == 0 && built ? glsl_bytes : 0ull);
+      bench_report_cellf(report, "%u", step == 0 && built && stats_valid ? vgprs : 0u);
+      bench_report_cellf(report, "%llu", step == 0 && built && stats_valid ? isa_lines : 0ull);
+      bench_report_cellf(report, "%.*s", str8_varg(shape->where[step]));
+      bench_report_row_end(report);
+    }
+  }
+}
+
 internal void
 entry_point(CmdLine* cmdline)
 {
@@ -272,6 +525,7 @@ entry_point(CmdLine* cmdline)
   }
   B32 route = cmd_line_has_flag(cmdline, str8_lit("route"));
   B32 idrange = cmd_line_has_flag(cmdline, str8_lit("idrange"));
+  B32 sweep = cmd_line_has_flag(cmdline, str8_lit("sweep"));
   if (idrange)
   {
     shape_count = 1;
@@ -303,7 +557,25 @@ entry_point(CmdLine* cmdline)
   CQL_Database* database = cql_database_alloc(str8_lit("pq_db"));
   cql_add_database(database);
   PC_Table data = {0};
-  pc_load_table(database, &data, row_count);
+  pc_load_table(arena, database, &data, row_count, sweep);
+
+  if (sweep)
+  {
+    U64 sweep_failures = 0;
+    pc_run_sweep(arena, database, &data, report, row_count, &sweep_failures);
+    if (sweep_failures > 0)
+    {
+      bench_report_warn(report, "%llu comparisons disagreed with the interpreter", sweep_failures);
+    }
+    if (!os_file_path_exists(str8_lit("bench_reports/")))
+    {
+      os_make_directory(str8_lit("bench_reports/"));
+    }
+    bench_report_write(report, str8_lit("bench_reports/perquery_compile_report.md"));
+    arena_release(arena);
+    log_release();
+    return;
+  }
 
   bench_report_section(report, "per shape (%llu rows)", row_count);
   bench_report_row_begin(report);
