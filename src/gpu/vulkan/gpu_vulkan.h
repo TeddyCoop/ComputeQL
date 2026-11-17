@@ -165,6 +165,14 @@ struct GPU_VulkanState
   // tec: VK_AMD_shader_info, only turned on by GPU_VULKAN_SHADER_INFO for reading a kernel's register and scratch use
   B32 has_shader_info_ext;
   PFN_vkGetShaderInfoAMD vkGetShaderInfoAMD_fn;
+  // tec: statistics of the pipeline that kernel_create built last, filled only while has_shader_info_ext is set
+  B32 last_stats_valid;
+  U32 last_vgprs;
+  U32 last_sgprs;
+  U32 last_available_vgprs;
+  U64 last_scratch_bytes;
+  U64 last_lds_bytes;
+  U64 last_isa_lines;
 
   // tec: Resizable BAR
   // a memory type that's both DEVICE_LOCAL and HOST_VISIBLE lets gpu_buffer_alloc write straight into vram with a memcpy,

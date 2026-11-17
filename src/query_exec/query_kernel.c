@@ -338,6 +338,7 @@ qk_spirv_compile(Arena* arena, String8 source)
     return spirv;
   }
   QK_State* state = &g_qk_state;
+  state->last_source_bytes = source.size;
   B32 use_disk_cache = settings_u64(str8_lit("QE_SPIRV_DISK_CACHE"), 1) != 0;
   Temp scratch = scratch_begin(&arena, 1);
   String8 cache_path = use_disk_cache ? qk_spirv_cache_path(scratch.arena, source) : str8_zero();
@@ -352,6 +353,7 @@ qk_spirv_compile(Arena* arena, String8 source)
       if (data.size == file_size && *(U32*)data.str == 0x07230203u)
       {
         os_file_close(file);
+        state->last_spirv_bytes = data.size;
         os_mutex_take(state->lock);
         state->disk_cache_hits += 1;
         os_mutex_drop(state->lock);
@@ -383,6 +385,7 @@ qk_spirv_compile(Arena* arena, String8 source)
   U64 length = state->result_length(result);
   spirv.str = push_array_no_zero(arena, U8, length);
   spirv.size = length;
+  state->last_spirv_bytes = length;
   MemoryCopy(spirv.str, state->result_bytes(result), length);
   state->result_release(result);
   os_mutex_drop(state->lock);
@@ -1644,6 +1647,51 @@ qk_kernel_from_source(Arena* arena, String8 source, String8* out_name)
   return kernel;
 }
 
+// tec: a conjunction of plain comparisons has a precompiled path (scan_simple, or the interpreter for the terms it does not cover), and generating for it costs a median of 85.7 ms on first use.
+// with QE_ROUTE_CONJUNCTIONS:1 the first execution of such a shape is left to the precompiled path and the kernel is generated when the shape comes back
+internal B32
+qk_route_defer(U64 key)
+{
+  if (settings_u64(str8_lit("QE_ROUTE_CONJUNCTIONS"), 0) == 0)
+  {
+    return 0;
+  }
+  QK_State* state = &g_qk_state;
+  B32 defer = 0;
+  os_mutex_take(state->lock);
+  B32 seen = 0;
+  for (U32 i = 0; i < state->routed_key_count && !seen; i++)
+  {
+    seen = state->routed_keys[i] == key;
+  }
+  if (!seen)
+  {
+    // tec: a full table forgets the oldest key, so that shape is deferred once more
+    U32 slot = 0;
+    if (state->routed_key_count < QK_ROUTED_KEY_CAP)
+    {
+      slot = state->routed_key_count;
+      state->routed_key_count += 1;
+    }
+    else
+    {
+      slot = state->routed_next;
+      state->routed_next = (state->routed_next + 1) % QK_ROUTED_KEY_CAP;
+    }
+    state->routed_keys[slot] = key;
+    state->routed_deferrals += 1;
+    defer = 1;
+  }
+  os_mutex_drop(state->lock);
+  return defer;
+}
+
+internal U64
+qk_routed_deferrals(void)
+{
+  return g_qk_state.routed_deferrals;
+}
+
 internal GPU_Kernel*
 qk_simple_kernel(Arena* arena, U32* words, String8* out_name)
 {
@@ -1654,6 +1702,10 @@ qk_simple_kernel(Arena* arena, U32* words, String8* out_name)
   g_qk_state.kernels_requested += 1;
   String8 source = {0};
   if (!qk_simple_source_build(arena, words, &source))
+  {
+    return 0;
+  }
+  if (qk_route_defer(u64_hash_from_str8(source)))
   {
     return 0;
   }
@@ -1674,6 +1726,12 @@ qk_scan_kernel(Arena* arena, QE_BytecodeProgram* prog, QK_HybridInfo* hybrid, St
   if (!qk_scan_source_build(arena, prog, hybrid, 0, &source))
   {
     log_debug("per query kernels: the bytecode has an operator the generator does not handle, using the interpreter");
+    return 0;
+  }
+  if (hybrid && hybrid->is_hybrid && qk_route_defer(u64_hash_from_str8(source)))
+  {
+    // tec: the caller reads is_hybrid and the wide slot mask after this call, and the interpreter runs without them
+    MemoryZeroStruct(hybrid);
     return 0;
   }
   return qk_kernel_from_source(arena, source, out_name);
@@ -2597,6 +2655,13 @@ qk_window_flags_kernel(Arena* arena, U32 key_count, U32 partition_count, B32 nar
   String8 source = str8_list_join(arena, &out, 0);
   scratch_end(scratch);
   return qk_kernel_from_source(arena, source, out_name);
+}
+
+internal void
+qk_last_sizes(U64* out_source_bytes, U64* out_spirv_bytes)
+{
+  *out_source_bytes = g_qk_state.last_source_bytes;
+  *out_spirv_bytes = g_qk_state.last_spirv_bytes;
 }
 
 internal void

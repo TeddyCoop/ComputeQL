@@ -13,9 +13,11 @@
 //   QE_PERQUERY_KERNELS:0       scan_simple and the interpreter only
 //   QE_PERQUERY_MIN_ROWS:0      tables with fewer rows keep the interpreter
 //   QE_PERQUERY_LOG_SOURCE:1    log the generated GLSL at debug level
+//   QE_ROUTE_CONJUNCTIONS:1     a conjunction of plain comparisons runs on the precompiled path the first time its shape is seen and gets a generated kernel from the second execution on
 
 #define QK_FAILED_KEY_CAP 64
 #define QK_MAX_STACK 64
+#define QK_ROUTED_KEY_CAP 256
 
 typedef void* QK_CompilerInitProc(void);
 typedef void QK_CompilerReleaseProc(void* compiler);
@@ -65,6 +67,11 @@ struct QK_State
 
   U64 failed_keys[QK_FAILED_KEY_CAP];
   U32 failed_key_count;
+  // tec: shapes the conjunction router has seen once
+  U64 routed_keys[QK_ROUTED_KEY_CAP];
+  U32 routed_key_count;
+  U32 routed_next;
+  U64 routed_deferrals;
   
   QK_Name names[QK_NAME_CAP];
   U32 name_count;
@@ -78,6 +85,9 @@ struct QK_State
   U64 kernels_compiled;
   U64 compile_failures;
   U64 compile_microseconds;
+  // tec: sizes of the last source handed to shaderc and of the SPIR-V it returned (or that the disk cache held)
+  U64 last_source_bytes;
+  U64 last_spirv_bytes;
 };
 global QK_State g_qk_state = {0};
 
@@ -199,6 +209,8 @@ internal GPU_Kernel* qk_hash_reduce_kernel(Arena* arena, B32 fixed, U32 num_expr
 internal GPU_Kernel* qk_gather_kernel(Arena* arena, U32 mode, String8* out_name);
 // tec: the window rank flags over keys sorted by qk_sort_kernel. bindings as window_rank_flags.comp, the key layout is the sort kernel's. push constant slot 0 is the row count
 internal GPU_Kernel* qk_window_flags_kernel(Arena* arena, U32 key_count, U32 partition_count, B32 narrow, String8* out_name);
+internal U64 qk_routed_deferrals(void);
+internal void qk_last_sizes(U64* out_source_bytes, U64* out_spirv_bytes);
 internal void qk_stats(U64* out_requested, U64* out_compiled, U64* out_failures, U64* out_compile_microseconds);
 
 #endif //QUERY_KERNEL_H

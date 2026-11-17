@@ -3,6 +3,7 @@
 //   default:   scan_simple where it applies, interpreter otherwise (QE_PERQUERY_KERNELS:0)
 //   compiled:  a kernel generated for the query (QE_PERQUERY_KERNELS:2)
 // --rows=N sets the table size, --samples prints every timed run, --setting=A:1,B:2 applies extra settings
+// --edge runs the clauses that probe how a literal maps to a whole number interval (fractions, negative values, values beyond the column type and the narrow window) instead of the coverage clauses, run it in the same three configurations
 // --narrow gives columns a and b small value ranges. run it with --setting=GPU_MAX_BUFFER_SIZE:4000000 so the numeric filters stream and hold those columns at 1 and 2 bytes
 // the mixed cases (24 on) put plain comparisons next to terms that are not, which run on one kernel with scan_simple's layout. configurations to run
 //   bench_query_perquery
@@ -69,6 +70,7 @@ struct PQ_Data
 };
 
 global B32 g_pq_narrow = 0;
+global B32 g_pq_edge = 0;
 
 global char* g_pq_tags[] = { "alpha", "bravo", "charlie", "delta", "echo", "foxtrot" };
 
@@ -157,6 +159,7 @@ entry_point(CmdLine* cmdline)
   }
   g_bench_print_samples = cmd_line_has_flag(cmdline, str8_lit("samples"));
   g_pq_narrow = cmd_line_has_flag(cmdline, str8_lit("narrow"));
+  g_pq_edge = cmd_line_has_flag(cmdline, str8_lit("edge"));
   {
     char setting[96];
     snprintf(setting, sizeof(setting), "CQL_COLUMN_ARENA_RESERVE_SIZE:%llu", row_count * sizeof(U64) + MB(256));
@@ -224,6 +227,28 @@ entry_point(CmdLine* cmdline)
     { "36 count leaf and string equality", push_str8f(arena, "b > 0 AND name = '%.*s'", str8_varg(data.sample_name)), 1 },
   };
 
+  // tec: literals that do not map straight onto a whole number code. a is u32 and b is i32, each clause also runs with a second term so that the numeric AND layout is used
+  char* edge_text[] =
+  {
+    "a < 5.5", "a <= 5.5", "a > 5.5", "a >= 5.5", "a = 5.5", "a = 5", "a != 5.5",
+    "a < -1", "a <= -0.5", "a > -1", "a >= -0.5", "a = -1", "a < 0", "a <= 0", "a > 0", "a >= 0.5",
+    "a < 4294967295", "a <= 4294967295", "a > 4294967295", "a >= 4294967295.5", "a < 4294967296", "a <= 4294967296.5", "a > 4294967296", "a >= 10000000000000000000.0", "a < 10000000000000000000.0", "a > -10000000000000000000.0",
+    "a < 1999999.5", "a > 1999999.5", "a >= 59999.5", "a > 59999", "a <= 59999", "a < 60000.5",
+    "b < 2147483647", "b <= 2147483647", "b > 2147483646.5", "b >= 2147483647", "b > 2147483647", "b >= 2147483647.5", "b < 2147483648", "b <= 2147483648",
+    "b > -2147483648", "b >= -2147483648", "b < -2147483648", "b <= -2147483648", "b < -2147483647.5", "b >= -2147483648.5", "b > -2147483649", "b < -2147483649", "b <= -10000000000000000000.0", "b >= 10000000000000000000.0",
+    "b < -0.5", "b <= -0.5", "b > -0.5", "b >= -0.5", "b = -0.5", "b = -1", "b < 0.5", "b >= 0.5", "b != -0.5",
+    "b >= -100", "b > -100.5", "b > -100", "b < 99.5", "b <= 99", "b < 99", "b > 99", "b >= 99.5", "b < -100", "b <= -100.5",
+    "5.5 > a", "-0.5 < b", "2147483647.5 > b",
+  };
+  PQ_Case edge_cases[ArrayCount(edge_text) * 2];
+  for (U32 i = 0; i < ArrayCount(edge_text); i++)
+  {
+    edge_cases[i * 2] = (PQ_Case){ edge_text[i], str8_cstring(edge_text[i]), 1 };
+    edge_cases[i * 2 + 1] = (PQ_Case){ edge_text[i], push_str8f(arena, "%s AND d < 2.0", edge_text[i]), 0 };
+  }
+  PQ_Case* case_list = g_pq_edge ? edge_cases : cases;
+  U32 case_count = g_pq_edge ? (U32)ArrayCount(edge_cases) : (U32)ArrayCount(cases);
+
   bench_report_section(report, "WHERE clauses (%llu rows)", row_count);
   bench_report_row_begin(report);
   bench_report_cellf(report, "case");
@@ -238,21 +263,22 @@ entry_point(CmdLine* cmdline)
 
   U64 failures = 0;
   U64 unused = 0;
-  for (U32 i = 0; i < ArrayCount(cases); i++)
+  for (U32 i = 0; i < case_count; i++)
   {
-    PQ_Result reference = pq_run(arena, database, &cases[i], 0);
-    PQ_Result standard = pq_run(arena, database, &cases[i], 1);
-    PQ_Result compiled = pq_run(arena, database, &cases[i], 2);
+    PQ_Case* test_case = &case_list[i];
+    PQ_Result reference = pq_run(arena, database, test_case, 0);
+    PQ_Result standard = pq_run(arena, database, test_case, 1);
+    PQ_Result compiled = pq_run(arena, database, test_case, 2);
 
     B32 match = reference.rows == compiled.rows && reference.checksum == compiled.checksum &&
       reference.rows == standard.rows && reference.checksum == standard.checksum;
     B32 used = str8_find_needle(compiled.kernels, 0, str8_lit("qk_scan_"), 0) < compiled.kernels.size;
     printf("%-28s rows %9llu  ref %8.3f ms  default %8.3f ms  compiled %8.3f ms  %5.2fx  [%.*s] -> [%.*s]%s%s\n",
-           cases[i].label, reference.rows, reference.stats.execute_median, standard.stats.execute_median, compiled.stats.execute_median,
+           test_case->label, reference.rows, reference.stats.execute_median, standard.stats.execute_median, compiled.stats.execute_median,
            reference.stats.execute_median / Max(compiled.stats.execute_median, 0.0001),
            str8_varg(standard.kernels), str8_varg(compiled.kernels), match ? "" : "  !! MISMATCH", used ? "" : "  (no generated kernel ran)");
     bench_report_row_begin(report);
-    bench_report_cellf(report, "%s", cases[i].label);
+    bench_report_cellf(report, "%s", test_case->label);
     bench_report_cellf(report, "%llu", reference.rows);
     bench_report_cellf(report, "%.3f", reference.stats.execute_median);
     bench_report_cellf(report, "%.3f", standard.stats.execute_median);
@@ -265,7 +291,7 @@ entry_point(CmdLine* cmdline)
     {
       failures += 1;
       bench_report_warn(report, "%s: reference %llu rows checksum %llu, default %llu rows checksum %llu, compiled %llu rows checksum %llu",
-                        cases[i].label, reference.rows, reference.checksum, standard.rows, standard.checksum, compiled.rows, compiled.checksum);
+                        test_case->label, reference.rows, reference.checksum, standard.rows, standard.checksum, compiled.rows, compiled.checksum);
     }
     if (!used)
     {
@@ -293,7 +319,7 @@ entry_point(CmdLine* cmdline)
   {
     os_make_directory(str8_lit("bench_reports/"));
   }
-  bench_report_write(report, str8_lit("bench_reports/perquery_report.md"));
+  bench_report_write(report, g_pq_edge ? str8_lit("bench_reports/perquery_edge_report.md") : str8_lit("bench_reports/perquery_report.md"));
 
   arena_release(arena);
   log_release();

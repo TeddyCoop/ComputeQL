@@ -2472,6 +2472,46 @@ gpu_vulkan_load_spirv_from_disk(Arena* arena, String8 kernel_name)
   return result;
 }
 
+// tec: reads the register, scratch and instruction counts of a built pipeline through VK_AMD_shader_info (GPU_VULKAN_SHADER_INFO:1), the numbers stay in the state until the next pipeline
+internal void
+gpu_vulkan_read_shader_stats(VkPipeline pipeline)
+{
+  g_vulkan_state->last_stats_valid = 0;
+  if (!g_vulkan_state->has_shader_info_ext)
+  {
+    return;
+  }
+  VkShaderStatisticsInfoAMD stats = {0};
+  size_t stats_size = sizeof(stats);
+  if (g_vulkan_state->vkGetShaderInfoAMD_fn(g_vulkan_state->device, pipeline, VK_SHADER_STAGE_COMPUTE_BIT, VK_SHADER_INFO_TYPE_STATISTICS_AMD, &stats_size, &stats) != VK_SUCCESS)
+  {
+    return;
+  }
+  g_vulkan_state->last_vgprs = stats.resourceUsage.numUsedVgprs;
+  g_vulkan_state->last_sgprs = stats.resourceUsage.numUsedSgprs;
+  g_vulkan_state->last_available_vgprs = stats.numAvailableVgprs;
+  g_vulkan_state->last_scratch_bytes = stats.resourceUsage.scratchMemUsageInBytes;
+  g_vulkan_state->last_lds_bytes = stats.resourceUsage.ldsUsageSizeInBytes;
+
+  size_t isa_size = 0;
+  U64 lines = 0;
+  if (g_vulkan_state->vkGetShaderInfoAMD_fn(g_vulkan_state->device, pipeline, VK_SHADER_STAGE_COMPUTE_BIT, VK_SHADER_INFO_TYPE_DISASSEMBLY_AMD, &isa_size, 0) == VK_SUCCESS && isa_size > 0)
+  {
+    Temp scratch = scratch_begin(0, 0);
+    char* text = push_array_no_zero(scratch.arena, char, isa_size);
+    if (g_vulkan_state->vkGetShaderInfoAMD_fn(g_vulkan_state->device, pipeline, VK_SHADER_STAGE_COMPUTE_BIT, VK_SHADER_INFO_TYPE_DISASSEMBLY_AMD, &isa_size, text) == VK_SUCCESS)
+    {
+      for (size_t i = 0; i < isa_size; i++)
+      {
+        lines += text[i] == '\n';
+      }
+    }
+    scratch_end(scratch);
+  }
+  g_vulkan_state->last_isa_lines = lines;
+  g_vulkan_state->last_stats_valid = 1;
+}
+
 // tec: builds the pipeline for a SPIR-V blob. `reuse` is a kernel struct to fill in, or 0 to allocate one from `arena`
 internal GPU_VulkanKernel*
 gpu_vulkan_kernel_create(Arena* arena, String8 name, String8 spirv_bin, GPU_VulkanKernel* kernel)
@@ -2510,6 +2550,7 @@ gpu_vulkan_kernel_create(Arena* arena, String8 name, String8 spirv_bin, GPU_Vulk
     vkDestroyShaderModule(g_vulkan_state->device, shader, 0);
     return 0;
   }
+  gpu_vulkan_read_shader_stats(pipeline);
   
   VkDescriptorSetAllocateInfo desc_alloc_info =
   {

@@ -2,6 +2,9 @@
 //   cold:     the first execution of the shape (generate GLSL, shaderc, pipeline creation, dispatch)
 //   variant:  the same shape with other literals (the kernel is already built, so this is a cache hit)
 //   steady:   median of the timed runs after that
+//   --route:  the router policy (QE_ROUTE_CONJUNCTIONS:1). a conjunction of plain comparisons runs on the precompiled path the first time, so its cold column is that run, and
+//             the generation happens on the second run ("second run" column), where shaderc and pipeline creation are counted. other shapes behave as without --route
+//   --idrange: instead of random shapes, the one query "SELECT COUNT(*) FROM pq WHERE id > 1000 AND id <= 900000000" of the scale test (a range on the row number), with the same columns of the report: the steady times on the interpreter, the precompiled path and the generated kernel, and the size, registers and instruction lines of the generated pipeline
 //   interp:   the same query on the bytecode interpreter (QE_PERQUERY_KERNELS:0, QE_SCAN_SIMPLE_KERNEL:0), row count and checksum must match
 // shaderc time comes from the generator's own counter, the rest of cold minus steady is pipeline creation and first use.
 // --rows=N table size, --shapes=N number of shapes, --seed=N shape seed (default: the clock, so the shapes are new to the driver's shader cache; rerun with the same seed for the driver cache hit case)
@@ -267,6 +270,12 @@ entry_point(CmdLine* cmdline)
   {
     shape_count = u64_from_str8(cmd_line_string(cmdline, str8_lit("shapes")), 10);
   }
+  B32 route = cmd_line_has_flag(cmdline, str8_lit("route"));
+  B32 idrange = cmd_line_has_flag(cmdline, str8_lit("idrange"));
+  if (idrange)
+  {
+    shape_count = 1;
+  }
   U64 seed = os_now_microseconds();
   if (cmd_line_has_argument(cmdline, str8_lit("seed")))
   {
@@ -309,6 +318,15 @@ entry_point(CmdLine* cmdline)
   bench_report_cellf(report, "pipeline and first use (ms)");
   bench_report_cellf(report, "other literals first run (ms)");
   bench_report_cellf(report, "where");
+  bench_report_cellf(report, "glsl (bytes)");
+  bench_report_cellf(report, "spirv (bytes)");
+  bench_report_cellf(report, "vgprs");
+  bench_report_cellf(report, "isa lines");
+  if (route)
+  {
+    bench_report_cellf(report, "routed (deferred)");
+    bench_report_cellf(report, "second run (ms)");
+  }
   bench_report_table_header_end(report);
 
   Bench_Rng rng = { seed };
@@ -328,6 +346,13 @@ entry_point(CmdLine* cmdline)
     String8 sql = push_str8f(arena, "SELECT id FROM pq WHERE %.*s;", str8_varg(where));
     String8 variant_where = pc_where(arena, &shape, 5);
     String8 variant_sql = push_str8f(arena, "SELECT id FROM pq WHERE %.*s;", str8_varg(variant_where));
+    if (idrange)
+    {
+      where = str8_lit("id > 1000 AND id <= 900000000");
+      sql = str8_lit("SELECT COUNT(*) FROM pq WHERE id > 1000 AND id <= 900000000;");
+      variant_sql = sql;
+      shape.leaf_count = 2;
+    }
 
     // tec: the interpreter first, so its run does not warm the generated kernel
     settings_load_from_string(str8_lit("QE_PERQUERY_KERNELS:0"));
@@ -341,19 +366,42 @@ entry_point(CmdLine* cmdline)
     F64 pre_ms = pc_steady(database, sql, &pre_rows, &pre_checksum);
 
     settings_load_from_string(str8_lit("QE_PERQUERY_KERNELS:2"));
+    if (route)
+    {
+      settings_load_from_string(str8_lit("QE_ROUTE_CONJUNCTIONS:1"));
+    }
     U64 requested_before = 0, compiled_before = 0, failed_before = 0, us_before = 0;
     qk_stats(&requested_before, &compiled_before, &failed_before, &us_before);
     U64 gpu_before = 0, evicted_before = 0;
     gpu_generated_kernel_stats(&gpu_before, &evicted_before);
 
     U64 rows = 0, checksum = 0;
+    U64 deferred_before = qk_routed_deferrals();
     F64 cold_ms = pc_run_once(database, sql, &rows, &checksum);
+    B32 deferred = qk_routed_deferrals() > deferred_before;
+    F64 second_ms = 0.0;
+    if (route && deferred)
+    {
+      // tec: the second execution of a routed shape is the one that generates, builds the pipeline and dispatches it
+      U64 second_rows = 0, second_checksum = 0;
+      second_ms = pc_run_once(database, sql, &second_rows, &second_checksum);
+      if (second_rows != rows || second_checksum != checksum)
+      {
+        failures += 1;
+        bench_report_warn(report, "shape %llu: the routed first run gave %llu rows checksum %llu, the second %llu rows checksum %llu", s, rows, checksum, second_rows, second_checksum);
+      }
+    }
 
     U64 requested_after = 0, compiled_after = 0, failed_after = 0, us_after = 0;
     qk_stats(&requested_after, &compiled_after, &failed_after, &us_after);
     U64 gpu_after = 0, evicted_after = 0;
     gpu_generated_kernel_stats(&gpu_after, &evicted_after);
     B32 built = gpu_after > gpu_before;
+    U64 glsl_bytes = 0, spirv_bytes = 0;
+    qk_last_sizes(&glsl_bytes, &spirv_bytes);
+    B32 stats_valid = g_vulkan_state->last_stats_valid;
+    U32 vgprs = g_vulkan_state->last_vgprs;
+    U64 isa_lines = g_vulkan_state->last_isa_lines;
 
     U64 variant_rows = 0, variant_checksum = 0;
     F64 variant_ms = pc_run_once(database, variant_sql, &variant_rows, &variant_checksum);
@@ -383,7 +431,7 @@ entry_point(CmdLine* cmdline)
       reused_shapes += 1;
     }
     F64 shaderc_ms = (F64)(us_after - us_before) / 1000.0;
-    F64 pipeline_ms = cold_ms - steady_ms - shaderc_ms;
+    F64 pipeline_ms = (route && deferred ? second_ms : cold_ms) - steady_ms - shaderc_ms;
     printf("shape %2llu  %u comparisons  %9llu rows  interpreter %8.3f ms  precompiled %8.3f ms  generated %8.3f ms  cold %8.3f ms (shaderc %7.3f ms)  other literals %8.3f ms%s\n",
            s, shape.leaf_count, rows, interp_ms, pre_ms, steady_ms, cold_ms, shaderc_ms, variant_ms, built ? "" : "  [kernel already cached]");
     fflush(stdout);
@@ -400,11 +448,20 @@ entry_point(CmdLine* cmdline)
     bench_report_cellf(report, "%.3f", pipeline_ms);
     bench_report_cellf(report, "%.3f", variant_ms);
     bench_report_cellf(report, "%.*s", str8_varg(where));
+    bench_report_cellf(report, "%llu", built ? glsl_bytes : 0ull);
+    bench_report_cellf(report, "%llu", built ? spirv_bytes : 0ull);
+    bench_report_cellf(report, "%u", built && stats_valid ? vgprs : 0u);
+    bench_report_cellf(report, "%llu", built && stats_valid ? isa_lines : 0ull);
+    if (route)
+    {
+      bench_report_cellf(report, "%u", (U32)deferred);
+      bench_report_cellf(report, "%.3f", second_ms);
+    }
     bench_report_row_end(report);
 
     if (built)
     {
-      cold_samples[measured] = cold_ms;
+      cold_samples[measured] = (route && deferred) ? second_ms : cold_ms;
       shaderc_samples[measured] = shaderc_ms;
       pipeline_samples[measured] = pipeline_ms;
       variant_samples[measured] = variant_ms;
@@ -412,6 +469,7 @@ entry_point(CmdLine* cmdline)
       measured += 1;
     }
   }
+  settings_load_from_string(str8_lit("QE_ROUTE_CONJUNCTIONS:0"));
   settings_load_from_string(str8_lit("QE_PERQUERY_KERNELS:0"));
   settings_load_from_string(str8_lit("QE_SCAN_SIMPLE_KERNEL:1"));
 
