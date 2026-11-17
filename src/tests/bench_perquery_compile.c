@@ -7,6 +7,8 @@
 //   --idrange: instead of random shapes, the one query "SELECT COUNT(*) FROM pq WHERE id > 1000 AND id <= 900000000" of the scale test (a range on the row number), with the same columns of the report: the steady times on the interpreter, the precompiled path and the generated kernel, and the size, registers and instruction lines of the generated pipeline
 //   --sweep:  instead of random shapes, a few fixed shapes at selectivities from 0.1% to 50% (numeric single, AND of two, AND of four and OR of two comparisons) and string and dictionary shapes, each as SELECT COUNT(*),
 //             with the steady times on the interpreter, the precompiled path and the generated kernel, and the cold first run and size of the generated pipeline of the first literals of each shape
+//   --lib:    only the precompiled path (QE_PERQUERY_KERNELS:0): the first run of each shape, which uses kernels that are not specific to the shape, its steady time and the interpreter's,
+//             to be run in a fresh process after an earlier process has filled the kernel caches, to compare with the cold first run of the generated kernel
 //   interp:   the same query on the bytecode interpreter (QE_PERQUERY_KERNELS:0, QE_SCAN_SIMPLE_KERNEL:0), row count and checksum must match
 // shaderc time comes from the generator's own counter, the rest of cold minus steady is pipeline creation and first use.
 // --rows=N table size, --shapes=N number of shapes, --seed=N shape seed (default: the clock, so the shapes are new to the driver's shader cache; rerun with the same seed for the driver cache hit case)
@@ -526,6 +528,7 @@ entry_point(CmdLine* cmdline)
   B32 route = cmd_line_has_flag(cmdline, str8_lit("route"));
   B32 idrange = cmd_line_has_flag(cmdline, str8_lit("idrange"));
   B32 sweep = cmd_line_has_flag(cmdline, str8_lit("sweep"));
+  B32 lib = cmd_line_has_flag(cmdline, str8_lit("lib"));
   if (idrange)
   {
     shape_count = 1;
@@ -582,6 +585,16 @@ entry_point(CmdLine* cmdline)
   bench_report_cellf(report, "shape");
   bench_report_cellf(report, "comparisons");
   bench_report_cellf(report, "rows");
+  if (lib)
+  {
+    bench_report_cellf(report, "library first run (ms)");
+    bench_report_cellf(report, "library steady (ms)");
+    bench_report_cellf(report, "interpreter (ms)");
+    bench_report_cellf(report, "where");
+    bench_report_table_header_end(report);
+  }
+  else
+  {
   bench_report_cellf(report, "interpreter (ms)");
   bench_report_cellf(report, "precompiled (ms)");
   bench_report_cellf(report, "generated steady (ms)");
@@ -600,6 +613,7 @@ entry_point(CmdLine* cmdline)
     bench_report_cellf(report, "second run (ms)");
   }
   bench_report_table_header_end(report);
+  }
 
   Bench_Rng rng = { seed };
   F64* cold_samples = push_array(arena, F64, shape_count);
@@ -624,6 +638,38 @@ entry_point(CmdLine* cmdline)
       sql = str8_lit("SELECT COUNT(*) FROM pq WHERE id > 1000 AND id <= 900000000;");
       variant_sql = sql;
       shape.leaf_count = 2;
+    }
+
+    if (lib)
+    {
+      settings_load_from_string(str8_lit("QE_PERQUERY_KERNELS:0"));
+      settings_load_from_string(str8_lit("QE_SCAN_SIMPLE_KERNEL:1"));
+      U64 lib_rows = 0, lib_checksum = 0;
+      F64 lib_first_ms = pc_run_once(database, sql, &lib_rows, &lib_checksum);
+      U64 steady_lib_rows = 0, steady_lib_checksum = 0;
+      F64 lib_steady_ms = pc_steady(database, sql, &steady_lib_rows, &steady_lib_checksum);
+      settings_load_from_string(str8_lit("QE_SCAN_SIMPLE_KERNEL:0"));
+      U64 ref_rows = 0, ref_checksum = 0;
+      F64 ref_ms = pc_steady(database, sql, &ref_rows, &ref_checksum);
+      if (lib_rows != ref_rows || lib_checksum != ref_checksum || steady_lib_checksum != ref_checksum)
+      {
+        failures += 1;
+        bench_report_warn(report, "shape %llu: library %llu rows checksum %llu differs from the interpreter", s, lib_rows, lib_checksum);
+      }
+      printf("shape %2llu  %u comparisons  %9llu rows  library first run %8.3f ms  steady %8.3f ms  interpreter %8.3f ms\n", s, shape.leaf_count, lib_rows, lib_first_ms, lib_steady_ms, ref_ms);
+      fflush(stdout);
+      bench_report_row_begin(report);
+      bench_report_cellf(report, "%llu", s);
+      bench_report_cellf(report, "%u", shape.leaf_count);
+      bench_report_cellf(report, "%llu", lib_rows);
+      bench_report_cellf(report, "%.3f", lib_first_ms);
+      bench_report_cellf(report, "%.3f", lib_steady_ms);
+      bench_report_cellf(report, "%.3f", ref_ms);
+      bench_report_cellf(report, "%.*s", str8_varg(where));
+      bench_report_row_end(report);
+      cold_samples[measured] = lib_first_ms;
+      measured += 1;
+      continue;
     }
 
     // tec: the interpreter first, so its run does not warm the generated kernel
@@ -745,7 +791,13 @@ entry_point(CmdLine* cmdline)
   settings_load_from_string(str8_lit("QE_PERQUERY_KERNELS:0"));
   settings_load_from_string(str8_lit("QE_SCAN_SIMPLE_KERNEL:1"));
 
-  if (measured > 0)
+  if (lib && measured > 0)
+  {
+    bench_report_section(report, "summary");
+    bench_report_text(report, "library first run: median %.3f ms, first shape %.3f ms", pc_median(cold_samples, (U32)measured), cold_samples[0]);
+    printf("library first run median %.3f ms, first shape %.3f ms\n", pc_median(cold_samples, (U32)measured), cold_samples[0]);
+  }
+  else if (measured > 0)
   {
     F64 cold_total = 0.0, shaderc_total = 0.0;
     F64 cold_min = cold_samples[0], cold_max = cold_samples[0];

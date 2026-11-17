@@ -23,6 +23,10 @@ set "only_routerfilled=0"
 set "only_interleaved=0"
 set "only_profile=0"
 set "only_sweep=0"
+set "only_libnew=0"
+if /i "%~1"=="libnew" (
+  set "only_libnew=1"
+)
 if /i "%~1"=="sweep" (
   set "only_sweep=1"
 )
@@ -119,6 +123,11 @@ if "%only_routerfilled%"=="1" (
 
 if "%only_interleaved%"=="1" (
   call :interleaved
+  goto :finish
+)
+
+if "%only_libnew%"=="1" (
+  call :libnew
   goto :finish
 )
 
@@ -343,6 +352,30 @@ for %%n in (10000000 50000000) do (
     call :run sweep sweep_%%n_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=%%n --sweep --seed=%SEED% --setting=QE_SPIRV_DISK_CACHE:0,GPU_VULKAN_SHADER_INFO:1"
   )
 )
+exit /b 0
+
+
+::~
+:: new shapes against library kernels, three processes of each state, 40 shapes at 20M rows:
+:: gen_empty, lib_empty: no caches (the engine's disk caches off, the driver's cache off)
+:: gen_filled, lib_filled: the engine's disk caches and the driver's cache filled by the process before, which has the same arguments
+:libnew
+for /l %%i in (1,1,3) do (
+  call :run libnew gen_empty_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=20000000 --shapes=40 --seed=%SEED% --setting=QE_SPIRV_DISK_CACHE:0"
+  call :run libnew lib_empty_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=20000000 --shapes=40 --seed=%SEED% --lib --setting=QE_SPIRV_DISK_CACHE:0"
+)
+call :clear
+set "clear_caches=0"
+call :run libnew gen_fill bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=20000000 --shapes=40 --seed=%SEED%"
+for /l %%i in (1,1,3) do (
+  call :run libnew gen_filled_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=20000000 --shapes=40 --seed=%SEED%"
+)
+call :clear
+call :run libnew lib_fill bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=20000000 --shapes=40 --seed=%SEED% --lib"
+for /l %%i in (1,1,3) do (
+  call :run libnew lib_filled_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=20000000 --shapes=40 --seed=%SEED% --lib"
+)
+set "clear_caches=1"
 exit /b 0
 
 
