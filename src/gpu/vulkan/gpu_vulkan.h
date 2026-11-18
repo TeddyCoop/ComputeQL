@@ -173,6 +173,8 @@ struct GPU_VulkanState
   U64 last_scratch_bytes;
   U64 last_lds_bytes;
   U64 last_isa_lines;
+  U64 pipeline_create_us;
+  U64 pipeline_create_count;
 
   // tec: Resizable BAR
   // a memory type that's both DEVICE_LOCAL and HOST_VISIBLE lets gpu_buffer_alloc write straight into vram with a memcpy,

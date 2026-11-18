@@ -285,6 +285,8 @@ pc_steady(CQL_Database* database, String8 sql, U64* out_rows, U64* out_checksum)
 
 
 #define PC_SWEEP_STEPS 6
+// tec: --warmup runs one throwaway shape on each of the three paths before the sweep, so the first literal is not the first query of the process
+global B32 g_pc_warmup = 0;
 global F64 g_pc_sweep_target[PC_SWEEP_STEPS] = { 0.001, 0.01, 0.05, 0.1, 0.25, 0.5 };
 // tec: the selectivity of one comparison that makes k independent comparisons joined by AND pass the target together (the k-th root of the target), and for the OR of two, half of it
 global F64 g_pc_sweep_and2[PC_SWEEP_STEPS] = { 0.0316, 0.1, 0.2236, 0.3162, 0.5, 0.7071 };
@@ -413,6 +415,19 @@ pc_run_sweep(Arena* arena, CQL_Database* database, PC_Table* data, Bench_Report*
   bench_report_cellf(report, "where");
   bench_report_table_header_end(report);
 
+  if (g_pc_warmup)
+  {
+    String8 warm_sql = str8_lit("SELECT COUNT(*) FROM pq WHERE a < 1500000 AND b < 0;");
+    U64 warm_rows = 0, warm_checksum = 0;
+    settings_load_from_string(str8_lit("QE_PERQUERY_KERNELS:0"));
+    settings_load_from_string(str8_lit("QE_SCAN_SIMPLE_KERNEL:0"));
+    pc_steady(database, warm_sql, &warm_rows, &warm_checksum);
+    settings_load_from_string(str8_lit("QE_SCAN_SIMPLE_KERNEL:1"));
+    pc_steady(database, warm_sql, &warm_rows, &warm_checksum);
+    settings_load_from_string(str8_lit("QE_PERQUERY_KERNELS:2"));
+    pc_steady(database, warm_sql, &warm_rows, &warm_checksum);
+  }
+
   for (U32 sh = 0; sh < shape_count; sh++)
   {
     PC_SweepShape* shape = &shapes[sh];
@@ -508,6 +523,98 @@ pc_run_sweep(Arena* arena, CQL_Database* database, PC_Table* data, Bench_Report*
   }
 }
 
+// tec: the cold cost of one process, itemized: each probe is one execution, with the time inside shaderc, the time inside vkCreateComputePipelines and the rest
+typedef struct PC_ColdProbe PC_ColdProbe;
+struct PC_ColdProbe
+{
+  char* label;
+  char* kernels;
+  char* simple;
+  char* where;
+  B32 check;
+};
+
+internal void
+pc_run_cold(Arena* arena, CQL_Database* database, Bench_Report* report, U64 row_count, U64* failures)
+{
+  PC_ColdProbe probes[] =
+  {
+    { "first query, no filter (upload, statistics)", "0", "1", "", 0 },
+    { "scan_simple kernel, first use", "0", "1", "WHERE a < 20000", 0 },
+    { "scan_simple kernel, repeat", "0", "1", "WHERE a < 20000", 0 },
+    { "scan_simple kernel, new literal", "0", "1", "WHERE a < 40000", 0 },
+    { "interpreter kernel, first use", "0", "0", "WHERE a < 20000", 0 },
+    { "interpreter kernel, repeat", "0", "0", "WHERE a < 20000", 0 },
+    { "interpreter kernel, other predicate", "0", "0", "WHERE a < 20000 OR b < 0", 0 },
+    { "generated, first shape", "2", "1", "WHERE a < 1500000 AND b < 0", 1 },
+    { "generated, repeat", "2", "1", "WHERE a < 1500000 AND b < 0", 1 },
+    { "generated, new literal, same shape", "2", "1", "WHERE a < 1700000 AND b < 100000", 1 },
+    { "generated, second shape", "2", "1", "WHERE a < 20000 OR b < 0", 1 },
+    { "generated, third shape", "2", "1", "WHERE a < 1500000 AND b < 0 AND d < 900.0", 1 },
+    { "generated, fourth shape", "2", "1", "WHERE a < 1500000 OR b < 0 OR e < 5.0", 1 },
+  };
+
+  bench_report_section(report, "itemized cold cost (%llu rows, SELECT COUNT(*), one process)", row_count);
+  bench_report_row_begin(report);
+  bench_report_cellf(report, "probe");
+  bench_report_cellf(report, "run (ms)");
+  bench_report_cellf(report, "shaderc (ms)");
+  bench_report_cellf(report, "pipeline creation (ms)");
+  bench_report_cellf(report, "pipelines created");
+  bench_report_cellf(report, "other (ms)");
+  bench_report_cellf(report, "count");
+  bench_report_table_header_end(report);
+
+  for (U32 p = 0; p < ArrayCount(probes); p++)
+  {
+    PC_ColdProbe* probe = &probes[p];
+    char setting[64];
+    snprintf(setting, sizeof(setting), "QE_PERQUERY_KERNELS:%s", probe->kernels);
+    settings_load_from_string(str8_cstring(setting));
+    snprintf(setting, sizeof(setting), "QE_SCAN_SIMPLE_KERNEL:%s", probe->simple);
+    settings_load_from_string(str8_cstring(setting));
+    String8 sql = push_str8f(arena, "SELECT COUNT(*) FROM pq %s;", probe->where);
+
+    U64 requested = 0, compiled = 0, failed = 0, shaderc_before = 0;
+    qk_stats(&requested, &compiled, &failed, &shaderc_before);
+    U64 pipeline_us_before = g_vulkan_state->pipeline_create_us;
+    U64 pipeline_count_before = g_vulkan_state->pipeline_create_count;
+    U64 rows = 0, checksum = 0;
+    F64 ms = pc_run_once(database, sql, &rows, &checksum);
+    U64 count = g_pc_last_value;
+    U64 shaderc_after = 0;
+    qk_stats(&requested, &compiled, &failed, &shaderc_after);
+    F64 shaderc_ms = (F64)(shaderc_after - shaderc_before) / 1000.0;
+    F64 pipeline_ms = (F64)(g_vulkan_state->pipeline_create_us - pipeline_us_before) / 1000.0;
+    U64 pipelines = g_vulkan_state->pipeline_create_count - pipeline_count_before;
+    F64 other_ms = ms - shaderc_ms - pipeline_ms;
+
+    if (probe->check)
+    {
+      settings_load_from_string(str8_lit("QE_PERQUERY_KERNELS:0"));
+      settings_load_from_string(str8_lit("QE_SCAN_SIMPLE_KERNEL:0"));
+      U64 ref_rows = 0, ref_checksum = 0;
+      pc_run_once(database, sql, &ref_rows, &ref_checksum);
+      if (g_pc_last_value != count || ref_checksum != checksum)
+      {
+        *failures += 1;
+        bench_report_warn(report, "%s: generated count %llu differs from the interpreter %llu", probe->label, count, g_pc_last_value);
+      }
+    }
+
+    printf("%-48s %9.3f ms  shaderc %8.3f ms  pipeline creation %8.3f ms (%llu)  other %9.3f ms  count %llu\n", probe->label, ms, shaderc_ms, pipeline_ms, pipelines, other_ms, count);
+    bench_report_row_begin(report);
+    bench_report_cellf(report, "%s", probe->label);
+    bench_report_cellf(report, "%.3f", ms);
+    bench_report_cellf(report, "%.3f", shaderc_ms);
+    bench_report_cellf(report, "%.3f", pipeline_ms);
+    bench_report_cellf(report, "%llu", pipelines);
+    bench_report_cellf(report, "%.3f", other_ms);
+    bench_report_cellf(report, "%llu", count);
+    bench_report_row_end(report);
+  }
+}
+
 internal void
 entry_point(CmdLine* cmdline)
 {
@@ -529,6 +636,8 @@ entry_point(CmdLine* cmdline)
   B32 idrange = cmd_line_has_flag(cmdline, str8_lit("idrange"));
   B32 sweep = cmd_line_has_flag(cmdline, str8_lit("sweep"));
   B32 lib = cmd_line_has_flag(cmdline, str8_lit("lib"));
+  B32 cold = cmd_line_has_flag(cmdline, str8_lit("cold"));
+  g_pc_warmup = cmd_line_has_flag(cmdline, str8_lit("warmup"));
   if (idrange)
   {
     shape_count = 1;
@@ -561,6 +670,24 @@ entry_point(CmdLine* cmdline)
   cql_add_database(database);
   PC_Table data = {0};
   pc_load_table(arena, database, &data, row_count, sweep);
+
+  if (cold)
+  {
+    U64 cold_failures = 0;
+    pc_run_cold(arena, database, report, row_count, &cold_failures);
+    if (!os_file_path_exists(str8_lit("bench_reports/")))
+    {
+      os_make_directory(str8_lit("bench_reports/"));
+    }
+    bench_report_write(report, str8_lit("bench_reports/perquery_compile_report.md"));
+    arena_release(arena);
+    log_release();
+    if (cold_failures > 0)
+    {
+      exit(1);
+    }
+    return;
+  }
 
   if (sweep)
   {

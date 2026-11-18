@@ -2544,7 +2544,11 @@ gpu_vulkan_kernel_create(Arena* arena, String8 name, String8 spirv_bin, GPU_Vulk
   };
   
   VkPipeline pipeline;
-  if (vkCreateComputePipelines(g_vulkan_state->device, g_vulkan_state->pipeline_cache, 1, &pipeline_info, 0, &pipeline) != VK_SUCCESS)
+  U64 pipeline_begin_us = os_now_microseconds();
+  VkResult pipeline_result = vkCreateComputePipelines(g_vulkan_state->device, g_vulkan_state->pipeline_cache, 1, &pipeline_info, 0, &pipeline);
+  g_vulkan_state->pipeline_create_us += os_now_microseconds() - pipeline_begin_us;
+  g_vulkan_state->pipeline_create_count += 1;
+  if (pipeline_result != VK_SUCCESS)
   {
     log_error("failed to create Vulkan compute pipeline for kernel '%.*s'", str8_varg(name));
     vkDestroyShaderModule(g_vulkan_state->device, shader, 0);

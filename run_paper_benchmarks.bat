@@ -12,6 +12,11 @@ setlocal
 ::        run_paper_benchmarks.bat scaling        runs only the new-shape cost at 5M and 100M rows
 ::        run_paper_benchmarks.bat router         runs only the conjunction router (QE_ROUTE_CONJUNCTIONS:1): the 40 shapes cold at 5M, 20M and 100M rows and the 37-query workload
 ::        run_paper_benchmarks.bat routerfilled   runs only the router on the 37-query workload with the engine caches filled by an earlier process
+::        run_paper_benchmarks.bat overnight      runs coldcost, sweepmore, libmore and families in one go (no 1B rows)
+::        run_paper_benchmarks.bat coldcost       the itemized cold cost of one process (shaderc, pipeline creation, the rest) at 5M, 20M and 100M rows, caches empty and filled
+::        run_paper_benchmarks.bat sweepmore      the selectivity sweep with a warm-up query, and at 1M, 5M and 20M rows
+::        run_paper_benchmarks.bat libmore        new shapes against library kernels at 5M and 100M rows
+::        run_paper_benchmarks.bat families       the workloads with one generation switch off at a time
 ::
 :: every run that measures a cold execution starts with the engine's caches deleted and with the graphics driver's own pipeline cache switched off
 :: (AMD_VK_USE_PIPELINE_CACHE=0, which is the switch of the AMD driver; another driver has its own, for example MESA_SHADER_CACHE_DISABLE=true for Mesa)
@@ -24,6 +29,26 @@ set "only_interleaved=0"
 set "only_profile=0"
 set "only_sweep=0"
 set "only_libnew=0"
+set "only_overnight=0"
+set "only_coldcost=0"
+set "only_sweepmore=0"
+set "only_libmore=0"
+set "only_families=0"
+if /i "%~1"=="overnight" (
+  set "only_overnight=1"
+)
+if /i "%~1"=="coldcost" (
+  set "only_coldcost=1"
+)
+if /i "%~1"=="sweepmore" (
+  set "only_sweepmore=1"
+)
+if /i "%~1"=="libmore" (
+  set "only_libmore=1"
+)
+if /i "%~1"=="families" (
+  set "only_families=1"
+)
 if /i "%~1"=="libnew" (
   set "only_libnew=1"
 )
@@ -100,6 +125,34 @@ set "INTERP=QE_PERQUERY_KERNELS:0,QE_SCAN_SIMPLE_KERNEL:0,GPU_VULKAN_MAX_CACHED_
 set "NOSTORE=QE_ENCODE:0,QE_ENCODE_SEQUENCE:0,QE_ZONEMAP:0"
 :: the router: the first execution of a conjunction of plain comparisons runs on the precompiled path, the kernel is generated on the second
 set "ROUTE=QE_ROUTE_CONJUNCTIONS:1,GPU_VULKAN_MAX_CACHED_KERNELS:64"
+
+if "%only_overnight%"=="1" (
+  call :coldcost
+  call :sweepmore
+  call :libmore
+  call :families
+  goto :finish
+)
+
+if "%only_coldcost%"=="1" (
+  call :coldcost
+  goto :finish
+)
+
+if "%only_sweepmore%"=="1" (
+  call :sweepmore
+  goto :finish
+)
+
+if "%only_libmore%"=="1" (
+  call :libmore
+  goto :finish
+)
+
+if "%only_families%"=="1" (
+  call :families
+  goto :finish
+)
 
 if "%only_1b%"=="1" (
   call :billion
@@ -376,6 +429,87 @@ for /l %%i in (1,1,3) do (
   call :run libnew lib_filled_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=20000000 --shapes=40 --seed=%SEED% --lib"
 )
 set "clear_caches=1"
+exit /b 0
+
+
+::~
+:: the cold cost of one process itemized by probe (shaderc, pipeline creation, the rest), three processes at each size with empty caches,
+:: then at 20M rows with the engine's disk caches and the driver's cache filled by the process before
+:coldcost
+for %%n in (5000000 20000000 100000000) do (
+  for /l %%i in (1,1,3) do (
+    call :run coldcost empty_%%n_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=%%n --cold --seed=%SEED% --setting=QE_SPIRV_DISK_CACHE:0"
+  )
+)
+call :clear
+set "clear_caches=0"
+set "driver_cache=1"
+call :run coldcost filled_fill bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=20000000 --cold --seed=%SEED%"
+for /l %%i in (1,1,3) do (
+  call :run coldcost filled_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=20000000 --cold --seed=%SEED%"
+)
+set "clear_caches=1"
+set "driver_cache=0"
+exit /b 0
+
+
+::~
+:: the sweep with a throwaway query first (does the first literal carry a first-query effect), and at other table sizes
+:sweepmore
+for %%n in (10000000 50000000) do (
+  for /l %%i in (1,1,3) do (
+    call :run sweep_warm warm_%%n_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=%%n --sweep --warmup --seed=%SEED% --setting=QE_SPIRV_DISK_CACHE:0,GPU_VULKAN_SHADER_INFO:1"
+  )
+)
+for %%n in (1000000 5000000 20000000) do (
+  for /l %%i in (1,1,3) do (
+    call :run sweep_rows rows_%%n_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=%%n --sweep --warmup --seed=%SEED% --setting=QE_SPIRV_DISK_CACHE:0,GPU_VULKAN_SHADER_INFO:1"
+  )
+)
+exit /b 0
+
+
+::~
+:: new shapes against library kernels at other table sizes, the layout of :libnew
+:libmore
+for %%n in (5000000 100000000) do (
+  call :libsize %%n
+)
+exit /b 0
+
+
+:libsize
+set "clear_caches=1"
+for /l %%i in (1,1,3) do (
+  call :run libnew_%1 gen_empty_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=%1 --shapes=40 --seed=%SEED% --setting=QE_SPIRV_DISK_CACHE:0"
+  call :run libnew_%1 lib_empty_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=%1 --shapes=40 --seed=%SEED% --lib --setting=QE_SPIRV_DISK_CACHE:0"
+)
+call :clear
+set "clear_caches=0"
+set "driver_cache=1"
+call :run libnew_%1 gen_fill bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=%1 --shapes=40 --seed=%SEED%"
+for /l %%i in (1,1,3) do (
+  call :run libnew_%1 gen_filled_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=%1 --shapes=40 --seed=%SEED%"
+)
+call :clear
+call :run libnew_%1 lib_fill bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=%1 --shapes=40 --seed=%SEED% --lib"
+for /l %%i in (1,1,3) do (
+  call :run libnew_%1 lib_filled_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=%1 --shapes=40 --seed=%SEED% --lib"
+)
+set "clear_caches=1"
+set "driver_cache=0"
+exit /b 0
+
+
+::~
+:: the workloads with one generation switch off at a time, and a default pass beside them, in folders ablation\fam_<name>
+:families
+call :ablate fam_default "GPU_VULKAN_MAX_CACHED_KERNELS:64" 0
+for %%g in (SORT JOIN GATHER COMPACT HASH_REDUCE HAVING MEMBER_REDUCE) do (
+  call :ablate fam_%%g "GPU_VULKAN_MAX_CACHED_KERNELS:64,QE_GENERATE_%%g:0" 0
+)
+call :ablate fam_FUSE_GROUP_BY "GPU_VULKAN_MAX_CACHED_KERNELS:64,QE_FUSE_GROUP_BY:0" 0
+call :ablate fam_FUSE_AGGREGATE "GPU_VULKAN_MAX_CACHED_KERNELS:64,QE_FUSE_AGGREGATE:0" 0
 exit /b 0
 
 
