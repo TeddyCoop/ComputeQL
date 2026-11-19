@@ -175,6 +175,10 @@ struct GPU_VulkanState
   U64 last_isa_lines;
   U64 pipeline_create_us;
   U64 pipeline_create_count;
+  U64 test_pipeline_count;
+  // tec: specialization constants for the pipeline that the kernel alloc under kernel_lock is about to build
+  U32 pending_spec_values[32];
+  U32 pending_spec_count;
 
   // tec: Resizable BAR
   // a memory type that's both DEVICE_LOCAL and HOST_VISIBLE lets gpu_buffer_alloc write straight into vram with a memcpy,

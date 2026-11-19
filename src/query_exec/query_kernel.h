@@ -14,6 +14,14 @@
 //   QE_PERQUERY_MIN_ROWS:0      tables with fewer rows keep the interpreter
 //   QE_PERQUERY_LOG_SOURCE:1    log the generated GLSL at debug level
 //   QE_ROUTE_CONJUNCTIONS:1     a conjunction of plain comparisons runs on the precompiled path the first time its shape is seen and gets a generated kernel from the second execution on
+//   QE_GEN_FIXED_WIDTH:1        the generated numeric AND kernel gets the column width, type flags and bias of every comparison as constants of its source (a column encoded differently gets another kernel)
+//   QE_SCAN_SPEC:1              numeric AND scans use one precompiled module, scan_spec.comp, with the comparisons given as specialization constants when the pipeline is built, and no per query GLSL
+//   QE_COLLISION_CHECK:0        a kernel is identified by the 64 bit hash of its source alone (the default adds a second hash of a different kind and the length, and the name carries both)
+//
+// settings that exist for tests only:
+//   QE_TEST_FAIL_SHADERC:N      every Nth generated source fails to compile (1 is every one), the query falls back to the precompiled path
+//   QE_TEST_FAIL_PIPELINE:N     every Nth pipeline of a generated kernel fails to build
+//   QE_TEST_KEY_BITS:B          the first hash of a generated source is cut to its low B bits, so that distinct sources collide
 
 #define QK_FAILED_KEY_CAP 64
 #define QK_MAX_STACK 64
@@ -39,7 +47,8 @@ typedef struct QK_Name QK_Name;
 struct QK_Name
 {
   U64 key;
-  char text[32];
+  U64 check;
+  char text[48];
 };
 
 typedef struct QK_State QK_State;
@@ -81,6 +90,11 @@ struct QK_State
   OS_Handle lock;
   U64 disk_cache_hits;
 
+  U64 test_shaderc_count;
+  String8 spec_spirv;
+  B32 spec_spirv_tried;
+  U64 collisions_avoided;
+  U64 spec_requests;
   U64 kernels_requested;
   U64 kernels_compiled;
   U64 compile_failures;
@@ -176,7 +190,7 @@ struct QK_FusedAgg
 
 internal void qk_init(void);
 internal String8 qk_library_spirv(Arena* arena, String8 name);
-internal String8 qk_kernel_name(U64 key);
+internal String8 qk_kernel_name(U64 key, U64 check);
 internal B32 qk_enabled(U64 row_count);
 internal B32 qk_compiler_available(void);
 internal B32 qk_scan_source_build(Arena* arena, QE_BytecodeProgram* prog, QK_HybridInfo* hybrid, QK_FusedAgg* fuse, String8* out_source);
@@ -211,6 +225,7 @@ internal GPU_Kernel* qk_gather_kernel(Arena* arena, U32 mode, String8* out_name)
 internal GPU_Kernel* qk_window_flags_kernel(Arena* arena, U32 key_count, U32 partition_count, B32 narrow, String8* out_name);
 internal U64 qk_routed_deferrals(void);
 internal void qk_last_sizes(U64* out_source_bytes, U64* out_spirv_bytes);
+internal U64 qk_spec_request_count(void);
 internal void qk_stats(U64* out_requested, U64* out_compiled, U64* out_failures, U64* out_compile_microseconds);
 
 #endif //QUERY_KERNEL_H

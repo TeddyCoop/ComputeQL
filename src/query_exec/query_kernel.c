@@ -194,25 +194,67 @@ global char* qk_glsl_edit_distance =
   ;
 
 
-internal String8 qk_kernel_name_locked(U64 key);
+// tec: the second hash of a source, FNV-1a with the length folded in. the first one (u64_hash_from_str8) is a multiply by 33 and add, which is easy to collide
+internal U64
+qk_check_hash(String8 source)
+{
+  U64 hash = 0xcbf29ce484222325ull;
+  for (U64 i = 0; i < source.size; i++)
+  {
+    hash ^= source.str[i];
+    hash *= 0x100000001b3ull;
+  }
+  hash ^= source.size;
+  hash *= 0x100000001b3ull;
+  return hash;
+}
+
+// tec: a kernel is named by two hashes of its source. QE_TEST_KEY_BITS cuts the first so that tests can make sources collide
+internal U64
+qk_source_key(String8 source, U64* out_check)
+{
+  U64 key = u64_hash_from_str8(source);
+  U64 bits = settings_u64(str8_lit("QE_TEST_KEY_BITS"), 0);
+  if (bits > 0 && bits < 64)
+  {
+    key &= (1ull << bits) - 1;
+  }
+  *out_check = (settings_u64(str8_lit("QE_COLLISION_CHECK"), 1) != 0) ? qk_check_hash(source) : 0;
+  return key;
+}
+
+// tec: every Nth call returns true, for the failure tests
+internal B32
+qk_test_fail_due(char* setting, U64* counter)
+{
+  U64 every = settings_u64(str8_cstring(setting), 0);
+  if (every == 0)
+  {
+    return 0;
+  }
+  *counter += 1;
+  return (*counter % every) == 0;
+}
+
+internal String8 qk_kernel_name_locked(U64 key, U64 check);
 
 internal String8
-qk_kernel_name(U64 key)
+qk_kernel_name(U64 key, U64 check)
 {
   QK_State* state = &g_qk_state;
   os_mutex_take(state->lock);
-  String8 name = qk_kernel_name_locked(key);
+  String8 name = qk_kernel_name_locked(key, check);
   os_mutex_drop(state->lock);
   return name;
 }
 
 internal String8
-qk_kernel_name_locked(U64 key)
+qk_kernel_name_locked(U64 key, U64 check)
 {
   QK_State* state = &g_qk_state;
   for (U32 i = 0; i < state->name_count; i++)
   {
-    if (state->names[i].key == key)
+    if (state->names[i].key == key && state->names[i].check == check)
     {
       return str8_cstring(state->names[i].text);
     }
@@ -228,7 +270,8 @@ qk_kernel_name_locked(U64 key)
     state->name_next = (state->name_next + 1) % QK_NAME_CAP;
   }
   state->names[slot].key = key;
-  snprintf(state->names[slot].text, sizeof(state->names[slot].text), "qk_scan_%016llx", key);
+  state->names[slot].check = check;
+  snprintf(state->names[slot].text, sizeof(state->names[slot].text), "qk_scan_%016llx%016llx", key, check);
   return str8_cstring(state->names[slot].text);
 }
 
@@ -326,7 +369,8 @@ internal String8
 qk_spirv_cache_path(Arena* arena, String8 source)
 {
   U64 key = u64_hash_from_str8(source) ^ 0x5bd1e9955bd1e995ull;
-  return push_str8f(arena, "%.*s/shaders/cache/%016llx.spv", str8_varg(os_get_process_info()->binary_path), key);
+  U64 check = qk_check_hash(source);
+  return push_str8f(arena, "%.*s/shaders/cache/%016llx%016llx.spv", str8_varg(os_get_process_info()->binary_path), key, check);
 }
 
 internal String8
@@ -715,15 +759,28 @@ qk_emit_simple_prologue(Arena* arena, String8List* out)
 
 // tec: comparison l, its words start at 1 + l * 6 in the leaf words
 internal void
-qk_emit_simple_leaf(Arena* arena, String8List* out, U32 l, U32 slot, U32 coltype, U32 op, B32 is_int)
+qk_emit_simple_leaf(Arena* arena, String8List* out, U32 l, U32 slot, U32 coltype, U32 op, B32 is_int, B32 fixed, U32 fixed_flags)
 {
   U32 base = 1 + l * 6;
-  str8_list_pushf(arena, out,
-                  "  if (live != 0u)\n"
-                  "  {\n"
-                  "    uint flags = leaf_words[%uu];\n"
-                  "    uint width = (flags >> 8u) & 0xffu;\n",
-                  base + 1);
+  if (fixed)
+  {
+    // tec: QE_GEN_FIXED_WIDTH, the flags word of the comparison is known when the source is written, so the compiler can drop the width tests
+    str8_list_pushf(arena, out,
+                    "  if (live != 0u)\n"
+                    "  {\n"
+                    "    uint flags = %uu;\n"
+                    "    uint width = (flags >> 8u) & 0xffu;\n",
+                    fixed_flags);
+  }
+  else
+  {
+    str8_list_pushf(arena, out,
+                    "  if (live != 0u)\n"
+                    "  {\n"
+                    "    uint flags = leaf_words[%uu];\n"
+                    "    uint width = (flags >> 8u) & 0xffu;\n",
+                    base + 1);
+  }
   if (is_int)
   {
     str8_list_pushf(arena, out,
@@ -804,6 +861,7 @@ qk_simple_source_build(Arena* arena, U32* words, String8* out_source)
     slot_used[slot] = 1;
   }
 
+  B32 fixed_width = settings_u64(str8_lit("QE_GEN_FIXED_WIDTH"), 0) != 0;
   String8List out = {0};
   qk_emit_simple_header(scratch.arena, &out);
   qk_emit_simple_columns(scratch.arena, &out, slot_used, slot_used);
@@ -813,7 +871,7 @@ qk_simple_source_build(Arena* arena, U32* words, String8* out_source)
   for (U32 l = 0; l < leaf_count; l++)
   {
     U32 base = 1 + l * 6;
-    qk_emit_simple_leaf(scratch.arena, &out, l, words[base + 0], words[base + 1] & 0xffu, words[base + 2], (words[base + 1] & QE_SCAN_INT_FLAG) != 0);
+    qk_emit_simple_leaf(scratch.arena, &out, l, words[base + 0], words[base + 1] & 0xffu, words[base + 2], (words[base + 1] & QE_SCAN_INT_FLAG) != 0, fixed_width, words[base + 1]);
   }
   qk_emit_simple_epilogue(scratch.arena, &out);
   *out_source = str8_list_join(arena, &out, 0);
@@ -1333,7 +1391,7 @@ qk_scan_source_build(Arena* arena, QE_BytecodeProgram* prog, QK_HybridInfo* hybr
     for (U32 l = 0; l < hybrid->leaf_count; l++)
     {
       QK_HybridLeaf* leaf = &hybrid->leaves[l];
-      qk_emit_simple_leaf(scratch.arena, &out, l, leaf->slot, leaf->coltype, leaf->op, qk_leaf_is_int(leaf->coltype));
+      qk_emit_simple_leaf(scratch.arena, &out, l, leaf->slot, leaf->coltype, leaf->op, qk_leaf_is_int(leaf->coltype), 0, 0);
     }
     // tec: the other terms only look at the rows the comparisons left
     str8_list_pushf(scratch.arena, &out,
@@ -1600,7 +1658,9 @@ internal GPU_Kernel*
 qk_kernel_from_source(Arena* arena, String8 source, String8* out_name)
 {
   QK_State* state = &g_qk_state;
-  U64 key = u64_hash_from_str8(source);
+  U64 check = 0;
+  U64 source_key = qk_source_key(source, &check);
+  U64 key = source_key ^ (check * 0x9e3779b97f4a7c15ull);
   os_mutex_take(state->lock);
   for (U32 i = 0; i < state->failed_key_count; i++)
   {
@@ -1612,7 +1672,7 @@ qk_kernel_from_source(Arena* arena, String8 source, String8* out_name)
   }
   os_mutex_drop(state->lock);
 
-  String8 name = qk_kernel_name(key);
+  String8 name = qk_kernel_name(source_key, check);
   GPU_Kernel* kernel = gpu_kernel_alloc_from_spirv(name, str8_zero());
   if (!kernel)
   {
@@ -1620,7 +1680,14 @@ qk_kernel_from_source(Arena* arena, String8 source, String8* out_name)
     {
       log_debug("per query kernels: source for %.*s\n%.*s", str8_varg(name), str8_varg(source));
     }
-    String8 spirv = qk_spirv_compile(arena, source);
+    String8 spirv = {0};
+    os_mutex_take(state->lock);
+    B32 inject = qk_test_fail_due("QE_TEST_FAIL_SHADERC", &state->test_shaderc_count);
+    os_mutex_drop(state->lock);
+    if (!inject)
+    {
+      spirv = qk_spirv_compile(arena, source);
+    }
     if (spirv.size > 0)
     {
       kernel = gpu_kernel_alloc_from_spirv(name, spirv);
@@ -1692,6 +1759,68 @@ qk_routed_deferrals(void)
   return g_qk_state.routed_deferrals;
 }
 
+// tec: QE_SCAN_SPEC, one precompiled module with the comparisons as specialization constants. the pipeline is built per combination, there is no per query source and no shaderc call after the first
+internal GPU_Kernel*
+qk_spec_kernel(Arena* arena, U32* words, String8* out_name)
+{
+  QK_State* state = &g_qk_state;
+  U32 leaf_count = words[0];
+  if (leaf_count == 0 || leaf_count > 8)
+  {
+    return 0;
+  }
+  U32 values[25] = {0};
+  state->spec_requests += 1;
+  values[0] = leaf_count;
+  for (U32 l = 0; l < leaf_count; l++)
+  {
+    U32 base = 1 + l * 6;
+    if (words[base + 0] >= QE_MAX_COLUMN_BINDINGS)
+    {
+      return 0;
+    }
+    values[1 + l] = words[base + 0];
+    values[9 + l] = words[base + 1];
+    values[17 + l] = words[base + 2];
+  }
+  String8 bytes = str8((U8*)values, sizeof(values));
+  U64 key = u64_hash_from_str8(bytes) ^ 0x7e5ca1ed5ca1ab1eull;
+  U64 check = qk_check_hash(bytes);
+  String8 name = qk_kernel_name(key, check);
+  GPU_Kernel* kernel = gpu_kernel_alloc_from_spirv_spec(name, str8_zero(), values, ArrayCount(values));
+  if (!kernel)
+  {
+    os_mutex_take(state->lock);
+    B32 tried = state->spec_spirv_tried;
+    state->spec_spirv_tried = 1;
+    os_mutex_drop(state->lock);
+    if (!tried)
+    {
+      state->spec_spirv = qk_library_spirv(state->arena, str8_lit("scan_spec"));
+    }
+    if (state->spec_spirv.size == 0)
+    {
+      return 0;
+    }
+    kernel = gpu_kernel_alloc_from_spirv_spec(name, state->spec_spirv, values, ArrayCount(values));
+    if (!kernel)
+    {
+      os_mutex_take(state->lock);
+      state->compile_failures += 1;
+      os_mutex_drop(state->lock);
+      return 0;
+    }
+    os_mutex_take(state->lock);
+    state->kernels_compiled += 1;
+    os_mutex_drop(state->lock);
+  }
+  if (out_name)
+  {
+    *out_name = name;
+  }
+  return kernel;
+}
+
 internal GPU_Kernel*
 qk_simple_kernel(Arena* arena, U32* words, String8* out_name)
 {
@@ -1700,6 +1829,10 @@ qk_simple_kernel(Arena* arena, U32* words, String8* out_name)
     return 0;
   }
   g_qk_state.kernels_requested += 1;
+  if (settings_u64(str8_lit("QE_SCAN_SPEC"), 0) != 0)
+  {
+    return qk_spec_kernel(arena, words, out_name);
+  }
   String8 source = {0};
   if (!qk_simple_source_build(arena, words, &source))
   {
@@ -2671,4 +2804,10 @@ qk_stats(U64* out_requested, U64* out_compiled, U64* out_failures, U64* out_comp
   *out_compiled = g_qk_state.kernels_compiled;
   *out_failures = g_qk_state.compile_failures;
   *out_compile_microseconds = g_qk_state.compile_microseconds;
+}
+
+internal U64
+qk_spec_request_count(void)
+{
+  return g_qk_state.spec_requests;
 }

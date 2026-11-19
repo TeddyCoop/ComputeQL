@@ -16,6 +16,8 @@ setlocal
 ::        run_paper_benchmarks.bat coldcost       the itemized cold cost of one process (shaderc, pipeline creation, the rest) at 5M, 20M and 100M rows, caches empty and filled
 ::        run_paper_benchmarks.bat sweepmore      the selectivity sweep with a warm-up query, and at 1M, 5M and 20M rows
 ::        run_paper_benchmarks.bat libmore        new shapes against library kernels at 5M and 100M rows
+::        run_paper_benchmarks.bat specialize     generated scan, fixed widths and specialization constants against the precompiled scan, and the single comparison gap
+::        run_paper_benchmarks.bat failure        failures of generation and name collisions on the 40 scan shapes (not on aggregation queries)
 ::        run_paper_benchmarks.bat families       the workloads with one generation switch off at a time
 ::
 :: every run that measures a cold execution starts with the engine's caches deleted and with the graphics driver's own pipeline cache switched off
@@ -34,6 +36,14 @@ set "only_coldcost=0"
 set "only_sweepmore=0"
 set "only_libmore=0"
 set "only_families=0"
+set "only_specialize=0"
+set "only_failure=0"
+if /i "%~1"=="specialize" (
+  set "only_specialize=1"
+)
+if /i "%~1"=="failure" (
+  set "only_failure=1"
+)
 if /i "%~1"=="overnight" (
   set "only_overnight=1"
 )
@@ -131,6 +141,16 @@ if "%only_overnight%"=="1" (
   call :sweepmore
   call :libmore
   call :families
+  goto :finish
+)
+
+if "%only_specialize%"=="1" (
+  call :specialize
+  goto :finish
+)
+
+if "%only_failure%"=="1" (
+  call :failure
   goto :finish
 )
 
@@ -498,6 +518,41 @@ for /l %%i in (1,1,3) do (
 )
 set "clear_caches=1"
 set "driver_cache=0"
+exit /b 0
+
+
+::~
+:: the steady and cold cost of the numeric conjunctions with the fused count off: generated scan, fixed widths in the source, specialization constants
+:specialize
+for %%n in (20000000 100000000) do (
+  for /l %%i in (1,1,3) do (
+    call :run spec sw_default_%%n_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=%%n --sweep --warmup --seed=%SEED% --setting=QE_SPIRV_DISK_CACHE:0,GPU_VULKAN_SHADER_INFO:1"
+    call :run spec2 sw_default_%%n_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=%%n --sweep --warmup --seed=%SEED% --setting=QE_SPIRV_DISK_CACHE:0,QE_FUSE_AGGREGATE:0,GPU_VULKAN_SHADER_INFO:1"
+    call :run spec2 sw_fixed_%%n_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=%%n --sweep --warmup --seed=%SEED% --setting=QE_SPIRV_DISK_CACHE:0,QE_FUSE_AGGREGATE:0,QE_GEN_FIXED_WIDTH:1,GPU_VULKAN_SHADER_INFO:1"
+    call :run spec2 sw_spec_%%n_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=%%n --sweep --warmup --seed=%SEED% --setting=QE_SPIRV_DISK_CACHE:0,QE_FUSE_AGGREGATE:0,QE_SCAN_SPEC:1,GPU_VULKAN_SHADER_INFO:1"
+  )
+)
+for /l %%i in (1,1,3) do (
+  call :run spec3 cold_default_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=20000000 --cold --seed=%SEED% --setting=QE_SPIRV_DISK_CACHE:0,QE_FUSE_AGGREGATE:0"
+  call :run spec3 cold_spec_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=20000000 --cold --seed=%SEED% --setting=QE_SPIRV_DISK_CACHE:0,QE_FUSE_AGGREGATE:0,QE_SCAN_SPEC:1"
+  call :run gap g_on_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=10000000 --sweep --warmup --seed=%SEED% --setting=QE_SPIRV_DISK_CACHE:0,GPU_VULKAN_SHADER_INFO:1"
+  call :run gap g_off_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=10000000 --sweep --warmup --seed=%SEED% --setting=QE_SPIRV_DISK_CACHE:0,QE_FUSE_AGGREGATE:0,GPU_VULKAN_SHADER_INFO:1"
+)
+exit /b 0
+
+
+::~
+:: failures of generation injected into the 40 scan shapes, and forced kernel name collisions with and without the second hash.
+:: aggregation queries are NOT run with these settings: QE_TEST_FAIL_SHADERC:1 on the 37 queries hung the GPU on "group by user (1M)" and crashed the machine
+:failure
+call :run failure base bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=2000000 --shapes=40 --seed=1 --setting=QE_SPIRV_DISK_CACHE:0"
+call :run failure shaderc bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=2000000 --shapes=40 --seed=1 --setting=QE_SPIRV_DISK_CACHE:0,QE_TEST_FAIL_SHADERC:1"
+call :run failure pipeline bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=2000000 --shapes=40 --seed=1 --setting=QE_SPIRV_DISK_CACHE:0,QE_TEST_FAIL_PIPELINE:1"
+call :run failure shaderc3 bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=2000000 --shapes=40 --seed=1 --setting=QE_SPIRV_DISK_CACHE:0,QE_TEST_FAIL_SHADERC:3"
+call :run failure pipeline3 bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=2000000 --shapes=40 --seed=1 --setting=QE_SPIRV_DISK_CACHE:0,QE_TEST_FAIL_PIPELINE:3"
+call :run failure collide_on bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=2000000 --shapes=40 --seed=1 --setting=QE_SPIRV_DISK_CACHE:0,QE_TEST_KEY_BITS:2"
+:: the next run is expected to exit with code 1, wrong counts are the result
+call :run failure collide_off bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=2000000 --shapes=40 --seed=1 --setting=QE_SPIRV_DISK_CACHE:0,QE_TEST_KEY_BITS:2,QE_COLLISION_CHECK:0"
 exit /b 0
 
 

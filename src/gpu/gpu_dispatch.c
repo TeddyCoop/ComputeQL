@@ -380,6 +380,15 @@ gpu_kernel_alloc_from_spirv(String8 name, String8 spirv)
   return kernel;
 }
 
+internal GPU_Kernel*
+gpu_kernel_alloc_from_spirv_spec(String8 name, String8 spirv, U32* spec_values, U32 spec_count)
+{
+  gpu_kernel_log_note(name);
+  GPU_Kernel* kernel = g_active_gpu_backend_reg->backend->kernel_alloc_from_spirv_spec(name, spirv, spec_values, spec_count);
+  gpu_kernel_set_missing_arg(kernel, 0);
+  return kernel;
+}
+
 internal void
 gpu_generated_kernel_stats(U64* out_compiles, U64* out_evictions)
 {

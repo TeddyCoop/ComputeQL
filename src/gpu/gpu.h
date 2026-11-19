@@ -128,6 +128,8 @@ internal void gpu_set_spirv_provider(GPU_SpirvProviderProc* provider);
 internal GPU_Kernel* gpu_kernel_alloc(String8 name);
 // tec: a kernel from SPIR-V made at run time. `name` identifies it in the cache and has to outlive the kernel log. an empty `spirv` only looks the name up. returns 0 if there is no such kernel or the pipeline can not be built
 internal GPU_Kernel* gpu_kernel_alloc_from_spirv(String8 name, String8 spirv);
+// tec: the same with specialization constants, value i is the constant with id i
+internal GPU_Kernel* gpu_kernel_alloc_from_spirv_spec(String8 name, String8 spirv, U32* spec_values, U32 spec_count);
 internal void gpu_generated_kernel_stats(U64* out_compiles, U64* out_evictions);
 internal void gpu_kernel_release(GPU_Kernel *kernel);
 internal void gpu_kernel_execute(GPU_Kernel* kernel, U32 global_work_size, U32 local_work_size);

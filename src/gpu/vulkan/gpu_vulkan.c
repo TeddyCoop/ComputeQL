@@ -2530,6 +2530,20 @@ gpu_vulkan_kernel_create(Arena* arena, String8 name, String8 spirv_bin, GPU_Vulk
     return 0;
   }
   
+  VkSpecializationMapEntry spec_entries[32];
+  VkSpecializationInfo spec_info = {0};
+  U32 spec_count = Min(g_vulkan_state->pending_spec_count, (U32)ArrayCount(spec_entries));
+  for (U32 i = 0; i < spec_count; i++)
+  {
+    spec_entries[i].constantID = i;
+    spec_entries[i].offset = i * sizeof(U32);
+    spec_entries[i].size = sizeof(U32);
+  }
+  spec_info.mapEntryCount = spec_count;
+  spec_info.pMapEntries = spec_entries;
+  spec_info.dataSize = spec_count * sizeof(U32);
+  spec_info.pData = g_vulkan_state->pending_spec_values;
+
   VkComputePipelineCreateInfo pipeline_info =
   {
     .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
@@ -2539,13 +2553,26 @@ gpu_vulkan_kernel_create(Arena* arena, String8 name, String8 spirv_bin, GPU_Vulk
       .stage = VK_SHADER_STAGE_COMPUTE_BIT,
       .module = shader,
       .pName = "main",
+      .pSpecializationInfo = spec_count > 0 ? &spec_info : 0,
     },
     .layout = g_vulkan_state->shared_pipeline_layout,
   };
   
   VkPipeline pipeline;
   U64 pipeline_begin_us = os_now_microseconds();
-  VkResult pipeline_result = vkCreateComputePipelines(g_vulkan_state->device, g_vulkan_state->pipeline_cache, 1, &pipeline_info, 0, &pipeline);
+  VkResult pipeline_result = VK_ERROR_INITIALIZATION_FAILED;
+  // tec: QE_TEST_FAIL_PIPELINE:N makes every Nth pipeline of a generated kernel fail, for the failure tests
+  B32 inject_failure = 0;
+  U64 inject_every = settings_u64(str8_lit("QE_TEST_FAIL_PIPELINE"), 0);
+  if (inject_every > 0 && name.size > 8 && MemoryCompare(name.str, "qk_scan_", 8) == 0)
+  {
+    g_vulkan_state->test_pipeline_count += 1;
+    inject_failure = (g_vulkan_state->test_pipeline_count % inject_every) == 0;
+  }
+  if (!inject_failure)
+  {
+    pipeline_result = vkCreateComputePipelines(g_vulkan_state->device, g_vulkan_state->pipeline_cache, 1, &pipeline_info, 0, &pipeline);
+  }
   g_vulkan_state->pipeline_create_us += os_now_microseconds() - pipeline_begin_us;
   g_vulkan_state->pipeline_create_count += 1;
   if (pipeline_result != VK_SUCCESS)
@@ -2595,6 +2622,19 @@ gpu_vulkan_kernel_alloc(String8 name)
 {
   os_mutex_take(g_vulkan_state->kernel_lock);
   GPU_Kernel* kernel = gpu_vulkan_kernel_alloc_locked(name);
+  os_mutex_drop(g_vulkan_state->kernel_lock);
+  return kernel;
+}
+
+internal GPU_Kernel*
+gpu_vulkan_kernel_alloc_from_spirv_spec(String8 name, String8 spirv, U32* spec_values, U32 spec_count)
+{
+  os_mutex_take(g_vulkan_state->kernel_lock);
+  spec_count = Min(spec_count, (U32)ArrayCount(g_vulkan_state->pending_spec_values));
+  MemoryCopy(g_vulkan_state->pending_spec_values, spec_values, spec_count * sizeof(U32));
+  g_vulkan_state->pending_spec_count = spec_count;
+  GPU_Kernel* kernel = gpu_vulkan_kernel_alloc_from_spirv_locked(name, spirv);
+  g_vulkan_state->pending_spec_count = 0;
   os_mutex_drop(g_vulkan_state->kernel_lock);
   return kernel;
 }
@@ -3114,6 +3154,7 @@ gpu_vulkan_get_backend(void)
   
   backend.kernel_alloc = gpu_vulkan_kernel_alloc;
   backend.kernel_alloc_from_spirv = gpu_vulkan_kernel_alloc_from_spirv;
+  backend.kernel_alloc_from_spirv_spec = gpu_vulkan_kernel_alloc_from_spirv_spec;
   backend.generated_kernel_stats = gpu_vulkan_generated_kernel_stats;
   backend.kernel_release = gpu_vulkan_kernel_release;
   backend.kernel_execute = gpu_vulkan_kernel_execute;

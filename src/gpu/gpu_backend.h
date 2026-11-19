@@ -39,6 +39,7 @@ struct GPU_Backend
   
   GPU_Kernel* (*kernel_alloc)(String8 name);
   GPU_Kernel* (*kernel_alloc_from_spirv)(String8 name, String8 spirv);
+  GPU_Kernel* (*kernel_alloc_from_spirv_spec)(String8 name, String8 spirv, U32* spec_values, U32 spec_count);
   void        (*generated_kernel_stats)(U64* out_compiles, U64* out_evictions);
   void        (*kernel_release)(GPU_Kernel* kernel);
   void        (*kernel_execute)(GPU_Kernel* kernel, U32 global_work_size, U32 local_work_size);

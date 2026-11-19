@@ -693,6 +693,11 @@ entry_point(CmdLine* cmdline)
   {
     U64 sweep_failures = 0;
     pc_run_sweep(arena, database, &data, report, row_count, &sweep_failures);
+    {
+      U64 requested = 0, compiled = 0, compile_failures = 0, compile_us = 0;
+      qk_stats(&requested, &compiled, &compile_failures, &compile_us);
+      printf("kernels requested %llu, compiled %llu, failed %llu, pipelines created %llu, specialized requests %llu\n", requested, compiled, compile_failures, g_vulkan_state->pipeline_create_count, qk_spec_request_count());
+    }
     if (sweep_failures > 0)
     {
       bench_report_warn(report, "%llu comparisons disagreed with the interpreter", sweep_failures);
@@ -948,6 +953,13 @@ entry_point(CmdLine* cmdline)
     bench_report_text(report, "median time the generated kernel saves per execution against the interpreter: %.3f ms", gain_median);
     printf("cold first run median %.3f ms (min %.3f, max %.3f), shaderc median %.3f ms, other literals median %.3f ms, saving per execution median %.3f ms\n",
            cold_median, cold_min, cold_max, shaderc_median, variant_median, gain_median);
+  }
+  {
+    U64 requested = 0, compiled = 0, compile_failures = 0, compile_us = 0;
+    qk_stats(&requested, &compiled, &compile_failures, &compile_us);
+    bench_report_section(report, "generator counters");
+    bench_report_text(report, "kernels requested %llu, compiled %llu, failed %llu, pipelines created %llu, specialized requests %llu", requested, compiled, compile_failures, g_vulkan_state->pipeline_create_count, qk_spec_request_count());
+    printf("kernels requested %llu, compiled %llu, failed %llu, pipelines created %llu, specialized requests %llu, shapes that disagreed with the interpreter %llu\n", requested, compiled, compile_failures, g_vulkan_state->pipeline_create_count, qk_spec_request_count(), failures);
   }
   if (failures > 0)
   {
