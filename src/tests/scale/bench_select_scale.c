@@ -823,6 +823,8 @@ entry_point(CmdLine* cmdline)
   B32 explain = cmd_line_has_flag(cmdline, str8_lit("explain"));
   B32 explain_cold = cmd_line_has_flag(cmdline, str8_lit("explain_cold"));
   B32 run_group_join = !cmd_line_has_flag(cmdline, str8_lit("no_group_join"));
+  // tec: --duckdb_only loads and queries duckdb's table without cql's, so the two engines never hold a copy of the table in one process
+  B32 duckdb_only = cmd_line_has_flag(cmdline, str8_lit("duckdb_only"));
   B32 run_duckdb_narrow = cmd_line_has_flag(cmdline, str8_lit("duckdb_narrow"));
   B32 run_duckdb_rewrite = cmd_line_has_flag(cmdline, str8_lit("duckdb_rewrite"));
   B32 duckdb_narrow_only = cmd_line_has_flag(cmdline, str8_lit("duckdb_narrow_only"));
@@ -928,13 +930,17 @@ entry_point(CmdLine* cmdline)
   cql_add_database(database);
   
   U64 load_start = os_now_microseconds();
-  ss_load_cql(database, row_count);
-  ss_load_dimensions_cql(database, row_count);
+  if (!duckdb_only)
+  {
+    ss_load_cql(database, row_count);
+    ss_load_dimensions_cql(database, row_count);
+  }
   
   // tec: what the first query on a column pays besides the copy to VRAM: reading the memory, building the zone map and the optimizer statistics. measured before duckdb loads its copy
   F64 touch_read_ms[SS_TOUCH_COLUMN_COUNT] = {0};
   F64 touch_zone_ms[SS_TOUCH_COLUMN_COUNT] = {0};
   F64 touch_stats_ms[SS_TOUCH_COLUMN_COUNT] = {0};
+  if (!duckdb_only)
   {
     CQL_Table* touch_table = cql_database_find_table(database, str8_lit("scale_events"));
     for (U64 c = 0; c < SS_TOUCH_COLUMN_COUNT; c++)
@@ -1189,6 +1195,10 @@ entry_point(CmdLine* cmdline)
       continue;
     }
     
+    Bench_ColdRun cql_cold = {0};
+    U64 cql_rows = 0, cql_checksum = 0;
+    if (!duckdb_only)
+    {
     // tec: the first run starts with nothing resident on the GPU, so it pays the whole copy. the timed runs after it find the chunks it left in VRAM
     // unless --cold, which empties the cache before every run too
     // tec: --explain_cold runs the query once under EXPLAIN ANALYZE with nothing resident first, to see where a first execution spends its time
@@ -1204,7 +1214,7 @@ entry_point(CmdLine* cmdline)
     qe_resident_clear();
     QE_ResidentStats resident_before = qe_resident_stats();
     gpu_kernel_log_reset();
-    Bench_ColdRun cql_cold = bench_cql_cold_run(database, sql, 1);
+    cql_cold = bench_cql_cold_run(database, sql, 1);
     F64 cold_ms = cql_cold.total_ms;
     SS_Result verified = ss_run_cql_once(database, sql);
     {
@@ -1221,7 +1231,6 @@ entry_point(CmdLine* cmdline)
       printf("FAIL %s\n", test_case->label);
     }
     
-    U64 cql_rows = 0, cql_checksum = 0;
     Bench_Stats cql_stats = bench_run_cql_query(database, sql, &cql_rows, &cql_checksum);
     bench_print_table_row(report, label, "cql", cql_rows, cql_checksum, &cql_stats);
     QE_ResidentStats resident_warm = qe_resident_stats();
@@ -1248,6 +1257,8 @@ entry_point(CmdLine* cmdline)
       bandwidth_samples[bandwidth_sample_count++] = (SS_BandwidthSample){ test_case->label, "cql", test_case->scan_bytes, cql_stats.execute_median };
     }
     
+    }
+    
     if (run_duckdb)
     {
       U64 rows = 0, checksum = 0;
@@ -1259,7 +1270,10 @@ entry_point(CmdLine* cmdline)
       {
         bandwidth_samples[bandwidth_sample_count++] = (SS_BandwidthSample){ test_case->label, "duckdb", test_case->scan_bytes, stats.execute_median };
       }
-      bench_check_match(report, label, "cql", cql_rows, cql_checksum, "duckdb", rows, checksum);
+      if (!duckdb_only)
+      {
+        bench_check_match(report, label, "cql", cql_rows, cql_checksum, "duckdb", rows, checksum);
+      }
     }
     
     // tec: the same query on a duckdb table with 1 and 2 byte columns. a query that reads neither of them is the same as the duckdb row above

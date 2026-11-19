@@ -18,6 +18,10 @@ setlocal
 ::        run_paper_benchmarks.bat libmore        new shapes against library kernels at 5M and 100M rows
 ::        run_paper_benchmarks.bat specialize     generated scan, fixed widths and specialization constants against the precompiled scan, and the single comparison gap
 ::        run_paper_benchmarks.bat datashapes     the 40 shapes with other selectivities, skew, clustering and outputs, and the row-number filter in four forms
+::        run_paper_benchmarks.bat fusedcount     COUNT(*) over numeric conjunctions, generated fused kernel against the precompiled fused count with specialization constants
+::        run_paper_benchmarks.bat steadyagain    the 40 shapes with a second steady measurement after the last shape
+::        run_paper_benchmarks.bat libtouch       new shapes against library kernels with the columns read first
+::        run_paper_benchmarks.bat duckdbsep      the one billion row scale test with cql and duckdb in separate processes
 ::        run_paper_benchmarks.bat failure        failures of generation and name collisions on the 40 scan shapes (not on aggregation queries)
 ::        run_paper_benchmarks.bat families       the workloads with one generation switch off at a time
 ::
@@ -39,6 +43,22 @@ set "only_libmore=0"
 set "only_families=0"
 set "only_specialize=0"
 set "only_failure=0"
+set "only_duckdbsep=0"
+if /i "%~1"=="duckdbsep" (
+  set "only_duckdbsep=1"
+)
+set "only_libtouch=0"
+if /i "%~1"=="libtouch" (
+  set "only_libtouch=1"
+)
+set "only_steadyagain=0"
+if /i "%~1"=="steadyagain" (
+  set "only_steadyagain=1"
+)
+set "only_fusedcount=0"
+if /i "%~1"=="fusedcount" (
+  set "only_fusedcount=1"
+)
 set "only_datashapes=0"
 if /i "%~1"=="datashapes" (
   set "only_datashapes=1"
@@ -151,6 +171,26 @@ if "%only_overnight%"=="1" (
 
 if "%only_specialize%"=="1" (
   call :specialize
+  goto :finish
+)
+
+if "%only_steadyagain%"=="1" (
+  call :steadyagain
+  goto :finish
+)
+
+if "%only_libtouch%"=="1" (
+  call :libtouch
+  goto :finish
+)
+
+if "%only_duckdbsep%"=="1" (
+  call :duckdbsep
+  goto :finish
+)
+
+if "%only_fusedcount%"=="1" (
+  call :fusedcount
   goto :finish
 )
 
@@ -547,6 +587,62 @@ for /l %%i in (1,1,3) do (
   call :run spec3 cold_spec_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=20000000 --cold --seed=%SEED% --setting=QE_SPIRV_DISK_CACHE:0,QE_FUSE_AGGREGATE:0,QE_SCAN_SPEC:1"
   call :run gap g_on_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=10000000 --sweep --warmup --seed=%SEED% --setting=QE_SPIRV_DISK_CACHE:0,GPU_VULKAN_SHADER_INFO:1"
   call :run gap g_off_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=10000000 --sweep --warmup --seed=%SEED% --setting=QE_SPIRV_DISK_CACHE:0,QE_FUSE_AGGREGATE:0,GPU_VULKAN_SHADER_INFO:1"
+)
+exit /b 0
+
+
+::~
+:: the 40 shapes, each measured a second time after the last shape (--resteady) with every kernel built, at 5M, 20M and 100M rows
+:steadyagain
+for %%n in (5000000 20000000 100000000) do (
+  for /l %%i in (1,1,3) do (
+    call :run steady again_%%n_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=%%n --shapes=40 --seed=%SEED% --resteady --setting=QE_SPIRV_DISK_CACHE:0"
+  )
+)
+exit /b 0
+
+
+::~
+:: new shapes against library kernels as in :libmore, with every column read once before the first shape (--touch), so that the upload of a column is not in the first run of the shape that uses it first
+:libtouch
+for %%n in (5000000 20000000 100000000) do (
+  for /l %%i in (1,1,3) do (
+    call :run libtouch_%%n lib_empty_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=%%n --shapes=40 --seed=%SEED% --lib --touch --setting=QE_SPIRV_DISK_CACHE:0"
+  )
+)
+for %%n in (5000000 20000000 100000000) do (
+  call :run libtouch_%%n lib_fill bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=%%n --shapes=40 --seed=%SEED% --lib --touch"
+  for /l %%i in (1,1,3) do (
+    call :run libtouch_%%n lib_filled_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=%%n --shapes=40 --seed=%SEED% --lib --touch"
+  )
+)
+exit /b 0
+
+
+::~
+:: the one billion row scale test with each engine in a process of its own, so neither holds the other's copy of the table in memory
+:duckdbsep
+for /l %%i in (1,1,2) do (
+  call :run sep1b cql_%%i bench_reports\select_scale_1000000000_report.md "bench_select_scale.exe --rows=1000000000 --samples --no_duckdb"
+  call :run sep1b duckdb_%%i bench_reports\select_scale_1000000000_report.md "bench_select_scale.exe --rows=1000000000 --samples --no_bandwidth --duckdb_only"
+)
+exit /b 0
+
+
+::~
+:: COUNT(*) over numeric conjunctions with the generated fused kernel against one precompiled fused count module with specialization constants (QE_FUSE_COUNT_SPEC:1), steady and first use
+:fusedcount
+for %%n in (20000000 100000000) do (
+  for /l %%i in (1,1,3) do (
+    call :run fcs sw_gen_%%n_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=%%n --sweep --warmup --seed=%SEED% --setting=QE_SPIRV_DISK_CACHE:0,GPU_VULKAN_SHADER_INFO:1"
+    call :run fcs sw_spec_%%n_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=%%n --sweep --warmup --seed=%SEED% --setting=QE_SPIRV_DISK_CACHE:0,QE_FUSE_COUNT_SPEC:1,GPU_VULKAN_SHADER_INFO:1"
+    call :run fcs id_gen_%%n_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=%%n --idrange --seed=%SEED% --setting=QE_SPIRV_DISK_CACHE:0"
+    call :run fcs id_spec_%%n_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=%%n --idrange --seed=%SEED% --setting=QE_SPIRV_DISK_CACHE:0,QE_FUSE_COUNT_SPEC:1"
+  )
+)
+for /l %%i in (1,1,3) do (
+  call :run fcs cold_gen_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=20000000 --cold --seed=%SEED% --setting=QE_SPIRV_DISK_CACHE:0"
+  call :run fcs cold_spec_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=20000000 --cold --seed=%SEED% --setting=QE_SPIRV_DISK_CACHE:0,QE_FUSE_COUNT_SPEC:1"
 )
 exit /b 0
 

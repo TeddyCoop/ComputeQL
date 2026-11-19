@@ -346,6 +346,10 @@ pc_steady(CQL_Database* database, String8 sql, U64* out_rows, U64* out_checksum)
 #define PC_SWEEP_STEPS 6
 // tec: --warmup runs one throwaway shape on each of the three paths before the sweep, so the first literal is not the first query of the process
 global B32 g_pc_warmup = 0;
+// tec: --touch makes a --lib run read every column once before the first shape, so the upload of the columns is not in the first run of the shape that happens to use a column first. the generated runs have the columns resident by then, the interpreter and the precompiled path run before them
+global B32 g_pc_touch = 0;
+// tec: --resteady measures the interpreter, the precompiled path and the generated kernel of every shape a second time after the last shape, with every kernel built
+global B32 g_pc_resteady = 0;
 global F64 g_pc_sweep_target[PC_SWEEP_STEPS] = { 0.001, 0.01, 0.05, 0.1, 0.25, 0.5 };
 // tec: the selectivity of one comparison that makes k independent comparisons joined by AND pass the target together (the k-th root of the target), and for the OR of two, half of it
 global F64 g_pc_sweep_and2[PC_SWEEP_STEPS] = { 0.0316, 0.1, 0.2236, 0.3162, 0.5, 0.7071 };
@@ -711,6 +715,8 @@ entry_point(CmdLine* cmdline)
     g_pc_fraction = f64_from_str8(cmd_line_string(cmdline, str8_lit("fraction")));
   }
   g_pc_warmup = cmd_line_has_flag(cmdline, str8_lit("warmup"));
+  g_pc_touch = cmd_line_has_flag(cmdline, str8_lit("touch"));
+  g_pc_resteady = cmd_line_has_flag(cmdline, str8_lit("resteady"));
   if (idrange)
   {
     shape_count = 1;
@@ -769,7 +775,7 @@ entry_point(CmdLine* cmdline)
     {
       U64 requested = 0, compiled = 0, compile_failures = 0, compile_us = 0;
       qk_stats(&requested, &compiled, &compile_failures, &compile_us);
-      printf("kernels requested %llu, compiled %llu, failed %llu, pipelines created %llu, specialized requests %llu\n", requested, compiled, compile_failures, g_vulkan_state->pipeline_create_count, qk_spec_request_count());
+      printf("kernels requested %llu, compiled %llu, failed %llu, pipelines created %llu, specialized requests %llu\n", requested, compiled, compile_failures, g_vulkan_state->pipeline_create_count, qk_spec_request_count() + qk_count_spec_request_count());
     }
     if (sweep_failures > 0)
     {
@@ -818,6 +824,16 @@ entry_point(CmdLine* cmdline)
     bench_report_cellf(report, "second run (ms)");
   }
   bench_report_table_header_end(report);
+  }
+
+  if (lib && g_pc_touch)
+  {
+    settings_load_from_string(str8_lit("QE_PERQUERY_KERNELS:0"));
+    settings_load_from_string(str8_lit("QE_SCAN_SIMPLE_KERNEL:1"));
+    U64 touch_rows = 0, touch_checksum = 0;
+    F64 touch_ms = pc_run_once(database, str8_lit("SELECT COUNT(*) FROM pq WHERE id < 0 AND a < 0 AND b < -2147483647 AND c < 0 AND d < -1.0 AND e < -1.0;"), &touch_rows, &touch_checksum);
+    printf("touch of every column %8.3f ms\n", touch_ms);
+    bench_report_text(report, "touch of every column before the first shape: %.3f ms", touch_ms);
   }
 
   Bench_Rng rng = { seed };
@@ -992,6 +1008,39 @@ entry_point(CmdLine* cmdline)
       measured += 1;
     }
   }
+  if (g_pc_resteady && !lib)
+  {
+    bench_report_section(report, "second steady measurement of every shape, after the last shape (%llu rows)", row_count);
+    bench_report_row_begin(report);
+    bench_report_cellf(report, "shape");
+    bench_report_cellf(report, "interpreter (ms)");
+    bench_report_cellf(report, "precompiled (ms)");
+    bench_report_cellf(report, "generated steady (ms)");
+    bench_report_table_header_end(report);
+    Bench_Rng rng2 = { seed };
+    for (U64 s2 = 0; s2 < shape_count; s2++)
+    {
+      PC_Shape shape2 = pc_random_shape(&rng2);
+      String8 where2 = pc_where(arena, &shape2, 0);
+      String8 sql2 = push_str8f(arena, "SELECT %s FROM pq WHERE %.*s;", g_pc_select, str8_varg(where2));
+      U64 r2_rows = 0, r2_checksum = 0;
+      settings_load_from_string(str8_lit("QE_PERQUERY_KERNELS:0"));
+      settings_load_from_string(str8_lit("QE_SCAN_SIMPLE_KERNEL:0"));
+      F64 interp2 = pc_steady(database, sql2, &r2_rows, &r2_checksum);
+      settings_load_from_string(str8_lit("QE_SCAN_SIMPLE_KERNEL:1"));
+      F64 pre2 = pc_steady(database, sql2, &r2_rows, &r2_checksum);
+      settings_load_from_string(str8_lit("QE_PERQUERY_KERNELS:2"));
+      F64 gen2 = pc_steady(database, sql2, &r2_rows, &r2_checksum);
+      printf("again shape %2llu  interpreter %8.3f ms  precompiled %8.3f ms  generated %8.3f ms\n", s2, interp2, pre2, gen2);
+      fflush(stdout);
+      bench_report_row_begin(report);
+      bench_report_cellf(report, "%llu", s2);
+      bench_report_cellf(report, "%.3f", interp2);
+      bench_report_cellf(report, "%.3f", pre2);
+      bench_report_cellf(report, "%.3f", gen2);
+      bench_report_row_end(report);
+    }
+  }
   settings_load_from_string(str8_lit("QE_ROUTE_CONJUNCTIONS:0"));
   settings_load_from_string(str8_lit("QE_PERQUERY_KERNELS:0"));
   settings_load_from_string(str8_lit("QE_SCAN_SIMPLE_KERNEL:1"));
@@ -1031,7 +1080,7 @@ entry_point(CmdLine* cmdline)
     U64 requested = 0, compiled = 0, compile_failures = 0, compile_us = 0;
     qk_stats(&requested, &compiled, &compile_failures, &compile_us);
     bench_report_section(report, "generator counters");
-    bench_report_text(report, "kernels requested %llu, compiled %llu, failed %llu, pipelines created %llu, specialized requests %llu", requested, compiled, compile_failures, g_vulkan_state->pipeline_create_count, qk_spec_request_count());
+    bench_report_text(report, "kernels requested %llu, compiled %llu, failed %llu, pipelines created %llu, specialized requests %llu", requested, compiled, compile_failures, g_vulkan_state->pipeline_create_count, qk_spec_request_count() + qk_count_spec_request_count());
     printf("kernels requested %llu, compiled %llu, failed %llu, pipelines created %llu, specialized requests %llu, shapes that disagreed with the interpreter %llu\n", requested, compiled, compile_failures, g_vulkan_state->pipeline_create_count, qk_spec_request_count(), failures);
   }
   if (failures > 0)

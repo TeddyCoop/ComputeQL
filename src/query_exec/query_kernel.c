@@ -1821,6 +1821,72 @@ qk_spec_kernel(Arena* arena, U32* words, String8* out_name)
   return kernel;
 }
 
+// tec: QE_FUSE_COUNT_SPEC, COUNT(*) over a numeric conjunction on one precompiled module, fused_count_spec.comp, the comparisons are specialization constants and the literals are read from a buffer
+internal GPU_Kernel*
+qk_fused_count_spec_kernel(U32 leaf_count, U32* slots, U32* types, U32* ops, String8* out_name)
+{
+  QK_State* state = &g_qk_state;
+  if (leaf_count == 0 || leaf_count > 8)
+  {
+    return 0;
+  }
+  U32 values[25] = {0};
+  state->count_spec_requests += 1;
+  values[0] = leaf_count;
+  for (U32 l = 0; l < leaf_count; l++)
+  {
+    if (slots[l] >= QE_MAX_COLUMN_BINDINGS)
+    {
+      return 0;
+    }
+    values[1 + l] = slots[l];
+    values[9 + l] = types[l];
+    values[17 + l] = ops[l];
+  }
+  String8 bytes = str8((U8*)values, sizeof(values));
+  U64 key = u64_hash_from_str8(bytes) ^ 0x0c0a7c0a7c0a7c0aull;
+  U64 check = qk_check_hash(bytes);
+  String8 name = qk_kernel_name(key, check);
+  GPU_Kernel* kernel = gpu_kernel_alloc_from_spirv_spec(name, str8_zero(), values, ArrayCount(values));
+  if (!kernel)
+  {
+    os_mutex_take(state->lock);
+    B32 tried = state->count_spec_spirv_tried;
+    state->count_spec_spirv_tried = 1;
+    os_mutex_drop(state->lock);
+    if (!tried)
+    {
+      state->count_spec_spirv = qk_library_spirv(state->arena, str8_lit("fused_count_spec"));
+    }
+    if (state->count_spec_spirv.size == 0)
+    {
+      return 0;
+    }
+    kernel = gpu_kernel_alloc_from_spirv_spec(name, state->count_spec_spirv, values, ArrayCount(values));
+    if (!kernel)
+    {
+      os_mutex_take(state->lock);
+      state->compile_failures += 1;
+      os_mutex_drop(state->lock);
+      return 0;
+    }
+    os_mutex_take(state->lock);
+    state->kernels_compiled += 1;
+    os_mutex_drop(state->lock);
+  }
+  if (out_name)
+  {
+    *out_name = name;
+  }
+  return kernel;
+}
+
+internal U64
+qk_count_spec_request_count(void)
+{
+  return g_qk_state.count_spec_requests;
+}
+
 internal GPU_Kernel*
 qk_simple_kernel(Arena* arena, U32* words, String8* out_name)
 {

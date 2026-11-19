@@ -10018,14 +10018,62 @@ qe_fused_filter_aggregate(Arena* arena, CQL_Database* database, CQL_Table* table
   }
 
   String8 kernel_name = {0};
-  GPU_Kernel* kernel = qk_fused_aggregate_kernel(arena, prog, &fuse, &kernel_name);
+  GPU_Kernel* kernel = 0;
+  U32 count_spec_words[16] = {0};
+  B32 count_spec = 0;
+  // tec: QE_FUSE_COUNT_SPEC:1, a COUNT(*) over a conjunction of numeric comparisons runs on one precompiled module and no source is generated
+  if (agg_column_count == 0 && settings_u64(str8_lit("QE_FUSE_COUNT_SPEC"), 0) != 0 && qk_compiler_available())
+  {
+    QE_CpuScanLeaf count_leaves[QE_CPU_SCAN_MAX_LEAVES] = {0};
+    U32 count_leaf_count = 0;
+    if (qe_cpu_scan_collect_leaves(table, where_clause, count_leaves, &count_leaf_count) && count_leaf_count <= 8)
+    {
+      U32 leaf_slots[8] = {0};
+      U32 leaf_types[8] = {0};
+      U32 leaf_ops[8] = {0};
+      B32 covered = 1;
+      for (U32 l = 0; l < count_leaf_count && covered; l++)
+      {
+        QE_ColumnBinding* leaf_binding = 0;
+        for (U32 b = 0; b < prog->binding_count; b++)
+        {
+          if (prog->bindings[b].column == count_leaves[l].column)
+          {
+            leaf_binding = &prog->bindings[b];
+            break;
+          }
+        }
+        CQL_ColumnType leaf_type = count_leaves[l].column->type;
+        B32 shader_type = leaf_type == CQL_ColumnType_U32 || leaf_type == CQL_ColumnType_I32 || leaf_type == CQL_ColumnType_F32 || leaf_type == CQL_ColumnType_F64 || leaf_type == CQL_ColumnType_U64;
+        if (!shader_type || !leaf_binding || leaf_binding->use_dict_codes || leaf_binding->type != leaf_type)
+        {
+          covered = 0;
+          break;
+        }
+        leaf_slots[l] = leaf_binding->first_slot;
+        leaf_types[l] = (U32)leaf_type;
+        leaf_ops[l] = count_leaves[l].op;
+        F64 leaf_target = count_leaves[l].target;
+        MemoryCopy(&count_spec_words[l * 2], &leaf_target, sizeof(F64));
+      }
+      if (covered)
+      {
+        kernel = qk_fused_count_spec_kernel(count_leaf_count, leaf_slots, leaf_types, leaf_ops, &kernel_name);
+        count_spec = kernel != 0;
+      }
+    }
+  }
+  if (!kernel)
+  {
+    kernel = qk_fused_aggregate_kernel(arena, prog, &fuse, &kernel_name);
+  }
   if (!kernel)
   {
     ProfEnd();
     return 0;
   }
 
-  U64 const_words = prog->const_count * 2;
+  U64 const_words = count_spec ? 16 : prog->const_count * 2;
   GPU_Buffer* filler_buffer = gpu_buffer_alloc_pooled(str8_lit("fused_agg_filler"), 16, GPU_BufferFlag_Write, 0);
   GPU_Buffer* num_consts_buffer = gpu_buffer_alloc_pooled(str8_lit("fused_agg_num_consts"), Max(const_words, (U64)1) * sizeof(U32), GPU_BufferFlag_Write, 0);
   GPU_Buffer* str_consts_buffer = gpu_buffer_alloc_pooled(str8_lit("fused_agg_str_consts"), Max(prog->str_const_pool_size, (U64)4), GPU_BufferFlag_Write, 0);
@@ -10043,7 +10091,7 @@ qe_fused_filter_aggregate(Arena* arena, CQL_Database* database, CQL_Table* table
     GPU_Batch* batch = gpu_batch_begin(const_words * sizeof(U32) + prog->str_const_pool_size, 0);
     if (const_words > 0)
     {
-      gpu_batch_buffer_write(batch, num_consts_buffer, prog->consts, const_words * sizeof(U32));
+      gpu_batch_buffer_write(batch, num_consts_buffer, count_spec ? (void*)count_spec_words : (void*)prog->consts, const_words * sizeof(U32));
     }
     if (prog->str_const_pool_size > 0)
     {

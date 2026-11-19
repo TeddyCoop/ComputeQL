@@ -1,0 +1,170 @@
+#version 450
+#extension GL_ARB_gpu_shader_fp64 : enable
+
+// tec: a count of the rows that pass a conjunction of numeric comparisons, with the comparisons given as specialization constants, so one SPIR-V module serves every conjunction and no per query source exists.
+// the bindings and push constants are those of the fused kernel that query_kernel.c generates for COUNT(*): partials per workgroup in binding 3, the literals of the comparisons as 2 words each in binding 1, whole columns from binding 6, the row count in word 0 and the number of workgroups in word 12.
+// constant ids: 0 the number of comparisons, 1..8 the column slots, 9..16 the column types, 17..24 the operators
+
+layout(local_size_x = 256) in;
+
+#define COLTYPE_U32 1
+#define COLTYPE_U64 2
+#define COLTYPE_F32 3
+#define COLTYPE_F64 4
+#define COLTYPE_I32 7
+
+#define CMP_EQ 0u
+#define CMP_LT 1u
+#define CMP_LE 2u
+#define CMP_GT 3u
+#define CMP_GE 4u
+
+layout(std430, binding = 1) readonly buffer NumConstsBuf { uint num_consts[]; };
+layout(std430, binding = 3) buffer PartialsBuf { double partials[]; };
+
+layout(std430, binding = 6)  readonly buffer ColBuf6  { uint col_data6[]; };
+layout(std430, binding = 7)  readonly buffer ColBuf7  { uint col_data7[]; };
+layout(std430, binding = 8)  readonly buffer ColBuf8  { uint col_data8[]; };
+layout(std430, binding = 9)  readonly buffer ColBuf9  { uint col_data9[]; };
+layout(std430, binding = 10) readonly buffer ColBuf10 { uint col_data10[]; };
+layout(std430, binding = 11) readonly buffer ColBuf11 { uint col_data11[]; };
+layout(std430, binding = 12) readonly buffer ColBuf12 { uint col_data12[]; };
+layout(std430, binding = 13) readonly buffer ColBuf13 { uint col_data13[]; };
+layout(std430, binding = 14) readonly buffer ColBuf14 { uint col_data14[]; };
+layout(std430, binding = 15) readonly buffer ColBuf15 { uint col_data15[]; };
+
+layout(constant_id = 0) const uint SPEC_LEAVES = 0u;
+layout(constant_id = 1) const uint SPEC_SLOT0 = 0u;
+layout(constant_id = 2) const uint SPEC_SLOT1 = 0u;
+layout(constant_id = 3) const uint SPEC_SLOT2 = 0u;
+layout(constant_id = 4) const uint SPEC_SLOT3 = 0u;
+layout(constant_id = 5) const uint SPEC_SLOT4 = 0u;
+layout(constant_id = 6) const uint SPEC_SLOT5 = 0u;
+layout(constant_id = 7) const uint SPEC_SLOT6 = 0u;
+layout(constant_id = 8) const uint SPEC_SLOT7 = 0u;
+layout(constant_id = 9) const uint SPEC_TYPE0 = 0u;
+layout(constant_id = 10) const uint SPEC_TYPE1 = 0u;
+layout(constant_id = 11) const uint SPEC_TYPE2 = 0u;
+layout(constant_id = 12) const uint SPEC_TYPE3 = 0u;
+layout(constant_id = 13) const uint SPEC_TYPE4 = 0u;
+layout(constant_id = 14) const uint SPEC_TYPE5 = 0u;
+layout(constant_id = 15) const uint SPEC_TYPE6 = 0u;
+layout(constant_id = 16) const uint SPEC_TYPE7 = 0u;
+layout(constant_id = 17) const uint SPEC_OP0 = 0u;
+layout(constant_id = 18) const uint SPEC_OP1 = 0u;
+layout(constant_id = 19) const uint SPEC_OP2 = 0u;
+layout(constant_id = 20) const uint SPEC_OP3 = 0u;
+layout(constant_id = 21) const uint SPEC_OP4 = 0u;
+layout(constant_id = 22) const uint SPEC_OP5 = 0u;
+layout(constant_id = 23) const uint SPEC_OP6 = 0u;
+layout(constant_id = 24) const uint SPEC_OP7 = 0u;
+
+layout(push_constant) uniform PushConstants
+{
+  uint words[16];
+} pc;
+
+shared double sh_reduce[256];
+
+uint
+read_col_word(uint slot, uint word_index)
+{
+  switch (slot)
+  {
+    case 0u: return col_data6[word_index];
+    case 1u: return col_data7[word_index];
+    case 2u: return col_data8[word_index];
+    case 3u: return col_data9[word_index];
+    case 4u: return col_data10[word_index];
+    case 5u: return col_data11[word_index];
+    case 6u: return col_data12[word_index];
+    case 7u: return col_data13[word_index];
+    case 8u: return col_data14[word_index];
+    case 9u: return col_data15[word_index];
+  }
+  return 0u;
+}
+
+// tec: the same values the generated loaders read, widened to double
+double
+load_value(uint slot, uint coltype, uint row)
+{
+  if (coltype == COLTYPE_F64)
+  {
+    return packDouble2x32(uvec2(read_col_word(slot, row * 2u), read_col_word(slot, row * 2u + 1u)));
+  }
+  if (coltype == COLTYPE_U64)
+  {
+    uint lo = read_col_word(slot, row * 2u);
+    uint hi = read_col_word(slot, row * 2u + 1u);
+    double unsigned_value = double(hi) * 4294967296.0LF + double(lo);
+    return ((hi & 0x80000000u) != 0u) ? unsigned_value - 18446744073709551616.0LF : unsigned_value;
+  }
+  uint word = read_col_word(slot, row);
+  if (coltype == COLTYPE_U32)
+  {
+    return double(word);
+  }
+  else if (coltype == COLTYPE_I32)
+  {
+    return double(int(word));
+  }
+  return double(uintBitsToFloat(word));
+}
+
+bool
+compare(uint op, double value, double target)
+{
+  if (op == CMP_EQ)      { return value == target; }
+  else if (op == CMP_LT) { return value < target; }
+  else if (op == CMP_LE) { return value <= target; }
+  else if (op == CMP_GT) { return value > target; }
+  return value >= target;
+}
+
+bool
+leaf_passes(uint l, uint slot, uint coltype, uint op, uint row)
+{
+  double target = packDouble2x32(uvec2(num_consts[l * 2u], num_consts[l * 2u + 1u]));
+  return compare(op, load_value(slot, coltype, row), target);
+}
+
+void
+main()
+{
+  uint row_count = pc.words[0];
+  uint group_count = pc.words[12];
+  uint tid = gl_LocalInvocationIndex;
+  uint stride = group_count * 256u;
+  double cnt = 0.0LF;
+  for (uint row = gl_GlobalInvocationID.x; row < row_count; row += stride)
+  {
+    bool pass = true;
+    if (0u < SPEC_LEAVES && pass) { pass = leaf_passes(0u, SPEC_SLOT0, SPEC_TYPE0, SPEC_OP0, row); }
+    if (1u < SPEC_LEAVES && pass) { pass = leaf_passes(1u, SPEC_SLOT1, SPEC_TYPE1, SPEC_OP1, row); }
+    if (2u < SPEC_LEAVES && pass) { pass = leaf_passes(2u, SPEC_SLOT2, SPEC_TYPE2, SPEC_OP2, row); }
+    if (3u < SPEC_LEAVES && pass) { pass = leaf_passes(3u, SPEC_SLOT3, SPEC_TYPE3, SPEC_OP3, row); }
+    if (4u < SPEC_LEAVES && pass) { pass = leaf_passes(4u, SPEC_SLOT4, SPEC_TYPE4, SPEC_OP4, row); }
+    if (5u < SPEC_LEAVES && pass) { pass = leaf_passes(5u, SPEC_SLOT5, SPEC_TYPE5, SPEC_OP5, row); }
+    if (6u < SPEC_LEAVES && pass) { pass = leaf_passes(6u, SPEC_SLOT6, SPEC_TYPE6, SPEC_OP6, row); }
+    if (7u < SPEC_LEAVES && pass) { pass = leaf_passes(7u, SPEC_SLOT7, SPEC_TYPE7, SPEC_OP7, row); }
+    if (pass)
+    {
+      cnt += 1.0LF;
+    }
+  }
+  sh_reduce[tid] = cnt;
+  barrier();
+  for (uint step = 128u; step > 0u; step >>= 1u)
+  {
+    if (tid < step)
+    {
+      sh_reduce[tid] += sh_reduce[tid + step];
+    }
+    barrier();
+  }
+  if (tid == 0u)
+  {
+    partials[gl_WorkGroupID.x] = sh_reduce[0];
+  }
+}
