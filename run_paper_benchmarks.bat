@@ -17,6 +17,7 @@ setlocal
 ::        run_paper_benchmarks.bat sweepmore      the selectivity sweep with a warm-up query, and at 1M, 5M and 20M rows
 ::        run_paper_benchmarks.bat libmore        new shapes against library kernels at 5M and 100M rows
 ::        run_paper_benchmarks.bat specialize     generated scan, fixed widths and specialization constants against the precompiled scan, and the single comparison gap
+::        run_paper_benchmarks.bat datashapes     the 40 shapes with other selectivities, skew, clustering and outputs, and the row-number filter in four forms
 ::        run_paper_benchmarks.bat failure        failures of generation and name collisions on the 40 scan shapes (not on aggregation queries)
 ::        run_paper_benchmarks.bat families       the workloads with one generation switch off at a time
 ::
@@ -38,6 +39,10 @@ set "only_libmore=0"
 set "only_families=0"
 set "only_specialize=0"
 set "only_failure=0"
+set "only_datashapes=0"
+if /i "%~1"=="datashapes" (
+  set "only_datashapes=1"
+)
 if /i "%~1"=="specialize" (
   set "only_specialize=1"
 )
@@ -146,6 +151,11 @@ if "%only_overnight%"=="1" (
 
 if "%only_specialize%"=="1" (
   call :specialize
+  goto :finish
+)
+
+if "%only_datashapes%"=="1" (
+  call :datashapes
   goto :finish
 )
 
@@ -537,6 +547,53 @@ for /l %%i in (1,1,3) do (
   call :run spec3 cold_spec_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=20000000 --cold --seed=%SEED% --setting=QE_SPIRV_DISK_CACHE:0,QE_FUSE_AGGREGATE:0,QE_SCAN_SPEC:1"
   call :run gap g_on_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=10000000 --sweep --warmup --seed=%SEED% --setting=QE_SPIRV_DISK_CACHE:0,GPU_VULKAN_SHADER_INFO:1"
   call :run gap g_off_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=10000000 --sweep --warmup --seed=%SEED% --setting=QE_SPIRV_DISK_CACHE:0,QE_FUSE_AGGREGATE:0,GPU_VULKAN_SHADER_INFO:1"
+)
+exit /b 0
+
+
+::~
+:: the 40 shapes at 20M rows with other selectivities (--fraction), skewed and clustered data and other select lists, and the row-number filter with generation in four forms.
+:: the ISA sizes of Table D9 are not made by this script: they come from amdllpc.exe --gfxip=gfx1031 --auto-layout-desc -filetype=asm on the .spv files of build\shaders\cache
+:datashapes
+for %%f in (0.001 0.01 0.1) do (
+  for /l %%i in (1,1,3) do (
+    call :run frac f%%f_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=20000000 --shapes=40 --seed=%SEED% --fraction=%%f --setting=QE_SPIRV_DISK_CACHE:0"
+  )
+)
+for /l %%i in (1,1,3) do (
+  call :run data skew3_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=20000000 --shapes=40 --seed=%SEED% --skew=3 --setting=QE_SPIRV_DISK_CACHE:0"
+)
+for /l %%i in (1,1,3) do (
+  call :run data cluster_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=20000000 --shapes=40 --seed=%SEED% --cluster --setting=QE_SPIRV_DISK_CACHE:0"
+)
+for /l %%i in (1,1,3) do (
+  call :run data sum_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=20000000 --shapes=40 --seed=%SEED% --select=SUM(e) --setting=QE_SPIRV_DISK_CACHE:0"
+)
+for /l %%i in (1,1,3) do (
+  call :run data wide_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=20000000 --shapes=40 --seed=%SEED% --select=id,a,e --setting=QE_SPIRV_DISK_CACHE:0"
+)
+for /l %%i in (1,1,3) do (
+  call :run data minmax_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=20000000 --shapes=40 --seed=%SEED% --select=MIN(a),MAX(e),SUM(d) --setting=QE_SPIRV_DISK_CACHE:0"
+)
+for %%n in (20000000 100000000) do (
+  for /l %%i in (1,1,3) do (
+    call :run idr fused_%%n_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=%%n --idrange --seed=%SEED% --setting=QE_SPIRV_DISK_CACHE:0"
+  )
+)
+for %%n in (20000000 100000000) do (
+  for /l %%i in (1,1,3) do (
+    call :run idr off_%%n_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=%%n --idrange --seed=%SEED% --setting=QE_SPIRV_DISK_CACHE:0,QE_FUSE_AGGREGATE:0"
+  )
+)
+for %%n in (20000000 100000000) do (
+  for /l %%i in (1,1,3) do (
+    call :run idr fixed_%%n_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=%%n --idrange --seed=%SEED% --setting=QE_SPIRV_DISK_CACHE:0,QE_FUSE_AGGREGATE:0,QE_GEN_FIXED_WIDTH:1"
+  )
+)
+for %%n in (20000000 100000000) do (
+  for /l %%i in (1,1,3) do (
+    call :run idr spec_%%n_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=%%n --idrange --seed=%SEED% --setting=QE_SPIRV_DISK_CACHE:0,QE_FUSE_AGGREGATE:0,QE_SCAN_SPEC:1"
+  )
 )
 exit /b 0
 

@@ -54,6 +54,11 @@
 
 global char* g_pc_column_names[PC_COLUMN_COUNT] = { "a", "b", "c", "d", "e" };
 
+// tec: --skew=S and --cluster change the data of the table, --select=LIST the select list of the shape queries
+global F64 g_pc_skew = 1.0;
+global B32 g_pc_cluster = 0;
+global char g_pc_select[128] = "id";
+
 typedef struct PC_Table PC_Table;
 struct PC_Table
 {
@@ -106,6 +111,25 @@ pc_load_table(Arena* arena, CQL_Database* database, PC_Table* data, U64 row_coun
     data->c[row] = r1 % 1000000000000ULL;
     data->d[row] = (F32)((r1 >> 40) % 1000u) / 1000.0f;
     data->e[row] = (F64)(r2 % 100000u) / 100.0;
+    if (g_pc_skew != 1.0)
+    {
+      // tec: --skew=S, each value is the S-th power of its uniform draw within the same range, so values pile up at the low end for S above 1
+      F64 ua = (F64)(r0 % 2000000u) / 2000000.0;
+      F64 ub = (F64)(U32)(r0 >> 32) / 4294967296.0;
+      F64 uc = (F64)(r1 % 1000000000000ULL) / 1000000000000.0;
+      F64 ud = (F64)((r1 >> 40) % 1000u) / 1000.0;
+      F64 ue = (F64)(r2 % 100000u) / 100000.0;
+      data->a[row] = (U32)(2000000.0 * pow(ua, g_pc_skew));
+      data->b[row] = (S32)(4294967296.0 * pow(ub, g_pc_skew) - 2147483648.0);
+      data->c[row] = (U64)(1000000000000.0 * pow(uc, g_pc_skew));
+      data->d[row] = (F32)pow(ud, g_pc_skew);
+      data->e[row] = 1000.0 * pow(ue, g_pc_skew);
+    }
+    if (g_pc_cluster)
+    {
+      // tec: --cluster, column a is in row order, so a zone map can skip the chunks that a comparison on a cannot match
+      data->a[row] = (U32)((U64)row * 2000000u / row_count);
+    }
     if (strings)
     {
       U64 w = (r2 >> 20) % ArrayCount(g_bench_words);
@@ -121,12 +145,47 @@ pc_load_table(Arena* arena, CQL_Database* database, PC_Table* data, U64 row_coun
   table->row_count = row_count;
 }
 
+// tec: --fraction=F, the share of the rows that one leaf passes, 0.001 keeps the literals of the first version of the study
+global F64 g_pc_fraction = 0.001;
+
 // tec: a leaf passes about 0.1% of the rows, so a tree of ORs stays small and the output does not dominate the time. the literal moves with the variant, the shape does not
 internal String8
 pc_leaf(Arena* arena, U32 column, B32 upper, B32 inclusive, U64 variant)
 {
   char* op = upper ? (inclusive ? ">=" : ">") : (inclusive ? "<=" : "<");
   U64 step = variant * 7;
+  if (g_pc_fraction != 0.001)
+  {
+    F64 f = g_pc_fraction;
+    switch (column)
+    {
+      case 0:
+      {
+        F64 value = upper ? 2000000.0 * (1.0 - f) - (F64)step : 2000000.0 * f + (F64)step;
+        return push_str8f(arena, "a %s %llu", op, (U64)value);
+      }
+      case 1:
+      {
+        F64 value = upper ? 2147483648.0 - 4294967296.0 * f - (F64)step * 1000.0 : -2147483648.0 + 4294967296.0 * f + (F64)step * 1000.0;
+        return push_str8f(arena, "b %s %lld", op, (S64)value);
+      }
+      case 2:
+      {
+        F64 value = upper ? 1000000000000.0 * (1.0 - f) - (F64)step * 1000.0 : 1000000000000.0 * f + (F64)step * 1000.0;
+        return push_str8f(arena, "c %s %llu", op, (U64)value);
+      }
+      case 3:
+      {
+        F64 value = upper ? (1.0 - f) - (F64)step / 100000.0 : f + (F64)step / 100000.0;
+        return push_str8f(arena, "d %s %.5f", op, value);
+      }
+      default:
+      {
+        F64 value = upper ? 1000.0 * (1.0 - f) - (F64)step / 100.0 : 1000.0 * f + (F64)step / 100.0;
+        return push_str8f(arena, "e %s %.2f", op, value);
+      }
+    }
+  }
   switch (column)
   {
     case 0:
@@ -637,6 +696,20 @@ entry_point(CmdLine* cmdline)
   B32 sweep = cmd_line_has_flag(cmdline, str8_lit("sweep"));
   B32 lib = cmd_line_has_flag(cmdline, str8_lit("lib"));
   B32 cold = cmd_line_has_flag(cmdline, str8_lit("cold"));
+  if (cmd_line_has_flag(cmdline, str8_lit("skew")))
+  {
+    g_pc_skew = f64_from_str8(cmd_line_string(cmdline, str8_lit("skew")));
+  }
+  g_pc_cluster = cmd_line_has_flag(cmdline, str8_lit("cluster"));
+  if (cmd_line_has_flag(cmdline, str8_lit("select")))
+  {
+    String8 select_list = cmd_line_string(cmdline, str8_lit("select"));
+    snprintf(g_pc_select, sizeof(g_pc_select), "%.*s", (int)Min(select_list.size, (U64)100), select_list.str);
+  }
+  if (cmd_line_has_flag(cmdline, str8_lit("fraction")))
+  {
+    g_pc_fraction = f64_from_str8(cmd_line_string(cmdline, str8_lit("fraction")));
+  }
   g_pc_warmup = cmd_line_has_flag(cmdline, str8_lit("warmup"));
   if (idrange)
   {
@@ -761,9 +834,9 @@ entry_point(CmdLine* cmdline)
   {
     PC_Shape shape = pc_random_shape(&rng);
     String8 where = pc_where(arena, &shape, 0);
-    String8 sql = push_str8f(arena, "SELECT id FROM pq WHERE %.*s;", str8_varg(where));
+    String8 sql = push_str8f(arena, "SELECT %s FROM pq WHERE %.*s;", g_pc_select, str8_varg(where));
     String8 variant_where = pc_where(arena, &shape, 5);
-    String8 variant_sql = push_str8f(arena, "SELECT id FROM pq WHERE %.*s;", str8_varg(variant_where));
+    String8 variant_sql = push_str8f(arena, "SELECT %s FROM pq WHERE %.*s;", g_pc_select, str8_varg(variant_where));
     if (idrange)
     {
       where = str8_lit("id > 1000 AND id <= 900000000");
