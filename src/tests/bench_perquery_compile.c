@@ -361,6 +361,8 @@ global B32 g_pc_warmup = 0;
 global B32 g_pc_touch = 0;
 // tec: --resteady measures the interpreter, the precompiled path and the generated kernel of every shape a second time after the last shape, with every kernel built
 global B32 g_pc_resteady = 0;
+// tec: --treespec measures every shape on scan_filter_spec.comp (QE_SCAN_FILTER_SPEC), the interpreter's program as specialization constants, against the interpreter and the generated kernel
+global B32 g_pc_treespec = 0;
 global F64 g_pc_sweep_target[PC_SWEEP_STEPS] = { 0.001, 0.01, 0.05, 0.1, 0.25, 0.5 };
 // tec: the selectivity of one comparison that makes k independent comparisons joined by AND pass the target together (the k-th root of the target), and for the OR of two, half of it
 global F64 g_pc_sweep_and2[PC_SWEEP_STEPS] = { 0.0316, 0.1, 0.2236, 0.3162, 0.5, 0.7071 };
@@ -502,6 +504,8 @@ pc_run_sweep(Arena* arena, CQL_Database* database, PC_Table* data, Bench_Report*
     pc_steady(database, warm_sql, &warm_rows, &warm_checksum);
   }
 
+  F64 spec_first[16] = {0};
+  F64 spec_steady[16][PC_SWEEP_STEPS] = {0};
   for (U32 sh = 0; sh < shape_count; sh++)
   {
     PC_SweepShape* shape = &shapes[sh];
@@ -570,6 +574,28 @@ pc_run_sweep(Arena* arena, CQL_Database* database, PC_Table* data, Bench_Report*
     settings_load_from_string(str8_lit("QE_PERQUERY_KERNELS:0"));
     settings_load_from_string(str8_lit("QE_SCAN_SIMPLE_KERNEL:1"));
 
+    if (g_pc_treespec)
+    {
+      settings_load_from_string(str8_lit("QE_SCAN_SIMPLE_KERNEL:0"));
+      settings_load_from_string(str8_lit("QE_SCAN_FILTER_SPEC:1"));
+      for (U32 step = 0; step < shape->where_count; step++)
+      {
+        U64 rows = 0, checksum = 0;
+        if (step == 0)
+        {
+          spec_first[sh] = pc_run_once(database, sql[step], &rows, &checksum);
+        }
+        spec_steady[sh][step] = pc_steady(database, sql[step], &rows, &checksum);
+        if (g_pc_last_value != counts[step] || checksum != checksums[step])
+        {
+          *failures += 1;
+          bench_report_warn(report, "%s: specialized %llu rows checksum %llu differs from the interpreter (%llu, %llu)", shape->label, rows, checksum, counts[step], checksums[step]);
+        }
+      }
+      settings_load_from_string(str8_lit("QE_SCAN_FILTER_SPEC:0"));
+      settings_load_from_string(str8_lit("QE_SCAN_SIMPLE_KERNEL:1"));
+    }
+
     for (U32 step = 0; step < shape->where_count; step++)
     {
       F64 selectivity = 100.0 * (F64)counts[step] / (F64)row_count;
@@ -594,6 +620,32 @@ pc_run_sweep(Arena* arena, CQL_Database* database, PC_Table* data, Bench_Report*
       bench_report_cellf(report, "%.*s", str8_varg(shape->where[step]));
       bench_report_row_end(report);
     }
+  }
+  if (g_pc_treespec)
+  {
+    bench_report_section(report, "sweep on the specialized interpreter (%llu rows)", row_count);
+    bench_report_row_begin(report);
+    bench_report_cellf(report, "group");
+    bench_report_cellf(report, "shape");
+    bench_report_cellf(report, "target (%)");
+    bench_report_cellf(report, "spec first run (ms)");
+    bench_report_cellf(report, "spec steady (ms)");
+    bench_report_table_header_end(report);
+    for (U32 sh = 0; sh < shape_count; sh++)
+    {
+      for (U32 step = 0; step < shapes[sh].where_count; step++)
+      {
+        bench_report_row_begin(report);
+        bench_report_cellf(report, "%s", shapes[sh].group);
+        bench_report_cellf(report, "%s", shapes[sh].label);
+        bench_report_cellf(report, "%.1f", 100.0 * shapes[sh].target[step]);
+        bench_report_cellf(report, "%.3f", step == 0 ? spec_first[sh] : 0.0);
+        bench_report_cellf(report, "%.3f", spec_steady[sh][step]);
+        bench_report_row_end(report);
+        printf("spec: %-40s step %u  first %8.3f  steady %8.3f ms\n", shapes[sh].label, step, step == 0 ? spec_first[sh] : 0.0, spec_steady[sh][step]);
+      }
+    }
+    fflush(stdout);
   }
 }
 
@@ -729,6 +781,7 @@ entry_point(CmdLine* cmdline)
   g_pc_touch = cmd_line_has_flag(cmdline, str8_lit("touch"));
   g_pc_spinwarm = cmd_line_has_flag(cmdline, str8_lit("spinwarm"));
   g_pc_resteady = cmd_line_has_flag(cmdline, str8_lit("resteady"));
+  g_pc_treespec = cmd_line_has_flag(cmdline, str8_lit("treespec"));
   if (idrange)
   {
     shape_count = 1;
@@ -1050,6 +1103,55 @@ entry_point(CmdLine* cmdline)
       bench_report_cellf(report, "%.3f", interp2);
       bench_report_cellf(report, "%.3f", pre2);
       bench_report_cellf(report, "%.3f", gen2);
+      bench_report_row_end(report);
+    }
+  }
+  if (g_pc_treespec && !lib)
+  {
+    bench_report_section(report, "interpreter on specialization constants (%llu rows)", row_count);
+    bench_report_row_begin(report);
+    bench_report_cellf(report, "shape");
+    bench_report_cellf(report, "interpreter (ms)");
+    bench_report_cellf(report, "precompiled (ms)");
+    bench_report_cellf(report, "generated (ms)");
+    bench_report_cellf(report, "spec first run (ms)");
+    bench_report_cellf(report, "spec steady (ms)");
+    bench_report_table_header_end(report);
+    Bench_Rng rng3 = { seed };
+    for (U64 s3 = 0; s3 < shape_count; s3++)
+    {
+      PC_Shape shape3 = pc_random_shape(&rng3);
+      String8 where3 = pc_where(arena, &shape3, 0);
+      String8 sql3 = push_str8f(arena, "SELECT %s FROM pq WHERE %.*s;", g_pc_select, str8_varg(where3));
+      U64 i_rows = 0, i_checksum = 0, s_rows = 0, s_checksum = 0;
+      settings_load_from_string(str8_lit("QE_SCAN_FILTER_SPEC:0"));
+      settings_load_from_string(str8_lit("QE_PERQUERY_KERNELS:0"));
+      settings_load_from_string(str8_lit("QE_SCAN_SIMPLE_KERNEL:0"));
+      F64 interp3 = pc_steady(database, sql3, &i_rows, &i_checksum);
+      settings_load_from_string(str8_lit("QE_SCAN_SIMPLE_KERNEL:1"));
+      F64 pre3 = pc_steady(database, sql3, &s_rows, &s_checksum);
+      settings_load_from_string(str8_lit("QE_PERQUERY_KERNELS:2"));
+      F64 gen3 = pc_steady(database, sql3, &s_rows, &s_checksum);
+      settings_load_from_string(str8_lit("QE_PERQUERY_KERNELS:0"));
+      settings_load_from_string(str8_lit("QE_SCAN_SIMPLE_KERNEL:0"));
+      settings_load_from_string(str8_lit("QE_SCAN_FILTER_SPEC:1"));
+      F64 first3 = pc_run_once(database, sql3, &s_rows, &s_checksum);
+      F64 spec3 = pc_steady(database, sql3, &s_rows, &s_checksum);
+      settings_load_from_string(str8_lit("QE_SCAN_FILTER_SPEC:0"));
+      if (s_rows != i_rows || s_checksum != i_checksum)
+      {
+        failures += 1;
+        printf("treespec shape %llu DISAGREES: interpreter %llu rows checksum %llx, spec %llu rows checksum %llx\n", s3, i_rows, i_checksum, s_rows, s_checksum);
+      }
+      printf("treespec shape %2llu  interpreter %8.3f  precompiled %8.3f  generated %8.3f  spec first %8.3f  spec steady %8.3f ms\n", s3, interp3, pre3, gen3, first3, spec3);
+      fflush(stdout);
+      bench_report_row_begin(report);
+      bench_report_cellf(report, "%llu", s3);
+      bench_report_cellf(report, "%.3f", interp3);
+      bench_report_cellf(report, "%.3f", pre3);
+      bench_report_cellf(report, "%.3f", gen3);
+      bench_report_cellf(report, "%.3f", first3);
+      bench_report_cellf(report, "%.3f", spec3);
       bench_report_row_end(report);
     }
   }

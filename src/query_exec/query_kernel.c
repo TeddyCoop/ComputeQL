@@ -1881,6 +1881,136 @@ qk_fused_count_spec_kernel(U32 leaf_count, U32* slots, U32* types, U32* ops, Str
   return kernel;
 }
 
+// tec: QE_SCAN_FILTER_SPEC, an AND/OR tree of up to 8 numeric or string comparisons on one precompiled module, scan_filter_spec.comp. the bytecode is read back into leaves and postfix tokens, which become the specialization constants, the literals stay in the buffers of the interpreter
+internal GPU_Kernel*
+qk_filter_spec_kernel(U32* words, U32 word_count, String8* out_name)
+{
+  QK_State* state = &g_qk_state;
+  U32 values[27] = {0};
+  U32 leaf_count = 0;
+  U32 token_count = 0;
+  U32 tokens = 0;
+  U32 depth = 0;
+  U32 ip = 0;
+  while (ip < word_count)
+  {
+    U32 opcode = words[ip++];
+    U32 kind = 0, a_slot = 0, a_type = 0, a_op = 0, b = 0, c = 0;
+    B32 leaf = 0;
+    if (opcode == QE_Opcode_PushTrue || opcode == QE_Opcode_PushFalse)
+    {
+      kind = opcode == QE_Opcode_PushTrue ? 9 : 10;
+      leaf = 1;
+    }
+    else if (opcode == QE_Opcode_LoadNumCol && ip + 3 < word_count + 0 && words[ip + 1] == QE_Opcode_PushConst && words[ip + 3] >= QE_Opcode_CmpEq && words[ip + 3] <= QE_Opcode_CmpGe)
+    {
+      a_slot = words[ip] & 0xffu;
+      a_type = (words[ip] >> 8) & 0xffu;
+      b = words[ip + 2];
+      a_op = words[ip + 3];
+      kind = 1;
+      ip += 4;
+      leaf = 1;
+    }
+    else if (opcode == QE_Opcode_PushConst && ip + 3 < word_count + 0 && words[ip + 1] == QE_Opcode_LoadNumCol && words[ip + 3] >= QE_Opcode_CmpEq && words[ip + 3] <= QE_Opcode_CmpGe)
+    {
+      // tec: literal on the left, the comparison is mirrored
+      a_slot = words[ip + 2] & 0xffu;
+      a_type = (words[ip + 2] >> 8) & 0xffu;
+      b = words[ip];
+      U32 cmp = words[ip + 3];
+      a_op = cmp == QE_Opcode_CmpLt ? QE_Opcode_CmpGt : cmp == QE_Opcode_CmpGt ? QE_Opcode_CmpLt : cmp == QE_Opcode_CmpLe ? QE_Opcode_CmpGe : cmp == QE_Opcode_CmpGe ? QE_Opcode_CmpLe : cmp;
+      kind = 1;
+      ip += 4;
+      leaf = 1;
+    }
+    else if ((opcode == QE_Opcode_StrEq || opcode == QE_Opcode_StrNe || opcode == QE_Opcode_StrContains || (opcode >= QE_Opcode_StrLt && opcode <= QE_Opcode_StrGe)) && ip + 2 < word_count + 0)
+    {
+      a_slot = words[ip] & 0xffu;
+      b = words[ip + 1];
+      c = words[ip + 2];
+      kind = opcode == QE_Opcode_StrEq ? 2 : opcode == QE_Opcode_StrNe ? 3 : opcode == QE_Opcode_StrContains ? 4 : 5 + (opcode - QE_Opcode_StrLt);
+      ip += 3;
+      leaf = 1;
+    }
+    if (leaf)
+    {
+      if (leaf_count >= 8 || token_count >= 15 || a_slot >= QE_MAX_COLUMN_BINDINGS)
+      {
+        return 0;
+      }
+      values[1 + 3 * leaf_count + 0] = kind | (a_slot << 8) | (a_type << 16) | (a_op << 24);
+      values[1 + 3 * leaf_count + 1] = b;
+      values[1 + 3 * leaf_count + 2] = c;
+      leaf_count += 1;
+      tokens |= 1u << (2 * token_count);
+      token_count += 1;
+      depth += 1;
+    }
+    else if (opcode == QE_Opcode_And || opcode == QE_Opcode_Or)
+    {
+      if (depth < 2 || token_count >= 15)
+      {
+        return 0;
+      }
+      tokens |= (opcode == QE_Opcode_And ? 2u : 3u) << (2 * token_count);
+      token_count += 1;
+      depth -= 1;
+    }
+    else if (opcode == QE_Opcode_Halt)
+    {
+      break;
+    }
+    else
+    {
+      return 0;
+    }
+  }
+  if (leaf_count == 0 || depth != 1)
+  {
+    return 0;
+  }
+  values[0] = leaf_count;
+  values[25] = tokens;
+  values[26] = token_count;
+  String8 bytes = str8((U8*)values, sizeof(values));
+  U64 key = u64_hash_from_str8(bytes) ^ 0x5fc1f17e25bec000ull;
+  U64 check = qk_check_hash(bytes);
+  String8 name = qk_kernel_name(key, check);
+  GPU_Kernel* kernel = gpu_kernel_alloc_from_spirv_spec(name, str8_zero(), values, ArrayCount(values));
+  if (!kernel)
+  {
+    os_mutex_take(state->lock);
+    B32 tried = state->filter_spec_spirv_tried;
+    state->filter_spec_spirv_tried = 1;
+    os_mutex_drop(state->lock);
+    if (!tried)
+    {
+      state->filter_spec_spirv = qk_library_spirv(state->arena, str8_lit("scan_filter_spec"));
+    }
+    if (state->filter_spec_spirv.size == 0)
+    {
+      return 0;
+    }
+    kernel = gpu_kernel_alloc_from_spirv_spec(name, state->filter_spec_spirv, values, ArrayCount(values));
+    if (!kernel)
+    {
+      os_mutex_take(state->lock);
+      state->compile_failures += 1;
+      os_mutex_drop(state->lock);
+      return 0;
+    }
+    os_mutex_take(state->lock);
+    state->kernels_compiled += 1;
+    os_mutex_drop(state->lock);
+  }
+  if (out_name)
+  {
+    *out_name = name;
+  }
+  return kernel;
+}
+
 internal U64
 qk_count_spec_request_count(void)
 {

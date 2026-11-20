@@ -25,6 +25,7 @@ setlocal
 ::        run_paper_benchmarks.bat spinwarm       the steady measurements again with a 300 ms busy warm-up before the timed runs
 ::        run_paper_benchmarks.bat spinspec       fusion off, fixed width and scan specialization with the busy warm-up
 ::        run_paper_benchmarks.bat spinshapes     the other selectivities, skewed and clustered data and select lists with the busy warm-up
+::        run_paper_benchmarks.bat treespec       the interpreter with the WHERE clause as specialization constants (QE_SCAN_FILTER_SPEC:1) against the interpreter and generation
 ::        run_paper_benchmarks.bat failure        failures of generation and name collisions on the 40 scan shapes (not on aggregation queries)
 ::        run_paper_benchmarks.bat families       the workloads with one generation switch off at a time
 ::
@@ -49,6 +50,10 @@ set "only_failure=0"
 set "only_spinshapes=0"
 if /i "%~1"=="spinshapes" (
   set "only_spinshapes=1"
+)
+set "only_treespec=0"
+if /i "%~1"=="treespec" (
+  set "only_treespec=1"
 )
 set "only_spinspec=0"
 if /i "%~1"=="spinspec" (
@@ -201,6 +206,11 @@ if "%only_libtouch%"=="1" (
 
 if "%only_duckdbsep%"=="1" (
   call :duckdbsep
+  goto :finish
+)
+
+if "%only_treespec%"=="1" (
+  call :treespec
   goto :finish
 )
 
@@ -742,6 +752,20 @@ for /l %%i in (1,1,3) do (
 )
 for /l %%i in (1,1,3) do (
   call :run spin_data minmax_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=20000000 --shapes=40 --seed=%SEED% --select=MIN(a),MAX(e),SUM(d) --spinwarm --setting=QE_SPIRV_DISK_CACHE:0"
+)
+exit /b 0
+
+
+::~
+:: the interpreter with the WHERE clause as specialization constants, the 40 shapes at three sizes and the sweep, with the busy warm-up
+:treespec
+for %%n in (5000000 20000000 100000000) do (
+  for /l %%i in (1,1,3) do (
+    call :run spin_tree shapes_%%n_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=%%n --shapes=40 --seed=%SEED% --treespec --spinwarm --setting=QE_SPIRV_DISK_CACHE:0"
+  )
+)
+for /l %%i in (1,1,3) do (
+  call :run spin_tree sweep_20000000_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=20000000 --sweep --warmup --treespec --spinwarm --seed=%SEED% --setting=QE_SPIRV_DISK_CACHE:0"
 )
 exit /b 0
 

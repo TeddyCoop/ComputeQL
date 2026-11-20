@@ -2565,6 +2565,7 @@ qe_scan_filter_selected(Arena* arena, CQL_Database* database, CQL_Table* table, 
   GPU_Kernel* kernel = 0;
   String8 generated_name = {0};
   B32 use_generated = 0;
+  B32 use_filter_spec = 0;
   QK_HybridInfo hybrid_info = {0};
   if (qk_enabled(table->row_count))
   {
@@ -2631,6 +2632,12 @@ qe_scan_filter_selected(Arena* arena, CQL_Database* database, CQL_Table* table, 
     ProfEnd();
     return qe_cpu_scan_filter(arena, table, where_clause, out_trace);
   }
+  // tec: QE_SCAN_FILTER_SPEC:1, the interpreter's program as specialization constants on one precompiled module
+  if (!kernel && !prog->has_score_output && settings_u64(str8_lit("QE_SCAN_FILTER_SPEC"), 0) != 0 && qk_compiler_available())
+  {
+    kernel = qk_filter_spec_kernel(prog->words, prog->word_count, &generated_name);
+    use_filter_spec = kernel != 0;
+  }
   if (!kernel)
   {
     kernel = gpu_kernel_alloc(str8_lit("scan_filter"));
@@ -2648,6 +2655,10 @@ qe_scan_filter_selected(Arena* arena, CQL_Database* database, CQL_Table* table, 
   if (out_trace && use_generated)
   {
     out_trace->strategy_reason = push_str8f(arena, "per query kernel %.*s", str8_varg(generated_name));
+  }
+  if (out_trace && use_filter_spec)
+  {
+    out_trace->strategy_reason = push_str8f(arena, "interpreter on specialization constants %.*s", str8_varg(generated_name));
   }
   if (out_trace && use_typed)
   {
