@@ -27,6 +27,7 @@ setlocal
 ::        run_paper_benchmarks.bat spinshapes     the other selectivities, skewed and clustered data and select lists with the busy warm-up
 ::        run_paper_benchmarks.bat treespec       the interpreter with the WHERE clause as specialization constants (QE_SCAN_FILTER_SPEC:1) against the interpreter and generation
 ::        run_paper_benchmarks.bat spinmore       the sweep at other sizes and the specialized module with a warm driver cache, with the busy warm-up
+::        run_paper_benchmarks.bat treerows8      the 40 shapes and the sweep on the specialized module with 8 rows per thread (scan_filter_spec8.comp, --specvariant=2)
 ::        run_paper_benchmarks.bat treegap        the 40 shapes with generated kernels that evaluate every leaf (QE_GEN_NO_SHORT_CIRCUIT:1) next to the specialized module
 ::        run_paper_benchmarks.bat failure        failures of generation and name collisions on the 40 scan shapes (not on aggregation queries)
 ::        run_paper_benchmarks.bat families       the workloads with one generation switch off at a time
@@ -56,6 +57,14 @@ if /i "%~1"=="spinshapes" (
 set "only_spinmore=0"
 if /i "%~1"=="spinmore" (
   set "only_spinmore=1"
+)
+set "only_treerows8=0"
+if /i "%~1"=="treerows8" (
+  set "only_treerows8=1"
+)
+set "only_treerows8x=0"
+if /i "%~1"=="treerows8x" (
+  set "only_treerows8x=1"
 )
 set "only_treegap=0"
 if /i "%~1"=="treegap" (
@@ -221,6 +230,16 @@ if "%only_duckdbsep%"=="1" (
 
 if "%only_spinmore%"=="1" (
   call :spinmore
+  goto :finish
+)
+
+if "%only_treerows8%"=="1" (
+  call :treerows8
+  goto :finish
+)
+
+if "%only_treerows8x%"=="1" (
+  call :treerows8x
   goto :finish
 )
 
@@ -772,6 +791,34 @@ for /l %%i in (1,1,3) do (
 )
 for /l %%i in (1,1,3) do (
   call :run spin_data minmax_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=20000000 --shapes=40 --seed=%SEED% --select=MIN(a),MAX(e),SUM(d) --spinwarm --setting=QE_SPIRV_DISK_CACHE:0"
+)
+exit /b 0
+
+
+::~
+:: the specialized module on the layout of scan_simple, 8 rows per thread, the 40 shapes at three sizes and the sweep, with the busy warm-up
+:treerows8
+for %%n in (5000000 20000000 100000000) do (
+  for /l %%i in (1,1,3) do (
+    call :run spin_tree8 shapes_%%n_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=%%n --shapes=40 --seed=%SEED% --treespec --specvariant=2 --spinwarm --setting=QE_SPIRV_DISK_CACHE:0"
+  )
+)
+for /l %%i in (1,1,3) do (
+  call :run spin_tree8 sweep_20000000_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=20000000 --sweep --warmup --treespec --specvariant=2 --spinwarm --seed=%SEED% --setting=QE_SPIRV_DISK_CACHE:0"
+)
+exit /b 0
+
+
+::~
+:: the same with the early exit of a thread whose rows are all decided (QE_SCAN_FILTER_SPEC:3)
+:treerows8x
+for %%n in (5000000 20000000 100000000) do (
+  for /l %%i in (1,1,3) do (
+    call :run spin_tree8x shapes_%%n_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=%%n --shapes=40 --seed=%SEED% --treespec --specvariant=3 --spinwarm --setting=QE_SPIRV_DISK_CACHE:0"
+  )
+)
+for /l %%i in (1,1,3) do (
+  call :run spin_tree8x sweep_20000000_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=20000000 --sweep --warmup --treespec --specvariant=3 --spinwarm --seed=%SEED% --setting=QE_SPIRV_DISK_CACHE:0"
 )
 exit /b 0
 

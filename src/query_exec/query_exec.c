@@ -2053,6 +2053,8 @@ struct QE_StreamedScanParams
   GPU_Kernel* kernel;
   GPU_Buffer* filler_buffer;
   B32 use_simple;
+  // tec: the kernel takes QE_SIMPLE_SCAN_ROWS_PER_THREAD rows per thread without being scan_simple
+  B32 use_rows8;
   // tec: the comparisons of a scan_simple condition, as uploaded, and how many words they are. their column types can take the narrow encoding
   U32* simple_words;
   U64 simple_word_count;
@@ -2154,7 +2156,7 @@ qe_stream_slot_dispatch(GPU_Stream* stream, U32 slot_index, QE_StreamSlot* slot,
 {
   qe_stream_slot_bind(slot, params, chunk_rows);
   gpu_stream_zero(stream, slot_index, slot->counter, 2 * sizeof(U32));
-  U64 threads = params->use_simple ? (chunk_rows + QE_SIMPLE_SCAN_ROWS_PER_THREAD - 1) / QE_SIMPLE_SCAN_ROWS_PER_THREAD : chunk_rows;
+  U64 threads = params->use_simple || params->use_rows8 ? (chunk_rows + QE_SIMPLE_SCAN_ROWS_PER_THREAD - 1) / QE_SIMPLE_SCAN_ROWS_PER_THREAD : chunk_rows;
   gpu_stream_dispatch(stream, slot_index, params->kernel, (U32)threads, QE_GPU_WORKGROUP_SIZE);
   gpu_stream_read(stream, slot_index, slot->counter, slot->counter_words, sizeof(slot->counter_words));
   if (slot->speculative_rows > 0)
@@ -2566,6 +2568,7 @@ qe_scan_filter_selected(Arena* arena, CQL_Database* database, CQL_Table* table, 
   String8 generated_name = {0};
   B32 use_generated = 0;
   B32 use_filter_spec = 0;
+  B32 use_rows8 = 0;
   QK_HybridInfo hybrid_info = {0};
   if (qk_enabled(table->row_count))
   {
@@ -2633,10 +2636,13 @@ qe_scan_filter_selected(Arena* arena, CQL_Database* database, CQL_Table* table, 
     return qe_cpu_scan_filter(arena, table, where_clause, out_trace);
   }
   // tec: QE_SCAN_FILTER_SPEC:1, the interpreter's program as specialization constants on one precompiled module
-  if (!kernel && !prog->has_score_output && settings_u64(str8_lit("QE_SCAN_FILTER_SPEC"), 0) != 0 && qk_compiler_available())
+  // tec: QE_SCAN_FILTER_SPEC:2 and 3 are the same tree on 8 rows per thread, 3 with an early exit, which needs zone map chunks of at least 8 rows like scan_simple
+  U64 filter_spec_setting = settings_u64(str8_lit("QE_SCAN_FILTER_SPEC"), 0);
+  if (!kernel && !prog->has_score_output && filter_spec_setting != 0 && qk_compiler_available() && (filter_spec_setting < 2 || g_cql_state->zonemap_chunk_rows >= QE_SIMPLE_SCAN_ROWS_PER_THREAD))
   {
-    kernel = qk_filter_spec_kernel(prog->words, prog->word_count, &generated_name);
+    kernel = qk_filter_spec_kernel(prog->words, prog->word_count, (U32)filter_spec_setting, &generated_name);
     use_filter_spec = kernel != 0;
+    use_rows8 = use_filter_spec && filter_spec_setting >= 2;
   }
   if (!kernel)
   {
@@ -2798,6 +2804,7 @@ qe_scan_filter_selected(Arena* arena, CQL_Database* database, CQL_Table* table, 
     stream_params.kernel = kernel;
     stream_params.filler_buffer = bytecode_buffer;
     stream_params.use_simple = use_simple;
+    stream_params.use_rows8 = use_rows8;
     stream_params.simple_words = use_simple ? simple_words : 0;
     stream_params.wide_slot_mask = hybrid_info.is_hybrid ? hybrid_info.wide_slot_mask : 0;
     stream_params.simple_leaves = simple_leaves;
@@ -3117,7 +3124,7 @@ qe_scan_filter_selected(Arena* arena, CQL_Database* database, CQL_Table* table, 
       U64 submit_wait_start = os_now_microseconds();
       GPU_Batch* dispatch_batch = gpu_batch_begin(0, sizeof(result_count32) + speculative_rows * 2 * sizeof(U32));
       gpu_batch_buffer_zero(dispatch_batch, result_counter_buffer, 2 * sizeof(U32));
-      U64 dispatch_threads = use_simple ? (chunk_rows + QE_SIMPLE_SCAN_ROWS_PER_THREAD - 1) / QE_SIMPLE_SCAN_ROWS_PER_THREAD : chunk_rows;
+      U64 dispatch_threads = use_simple || use_rows8 ? (chunk_rows + QE_SIMPLE_SCAN_ROWS_PER_THREAD - 1) / QE_SIMPLE_SCAN_ROWS_PER_THREAD : chunk_rows;
       gpu_batch_kernel_execute(dispatch_batch, kernel, (U32)dispatch_threads, QE_GPU_WORKGROUP_SIZE);
       gpu_batch_buffer_read(dispatch_batch, result_counter_buffer, result_count32, sizeof(result_count32));
       if (speculative_rows > 0)

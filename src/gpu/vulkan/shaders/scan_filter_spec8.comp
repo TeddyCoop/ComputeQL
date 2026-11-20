@@ -1,0 +1,510 @@
+#version 450
+#extension GL_ARB_gpu_shader_fp64 : enable
+
+// tec: scan_filter_spec.comp with the layout of scan_simple.comp: one thread takes 8 rows, reads numeric columns with 16 byte loads and keeps the result of a leaf as a mask of 8 bits, so AND and OR are bitwise on masks.
+// it tests whether the gap of the specialized tree module to the generated conjunctions is the layout. the columns are read at full width, no narrow encoding. QE_SCAN_FILTER_SPEC:2
+// scan_filter.comp with the WHERE clause given as specialization constants instead of a bytecode buffer, one precompiled module for AND/OR trees of up to 8 numeric or string leaves.
+// constant id 0 is the leaf count, leaf k has three words at ids 1+3k..3+3k and ids 25 and 26 are the postfix token word and the token count.
+// leaf word A: kind | slot << 8 | column type << 16 | comparison << 24 (kind 1 numeric, 2 string equal, 3 string not equal, 4 contains, 5 less, 6 greater, 7 less or equal, 8 greater or equal, 9 true, 10 false),
+// B: constant index (numeric) or string constant word offset, C: string constant length in bytes. the numeric literals and the string constants stay in bindings 1 and 2.
+// tokens are two bits each, from the lowest: 1 push the next leaf, 2 and, 3 or. the leaf helpers are those of scan_filter.comp, keep them in step
+//
+// NOTE: binding layout/opcode values MUST stay in sync with query_exec.h
+
+layout(local_size_x = 256) in;
+
+#define OP_PUSH_TRUE     0
+#define OP_LOAD_NUM_COL  1
+#define OP_PUSH_CONST    2
+#define OP_CMP_EQ        3
+#define OP_CMP_NE        4
+#define OP_CMP_LT        5
+#define OP_CMP_GT        6
+#define OP_CMP_LE        7
+#define OP_CMP_GE        8
+#define OP_AND           9
+#define OP_OR            10
+#define OP_STR_EQ        11
+#define OP_STR_CONTAINS  12
+#define OP_HALT          13
+#define OP_PUSH_FALSE    14
+#define OP_TRIGRAM_SIM   15
+#define OP_EDIT_DISTANCE 16
+#define OP_STR_NE        17
+#define OP_STR_LT        18
+#define OP_STR_GT        19
+#define OP_STR_LE        20
+#define OP_STR_GE        21
+
+// tec: QE_TRIGRAM_MAX_NEEDLE_LEN/QE_EDIT_DISTANCE_MAX_NEEDLE_LEN settings can only lower this cap. cause this is done at compile time
+#define QE_FUZZY_MAX_NEEDLE_LEN 64
+
+#define COLTYPE_U32      1
+#define COLTYPE_U64      2
+#define COLTYPE_F32      3
+#define COLTYPE_F64      4
+#define COLTYPE_BOOL      6
+#define COLTYPE_I32       7
+#define COLTYPE_I64       8
+#define COLTYPE_DATE      9
+#define COLTYPE_TIMESTAMP 10
+#define COLTYPE_DECIMAL   11
+#define COLTYPE_ENUM      12
+
+#define MAX_STACK 8
+#define ROWS_PER_THREAD 8u
+
+layout(std430, binding = 1) readonly buffer NumConstsBuf  { uint num_consts[]; };
+layout(std430, binding = 2) readonly buffer StrConstsBuf  { uint str_consts[]; };
+layout(std430, binding = 3) buffer OutIndicesBuf          { uint out_indices[]; };
+layout(std430, binding = 4) buffer OutCountBuf            { uint out_count[]; };
+
+// tec: one bit per zone map chunk, set when the zone map proves no row of the chunk can match
+layout(std430, binding = 5) readonly buffer SkipBuf { uint skip_bits[]; };
+layout(std430, binding = 6)  readonly buffer ColBuf6  { uint col_data6[]; };
+layout(std430, binding = 7)  readonly buffer ColBuf7  { uint col_data7[]; };
+layout(std430, binding = 8)  readonly buffer ColBuf8  { uint col_data8[]; };
+layout(std430, binding = 9)  readonly buffer ColBuf9  { uint col_data9[]; };
+layout(std430, binding = 10) readonly buffer ColBuf10 { uint col_data10[]; };
+layout(std430, binding = 11) readonly buffer ColBuf11 { uint col_data11[]; };
+layout(std430, binding = 12) readonly buffer ColBuf12 { uint col_data12[]; };
+layout(std430, binding = 13) readonly buffer ColBuf13 { uint col_data13[]; };
+layout(std430, binding = 14) readonly buffer ColBuf14 { uint col_data14[]; };
+layout(std430, binding = 15) readonly buffer ColBuf15 { uint col_data15[]; };
+
+layout(std430, binding = 6) readonly buffer VecBuf6 { uvec4 col_vec6[]; };
+layout(std430, binding = 7) readonly buffer VecBuf7 { uvec4 col_vec7[]; };
+layout(std430, binding = 8) readonly buffer VecBuf8 { uvec4 col_vec8[]; };
+layout(std430, binding = 9) readonly buffer VecBuf9 { uvec4 col_vec9[]; };
+layout(std430, binding = 10) readonly buffer VecBuf10 { uvec4 col_vec10[]; };
+layout(std430, binding = 11) readonly buffer VecBuf11 { uvec4 col_vec11[]; };
+layout(std430, binding = 12) readonly buffer VecBuf12 { uvec4 col_vec12[]; };
+layout(std430, binding = 13) readonly buffer VecBuf13 { uvec4 col_vec13[]; };
+layout(std430, binding = 14) readonly buffer VecBuf14 { uvec4 col_vec14[]; };
+layout(std430, binding = 15) readonly buffer VecBuf15 { uvec4 col_vec15[]; };
+
+layout(push_constant) uniform PushConstants
+{
+  uint words[16];
+} pc;
+
+// tec: matches are counted per workgroup in shared memory, so the global counter takes one atomic per workgroup instead of one per match
+shared uint s_match_count;
+shared uint s_match_base;
+
+uint
+read_col_word(uint slot, uint word_index)
+{
+  switch (slot)
+  {
+    case 0u: return col_data6[word_index];
+    case 1u: return col_data7[word_index];
+    case 2u: return col_data8[word_index];
+    case 3u: return col_data9[word_index];
+    case 4u: return col_data10[word_index];
+    case 5u: return col_data11[word_index];
+    case 6u: return col_data12[word_index];
+    case 7u: return col_data13[word_index];
+    case 8u: return col_data14[word_index];
+    case 9u: return col_data15[word_index];
+  }
+  return 0u;
+}
+
+uvec4
+read_col_vec(uint slot, uint vec_index)
+{
+  switch (slot)
+  {
+    case 0u: return col_vec6[vec_index];
+    case 1u: return col_vec7[vec_index];
+    case 2u: return col_vec8[vec_index];
+    case 3u: return col_vec9[vec_index];
+    case 4u: return col_vec10[vec_index];
+    case 5u: return col_vec11[vec_index];
+    case 6u: return col_vec12[vec_index];
+    case 7u: return col_vec13[vec_index];
+    case 8u: return col_vec14[vec_index];
+    case 9u: return col_vec15[vec_index];
+  }
+  return uvec4(0u);
+}
+
+uint
+read_col_byte(uint slot, uint byte_index)
+{
+  uint word = read_col_word(slot, byte_index / 4u);
+  uint shift = (byte_index % 4u) * 8u;
+  return (word >> shift) & 0xffu;
+}
+
+uint
+read_str_const_byte(uint word_offset, uint byte_index)
+{
+  uint word = str_consts[word_offset + byte_index / 4u];
+  uint shift = (byte_index % 4u) * 8u;
+  return (word >> shift) & 0xffu;
+}
+
+// tec: string columns occupy two consecutive slots: `slot` is the raw byte data buffer,
+// `slot + 1` is the (row_count + 1) U64 offsets array (2 words per offset, high word ignored, string blobs are assumed to stay under 4GB per chunk).
+uint
+read_str_offset(uint offsets_slot, uint row)
+{
+  return read_col_word(offsets_slot, row * 2u);
+}
+
+double
+read_num_column_value(uint slot, uint coltype, uint row)
+{
+  if (coltype == COLTYPE_U32 || coltype == COLTYPE_ENUM)
+  {
+    return double(read_col_word(slot, row));
+  }
+  else if (coltype == COLTYPE_U64)
+  {
+    uint lo = read_col_word(slot, row * 2u + 0u);
+    uint hi = read_col_word(slot, row * 2u + 1u);
+    return double(hi) * 4294967296.0LF + double(lo);
+  }
+  else if (coltype == COLTYPE_F32)
+  {
+    return double(uintBitsToFloat(read_col_word(slot, row)));
+  }
+  else if (coltype == COLTYPE_F64)
+  {
+    uint lo = read_col_word(slot, row * 2u + 0u);
+    uint hi = read_col_word(slot, row * 2u + 1u);
+    return packDouble2x32(uvec2(lo, hi));
+  }
+  else if (coltype == COLTYPE_BOOL)
+  {
+    return double(read_col_byte(slot, row));
+  }
+  else if (coltype == COLTYPE_I32 || coltype == COLTYPE_DATE)
+  {
+    return double(int(read_col_word(slot, row)));
+  }
+  else // COLTYPE_I64, COLTYPE_TIMESTAMP, or COLTYPE_DECIMAL
+  {
+    uint lo = read_col_word(slot, row * 2u + 0u);
+    uint hi = read_col_word(slot, row * 2u + 1u);
+    double unsigned_value = double(hi) * 4294967296.0LF + double(lo);
+    bool is_negative = (hi & 0x80000000u) != 0u;
+    return is_negative ? unsigned_value - 18446744073709551616.0LF : unsigned_value;
+  }
+}
+
+bool
+str_eq(uint slot, uint row, uint const_word_offset, uint const_len)
+{
+  uint start = read_str_offset(slot + 1u, row);
+  uint end = read_str_offset(slot + 1u, row + 1u);
+  uint len = end - start;
+
+  if (len != const_len) return false;
+
+  for (uint i = 0u; i < len; i++)
+  {
+    if (read_col_byte(slot, start + i) != read_str_const_byte(const_word_offset, i))
+    {
+      return false;
+    }
+  }
+  return true;
+}
+
+// tec: this matches qe_str8_compare. 3 way compare
+int
+str_cmp3(uint slot, uint row, uint const_word_offset, uint const_len)
+{
+  uint start = read_str_offset(slot + 1u, row);
+  uint end = read_str_offset(slot + 1u, row + 1u);
+  uint len = end - start;
+
+  uint min_len = min(len, const_len);
+  for (uint i = 0u; i < min_len; i++)
+  {
+    uint a = read_col_byte(slot, start + i);
+    uint b = read_str_const_byte(const_word_offset, i);
+    if (a != b) 
+		{
+			return (a < b) ? -1 : 1;
+		}
+  }
+  if (len < const_len) return -1;
+  if (len > const_len) return 1;
+  return 0;
+}
+
+// tec: cap on string length considered by the byte scan loops below
+#define MAX_SANE_STRING_LEN 1048576u
+
+bool
+str_contains(uint slot, uint row, uint const_word_offset, uint const_len)
+{
+  uint start = read_str_offset(slot + 1u, row);
+  uint end = read_str_offset(slot + 1u, row + 1u);
+  uint len = end - start;
+
+  if (const_len == 0u) return true;
+  if (len > MAX_SANE_STRING_LEN) return false;
+  if (const_len > len) return false;
+
+  for (uint window = 0u; window <= len - const_len; window++)
+  {
+    bool match = true;
+    for (uint i = 0u; i < const_len; i++)
+    {
+      if (read_col_byte(slot, start + window + i) != read_str_const_byte(const_word_offset, i))
+      {
+        match = false;
+        break;
+      }
+    }
+    if (match) return true;
+  }
+  return false;
+}
+
+
+layout(constant_id = 0) const uint SPEC_LEAVES = 0u;
+layout(constant_id = 1) const uint SPEC_A0 = 0u;
+layout(constant_id = 2) const uint SPEC_B0 = 0u;
+layout(constant_id = 3) const uint SPEC_C0 = 0u;
+layout(constant_id = 4) const uint SPEC_A1 = 0u;
+layout(constant_id = 5) const uint SPEC_B1 = 0u;
+layout(constant_id = 6) const uint SPEC_C1 = 0u;
+layout(constant_id = 7) const uint SPEC_A2 = 0u;
+layout(constant_id = 8) const uint SPEC_B2 = 0u;
+layout(constant_id = 9) const uint SPEC_C2 = 0u;
+layout(constant_id = 10) const uint SPEC_A3 = 0u;
+layout(constant_id = 11) const uint SPEC_B3 = 0u;
+layout(constant_id = 12) const uint SPEC_C3 = 0u;
+layout(constant_id = 13) const uint SPEC_A4 = 0u;
+layout(constant_id = 14) const uint SPEC_B4 = 0u;
+layout(constant_id = 15) const uint SPEC_C4 = 0u;
+layout(constant_id = 16) const uint SPEC_A5 = 0u;
+layout(constant_id = 17) const uint SPEC_B5 = 0u;
+layout(constant_id = 18) const uint SPEC_C5 = 0u;
+layout(constant_id = 19) const uint SPEC_A6 = 0u;
+layout(constant_id = 20) const uint SPEC_B6 = 0u;
+layout(constant_id = 21) const uint SPEC_C6 = 0u;
+layout(constant_id = 22) const uint SPEC_A7 = 0u;
+layout(constant_id = 23) const uint SPEC_B7 = 0u;
+layout(constant_id = 24) const uint SPEC_C7 = 0u;
+layout(constant_id = 25) const uint SPEC_TOKENS = 0u;
+layout(constant_id = 26) const uint SPEC_TOKEN_COUNT = 0u;
+// tec: 1 skips a leaf once no row of the thread is left, which is only sound when the tree has no OR token. QE_SCAN_FILTER_SPEC:3
+layout(constant_id = 27) const uint SPEC_EARLY_EXIT = 0u;
+
+bool
+eval_leaf(uint a, uint b, uint c, uint row)
+{
+  uint kind = a & 0xffu;
+  uint slot = (a >> 8) & 0xffu;
+  uint coltype = (a >> 16) & 0xffu;
+  uint op = a >> 24;
+  if (kind == 1u)
+  {
+    double x = read_num_column_value(slot, coltype, row);
+    double y = packDouble2x32(uvec2(num_consts[b * 2u + 0u], num_consts[b * 2u + 1u]));
+    switch (op)
+    {
+      case OP_CMP_EQ: return x == y;
+      case OP_CMP_NE: return x != y;
+      case OP_CMP_LT: return x < y;
+      case OP_CMP_GT: return x > y;
+      case OP_CMP_LE: return x <= y;
+      case OP_CMP_GE: return x >= y;
+    }
+    return false;
+  }
+  if (kind == 2u) { return str_eq(slot, row, b, c); }
+  if (kind == 3u) { return !str_eq(slot, row, b, c); }
+  if (kind == 4u) { return str_contains(slot, row, b, c); }
+  if (kind == 5u) { return str_cmp3(slot, row, b, c) < 0; }
+  if (kind == 6u) { return str_cmp3(slot, row, b, c) > 0; }
+  if (kind == 7u) { return str_cmp3(slot, row, b, c) <= 0; }
+  if (kind == 8u) { return str_cmp3(slot, row, b, c) >= 0; }
+  return kind == 9u;
+}
+
+bool
+compare_double(uint op, double x, double y)
+{
+  switch (op)
+  {
+    case OP_CMP_EQ: return x == y;
+    case OP_CMP_NE: return x != y;
+    case OP_CMP_LT: return x < y;
+    case OP_CMP_GT: return x > y;
+    case OP_CMP_LE: return x <= y;
+    case OP_CMP_GE: return x >= y;
+  }
+  return false;
+}
+
+double
+widen_word(uint coltype, uint word)
+{
+  if (coltype == COLTYPE_U32 || coltype == COLTYPE_ENUM)
+  {
+    return double(word);
+  }
+  else if (coltype == COLTYPE_I32 || coltype == COLTYPE_DATE)
+  {
+    return double(int(word));
+  }
+  return double(uintBitsToFloat(word));
+}
+
+// tec: bit k of the result is set when row first_row + k passes the leaf. valid rows are in the table, the rest are not read
+uint
+leaf_mask(uint a, uint b, uint c, uint first_row, uint valid)
+{
+  uint kind = a & 0xffu;
+  uint slot = (a >> 8) & 0xffu;
+  uint coltype = (a >> 16) & 0xffu;
+  uint op = a >> 24;
+  uint bits = 0u;
+  if (kind == 1u && valid == ROWS_PER_THREAD && (coltype == COLTYPE_U32 || coltype == COLTYPE_ENUM || coltype == COLTYPE_I32 || coltype == COLTYPE_DATE || coltype == COLTYPE_F32))
+  {
+    double y = packDouble2x32(uvec2(num_consts[b * 2u + 0u], num_consts[b * 2u + 1u]));
+    uint base = first_row / 4u;
+    for (uint v = 0u; v < ROWS_PER_THREAD / 4u; v++)
+    {
+      uvec4 words = read_col_vec(slot, base + v);
+      bits |= (compare_double(op, widen_word(coltype, words.x), y) ? 1u : 0u) << (v * 4u + 0u);
+      bits |= (compare_double(op, widen_word(coltype, words.y), y) ? 1u : 0u) << (v * 4u + 1u);
+      bits |= (compare_double(op, widen_word(coltype, words.z), y) ? 1u : 0u) << (v * 4u + 2u);
+      bits |= (compare_double(op, widen_word(coltype, words.w), y) ? 1u : 0u) << (v * 4u + 3u);
+    }
+    return bits;
+  }
+  if (kind == 1u && valid == ROWS_PER_THREAD && coltype == COLTYPE_F64)
+  {
+    double y = packDouble2x32(uvec2(num_consts[b * 2u + 0u], num_consts[b * 2u + 1u]));
+    uint base = first_row / 2u;
+    for (uint v = 0u; v < ROWS_PER_THREAD / 2u; v++)
+    {
+      uvec4 words = read_col_vec(slot, base + v);
+      bits |= (compare_double(op, packDouble2x32(uvec2(words.x, words.y)), y) ? 1u : 0u) << (v * 2u + 0u);
+      bits |= (compare_double(op, packDouble2x32(uvec2(words.z, words.w)), y) ? 1u : 0u) << (v * 2u + 1u);
+    }
+    return bits;
+  }
+  for (uint k = 0u; k < valid; k++)
+  {
+    bits |= (eval_leaf(a, b, c, first_row + k) ? 1u : 0u) << k;
+  }
+  return bits;
+}
+
+// tec: one postfix token, the macro is expanded once per token position so the driver folds the ones past the token count. the stack holds one mask per entry
+#define TOKEN(IDX)   if (SPEC_TOKEN_COUNT > IDX)   {     uint token = (SPEC_TOKENS >> (2u * IDX)) & 3u;     if (token == 1u)     {       stack[sp] = masks[next_leaf];       next_leaf++;       sp++;     }     else     {       uint b = stack[sp - 1u];       uint a = stack[sp - 2u];       sp--;       stack[sp - 1u] = (token == 2u) ? (a & b) : (a | b);     }   }
+
+void
+main()
+{
+  uint row_count = pc.words[0];
+  uint first_row = gl_GlobalInvocationID.x * ROWS_PER_THREAD;
+  uint valid = (first_row < row_count) ? min(ROWS_PER_THREAD, row_count - first_row) : 0u;
+  uint live = (1u << valid) - 1u;
+  // tec: zone map chunks are a multiple of ROWS_PER_THREAD rows, so one bit covers the whole group
+  if (valid != 0u && pc.words[8] != 0u)
+  {
+    uint skip_chunk = first_row >> pc.words[6];
+    if ((skip_bits[skip_chunk >> 5u] & (1u << (skip_chunk & 31u))) != 0u)
+    {
+      live = 0u;
+    }
+  }
+  if (gl_LocalInvocationIndex == 0u)
+  {
+    s_match_count = 0u;
+  }
+
+  if (live != 0u)
+  {
+    bool has_or = false;
+    for (uint t = 0u; t < 15u; t++)
+    {
+      if (t < SPEC_TOKEN_COUNT && ((SPEC_TOKENS >> (2u * t)) & 3u) == 3u)
+      {
+        has_or = true;
+      }
+    }
+    bool early = SPEC_EARLY_EXIT != 0u && !has_or;
+    uint acc = live;
+    uint masks[8];
+    masks[0] = (SPEC_LEAVES > 0u && (!early || acc != 0u)) ? leaf_mask(SPEC_A0, SPEC_B0, SPEC_C0, first_row, valid) : 0u;
+    acc &= masks[0];
+    masks[1] = (SPEC_LEAVES > 1u && (!early || acc != 0u)) ? leaf_mask(SPEC_A1, SPEC_B1, SPEC_C1, first_row, valid) : 0u;
+    acc &= masks[1];
+    masks[2] = (SPEC_LEAVES > 2u && (!early || acc != 0u)) ? leaf_mask(SPEC_A2, SPEC_B2, SPEC_C2, first_row, valid) : 0u;
+    acc &= masks[2];
+    masks[3] = (SPEC_LEAVES > 3u && (!early || acc != 0u)) ? leaf_mask(SPEC_A3, SPEC_B3, SPEC_C3, first_row, valid) : 0u;
+    acc &= masks[3];
+    masks[4] = (SPEC_LEAVES > 4u && (!early || acc != 0u)) ? leaf_mask(SPEC_A4, SPEC_B4, SPEC_C4, first_row, valid) : 0u;
+    acc &= masks[4];
+    masks[5] = (SPEC_LEAVES > 5u && (!early || acc != 0u)) ? leaf_mask(SPEC_A5, SPEC_B5, SPEC_C5, first_row, valid) : 0u;
+    acc &= masks[5];
+    masks[6] = (SPEC_LEAVES > 6u && (!early || acc != 0u)) ? leaf_mask(SPEC_A6, SPEC_B6, SPEC_C6, first_row, valid) : 0u;
+    acc &= masks[6];
+    masks[7] = (SPEC_LEAVES > 7u && (!early || acc != 0u)) ? leaf_mask(SPEC_A7, SPEC_B7, SPEC_C7, first_row, valid) : 0u;
+    acc &= masks[7];
+    uint stack[8];
+    for (uint i = 0u; i < 8u; i++)
+    {
+      stack[i] = 0u;
+    }
+    uint sp = 0u;
+    uint next_leaf = 0u;
+    TOKEN(0u)
+    TOKEN(1u)
+    TOKEN(2u)
+    TOKEN(3u)
+    TOKEN(4u)
+    TOKEN(5u)
+    TOKEN(6u)
+    TOKEN(7u)
+    TOKEN(8u)
+    TOKEN(9u)
+    TOKEN(10u)
+    TOKEN(11u)
+    TOKEN(12u)
+    TOKEN(13u)
+    TOKEN(14u)
+    live &= stack[0];
+  }
+
+  // tec: matches are counted per workgroup in shared memory, so the global counter takes one atomic per workgroup instead of one per match
+  uint match_count = bitCount(live);
+  barrier();
+  uint local_position = 0u;
+  if (match_count != 0u)
+  {
+    local_position = atomicAdd(s_match_count, match_count);
+  }
+  barrier();
+  if (gl_LocalInvocationIndex == 0u)
+  {
+    s_match_base = (s_match_count > 0u) ? atomicAdd(out_count[0], s_match_count) : 0u;
+  }
+  barrier();
+
+  uint capacity = out_indices.length() / 2u;
+  uint pos = s_match_base + local_position;
+  while (live != 0u)
+  {
+    uint k = uint(findLSB(live));
+    live &= live - 1u;
+    if (pos < capacity)
+    {
+      out_indices[pos * 2u + 0u] = first_row + k;
+      out_indices[pos * 2u + 1u] = 0u;
+    }
+    pos++;
+  }
+}

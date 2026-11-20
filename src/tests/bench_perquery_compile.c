@@ -363,6 +363,8 @@ global B32 g_pc_touch = 0;
 global B32 g_pc_resteady = 0;
 // tec: --treespec measures every shape on scan_filter_spec.comp (QE_SCAN_FILTER_SPEC), the interpreter's program as specialization constants, against the interpreter and the generated kernel
 global B32 g_pc_treespec = 0;
+// tec: --specvariant=2 or 3 runs --treespec on scan_filter_spec8.comp (QE_SCAN_FILTER_SPEC:2, 3 with the early exit), the same tree on the 8 rows per thread layout of scan_simple
+global U64 g_pc_spec_variant = 1;
 global F64 g_pc_sweep_target[PC_SWEEP_STEPS] = { 0.001, 0.01, 0.05, 0.1, 0.25, 0.5 };
 // tec: the selectivity of one comparison that makes k independent comparisons joined by AND pass the target together (the k-th root of the target), and for the OR of two, half of it
 global F64 g_pc_sweep_and2[PC_SWEEP_STEPS] = { 0.0316, 0.1, 0.2236, 0.3162, 0.5, 0.7071 };
@@ -577,7 +579,7 @@ pc_run_sweep(Arena* arena, CQL_Database* database, PC_Table* data, Bench_Report*
     if (g_pc_treespec)
     {
       settings_load_from_string(str8_lit("QE_SCAN_SIMPLE_KERNEL:0"));
-      settings_load_from_string(str8_lit("QE_SCAN_FILTER_SPEC:1"));
+      settings_load_from_string(g_pc_spec_variant == 3 ? str8_lit("QE_SCAN_FILTER_SPEC:3") : (g_pc_spec_variant == 2 ? str8_lit("QE_SCAN_FILTER_SPEC:2") : str8_lit("QE_SCAN_FILTER_SPEC:1")));
       for (U32 step = 0; step < shape->where_count; step++)
       {
         U64 rows = 0, checksum = 0;
@@ -782,6 +784,7 @@ entry_point(CmdLine* cmdline)
   g_pc_spinwarm = cmd_line_has_flag(cmdline, str8_lit("spinwarm"));
   g_pc_resteady = cmd_line_has_flag(cmdline, str8_lit("resteady"));
   g_pc_treespec = cmd_line_has_flag(cmdline, str8_lit("treespec"));
+  g_pc_spec_variant = cmd_line_has_argument(cmdline, str8_lit("specvariant")) ? u64_from_str8(cmd_line_string(cmdline, str8_lit("specvariant")), 10) : 1;
   if (idrange)
   {
     shape_count = 1;
@@ -1134,7 +1137,7 @@ entry_point(CmdLine* cmdline)
       F64 gen3 = pc_steady(database, sql3, &s_rows, &s_checksum);
       settings_load_from_string(str8_lit("QE_PERQUERY_KERNELS:0"));
       settings_load_from_string(str8_lit("QE_SCAN_SIMPLE_KERNEL:0"));
-      settings_load_from_string(str8_lit("QE_SCAN_FILTER_SPEC:1"));
+      settings_load_from_string(g_pc_spec_variant == 3 ? str8_lit("QE_SCAN_FILTER_SPEC:3") : (g_pc_spec_variant == 2 ? str8_lit("QE_SCAN_FILTER_SPEC:2") : str8_lit("QE_SCAN_FILTER_SPEC:1")));
       F64 first3 = pc_run_once(database, sql3, &s_rows, &s_checksum);
       F64 spec3 = pc_steady(database, sql3, &s_rows, &s_checksum);
       settings_load_from_string(str8_lit("QE_SCAN_FILTER_SPEC:0"));

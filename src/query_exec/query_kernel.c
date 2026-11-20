@@ -1900,10 +1900,10 @@ qk_fused_count_spec_kernel(U32 leaf_count, U32* slots, U32* types, U32* ops, Str
 
 // tec: QE_SCAN_FILTER_SPEC, an AND/OR tree of up to 8 numeric or string comparisons on one precompiled module, scan_filter_spec.comp. the bytecode is read back into leaves and postfix tokens, which become the specialization constants, the literals stay in the buffers of the interpreter
 internal GPU_Kernel*
-qk_filter_spec_kernel(U32* words, U32 word_count, String8* out_name)
+qk_filter_spec_kernel(U32* words, U32 word_count, U32 variant, String8* out_name)
 {
   QK_State* state = &g_qk_state;
-  U32 values[27] = {0};
+  U32 values[28] = {0};
   U32 leaf_count = 0;
   U32 token_count = 0;
   U32 tokens = 0;
@@ -1990,26 +1990,30 @@ qk_filter_spec_kernel(U32* words, U32 word_count, String8* out_name)
   values[0] = leaf_count;
   values[25] = tokens;
   values[26] = token_count;
+  values[27] = variant == 3 ? 1 : 0;
   String8 bytes = str8((U8*)values, sizeof(values));
-  U64 key = u64_hash_from_str8(bytes) ^ 0x5fc1f17e25bec000ull;
+  U64 key = u64_hash_from_str8(bytes) ^ (variant >= 2 ? 0x5fc1f17e25bec001ull : 0x5fc1f17e25bec000ull);
   U64 check = qk_check_hash(bytes);
   String8 name = qk_kernel_name(key, check);
   GPU_Kernel* kernel = gpu_kernel_alloc_from_spirv_spec(name, str8_zero(), values, ArrayCount(values));
   if (!kernel)
   {
+    // tec: variants 2 and 3 are scan_filter_spec8.comp, the same tree on the 8 rows per thread layout of scan_simple, 3 with the early exit of a thread whose rows are all decided
+    String8* spirv = variant >= 2 ? &state->filter_spec8_spirv : &state->filter_spec_spirv;
+    B32* spirv_tried = variant >= 2 ? &state->filter_spec8_spirv_tried : &state->filter_spec_spirv_tried;
     os_mutex_take(state->lock);
-    B32 tried = state->filter_spec_spirv_tried;
-    state->filter_spec_spirv_tried = 1;
+    B32 tried = *spirv_tried;
+    *spirv_tried = 1;
     os_mutex_drop(state->lock);
     if (!tried)
     {
-      state->filter_spec_spirv = qk_library_spirv(state->arena, str8_lit("scan_filter_spec"));
+      *spirv = qk_library_spirv(state->arena, variant >= 2 ? str8_lit("scan_filter_spec8") : str8_lit("scan_filter_spec"));
     }
-    if (state->filter_spec_spirv.size == 0)
+    if (spirv->size == 0)
     {
       return 0;
     }
-    kernel = gpu_kernel_alloc_from_spirv_spec(name, state->filter_spec_spirv, values, ArrayCount(values));
+    kernel = gpu_kernel_alloc_from_spirv_spec(name, *spirv, values, ArrayCount(values));
     if (!kernel)
     {
       os_mutex_take(state->lock);

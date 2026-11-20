@@ -98,6 +98,8 @@ struct QK_State
   U64 count_spec_requests;
   String8 filter_spec_spirv;
   B32 filter_spec_spirv_tried;
+  String8 filter_spec8_spirv;
+  B32 filter_spec8_spirv_tried;
   U64 collisions_avoided;
   U64 spec_requests;
   U64 kernels_requested;
@@ -232,8 +234,8 @@ internal U64 qk_routed_deferrals(void);
 internal void qk_last_sizes(U64* out_source_bytes, U64* out_spirv_bytes);
 internal U64 qk_spec_request_count(void);
 internal U64 qk_count_spec_request_count(void);
-// tec: QE_SCAN_FILTER_SPEC, an AND/OR tree of up to 8 numeric or string comparisons on one precompiled module, scan_filter_spec.comp, the tree is specialization constants. returns 0 when the program is not such a tree
-internal GPU_Kernel* qk_filter_spec_kernel(U32* words, U32 word_count, String8* out_name);
+// tec: QE_SCAN_FILTER_SPEC, an AND/OR tree of up to 8 numeric or string comparisons on one precompiled module, scan_filter_spec.comp, the tree is specialization constants. returns 0 when the program is not such a tree. variant 2 is scan_filter_spec8.comp, which takes 8 rows per thread
+internal GPU_Kernel* qk_filter_spec_kernel(U32* words, U32 word_count, U32 variant, String8* out_name);
 internal GPU_Kernel* qk_fused_count_spec_kernel(U32 leaf_count, U32* slots, U32* types, U32* ops, String8* out_name);
 internal void qk_stats(U64* out_requested, U64* out_compiled, U64* out_failures, U64* out_compile_microseconds);
 
