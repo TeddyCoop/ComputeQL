@@ -327,6 +327,8 @@ pc_median(F64* samples, U32 count)
   return samples[count / 2];
 }
 
+global B32 g_pc_spinwarm = 0;
+
 internal F64
 pc_steady(CQL_Database* database, String8 sql, U64* out_rows, U64* out_checksum)
 {
@@ -334,6 +336,15 @@ pc_steady(CQL_Database* database, String8 sql, U64* out_rows, U64* out_checksum)
   for (U32 w = 0; w < BENCH_WARMUP_RUNS; w++)
   {
     pc_run_once(database, sql, out_rows, out_checksum);
+  }
+  // tec: --spinwarm keeps the GPU busy for 300 ms with the query before the timed runs, so a timed run does not find the clock of an idle GPU after the compile and the pipeline creation
+  if (g_pc_spinwarm)
+  {
+    U64 spin_start = os_now_microseconds();
+    while ((os_now_microseconds() - spin_start) < 300000)
+    {
+      pc_run_once(database, sql, out_rows, out_checksum);
+    }
   }
   for (U32 i = 0; i < BENCH_TIMED_RUNS; i++)
   {
@@ -716,6 +727,7 @@ entry_point(CmdLine* cmdline)
   }
   g_pc_warmup = cmd_line_has_flag(cmdline, str8_lit("warmup"));
   g_pc_touch = cmd_line_has_flag(cmdline, str8_lit("touch"));
+  g_pc_spinwarm = cmd_line_has_flag(cmdline, str8_lit("spinwarm"));
   g_pc_resteady = cmd_line_has_flag(cmdline, str8_lit("resteady"));
   if (idrange)
   {

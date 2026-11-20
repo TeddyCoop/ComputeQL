@@ -22,6 +22,9 @@ setlocal
 ::        run_paper_benchmarks.bat steadyagain    the 40 shapes with a second steady measurement after the last shape
 ::        run_paper_benchmarks.bat libtouch       new shapes against library kernels with the columns read first
 ::        run_paper_benchmarks.bat duckdbsep      the one billion row scale test with cql and duckdb in separate processes
+::        run_paper_benchmarks.bat spinwarm       the steady measurements again with a 300 ms busy warm-up before the timed runs
+::        run_paper_benchmarks.bat spinspec       fusion off, fixed width and scan specialization with the busy warm-up
+::        run_paper_benchmarks.bat spinshapes     the other selectivities, skewed and clustered data and select lists with the busy warm-up
 ::        run_paper_benchmarks.bat failure        failures of generation and name collisions on the 40 scan shapes (not on aggregation queries)
 ::        run_paper_benchmarks.bat families       the workloads with one generation switch off at a time
 ::
@@ -43,6 +46,18 @@ set "only_libmore=0"
 set "only_families=0"
 set "only_specialize=0"
 set "only_failure=0"
+set "only_spinshapes=0"
+if /i "%~1"=="spinshapes" (
+  set "only_spinshapes=1"
+)
+set "only_spinspec=0"
+if /i "%~1"=="spinspec" (
+  set "only_spinspec=1"
+)
+set "only_spinwarm=0"
+if /i "%~1"=="spinwarm" (
+  set "only_spinwarm=1"
+)
 set "only_duckdbsep=0"
 if /i "%~1"=="duckdbsep" (
   set "only_duckdbsep=1"
@@ -186,6 +201,21 @@ if "%only_libtouch%"=="1" (
 
 if "%only_duckdbsep%"=="1" (
   call :duckdbsep
+  goto :finish
+)
+
+if "%only_spinspec%"=="1" (
+  call :spinspec
+  goto :finish
+)
+
+if "%only_spinshapes%"=="1" (
+  call :spinshapes
+  goto :finish
+)
+
+if "%only_spinwarm%"=="1" (
+  call :spinwarm
   goto :finish
 )
 
@@ -625,6 +655,93 @@ exit /b 0
 for /l %%i in (1,1,2) do (
   call :run sep1b cql_%%i bench_reports\select_scale_1000000000_report.md "bench_select_scale.exe --rows=1000000000 --samples --no_duckdb"
   call :run sep1b duckdb_%%i bench_reports\select_scale_1000000000_report.md "bench_select_scale.exe --rows=1000000000 --samples --no_bandwidth --duckdb_only"
+)
+exit /b 0
+
+
+::~
+:: the steady measurements again with a 300 ms busy warm-up before the timed runs of every steady time (--spinwarm): the 40 shapes, the sweep and the row-number range with the fused kernels, and the library comparison
+:spinwarm
+for %%n in (5000000 20000000 100000000) do (
+  for /l %%i in (1,1,3) do (
+    call :run spin again_%%n_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=%%n --shapes=40 --seed=%SEED% --resteady --spinwarm --setting=QE_SPIRV_DISK_CACHE:0"
+  )
+)
+for %%n in (20000000 100000000) do (
+  for /l %%i in (1,1,3) do (
+    call :run spin sw_gen_%%n_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=%%n --sweep --warmup --spinwarm --seed=%SEED% --setting=QE_SPIRV_DISK_CACHE:0"
+    call :run spin sw_spec_%%n_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=%%n --sweep --warmup --spinwarm --seed=%SEED% --setting=QE_SPIRV_DISK_CACHE:0,QE_FUSE_COUNT_SPEC:1"
+    call :run spin id_gen_%%n_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=%%n --idrange --spinwarm --seed=%SEED% --setting=QE_SPIRV_DISK_CACHE:0"
+    call :run spin id_spec_%%n_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=%%n --idrange --spinwarm --seed=%SEED% --setting=QE_SPIRV_DISK_CACHE:0,QE_FUSE_COUNT_SPEC:1"
+  )
+)
+for %%n in (5000000 20000000 100000000) do (
+  call :spinlibsize %%n
+)
+exit /b 0
+
+
+:spinlibsize
+set "clear_caches=1"
+for /l %%i in (1,1,3) do (
+  call :run spin_lib_%1 gen_empty_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=%1 --shapes=40 --seed=%SEED% --spinwarm --setting=QE_SPIRV_DISK_CACHE:0"
+  call :run spin_lib_%1 lib_empty_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=%1 --shapes=40 --seed=%SEED% --lib --touch --spinwarm --setting=QE_SPIRV_DISK_CACHE:0"
+)
+call :clear
+set "clear_caches=0"
+set "driver_cache=1"
+call :run spin_lib_%1 gen_fill bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=%1 --shapes=40 --seed=%SEED% --spinwarm"
+for /l %%i in (1,1,3) do (
+  call :run spin_lib_%1 gen_filled_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=%1 --shapes=40 --seed=%SEED% --spinwarm"
+  call :run spin_lib_%1 lib_filled_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=%1 --shapes=40 --seed=%SEED% --lib --touch --spinwarm"
+)
+set "clear_caches=1"
+set "driver_cache=0"
+exit /b 0
+
+
+::~
+:: the fusion off, fixed width and scan specialization runs of the sweep and the row-number range, and the single comparison at 10M, with the busy warm-up (--spinwarm)
+:spinspec
+for %%n in (20000000 100000000) do (
+  for /l %%i in (1,1,3) do (
+    call :run spin2 sw_off_%%n_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=%%n --sweep --warmup --spinwarm --seed=%SEED% --setting=QE_SPIRV_DISK_CACHE:0,QE_FUSE_AGGREGATE:0,GPU_VULKAN_SHADER_INFO:1"
+    call :run spin2 id_off_%%n_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=%%n --idrange --spinwarm --seed=%SEED% --setting=QE_SPIRV_DISK_CACHE:0,QE_FUSE_AGGREGATE:0"
+    call :run spin2 sw_fixed_%%n_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=%%n --sweep --warmup --spinwarm --seed=%SEED% --setting=QE_SPIRV_DISK_CACHE:0,QE_FUSE_AGGREGATE:0,QE_GEN_FIXED_WIDTH:1,GPU_VULKAN_SHADER_INFO:1"
+    call :run spin2 id_fixed_%%n_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=%%n --idrange --spinwarm --seed=%SEED% --setting=QE_SPIRV_DISK_CACHE:0,QE_FUSE_AGGREGATE:0,QE_GEN_FIXED_WIDTH:1"
+    call :run spin2 sw_scan_%%n_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=%%n --sweep --warmup --spinwarm --seed=%SEED% --setting=QE_SPIRV_DISK_CACHE:0,QE_FUSE_AGGREGATE:0,QE_SCAN_SPEC:1,GPU_VULKAN_SHADER_INFO:1"
+    call :run spin2 id_scan_%%n_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=%%n --idrange --spinwarm --seed=%SEED% --setting=QE_SPIRV_DISK_CACHE:0,QE_FUSE_AGGREGATE:0,QE_SCAN_SPEC:1"
+  )
+)
+for /l %%i in (1,1,3) do (
+    call :run spin2 g_on_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=10000000 --sweep --warmup --spinwarm --seed=%SEED% --setting=QE_SPIRV_DISK_CACHE:0,GPU_VULKAN_SHADER_INFO:1"
+    call :run spin2 g_off_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=10000000 --sweep --warmup --spinwarm --seed=%SEED% --setting=QE_SPIRV_DISK_CACHE:0,QE_FUSE_AGGREGATE:0,GPU_VULKAN_SHADER_INFO:1"
+)
+exit /b 0
+
+
+::~
+:: the other selectivities, skewed and clustered data and other select lists with the busy warm-up
+:spinshapes
+for %%f in (0.001 0.01 0.1) do (
+  for /l %%i in (1,1,3) do (
+    call :run spin_frac f%%f_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=20000000 --shapes=40 --seed=%SEED% --fraction=%%f --spinwarm --setting=QE_SPIRV_DISK_CACHE:0"
+  )
+)
+for /l %%i in (1,1,3) do (
+  call :run spin_data skew3_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=20000000 --shapes=40 --seed=%SEED% --skew=3 --spinwarm --setting=QE_SPIRV_DISK_CACHE:0"
+)
+for /l %%i in (1,1,3) do (
+  call :run spin_data cluster_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=20000000 --shapes=40 --seed=%SEED% --cluster --spinwarm --setting=QE_SPIRV_DISK_CACHE:0"
+)
+for /l %%i in (1,1,3) do (
+  call :run spin_data sum_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=20000000 --shapes=40 --seed=%SEED% --select=SUM(e) --spinwarm --setting=QE_SPIRV_DISK_CACHE:0"
+)
+for /l %%i in (1,1,3) do (
+  call :run spin_data wide_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=20000000 --shapes=40 --seed=%SEED% --select=id,a,e --spinwarm --setting=QE_SPIRV_DISK_CACHE:0"
+)
+for /l %%i in (1,1,3) do (
+  call :run spin_data minmax_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=20000000 --shapes=40 --seed=%SEED% --select=MIN(a),MAX(e),SUM(d) --spinwarm --setting=QE_SPIRV_DISK_CACHE:0"
 )
 exit /b 0
 
