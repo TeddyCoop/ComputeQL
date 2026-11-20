@@ -297,6 +297,8 @@ layout(constant_id = 25) const uint SPEC_TOKENS = 0u;
 layout(constant_id = 26) const uint SPEC_TOKEN_COUNT = 0u;
 // tec: 1 skips a leaf once no row of the thread is left, which is only sound when the tree has no OR token. QE_SCAN_FILTER_SPEC:3
 layout(constant_id = 27) const uint SPEC_EARLY_EXIT = 0u;
+// tec: bit k set when leaf k is a plain numeric comparison that is a term of the top level AND chain. not 0 selects the hybrid evaluation of the generated conjunctions, QE_SCAN_FILTER_SPEC:4. those leaves run on the eight rows layout and the rest of the tree is evaluated per row on the rows that remain, with the plain leaves taken as true
+layout(constant_id = 28) const uint SPEC_HYBRID = 0u;
 
 bool
 eval_leaf(uint a, uint b, uint c, uint row)
@@ -404,6 +406,34 @@ leaf_mask(uint a, uint b, uint c, uint first_row, uint valid)
 // tec: one postfix token, the macro is expanded once per token position so the driver folds the ones past the token count. the stack holds one mask per entry
 #define TOKEN(IDX)   if (SPEC_TOKEN_COUNT > IDX)   {     uint token = (SPEC_TOKENS >> (2u * IDX)) & 3u;     if (token == 1u)     {       stack[sp] = masks[next_leaf];       next_leaf++;       sp++;     }     else     {       uint b = stack[sp - 1u];       uint a = stack[sp - 2u];       sp--;       stack[sp - 1u] = (token == 2u) ? (a & b) : (a | b);     }   }
 
+uint
+run_tokens(uint masks[8])
+{
+  uint stack[8];
+  for (uint i = 0u; i < 8u; i++)
+  {
+    stack[i] = 0u;
+  }
+  uint sp = 0u;
+  uint next_leaf = 0u;
+  TOKEN(0u)
+  TOKEN(1u)
+  TOKEN(2u)
+  TOKEN(3u)
+  TOKEN(4u)
+  TOKEN(5u)
+  TOKEN(6u)
+  TOKEN(7u)
+  TOKEN(8u)
+  TOKEN(9u)
+  TOKEN(10u)
+  TOKEN(11u)
+  TOKEN(12u)
+  TOKEN(13u)
+  TOKEN(14u)
+  return stack[0];
+}
+
 void
 main()
 {
@@ -425,7 +455,51 @@ main()
     s_match_count = 0u;
   }
 
-  if (live != 0u)
+  if (live != 0u && SPEC_HYBRID != 0u)
+  {
+    uint acc = live;
+    for (uint k = 0u; k < 8u; k++)
+    {
+      if (k < SPEC_LEAVES && ((SPEC_HYBRID >> k) & 1u) != 0u && acc != 0u)
+      {
+        uint a = 0u, b = 0u, c = 0u;
+        switch (k)
+        {
+          case 0u: a = SPEC_A0; b = SPEC_B0; c = SPEC_C0; break;
+          case 1u: a = SPEC_A1; b = SPEC_B1; c = SPEC_C1; break;
+          case 2u: a = SPEC_A2; b = SPEC_B2; c = SPEC_C2; break;
+          case 3u: a = SPEC_A3; b = SPEC_B3; c = SPEC_C3; break;
+          case 4u: a = SPEC_A4; b = SPEC_B4; c = SPEC_C4; break;
+          case 5u: a = SPEC_A5; b = SPEC_B5; c = SPEC_C5; break;
+          case 6u: a = SPEC_A6; b = SPEC_B6; c = SPEC_C6; break;
+          default: a = SPEC_A7; b = SPEC_B7; c = SPEC_C7; break;
+        }
+        acc &= leaf_mask(a, b, c, first_row, valid);
+      }
+    }
+    uint remaining = acc;
+    while (remaining != 0u)
+    {
+      uint k = uint(findLSB(remaining));
+      remaining &= remaining - 1u;
+      uint row = first_row + k;
+      uint masks[8];
+      masks[0] = (SPEC_LEAVES > 0u) ? (((SPEC_HYBRID & 1u) != 0u) ? 1u : (eval_leaf(SPEC_A0, SPEC_B0, SPEC_C0, row) ? 1u : 0u)) : 0u;
+      masks[1] = (SPEC_LEAVES > 1u) ? (((SPEC_HYBRID & 2u) != 0u) ? 1u : (eval_leaf(SPEC_A1, SPEC_B1, SPEC_C1, row) ? 1u : 0u)) : 0u;
+      masks[2] = (SPEC_LEAVES > 2u) ? (((SPEC_HYBRID & 4u) != 0u) ? 1u : (eval_leaf(SPEC_A2, SPEC_B2, SPEC_C2, row) ? 1u : 0u)) : 0u;
+      masks[3] = (SPEC_LEAVES > 3u) ? (((SPEC_HYBRID & 8u) != 0u) ? 1u : (eval_leaf(SPEC_A3, SPEC_B3, SPEC_C3, row) ? 1u : 0u)) : 0u;
+      masks[4] = (SPEC_LEAVES > 4u) ? (((SPEC_HYBRID & 16u) != 0u) ? 1u : (eval_leaf(SPEC_A4, SPEC_B4, SPEC_C4, row) ? 1u : 0u)) : 0u;
+      masks[5] = (SPEC_LEAVES > 5u) ? (((SPEC_HYBRID & 32u) != 0u) ? 1u : (eval_leaf(SPEC_A5, SPEC_B5, SPEC_C5, row) ? 1u : 0u)) : 0u;
+      masks[6] = (SPEC_LEAVES > 6u) ? (((SPEC_HYBRID & 64u) != 0u) ? 1u : (eval_leaf(SPEC_A6, SPEC_B6, SPEC_C6, row) ? 1u : 0u)) : 0u;
+      masks[7] = (SPEC_LEAVES > 7u) ? (((SPEC_HYBRID & 128u) != 0u) ? 1u : (eval_leaf(SPEC_A7, SPEC_B7, SPEC_C7, row) ? 1u : 0u)) : 0u;
+      if ((run_tokens(masks) & 1u) == 0u)
+      {
+        acc &= ~(1u << k);
+      }
+    }
+    live = acc;
+  }
+  else if (live != 0u)
   {
     bool has_or = false;
     for (uint t = 0u; t < 15u; t++)
@@ -454,29 +528,7 @@ main()
     acc &= masks[6];
     masks[7] = (SPEC_LEAVES > 7u && (!early || acc != 0u)) ? leaf_mask(SPEC_A7, SPEC_B7, SPEC_C7, first_row, valid) : 0u;
     acc &= masks[7];
-    uint stack[8];
-    for (uint i = 0u; i < 8u; i++)
-    {
-      stack[i] = 0u;
-    }
-    uint sp = 0u;
-    uint next_leaf = 0u;
-    TOKEN(0u)
-    TOKEN(1u)
-    TOKEN(2u)
-    TOKEN(3u)
-    TOKEN(4u)
-    TOKEN(5u)
-    TOKEN(6u)
-    TOKEN(7u)
-    TOKEN(8u)
-    TOKEN(9u)
-    TOKEN(10u)
-    TOKEN(11u)
-    TOKEN(12u)
-    TOKEN(13u)
-    TOKEN(14u)
-    live &= stack[0];
+    live &= run_tokens(masks);
   }
 
   // tec: matches are counted per workgroup in shared memory, so the global counter takes one atomic per workgroup instead of one per match

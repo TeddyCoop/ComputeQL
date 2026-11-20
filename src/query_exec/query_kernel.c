@@ -1903,7 +1903,8 @@ internal GPU_Kernel*
 qk_filter_spec_kernel(U32* words, U32 word_count, U32 variant, String8* out_name)
 {
   QK_State* state = &g_qk_state;
-  U32 values[28] = {0};
+  U32 values[29] = {0};
+  U32 hybrid_stack[16] = {0};
   U32 leaf_count = 0;
   U32 token_count = 0;
   U32 tokens = 0;
@@ -1959,6 +1960,9 @@ qk_filter_spec_kernel(U32* words, U32 word_count, U32 variant, String8* out_name
       values[1 + 3 * leaf_count + 0] = kind | (a_slot << 8) | (a_type << 16) | (a_op << 24);
       values[1 + 3 * leaf_count + 1] = b;
       values[1 + 3 * leaf_count + 2] = c;
+      // tec: variant 4 marks the plain comparisons that are terms of the top level AND chain, the leaves scan_simple's layout takes in the generated conjunctions
+      B32 plain = kind == 1 && a_op != QE_Opcode_CmpNe && (a_type == 1 || a_type == 3 || a_type == 4 || a_type == COLTYPE_I32);
+      hybrid_stack[depth] = plain ? 1u << leaf_count : 0u;
       leaf_count += 1;
       tokens |= 1u << (2 * token_count);
       token_count += 1;
@@ -1970,6 +1974,7 @@ qk_filter_spec_kernel(U32* words, U32 word_count, U32 variant, String8* out_name
       {
         return 0;
       }
+      hybrid_stack[depth - 2] = opcode == QE_Opcode_And ? (hybrid_stack[depth - 2] | hybrid_stack[depth - 1]) : 0u;
       tokens |= (opcode == QE_Opcode_And ? 2u : 3u) << (2 * token_count);
       token_count += 1;
       depth -= 1;
@@ -1991,6 +1996,7 @@ qk_filter_spec_kernel(U32* words, U32 word_count, U32 variant, String8* out_name
   values[25] = tokens;
   values[26] = token_count;
   values[27] = variant == 3 ? 1 : 0;
+  values[28] = variant == 4 ? hybrid_stack[0] : 0;
   String8 bytes = str8((U8*)values, sizeof(values));
   U64 key = u64_hash_from_str8(bytes) ^ (variant >= 2 ? 0x5fc1f17e25bec001ull : 0x5fc1f17e25bec000ull);
   U64 check = qk_check_hash(bytes);
@@ -1998,7 +2004,7 @@ qk_filter_spec_kernel(U32* words, U32 word_count, U32 variant, String8* out_name
   GPU_Kernel* kernel = gpu_kernel_alloc_from_spirv_spec(name, str8_zero(), values, ArrayCount(values));
   if (!kernel)
   {
-    // tec: variants 2 and 3 are scan_filter_spec8.comp, the same tree on the 8 rows per thread layout of scan_simple, 3 with the early exit of a thread whose rows are all decided
+    // tec: variants 2, 3 and 4 are scan_filter_spec8.comp, the same tree on the 8 rows per thread layout of scan_simple, 3 with the early exit of a thread whose rows are all decided, 4 with the hybrid evaluation of the conjunctions
     String8* spirv = variant >= 2 ? &state->filter_spec8_spirv : &state->filter_spec_spirv;
     B32* spirv_tried = variant >= 2 ? &state->filter_spec8_spirv_tried : &state->filter_spec_spirv_tried;
     os_mutex_take(state->lock);

@@ -2636,7 +2636,7 @@ qe_scan_filter_selected(Arena* arena, CQL_Database* database, CQL_Table* table, 
     return qe_cpu_scan_filter(arena, table, where_clause, out_trace);
   }
   // tec: QE_SCAN_FILTER_SPEC:1, the interpreter's program as specialization constants on one precompiled module
-  // tec: QE_SCAN_FILTER_SPEC:2 and 3 are the same tree on 8 rows per thread, 3 with an early exit, which needs zone map chunks of at least 8 rows like scan_simple
+  // tec: QE_SCAN_FILTER_SPEC:2, 3 and 4 are the same tree on 8 rows per thread, 3 with an early exit, 4 with the hybrid evaluation of conjunctions, which needs zone map chunks of at least 8 rows like scan_simple
   U64 filter_spec_setting = settings_u64(str8_lit("QE_SCAN_FILTER_SPEC"), 0);
   if (!kernel && !prog->has_score_output && filter_spec_setting != 0 && qk_compiler_available() && (filter_spec_setting < 2 || g_cql_state->zonemap_chunk_rows >= QE_SIMPLE_SCAN_ROWS_PER_THREAD))
   {

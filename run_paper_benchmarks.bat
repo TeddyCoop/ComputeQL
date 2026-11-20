@@ -62,6 +62,10 @@ set "only_treerows8=0"
 if /i "%~1"=="treerows8" (
   set "only_treerows8=1"
 )
+set "only_treerows8h=0"
+if /i "%~1"=="treerows8h" (
+  set "only_treerows8h=1"
+)
 set "only_treerows8x=0"
 if /i "%~1"=="treerows8x" (
   set "only_treerows8x=1"
@@ -235,6 +239,11 @@ if "%only_spinmore%"=="1" (
 
 if "%only_treerows8%"=="1" (
   call :treerows8
+  goto :finish
+)
+
+if "%only_treerows8h%"=="1" (
+  call :treerows8h
   goto :finish
 )
 
@@ -819,6 +828,20 @@ for %%n in (5000000 20000000 100000000) do (
 )
 for /l %%i in (1,1,3) do (
   call :run spin_tree8x sweep_20000000_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=20000000 --sweep --warmup --treespec --specvariant=3 --spinwarm --seed=%SEED% --setting=QE_SPIRV_DISK_CACHE:0"
+)
+exit /b 0
+
+
+::~
+:: the same with the hybrid evaluation of conjunctions, the plain comparisons of the top level AND chain on the eight rows layout and the other terms per row on the rows that remain (QE_SCAN_FILTER_SPEC:4)
+:treerows8h
+for %%n in (5000000 20000000 100000000) do (
+  for /l %%i in (1,1,3) do (
+    call :run spin_tree8h shapes_%%n_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=%%n --shapes=40 --seed=%SEED% --treespec --specvariant=4 --spinwarm --setting=QE_SPIRV_DISK_CACHE:0"
+  )
+)
+for /l %%i in (1,1,3) do (
+  call :run spin_tree8h sweep_20000000_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=20000000 --sweep --warmup --treespec --specvariant=4 --spinwarm --seed=%SEED% --setting=QE_SPIRV_DISK_CACHE:0"
 )
 exit /b 0
 
