@@ -26,6 +26,8 @@ setlocal
 ::        run_paper_benchmarks.bat spinspec       fusion off, fixed width and scan specialization with the busy warm-up
 ::        run_paper_benchmarks.bat spinshapes     the other selectivities, skewed and clustered data and select lists with the busy warm-up
 ::        run_paper_benchmarks.bat treespec       the interpreter with the WHERE clause as specialization constants (QE_SCAN_FILTER_SPEC:1) against the interpreter and generation
+::        run_paper_benchmarks.bat spinmore       the sweep at other sizes and the specialized module with a warm driver cache, with the busy warm-up
+::        run_paper_benchmarks.bat treegap        the 40 shapes with generated kernels that evaluate every leaf (QE_GEN_NO_SHORT_CIRCUIT:1) next to the specialized module
 ::        run_paper_benchmarks.bat failure        failures of generation and name collisions on the 40 scan shapes (not on aggregation queries)
 ::        run_paper_benchmarks.bat families       the workloads with one generation switch off at a time
 ::
@@ -50,6 +52,14 @@ set "only_failure=0"
 set "only_spinshapes=0"
 if /i "%~1"=="spinshapes" (
   set "only_spinshapes=1"
+)
+set "only_spinmore=0"
+if /i "%~1"=="spinmore" (
+  set "only_spinmore=1"
+)
+set "only_treegap=0"
+if /i "%~1"=="treegap" (
+  set "only_treegap=1"
 )
 set "only_treespec=0"
 if /i "%~1"=="treespec" (
@@ -206,6 +216,16 @@ if "%only_libtouch%"=="1" (
 
 if "%only_duckdbsep%"=="1" (
   call :duckdbsep
+  goto :finish
+)
+
+if "%only_spinmore%"=="1" (
+  call :spinmore
+  goto :finish
+)
+
+if "%only_treegap%"=="1" (
+  call :treegap
   goto :finish
 )
 
@@ -753,6 +773,37 @@ for /l %%i in (1,1,3) do (
 for /l %%i in (1,1,3) do (
   call :run spin_data minmax_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=20000000 --shapes=40 --seed=%SEED% --select=MIN(a),MAX(e),SUM(d) --spinwarm --setting=QE_SPIRV_DISK_CACHE:0"
 )
+exit /b 0
+
+
+::~
+:: the 40 shapes with every leaf evaluated in the generated kernels, to test whether the short circuit explains the steady gap of the specialized module
+:treegap
+for %%n in (20000000 100000000) do (
+  for /l %%i in (1,1,3) do (
+    call :run spin_gap nosc_%%n_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=%%n --shapes=40 --seed=%SEED% --treespec --spinwarm --setting=QE_SPIRV_DISK_CACHE:0,QE_GEN_NO_SHORT_CIRCUIT:1"
+  )
+)
+exit /b 0
+
+
+::~
+:: the sweep at five sizes with the busy warm-up, and the specialized module with the SPIR-V and driver caches filled
+:spinmore
+for %%n in (1000000 5000000 10000000 20000000 50000000) do (
+  for /l %%i in (1,1,3) do (
+    call :run spin3 sweep_%%n_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=%%n --sweep --warmup --spinwarm --seed=%SEED% --setting=QE_SPIRV_DISK_CACHE:0,GPU_VULKAN_SHADER_INFO:1"
+  )
+)
+call :clear
+set "clear_caches=0"
+set "driver_cache=1"
+call :run spin_treecache fill bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=20000000 --shapes=40 --seed=%SEED% --treespec --spinwarm"
+for /l %%i in (1,1,3) do (
+  call :run spin_treecache filled_%%i bench_reports\perquery_compile_report.md "bench_perquery_compile.exe --rows=20000000 --shapes=40 --seed=%SEED% --treespec --spinwarm"
+)
+set "clear_caches=1"
+set "driver_cache=0"
 exit /b 0
 
 

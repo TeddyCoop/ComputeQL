@@ -383,6 +383,15 @@ qk_spirv_compile(Arena* arena, String8 source)
   }
   QK_State* state = &g_qk_state;
   state->last_source_bytes = source.size;
+  // tec: QE_DUMP_GLSL:1 writes every source handed to shaderc to shaders/dump, named by its hash
+  if (settings_u64(str8_lit("QE_DUMP_GLSL"), 0) != 0)
+  {
+    Temp dump_scratch = scratch_begin(&arena, 1);
+    String8 dump_path = push_str8f(dump_scratch.arena, "%.*s/shaders/dump/%016llx.comp", str8_varg(os_get_process_info()->binary_path), u64_hash_from_str8(source));
+    os_make_directory(push_str8f(dump_scratch.arena, "%.*s/shaders/dump", str8_varg(os_get_process_info()->binary_path)));
+    os_write_data_to_file_path(dump_path, source);
+    scratch_end(dump_scratch);
+  }
   B32 use_disk_cache = settings_u64(str8_lit("QE_SPIRV_DISK_CACHE"), 1) != 0;
   Temp scratch = scratch_begin(&arena, 1);
   String8 cache_path = use_disk_cache ? qk_spirv_cache_path(scratch.arena, source) : str8_zero();
@@ -1073,7 +1082,15 @@ qk_scan_source_build(Arena* arena, QE_BytecodeProgram* prog, QK_HybridInfo* hybr
         QK_Value av = stack[--sp];
         String8 b = qk_value_as_bool(scratch.arena, bv);
         String8 a = qk_value_as_bool(scratch.arena, av);
-        stack[sp] = qk_value_make(push_str8f(scratch.arena, "(%.*s %s %.*s)", str8_varg(a), opcode == QE_Opcode_And ? "&&" : "||", str8_varg(b)), 1);
+        // tec: QE_GEN_NO_SHORT_CIRCUIT:1 combines the operands with bitwise operators on integers, so both are always evaluated. an experiment against scan_filter_spec.comp, which has no short circuit
+        if (settings_u64(str8_lit("QE_GEN_NO_SHORT_CIRCUIT"), 0) != 0)
+        {
+          stack[sp] = qk_value_make(push_str8f(scratch.arena, "bool(uint(%.*s) %s uint(%.*s))", str8_varg(a), opcode == QE_Opcode_And ? "&" : "|", str8_varg(b)), 1);
+        }
+        else
+        {
+          stack[sp] = qk_value_make(push_str8f(scratch.arena, "(%.*s %s %.*s)", str8_varg(a), opcode == QE_Opcode_And ? "&&" : "||", str8_varg(b)), 1);
+        }
         stack[sp].slot_mask = av.slot_mask | bv.slot_mask;
         if (opcode == QE_Opcode_And && hybrid_allowed)
         {
